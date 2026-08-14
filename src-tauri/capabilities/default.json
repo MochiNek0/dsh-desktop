@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The loading window only. Everything the app does — starting dsh, navigating, opening external links — is driven from Rust, so the webview needs no extra permission.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

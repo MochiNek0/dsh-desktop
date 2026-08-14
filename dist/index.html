@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>dsh desktop/title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --fg: #1a1a1a;
+        --muted: #6b7280;
+        --line: #e5e7eb;
+        --accent: #4d6bfe;
+        --danger: #b42318;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #101014;
+          --fg: #ececf1;
+          --muted: #9aa0ac;
+          --line: #26262e;
+          --danger: #f97066;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: grid;
+        place-items: center;
+        background: var(--bg);
+        color: var(--fg);
+        font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      main {
+        width: min(560px, 86vw);
+        text-align: center;
+      }
+      .mark {
+        font-size: 34px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        margin-bottom: 22px;
+      }
+      .mark span {
+        color: var(--accent);
+      }
+      .spinner {
+        width: 22px;
+        height: 22px;
+        margin: 0 auto 14px;
+        border: 2px solid var(--line);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      #status {
+        color: var(--muted);
+      }
+      #error {
+        display: none;
+        text-align: left;
+      }
+      #error h2 {
+        font-size: 15px;
+        margin: 0 0 8px;
+        color: var(--danger);
+      }
+      #error pre {
+        margin: 0;
+        max-height: 40vh;
+        overflow: auto;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        font: 12px/1.5 ui-monospace, Consolas, monospace;
+        color: var(--muted);
+        white-space: pre-wrap;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      body.failed .spinner,
+      body.failed #status {
+        display: none;
+      }
+      body.failed #error {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark">d<span>s</span>h</div>
+      <div class="spinner"></div>
+      <p id="status">正在启动 dsh…</p>
+      <div id="error">
+        <h2 id="error-title"></h2>
+        <pre id="error-detail"></pre>
+      </div>
+    </main>
+    <script>
+      // Called from the Rust side via webview eval; see src-tauri/src/main.rs.
+      window.dshStatus = function (text) {
+        document.getElementById('status').textContent = text;
+      };
+      window.dshError = function (title, detail) {
+        document.body.classList.add('failed');
+        document.getElementById('error-title').textContent = title;
+        document.getElementById('error-detail').textContent = detail || '';
+      };
+    </script>
+  </body>
+</html>
