@@ -80,3 +80,7 @@ src-tauri/src/server.rs 托管的 dsh web 子进程
 
 - 需要系统里已装好 `dsh`；自包含安装包见[路线图](#路线图--todo)
 - 目前只在 Windows 上做了系统化验证；macOS / Linux 的 bundle 目标尚未配置
+
+## 许可证
+
+[MIT](LICENSE) © 2026 MochiNek0

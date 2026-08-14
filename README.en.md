@@ -74,3 +74,7 @@ In priority order:
 
 - Requires a system-installed `dsh`; the self-contained installer is on the [roadmap](#roadmap--todo)
 - Only Windows has been systematically verified so far; macOS / Linux bundle targets are not configured yet
+
+## License
+
+[MIT](LICENSE) © 2026 MochiNek0
