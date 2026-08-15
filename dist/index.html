@@ -4,6 +4,20 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>dsh desktop</title>
+    <script>
+      // dsh's own theme preference, injected before this page parses; see
+      // src-tauri/src/theme.rs. `system` is resolved here, the same way the dsh
+      // page resolves it, so the two agree on what the OS is asking for.
+      (function () {
+        var preference = window.__DSH_THEME__ || 'system';
+        var dark =
+          preference === 'dark' ||
+          (preference === 'system' &&
+            typeof matchMedia !== 'undefined' &&
+            matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      })();
+    </script>
     <style>
       :root {
         color-scheme: light dark;
@@ -14,14 +28,16 @@
         --accent: #4d6bfe;
         --danger: #b42318;
       }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --bg: #101014;
-          --fg: #ececf1;
-          --muted: #9aa0ac;
-          --line: #26262e;
-          --danger: #f97066;
-        }
+      :root[data-theme='dark'] {
+        color-scheme: dark;
+        --bg: #101014;
+        --fg: #ececf1;
+        --muted: #9aa0ac;
+        --line: #26262e;
+        --danger: #f97066;
+      }
+      :root[data-theme='light'] {
+        color-scheme: light;
       }
       * {
         box-sizing: border-box;

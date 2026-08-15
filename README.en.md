@@ -16,6 +16,7 @@ Launching the app starts a local `dsh web` server and loads its UI into a native
 - **No port conflicts**: starts with `--port 0` so the OS assigns a free loopback port — it won't clash with a `dsh web` (3080) you're running by hand, and both can coexist
 - **Your session stays put**: the window never leaves the dsh server's origin; links to the outside world open in the system browser
 - **Clear boot & failure UX**: a loading page while the server starts; if `dsh` is missing or exits early, the error and its output tail are shown in-window
+- **Themed like dsh**: the title bar and the loading page take their light/dark from dsh's own setting, so a dark UI never arrives in a light window frame — and changing the theme in the UI moves the frame with it
 - **Clean lifecycle**: a normal exit kills the whole child process tree; a Windows Job Object backs that up when the app is force-killed, so no orphaned node processes are left behind either way
 - **Window memory & tray**: window geometry is remembered; closing the window parks the app in the tray instead of interrupting the session, and quitting goes through the tray menu
 - **Auto-update**: signed updates via the Tauri updater, asking before both the download and the restart
@@ -55,22 +56,46 @@ version that others can update to:
 2. Pass the key at build time:
 
    ```sh
-   TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/dsh-desktop.key npm run build
+   TAURI_SIGNING_PRIVATE_KEY=~/.tauri/dsh-desktop.key npm run build
    ```
+
+   That variable takes either the key itself or a path to it; there is no `..._PATH` variant. Leave it
+   out and the installer is still produced — the build just fails at the last step, with no `.sig`.
 
    The key was generated without a password; to add one, generate a fresh pair and update the public
    key in the config.
-3. Upload the installer, its `.sig`, and a `latest.json` to a GitHub Release so that
+3. Non-interactively (CI, a background job), pass the empty password too:
+
+   ```sh
+   TAURI_SIGNING_PRIVATE_KEY=~/.tauri/dsh-desktop.key TAURI_SIGNING_PRIVATE_KEY_PASSWORD= npm run build
+   ```
+
+   The key has no password, but the CLI asks for one anyway; with stdin not a terminal it waits
+   forever, which looks exactly like a hung compile (the last line is `expect a prompt for password`).
+4. Quit the running app before building. It holds `target/release/dsh-desktop.exe` open, which the
+   bundler has to read, so the build fails with `os error 32`. Note the installer has already been
+   written by then — unsigned — which reads a lot like success.
+5. Upload the installer, its `.sig`, and a `latest.json` to a GitHub Release so that
    `releases/latest/download/latest.json` resolves.
 
 ## How it works
 
-1. Finds dsh in the order `DSH_BIN` → the app-managed dsh (bundled or downloaded, whichever is newer) → `dsh` on PATH, then starts `dsh web --port 0` with the user's home directory as the working directory, letting the OS pick a free loopback port — so it never fights your manually run `dsh web` (3080) for the port, and both can be up at once.
+1. Finds dsh in the order `DSH_BIN` → the app-managed dsh (bundled or downloaded, whichever is newer) → `dsh` on PATH, then starts `dsh web --port 0` with the user's home directory as the working directory, letting the OS pick a free loopback port — so it never fights your manually run `dsh web` (3080) for the port, and both can be up at once. This happens *before* the window is built: dsh takes a second or two to
+   come up and so does WebView2, and neither has anything to say to the other until the server is
+   listening.
 2. Reads the child's stdout, waiting for the line `dsh web: http://127.0.0.1:<port>` — that line is both the readiness signal and the URL to load. The window shows a loading page meanwhile; if startup fails or dsh exits early, the page shows the tail of its output.
 3. Once the URL is known, the window navigates to it. The window stays within that origin; links pointing outside are handed to the system browser so your session is never replaced.
 4. On exit, the entire child process tree is killed (`taskkill /T` — killing only the parent would orphan node). The child is also placed in a Windows Job Object with `KILL_ON_JOB_CLOSE` from the start: handles are closed by the kernel however a process dies, so the tree goes down with the app even when it is force-killed and no cleanup code ever runs.
 
 The working directory is just the initial default — pick the real project directory in the UI with the directory picker.
+
+The window's light/dark is not a setting of its own: dsh keeps the UI theme in
+`$DSH_HOME/settings.yaml` under `ui-theme.preference` (`light`/`dark`/`system`), and the window reads
+the same field — at creation, so neither the title bar nor the loading page flashes the opposite
+colour first. Its timestamp is then looked at every 50 ms, so switching the theme in the UI moves
+the frame without a restart — dsh writes the file on the click, so that interval is the whole gap
+between the page turning dark and the frame following, and a gap the eye can catch reads as two
+separate events.
 
 ### The two dsh installations
 
@@ -81,7 +106,8 @@ The app manages two copies of dsh and runs whichever has the higher version:
 | `<install dir>/resources/dsh/` | Shipped in the installer. Always present, always works, never changes — the floor for offline first launches and for every failure path |
 | `%LOCALAPPDATA%\ai.deepseek.dsh.desktop\dsh\` | Downloaded later because npm had something newer |
 
-After startup it runs `npm view @deepseek-ai/dsh version` in the background — through npm rather than
+Once the UI is up — not at launch, where it would compete with the booting dsh for disk and network —
+it runs `npm view @deepseek-ai/dsh version` in the background — through npm rather than
 a request of our own, so the user's `.npmrc` still applies and private registries and corporate
 proxies keep working. If something newer exists, a dialog names the version and the download size and
 **waits for consent**. The install lands in `dsh.next/` and is swapped in on the **next launch**: a
@@ -136,6 +162,18 @@ src-tauri/src/update.rs    The app's own auto-update
 
 - Self-containment has a price: the bundled resources unpack to roughly 350 MB (node 93 MB + dsh's
   dependency tree at 255 MB across 33k files), which NSIS compresses into a ~55 MB installer
+- The first launch after installing is visibly slow: the bundled dsh is 33k files, and reading its
+  whole dependency tree from a path the scanner has never seen drags Windows Defender's real-time
+  protection into it for tens of seconds. Launching again from the same path is back to 1–2 s. If
+  that bothers you, exclude the install directory — elevated PowerShell, **with the path you
+  actually chose at install time** (`%LOCALAPPDATA%\dsh-desktop` by default):
+
+  ```powershell
+  Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\dsh-desktop", "$env:LOCALAPPDATA\ai.deepseek.dsh.desktop"
+  ```
+
+  The installer does not do this for you: carving a directory out of real-time protection is the
+  user's own security trade-off, and a per-user install has no administrator rights to do it with
 - Only Windows has been systematically verified so far; macOS / Linux bundle targets are not configured yet
 - Installers must be built on the platform they target: npm resolves native optional dependencies against the machine doing the install
 - The node version is pinned in `scripts/bundle-runtime.mjs`, so bumping it means a code change and a new release. The **bundled** dsh version is pinned there too, but the app catches up to npm's latest at runtime, so that pin only decides the floor

@@ -10,15 +10,18 @@
 // Everything it writes lives under `src-tauri/resources/`, which is gitignored.
 // It is skipped entirely when that directory already holds the versions below.
 
-import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** Pinned so a build is reproducible and an update is a visible commit. */
 const NODE_VERSION = '24.19.0';
 const DSH_VERSION = '0.1.0-rc.6';
+
+/** How long the traced boot gets before it counts as broken. */
+const BOOT_TIMEOUT_MS = 180_000;
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const resources = join(root, 'src-tauri', 'resources');
@@ -26,24 +29,29 @@ const stamp = join(resources, 'bundled.json');
 
 const want = { node: NODE_VERSION, dsh: DSH_VERSION, platform: process.platform, arch: process.arch };
 
-main();
+await main();
 
-function main() {
+async function main() {
   if (isStaged()) {
     console.log(`[bundle] up to date: node ${NODE_VERSION}, dsh ${DSH_VERSION}`);
-    return;
+  } else {
+    // Only the two staged trees — `resources/` itself is tracked (`.gitkeep`) so
+    // that Tauri's resource glob always matches something.
+    for (const stale of ['runtime', 'dsh']) rmSync(join(resources, stale), { recursive: true, force: true });
+    rmSync(stamp, { force: true });
+    rmSync(bootSetTarget(), { force: true });
+    mkdirSync(resources, { recursive: true });
+
+    stageNode();
+    stageDsh();
+
+    writeFileSync(stamp, `${JSON.stringify(want, null, 2)}\n`);
   }
 
-  // Only the two staged trees — `resources/` itself is tracked (`.gitkeep`) so
-  // that Tauri's resource glob always matches something.
-  for (const stale of ['runtime', 'dsh']) rmSync(join(resources, stale), { recursive: true, force: true });
-  rmSync(stamp, { force: true });
-  mkdirSync(resources, { recursive: true });
+  // Kept out of the staging check: a trace that failed leaves no list, and
+  // retrying it should not mean downloading Node and dsh again.
+  if (!existsSync(bootSetTarget())) await traceBootSet();
 
-  stageNode();
-  stageDsh();
-
-  writeFileSync(stamp, `${JSON.stringify(want, null, 2)}\n`);
   console.log('[bundle] done');
 }
 
@@ -69,6 +77,16 @@ function nodeTarget() {
 /** npm's own entry point, which the app runs to fetch newer dsh releases. */
 function npmTarget() {
   return join(resources, 'runtime', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+}
+
+/** The warm-up list `traceBootSet` records and src-tauri/src/warm.rs reads. */
+function bootSetTarget() {
+  return join(resources, 'dsh-boot-set.txt');
+}
+
+/** dsh's own entry point inside the staged tree. */
+function dshEntry() {
+  return join(resources, 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 }
 
 /**
@@ -157,4 +175,123 @@ function stageDsh() {
     cwd: dir,
     stdio: 'inherit',
   });
+}
+
+/**
+ * Boot dsh once and write down every file it read, for the app to read again —
+ * in parallel, from several threads — while dsh is starting on the user's
+ * machine. See src-tauri/src/warm.rs for why that is worth doing.
+ *
+ * Best effort: a trace that fails costs a slow first launch, not a build. The
+ * boot runs against a throwaway `$DSH_HOME` so it neither reads nor rearranges
+ * the profile of whoever is doing the build.
+ */
+async function traceBootSet() {
+  const scratch = mkdtempSync(join(tmpdir(), 'dsh-trace-'));
+  const trace = join(scratch, 'trace.txt');
+  writeFileSync(trace, '');
+
+  console.log('[bundle] recording what a dsh boot reads');
+  let recorded;
+  try {
+    await bootOnce(trace, scratch);
+    recorded = readFileSync(trace, 'utf8');
+  } catch (error) {
+    console.warn(`[bundle] boot trace failed, first launch will be slow: ${error.message}`);
+    return;
+  } finally {
+    // Retried: the boot was killed a moment ago, and on Windows its handles can
+    // outlive it just long enough to make the first attempt fail.
+    rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+
+  const dir = join(resources, 'dsh');
+  const read = recorded
+    .split('\n')
+    .map((line) => line.split('\t'))
+    .filter((fields) => fields.length === 2)
+    .sort((left, right) => Number(left[0]) - Number(right[0]))
+    .map((fields) => fields[1]);
+
+  // Manifests first: the dependency-closure walk dsh opens with reads them, and
+  // Node's resolver reads them again on the way to every module. Neither shows
+  // up in the trace — the first is `readFileSync`, the second is internal.
+  const files = new Set(manifests(dir).map((file) => relative(dir, file)));
+  for (const file of read) {
+    if (file.startsWith(dir)) files.add(relative(dir, file));
+  }
+
+  const list = [...files].map((file) => file.split('\\').join('/'));
+  writeFileSync(bootSetTarget(), `${list.join('\n')}\n`);
+  console.log(`[bundle] boot reads ${list.length} files`);
+}
+
+/**
+ * Run `dsh web` until it says it is serving, then stop it.
+ *
+ * The trace is what this is for, so the port is left to the OS and the URL is
+ * only read as the signal to stop.
+ */
+function bootOnce(trace, home) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(nodeTarget(), ['--require', join(root, 'scripts', 'boot-trace', 'preload.cjs'), dshEntry(), 'web', '--port', '0'], {
+      cwd: home,
+      env: { ...process.env, DSH_HOME: join(home, 'home'), DSH_BOOT_TRACE: trace },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let output = '';
+    let settled = false;
+    const settle = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stop(child);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => settle(new Error(`dsh did not start within ${BOOT_TIMEOUT_MS / 1000}s`)), BOOT_TIMEOUT_MS);
+
+    for (const stream of [child.stdout, child.stderr]) {
+      stream.setEncoding('utf8');
+      stream.on('data', (chunk) => {
+        output += chunk;
+        if (output.includes('dsh web:')) settle();
+      });
+    }
+
+    child.on('error', (error) => settle(error));
+    child.on('exit', (code) => settle(new Error(`dsh exited with ${code} before serving:\n${output.trim()}`)));
+  });
+}
+
+/**
+ * Stop a traced boot along with the workers it spawned. `dsh web` is a server:
+ * left alone it would hold the build's temporary directory open for as long as
+ * the build runs.
+ */
+function stop(child) {
+  child.removeAllListeners('exit');
+  if (process.platform === 'win32') {
+    try {
+      execFileSync('taskkill', ['/T', '/F', '/PID', String(child.pid)], { stdio: 'ignore' });
+    } catch {
+      // Already gone, which is the state this wanted.
+    }
+  } else {
+    child.kill('SIGKILL');
+  }
+}
+
+/** Every package.json in the staged tree, as absolute paths. */
+function manifests(dir) {
+  const found = [];
+
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) found.push(...manifests(path));
+    else if (entry.name === 'package.json') found.push(path);
+  }
+
+  return found;
 }

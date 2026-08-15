@@ -16,6 +16,7 @@
 - **不抢端口**：以 `--port 0` 启动，由系统分配空闲的 loopback 端口，不会和你手动跑的 `dsh web`（3080）冲突，两者可以同时开着
 - **会话不被顶掉**：窗口只停留在 dsh 服务所在的 origin 内；指向站外的链接一律交给系统浏览器打开
 - **清晰的启动/失败体验**：启动期间显示加载页；dsh 缺失或启动失败时，展示错误信息和它的输出尾部
+- **主题跟随 dsh**：标题栏和加载页读 dsh 自己的亮/暗设置，不会出现深色界面配浅色窗框；在界面里改了主题，窗框立刻跟上
 - **生命周期完整**：正常退出结束整棵子进程树；被强杀时由 Windows Job Object 兜底，任何情况下都不残留孤儿 node
 - **窗口记忆与托盘**：记住窗口位置与大小；关闭窗口收进托盘而不是中断会话，退出走托盘菜单
 - **自动更新**：基于 Tauri updater 的签名更新，下载与重启都会先征求同意
@@ -53,11 +54,25 @@ Windows 上构建，macOS 的在 macOS 上构建。
 2. 构建时提供私钥：
 
    ```sh
-   TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/dsh-desktop.key npm run build
+   TAURI_SIGNING_PRIVATE_KEY=~/.tauri/dsh-desktop.key npm run build
    ```
 
+   这个变量收密钥本身或者密钥文件的路径，两者都认；没有 `..._PATH` 这个变体。
+   漏了它，安装包照样出得来，只是最后签名那步会失败退出，没有 `.sig`。
+
    密钥生成时没设密码；要加密码就重新生成一对，并同步更新配置里的公钥。
-3. 把安装包、`.sig` 文件和一份 `latest.json` 一起传到 GitHub Release，
+3. 非交互地跑（CI、后台任务）再加一个空密码：
+
+   ```sh
+   TAURI_SIGNING_PRIVATE_KEY=~/.tauri/dsh-desktop.key TAURI_SIGNING_PRIVATE_KEY_PASSWORD= npm run build
+   ```
+
+   密钥没设密码，但 CLI 仍然会问一次；stdin 不是终端时它就一直等下去，
+   看起来和编译卡死一模一样（最后一行停在 `expect a prompt for password`）。
+4. 构建前退出正在运行的 app。它锁着 `target/release/dsh-desktop.exe`，
+   打包器读不了这个文件，会以 `os error 32`（另一个程序正在使用此文件）失败。
+   注意失败之前安装包已经写出来了，只是没签名，很容易被当成构建成功。
+5. 把安装包、`.sig` 文件和一份 `latest.json` 一起传到 GitHub Release，
    使得 `releases/latest/download/latest.json` 可访问。
 
 ## 工作原理
@@ -65,6 +80,7 @@ Windows 上构建，macOS 的在 macOS 上构建。
 1. 按 `DSH_BIN` → app 管理的 dsh（内置与已下载的取版本高者）→ PATH 上的 `dsh` 的顺序找到 dsh，
    以用户主目录为工作目录启动 `dsh web --port 0`，让系统分配一个空闲的 loopback 端口，
    因此不会和你手动跑的 `dsh web`（3080）抢端口，两者可以同时开着。
+   这一步在建窗口**之前**做：dsh 起来要一两秒，WebView2 初始化也要，两件事互不相干，可以同时进行。
 2. 读子进程 stdout，等它打印 `dsh web: http://127.0.0.1:<port>` —— 这一行既是就绪信号，
    也是要加载的地址。期间窗口显示加载页；启动失败或 dsh 提前退出，加载页会显示它的输出尾部。
 3. 拿到地址后把窗口导航到该 URL。窗口保持在这个 origin 内；指向站外的链接交给系统浏览器打开，
@@ -75,6 +91,12 @@ Windows 上构建，macOS 的在 macOS 上构建。
 
 工作目录只是初始默认值 —— 具体项目目录在界面里用目录选择器选。
 
+窗口的亮/暗不是另一套设置：dsh 把界面主题存在 `$DSH_HOME/settings.yaml` 的
+`ui-theme.preference`（`light`/`dark`/`system`），窗口读同一个字段，建窗口时就带上，
+所以标题栏和加载页不会先闪一下相反的颜色。之后每 50 ms 看一眼这个文件的时间戳，
+在界面里换主题，窗框跟着换，不用重启 —— dsh 点下就写文件，这个间隔就是页面变色和
+窗框跟上之间的全部差距，肉眼能捕捉到的差距会被看成「分两步」。
+
 ### dsh 的两份安装
 
 app 管着两份 dsh，谁的版本高就跑谁：
@@ -84,7 +106,8 @@ app 管着两份 dsh，谁的版本高就跑谁：
 | `<安装目录>/resources/dsh/` | 安装包自带。永远在、永远能用、永不变化，是离线首启和一切失败路径的保底 |
 | `%LOCALAPPDATA%\ai.deepseek.dsh.desktop\dsh\` | 后来从 npm 下载的更新版 |
 
-启动后后台跑一次 `npm view @deepseek-ai/dsh version`（走 npm 而不是自己发请求，是为了继承用户
+**界面起来之后**（不是启动那一刻，免得和正在启动的 dsh 抢磁盘和网络）后台跑一次
+`npm view @deepseek-ai/dsh version`（走 npm 而不是自己发请求，是为了继承用户
 的 `.npmrc`——私有 registry 和公司代理才不会失效）。发现新版就弹窗告知版本号和体积，
 **用户同意才下载**。装到 `dsh.next/`，**下次启动**时才换进去——正在跑的服务没法热替换，
 而且启动那一刻没有任何进程占着目录，是 Windows 上唯一能安全改名的时机。
@@ -134,6 +157,17 @@ src-tauri/src/update.rs    应用自身的自动更新
 
 - 自包含是有代价的：内置资源解压后约 350 MB（node 93 MB + dsh 依赖树 255 MB / 33k 文件），
   NSIS 压缩后安装包约 55 MB
+- 装好之后第一次启动明显慢：内置 dsh 是 33k 个文件，第一次从一条杀软没见过的路径
+  把整棵依赖树读一遍，Windows Defender 的实时扫描能把它拖到几十秒；同一个路径上
+  之后再启动就回到 1–2 秒。介意的话给安装目录加排除项 —— 管理员 PowerShell，
+  **路径换成你安装时实际选的那个**（默认 `%LOCALAPPDATA%\dsh-desktop`）：
+
+  ```powershell
+  Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\dsh-desktop", "$env:LOCALAPPDATA\ai.deepseek.dsh.desktop"
+  ```
+
+  安装程序不替你做这件事：把一个目录从实时防护里挖掉是用户自己的安全取舍，
+  而且按用户安装本来就没有管理员权限，想做也做不了
 - 目前只在 Windows 上做了系统化验证；macOS / Linux 的 bundle 目标尚未配置
 - 安装包必须在目标平台上构建：npm 按执行安装的机器解析原生可选依赖
 - node 版本在 `scripts/bundle-runtime.mjs` 里写死，升级要改代码重新发版。

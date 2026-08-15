@@ -54,6 +54,9 @@ pub struct Install {
     /// without dsh probably has no Node either.
     node: PathBuf,
     entry: PathBuf,
+    /// The directory holding `node_modules`, which the warm-up list's paths are
+    /// relative to. See [`crate::warm`].
+    pub root: PathBuf,
     pub version: Version,
 }
 
@@ -82,6 +85,7 @@ impl Install {
         Some(Self {
             node: node.to_path_buf(),
             entry,
+            root: dir.to_path_buf(),
             version,
         })
     }
@@ -127,15 +131,25 @@ pub fn current(app: &AppHandle) -> Option<Install> {
 /// gives the tree that name once npm has exited cleanly. A download that was
 /// cut short is sitting under another name and is ignored here — swapping a
 /// half-written tree in would destroy a perfectly good one.
+///
+/// The tree a previous promotion displaced is cleared here too, whether or not
+/// there is anything to promote this time.
 pub fn promote(app: &AppHandle) {
     let (Some(staged), Some(live)) = (staging_dir(app), downloaded_dir(app)) else {
         return;
     };
+    let discarded = live.with_extension("old");
+
     if !staged.is_dir() {
+        // Nothing to swap in, but [`discard`] dies with the app that started
+        // it, so a quit part-way through one leaves a few hundred megabytes
+        // behind. Nothing else ever comes back for it, so every launch does.
+        discard(discarded);
         return;
     }
 
-    let discarded = live.with_extension("old");
+    // Synchronous, unlike the discard below: the rename that follows needs the
+    // name to be free.
     let _ = std::fs::remove_dir_all(&discarded);
 
     if live.is_dir() && std::fs::rename(&live, &discarded).is_err() {
@@ -147,8 +161,22 @@ pub fn promote(app: &AppHandle) {
         return;
     }
 
-    // Best effort: a locked leftover just gets cleared on a later launch.
-    let _ = std::fs::remove_dir_all(&discarded);
+    discard(discarded);
+}
+
+/// Delete a displaced dsh tree off the startup path. It is a couple of hundred
+/// megabytes of small files, and it is under a name nothing looks at, so
+/// nobody is waiting on it going away. Best effort: what this does not finish —
+/// because it was locked, or because the app quit out from under it — the
+/// [`promote`] on a later launch picks up.
+fn discard(dir: PathBuf) {
+    if !dir.is_dir() {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 /// Ask npm what the newest dsh is and, if we do not have it, offer to fetch it.
@@ -372,7 +400,7 @@ fn node(app: &AppHandle) -> Option<PathBuf> {
     node.is_file().then_some(node)
 }
 
-fn resources(app: &AppHandle) -> Option<PathBuf> {
+pub fn resources(app: &AppHandle) -> Option<PathBuf> {
     Some(simplified(app.path().resource_dir().ok()?).join("resources"))
 }
 

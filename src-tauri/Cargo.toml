@@ -18,6 +18,7 @@ serde_json = "1"
 # dsh versions carry prerelease tags (`0.1.0-rc.6`); comparing those by hand is
 # how you end up shipping rc.10 as older than rc.9.
 semver = "1"
+tauri-plugin-autostart = "2.5.1"
 
 [target.'cfg(windows)'.dependencies]
 # Job objects: the kernel-side backstop that kills the dsh process tree when the
