@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 /// Keeps a spawned process off the console it would otherwise pop up.
 #[cfg(windows)]
@@ -29,17 +31,23 @@ pub enum Event {
 
 pub struct Server {
     child: Child,
+    /// Held for the lifetime of the app; see [`Job`].
+    #[cfg(windows)]
+    _job: Option<Job>,
 }
 
 /// Spawn `dsh web` and return the handle plus a channel that yields exactly one
 /// [`Event`].
-pub fn start() -> std::io::Result<(Server, Receiver<Event>)> {
-    let mut child = command()
+pub fn start(app: &tauri::AppHandle) -> std::io::Result<(Server, Receiver<Event>)> {
+    let mut child = command(app)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(working_dir())
         .spawn()?;
+
+    #[cfg(windows)]
+    let job = Job::hold(&child);
 
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
@@ -50,40 +58,138 @@ pub fn start() -> std::io::Result<(Server, Receiver<Event>)> {
     pump(stderr, tail.clone(), None);
     pump(stdout, tail, Some(tx));
 
-    Ok((Server { child }, rx))
+    let server = Server {
+        child,
+        #[cfg(windows)]
+        _job: job,
+    };
+    Ok((server, rx))
 }
 
 impl Server {
-    /// Stop the server. On Windows the child is `cmd.exe` wrapping the `dsh.cmd`
-    /// shim wrapping node, so the whole tree has to go, not just the parent.
+    /// Stop the server.
     pub fn stop(&mut self) {
-        let pid = self.child.id();
-
-        #[cfg(windows)]
-        {
-            let _ = Command::new("taskkill")
-                .args(["/T", "/F", "/PID", &pid.to_string()])
-                .creation_flags(CREATE_NO_WINDOW)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-
-        #[cfg(not(windows))]
-        {
-            let _ = pid;
-            let _ = self.child.kill();
-        }
-
-        let _ = self.child.wait();
+        kill_tree(&mut self.child);
     }
 }
 
-/// The command that boots the browser UI. `DSH_BIN` overrides the executable
-/// for installs where `dsh` is not on the GUI session's PATH.
-fn command() -> Command {
-    let bin = std::env::var("DSH_BIN").unwrap_or_else(|_| default_bin().to_string());
-    let mut command = Command::new(bin);
+/// Kill a child process along with everything it spawned, and reap it.
+///
+/// The child is often a launcher rather than the process doing the work — on
+/// Windows `dsh` on PATH is `cmd.exe` wrapping the `dsh.cmd` shim wrapping
+/// node, and npm shells out to node of its own — so the whole tree has to go,
+/// not just the parent.
+pub fn kill_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = child.kill();
+    }
+
+    let _ = child.wait();
+}
+
+/// A Windows job object holding a child's process tree, configured to kill
+/// everything in it once the last handle to it closes. Used for the two
+/// children that outlive a single call: `dsh web`, and the npm that installs a
+/// dsh update.
+///
+/// [`kill_tree`] is the ordinary shutdown path and does the same job more
+/// politely. This is the backstop for the paths that never reach it: the app is
+/// force-killed (`taskkill /F` without `/T`), or it crashes. Handles are closed
+/// by the kernel when a process dies however it dies, so closing ours is enough
+/// to take the tree down with us — no cooperation from our own code required.
+///
+/// Best-effort: a failure here loses the backstop, not the app, so `hold`
+/// returns `None` rather than propagating.
+#[cfg(windows)]
+pub struct Job(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: a job object handle is process-wide, not owned by the thread that
+// created it, so moving it into the `Server` another thread may drop is fine.
+#[cfg(windows)]
+unsafe impl Send for Job {}
+
+#[cfg(windows)]
+impl Job {
+    /// Put `child` — and, by inheritance, everything it spawns — in a fresh job.
+    ///
+    /// There is a small race: the child is already running by the time it is
+    /// assigned, so a grandchild spawned in that window would escape. In
+    /// practice the child is a launcher that takes milliseconds to get to
+    /// spawning node, and the ordinary shutdown path covers the tree anyway.
+    pub fn hold(child: &Child) -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        // SAFETY: every call below is a documented Win32 entry point given a
+        // handle we just created (or std's live process handle) and a
+        // correctly sized, fully initialized limit struct.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+            let configured = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            let assigned =
+                configured != 0 && AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) != 0;
+
+            if !assigned {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self(job))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Job {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the handle `hold` created and never handed out.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// The command that boots the browser UI, from the first of three sources that
+/// this machine actually has:
+///
+/// 1. `DSH_BIN` — an explicit choice, so it wins outright.
+/// 2. The best dsh the app manages: whichever of the bundled copy and the
+///    downloaded one in app data has the higher version. Absent under
+///    `tauri dev`, where nothing has been staged.
+/// 3. `dsh` on PATH, for a build without a bundled runtime.
+fn command(app: &tauri::AppHandle) -> Command {
+    let mut command = if let Some(bin) = std::env::var_os("DSH_BIN") {
+        Command::new(bin)
+    } else if let Some(dsh) = crate::dsh::current(app) {
+        dsh.command()
+    } else {
+        Command::new(default_bin())
+    };
+
     command.args(["web", "--port", "0"]);
 
     #[cfg(windows)]

@@ -1,3 +1,9 @@
 node_modules/
 src-tauri/target/
 src-tauri/gen/
+# Staged by scripts/bundle-runtime.mjs: the Node runtime and dsh the installer
+# ships. The directory itself is tracked so the bundler's glob always matches —
+# a build without a staged runtime falls back to `dsh` on PATH.
+src-tauri/resources/*
+!src-tauri/resources/.gitkeep
+bash.exe.stackdump

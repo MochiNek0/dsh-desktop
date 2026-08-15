@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",
+    "bundle:runtime": "node scripts/bundle-runtime.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {

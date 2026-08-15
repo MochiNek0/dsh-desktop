@@ -1,15 +1,20 @@
 // The release build is a GUI app: no console window behind it.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod dsh;
 mod server;
+mod update;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::PageLoadEvent;
 use tauri::{Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_window_state::StateFlags;
 
 /// The origin `dsh web` bound to, once it has. Navigation inside it stays in the
 /// window; anything else is a link to the outside world.
@@ -27,11 +32,36 @@ fn main() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // Remember where the user put the window. Visibility is deliberately not
+        // remembered: the window can be hidden to the tray, and restoring that
+        // would start the app with nothing on screen.
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    StateFlags::SIZE
+                        | StateFlags::POSITION
+                        | StateFlags::MAXIMIZED
+                        | StateFlags::FULLSCREEN,
+                )
+                .build(),
+        )
         .setup(move |app| {
             let splash = Splash::default();
             let window = build_window(app.handle(), setup_origin.clone(), splash.clone())?;
+            build_tray(app.handle())?;
 
-            match server::start() {
+            // A dev build's version never matches a release, so it would prompt
+            // on every run.
+            #[cfg(not(debug_assertions))]
+            update::check_quietly(app.handle());
+
+            // Before the first spawn, while nothing holds the directory open.
+            dsh::promote(app.handle());
+            dsh::check(app.handle());
+
+            match server::start(app.handle()) {
                 Ok((child, events)) => {
                     *setup_server.lock().unwrap() = Some(child);
                     watch(window, setup_origin.clone(), splash, events);
@@ -41,8 +71,9 @@ fn main() {
                     "启动 dsh 失败",
                     &format!(
                         "无法执行 dsh：{error}\n\n\
-                         请确认 dsh 已安装并在 PATH 中（终端里执行 `dsh --version` 验证），\
-                         或用 DSH_BIN 环境变量指向 dsh 可执行文件的完整路径。"
+                         安装包内置的运行时不可用，PATH 中也没有找到 dsh\
+                         （终端里执行 `dsh --version` 验证）。\
+                         可用 DSH_BIN 环境变量指向 dsh 可执行文件的完整路径。"
                     ),
                 ),
             }
@@ -54,6 +85,7 @@ fn main() {
 
     app.run(move |_handle, event| {
         if let tauri::RunEvent::Exit = event {
+            dsh::stop();
             if let Some(child) = server.lock().unwrap().as_mut() {
                 child.stop();
             }
@@ -69,8 +101,9 @@ fn build_window(
     splash: Splash,
 ) -> tauri::Result<WebviewWindow> {
     let opener = app.clone();
+    let closer = app.clone();
 
-    WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("dsh desktop")
         .inner_size(1360.0, 900.0)
         .min_inner_size(720.0, 520.0)
@@ -89,7 +122,68 @@ fn build_window(
             let _ = opener.opener().open_url(url.to_string(), None::<&str>);
             false
         })
-        .build()
+        .build()?;
+
+    // Closing the window parks the app in the tray instead of tearing the agent
+    // down mid-task. Quitting for real goes through the tray menu.
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if let Some(window) = closer.get_webview_window("main") {
+                let _ = window.hide();
+            }
+        }
+    });
+
+    Ok(window)
+}
+
+/// The tray icon: how the window comes back once it has been closed, and the
+/// only way to actually quit.
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
+    let check = MenuItem::with_id(app, "check", "检查更新…", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出 dsh", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &check, &quit])?;
+
+    let mut tray = TrayIconBuilder::new()
+        .tooltip("dsh desktop")
+        .menu(&menu)
+        // Left click reveals the window; the menu belongs on the right button.
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => reveal(app),
+            "check" => update::check_now(app),
+            // Exits the run loop, which stops the dsh server on the way out.
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                reveal(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+
+    tray.build(app)?;
+    Ok(())
+}
+
+/// Bring the window back to the front, whatever it was hidden behind.
+fn reveal(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
 }
 
 /// Whether a navigation target is part of this app: the bundled loading page, or

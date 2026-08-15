@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "identifier": "ai.deepseek.dsh.desktop",
   "build": {
-    "frontendDist": "../dist"
+    "frontendDist": "../dist",
+    "beforeBuildCommand": "npm run bundle:runtime"
   },
   "app": {
     "windows": [],
@@ -12,9 +13,19 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/MochiNek0/dsh-desktop-tauri/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhCOTkyNUJDNjA1OTBFQ0QKUldUTkRsbGd2Q1daaTJNUnBUTmN0d291b1A5SGlpUG05My81bXdkOGlCU2o0Y0Y1N1pUdFBQUkIK"
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "resources": ["resources/**/*"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -25,6 +36,10 @@
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
       }
     }
   }
