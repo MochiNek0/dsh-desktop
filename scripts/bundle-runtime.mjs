@@ -1,6 +1,11 @@
-// Stage the runtime the installer ships: a Node binary and a pre-installed
-// `@deepseek-ai/dsh`, so the app has something to run on a machine that has
-// neither.
+// Stage the runtime the installer ships: a Node binary and npm, so the machine
+// has something to install and run dsh with.
+//
+// dsh itself is *not* shipped. The installer fetches it with the npm staged
+// here (see `src-tauri/installer-hooks.nsh`), and the app fetches it on first
+// launch if that did not work out. What is staged here instead is the warm-up
+// list, which needs a dsh tree to record against but not to ship one — that
+// install goes to a temporary directory and is thrown away.
 //
 // Runs from `beforeBuildCommand`, and by hand as `npm run bundle:runtime`.
 // Builds for the host platform only — npm resolves native optional
@@ -18,6 +23,14 @@ import { fileURLToPath } from 'node:url';
 
 /** Pinned so a build is reproducible and an update is a visible commit. */
 const NODE_VERSION = '24.19.0';
+
+/**
+ * The dsh the warm-up list is recorded against. Not what the user gets — the
+ * installer asks npm for the newest release at the moment they install — so
+ * this only has to be close enough that the two trees put the same files in
+ * the same places. A path that moved between the two is one warm-up read that
+ * misses, which `src-tauri/src/warm.rs` skips.
+ */
 const DSH_VERSION = '0.1.0-rc.6';
 
 /** How long the traced boot gets before it counts as broken. */
@@ -27,6 +40,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const resources = join(root, 'src-tauri', 'resources');
 const stamp = join(resources, 'bundled.json');
 
+// `dsh` is in here even though no dsh is staged: it is what the warm-up list
+// below was recorded against, so bumping it has to invalidate that list.
 const want = { node: NODE_VERSION, dsh: DSH_VERSION, platform: process.platform, arch: process.arch };
 
 await main();
@@ -35,15 +50,15 @@ async function main() {
   if (isStaged()) {
     console.log(`[bundle] up to date: node ${NODE_VERSION}, dsh ${DSH_VERSION}`);
   } else {
-    // Only the two staged trees — `resources/` itself is tracked (`.gitkeep`) so
-    // that Tauri's resource glob always matches something.
+    // `dsh` is no longer staged, but a tree an older build left there is 255 MB
+    // that would otherwise be swept into the installer by the resource glob.
+    // `resources/` itself is tracked (`.gitkeep`) so that glob always matches.
     for (const stale of ['runtime', 'dsh']) rmSync(join(resources, stale), { recursive: true, force: true });
     rmSync(stamp, { force: true });
     rmSync(bootSetTarget(), { force: true });
     mkdirSync(resources, { recursive: true });
 
     stageNode();
-    stageDsh();
 
     writeFileSync(stamp, `${JSON.stringify(want, null, 2)}\n`);
   }
@@ -58,6 +73,10 @@ async function main() {
 /** Whether a previous run already produced exactly what this one would. */
 function isStaged() {
   if (!existsSync(stamp)) return false;
+  // A tree from a build that still bundled dsh. The stamp matches — same node,
+  // same dsh — so nothing else here would notice, and the resource glob would
+  // put all 255 MB of it into the installer.
+  if (existsSync(join(resources, 'dsh'))) return false;
   try {
     const have = JSON.parse(readFileSync(stamp, 'utf8'));
     return (
@@ -84,9 +103,9 @@ function bootSetTarget() {
   return join(resources, 'dsh-boot-set.txt');
 }
 
-/** dsh's own entry point inside the staged tree. */
-function dshEntry() {
-  return join(resources, 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+/** dsh's own entry point inside a tree `installDsh` produced. */
+function dshEntry(dir) {
+  return join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 }
 
 /**
@@ -148,13 +167,11 @@ function nodeArchive() {
 }
 
 /**
- * Install dsh into its own tree. The CLI links its dependency closure into
- * `$DSH_HOME/profiles/node_modules` on every boot and re-points links that
- * moved, so this tree becomes the profile's resolution source as soon as the
- * app runs it — no extra wiring, and no network on first launch.
+ * Install dsh into `dir`, the same way the installer and the app do it at
+ * runtime, so that the tree this traces against is laid out like the one the
+ * user will end up with.
  */
-function stageDsh() {
-  const dir = join(resources, 'dsh');
+function installDsh(dir) {
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'package.json'),
@@ -188,14 +205,19 @@ function stageDsh() {
  */
 async function traceBootSet() {
   const scratch = mkdtempSync(join(tmpdir(), 'dsh-trace-'));
+  const dir = join(scratch, 'dsh');
   const trace = join(scratch, 'trace.txt');
   writeFileSync(trace, '');
 
   console.log('[bundle] recording what a dsh boot reads');
   let recorded;
+  let listed;
   try {
-    await bootOnce(trace, scratch);
+    installDsh(dir);
+    await bootOnce(dir, trace, scratch);
     recorded = readFileSync(trace, 'utf8');
+    // Walked before the cleanup below, which takes the tree it walks with it.
+    listed = manifests(dir);
   } catch (error) {
     console.warn(`[bundle] boot trace failed, first launch will be slow: ${error.message}`);
     return;
@@ -205,7 +227,6 @@ async function traceBootSet() {
     rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
 
-  const dir = join(resources, 'dsh');
   const read = recorded
     .split('\n')
     .map((line) => line.split('\t'))
@@ -216,7 +237,7 @@ async function traceBootSet() {
   // Manifests first: the dependency-closure walk dsh opens with reads them, and
   // Node's resolver reads them again on the way to every module. Neither shows
   // up in the trace — the first is `readFileSync`, the second is internal.
-  const files = new Set(manifests(dir).map((file) => relative(dir, file)));
+  const files = new Set(listed.map((file) => relative(dir, file)));
   for (const file of read) {
     if (file.startsWith(dir)) files.add(relative(dir, file));
   }
@@ -232,9 +253,9 @@ async function traceBootSet() {
  * The trace is what this is for, so the port is left to the OS and the URL is
  * only read as the signal to stop.
  */
-function bootOnce(trace, home) {
+function bootOnce(dir, trace, home) {
   return new Promise((resolve, reject) => {
-    const child = spawn(nodeTarget(), ['--require', join(root, 'scripts', 'boot-trace', 'preload.cjs'), dshEntry(), 'web', '--port', '0'], {
+    const child = spawn(nodeTarget(), ['--require', join(root, 'scripts', 'boot-trace', 'preload.cjs'), dshEntry(dir), 'web', '--port', '0'], {
       cwd: home,
       env: { ...process.env, DSH_HOME: join(home, 'home'), DSH_BOOT_TRACE: trace },
       stdio: ['ignore', 'pipe', 'pipe'],

@@ -1,6 +1,7 @@
 // The release build is a GUI app: no console window behind it.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod controls;
 mod dsh;
 mod server;
 mod theme;
@@ -18,7 +19,6 @@ use tauri::webview::PageLoadEvent;
 use tauri::{Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 use tauri_plugin_opener::OpenerExt;
-use tauri_plugin_window_state::StateFlags;
 
 /// The origin `dsh web` bound to, once it has. Navigation inside it stays in the
 /// window; anything else is a link to the outside world.
@@ -40,6 +40,13 @@ fn main() {
     let setup_server = server.clone();
 
     let app = tauri::Builder::default()
+        // First, before anything this process would otherwise start: a second
+        // launch has to be turned away before it spawns a dsh of its own. What
+        // the user meant by launching again is "show me the app", so the copy
+        // already running answers for it.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            reveal(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -47,86 +54,42 @@ fn main() {
             MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_FLAG]),
         ))
-        // Remember where the user put the window. Visibility is deliberately not
-        // remembered: the window can be hidden to the tray, and restoring that
-        // would start the app with nothing on screen.
-        .plugin(
-            tauri_plugin_window_state::Builder::default()
-                .with_state_flags(
-                    StateFlags::SIZE
-                        | StateFlags::POSITION
-                        | StateFlags::MAXIMIZED
-                        | StateFlags::FULLSCREEN,
-                )
-                .build(),
-        )
         .setup(move |app| {
             // Before the first spawn, while nothing holds the directory open.
             dsh::promote(app.handle());
 
-            // Ahead of the spawn below, so that the files dsh is about to read
+            // Ahead of the boot below, so that the files dsh is about to read
             // are being read from a dozen threads while it reads them from one.
+            // The update check it now overlaps with is the usual case — there is
+            // most often nothing newer to fetch — so this is still time the user
+            // would otherwise spend waiting.
             warm::start(app.handle());
-
-            // Started before the window rather than after it. dsh takes seconds
-            // to boot and WebView2 takes its own; the two have nothing to say to
-            // each other until the server is listening, so they may as well take
-            // them at the same time.
-            let started = server::start(app.handle());
 
             let preference = theme::preference();
             let splash = Splash::default();
             let visible = !std::env::args().any(|argument| argument == AUTOSTART_FLAG);
 
-            let built: tauri::Result<WebviewWindow> = (|| {
-                let window = build_window(
-                    app.handle(),
-                    setup_origin.clone(),
-                    splash.clone(),
-                    preference,
-                    visible,
-                )?;
-                build_tray(app.handle())?;
-                Ok(window)
-            })();
-
-            // The server is started before the window, so if there turns out to
-            // be no window to serve it is this code's job to stop it: a setup
-            // that returns an error never reaches the exit handler below.
-            let window = match built {
-                Ok(window) => window,
-                Err(error) => {
-                    if let Ok((mut child, _)) = started {
-                        child.stop();
-                    }
-                    return Err(error.into());
-                }
-            };
+            // The window comes up first now: the update check runs behind it and
+            // can put a question and a progress bar on the loading page, neither
+            // of which has anywhere to go without a window.
+            let window = build_window(
+                app.handle(),
+                setup_origin.clone(),
+                splash.clone(),
+                preference,
+                visible,
+            )?;
+            build_tray(app.handle())?;
 
             theme::paint(&window, preference);
-            theme::follow(window.clone(), preference);
 
-            match started {
-                Ok((child, events)) => {
-                    *setup_server.lock().unwrap() = Some(child);
-                    watch(app.handle().clone(), window, setup_origin.clone(), splash, events);
-                }
-                Err(error) => {
-                    splash.fail(
-                        &window,
-                        "启动 dsh 失败",
-                        &format!(
-                            "无法执行 dsh：{error}\n\n\
-                             安装包内置的运行时不可用，PATH 中也没有找到 dsh\
-                             （终端里执行 `dsh --version` 验证）。\
-                             可用 DSH_BIN 环境变量指向 dsh 可执行文件的完整路径。"
-                        ),
-                    );
-                    // Nothing is booting for them to get in the way of, and an
-                    // update is one of the things that could fix this.
-                    check_for_updates(app.handle());
-                }
-            }
+            boot(
+                app.handle().clone(),
+                window,
+                setup_origin.clone(),
+                splash,
+                setup_server.clone(),
+            );
 
             Ok(())
         })
@@ -160,18 +123,38 @@ fn build_window(
         .title("dsh desktop")
         .inner_size(1360.0, 900.0)
         .min_inner_size(720.0, 520.0)
+        // The same place every launch. Restoring the last geometry meant the
+        // window was built here and moved afterwards, which is one jump across
+        // the screen in front of the user — and the only thing it bought was
+        // not having to move a window that opens where it can be seen anyway.
         .center()
         .visible(visible)
-        // The frame is themed at creation rather than repainted right after it,
-        // and the loading page is told which theme it is being opened in.
+        // No frame: minimise, maximise and close are drawn into the page by
+        // `controls`, which carries its own colours and so needs nothing out
+        // here to repaint it when dsh changes theme.
+        .decorations(false)
+        // Still set, even without a frame to paint: it is what the webview
+        // resolves `prefers-color-scheme` against, so the loading page opens in
+        // the theme dsh is about to show.
         .theme(preference.window())
         .initialization_script(theme::script(preference))
+        .initialization_script(controls::script())
         .on_page_load(move |webview, payload| {
             if payload.event() == PageLoadEvent::Finished {
                 splash.flush(&webview);
+                // The buttons were just drawn by a fresh document that has no
+                // way of knowing the window is maximised — nothing resized to
+                // tell it. Every navigation lands here, so every navigation
+                // gets the answer.
+                controls::sync(&webview);
             }
         })
         .on_navigation(move |url| {
+            // A window button, before anything treats it as somewhere to go.
+            if let Some(action) = controls::action(url) {
+                controls::perform(&opener, action);
+                return false;
+            }
             if is_ours(url, &origin) {
                 return true;
             }
@@ -182,15 +165,23 @@ fn build_window(
         })
         .build()?;
 
-    // Closing the window parks the app in the tray instead of tearing the agent
-    // down mid-task. Quitting for real goes through the tray menu.
-    window.on_window_event(move |event| {
-        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+    window.on_window_event(move |event| match event {
+        // Closing the window parks the app in the tray instead of tearing the
+        // agent down mid-task. Quitting for real goes through the tray menu.
+        tauri::WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             if let Some(window) = closer.get_webview_window("main") {
                 let _ = window.hide();
             }
         }
+        // The maximise button's glyph. A snap or a Win+Up never reaches the
+        // page, so the page is told rather than left to work it out.
+        tauri::WindowEvent::Resized(_) => {
+            if let Some(window) = closer.get_webview_window("main") {
+                controls::sync(&window);
+            }
+        }
+        _ => {}
     });
 
     Ok(window)
@@ -293,17 +284,64 @@ fn is_ours(url: &Url, origin: &Origin) -> bool {
         .is_some_and(|ours| url.origin().ascii_serialization() == ours)
 }
 
-/// Wait for the server, hand the window over to it, and only then go looking
-/// for updates.
-fn watch(
+/// Settle which dsh this launch runs, start it, and hand the window over to it.
+///
+/// One background thread for the whole sequence, because the whole sequence is
+/// blocking and ordered: the update check waits on npm, the question it can
+/// raise waits on the user, the download that may follow runs for minutes, and
+/// only once all of that is behind us is there a server to wait for. None of it
+/// belongs on the main thread.
+fn boot(
     app: tauri::AppHandle,
     window: WebviewWindow,
     origin: Origin,
     splash: Splash,
-    events: Receiver<server::Event>,
+    server: Arc<Mutex<Option<server::Server>>>,
 ) {
     std::thread::spawn(move || {
-        serve(&window, &origin, &splash, &events);
+        let report = |text: &str, percent: f64| {
+            if !text.is_empty() {
+                splash.status(&window, text);
+            }
+            splash.progress(&window, percent);
+        };
+
+        // Skipped entirely on a login-item launch, which is sitting in the tray
+        // with nobody looking at it: a modal asking about a 185 MB download —
+        // from an app the user never opened — belongs to no window on screen,
+        // and the restart it leads to would be one nobody was expecting. The
+        // next launch someone actually asks for does the check.
+        //
+        // False means the user took the update and the app is on its way to
+        // restarting into it. Starting a server now would be starting one for a
+        // process that is about to go away.
+        if window_is_visible(&app) && !dsh::gate(&app, &report) {
+            return;
+        }
+
+        report("正在启动 dsh…", -1.0);
+
+        match server::start(&app) {
+            Ok((child, events)) => {
+                *server.lock().unwrap() = Some(child);
+                serve(&window, &origin, &splash, &events);
+            }
+            // Most often this is an install whose dsh download failed: the
+            // installer fetches dsh rather than carrying it, and an app that
+            // got this far without one has nothing to run. Running the
+            // installer again is the fix, so it is what this leads with.
+            Err(error) => splash.fail(
+                &window,
+                "启动 dsh 失败",
+                &format!(
+                    "无法执行 dsh：{error}\n\n\
+                     dsh 可能没有安装成功。请换一个网络或代理后重新运行安装程序。\n\n\
+                     如果你自己装过 dsh，也可以在终端里执行 `dsh --version` 确认，\
+                     或用 DSH_BIN 环境变量指向 dsh 可执行文件的完整路径。"
+                ),
+            ),
+        }
+
         check_for_updates(&app);
     });
 }
@@ -312,16 +350,17 @@ fn watch(
 /// tray. Picked up by [`reveal`].
 static PENDING_CHECK: AtomicBool = AtomicBool::new(false);
 
-/// Look for a newer app and a newer dsh, at most once per run.
+/// Look for a newer app, at most once per run. dsh is not checked here — that
+/// happens in [`boot`], before there is a dsh running to interrupt.
 ///
 /// Held back until the boot has settled — or, when it never does, until the
-/// wait has gone on long enough to call slow. Both checks spawn processes and
-/// reach the network, and on a first launch — where the whole of dsh is being
-/// read off disk for the first time — that is contention for the one thing the
-/// user is actually waiting on.
+/// wait has gone on long enough to call slow. The check reaches the network,
+/// and on a first launch — where the whole of dsh is being read off disk for
+/// the first time — that is contention for the one thing the user is actually
+/// waiting on.
 fn check_for_updates(app: &tauri::AppHandle) {
-    // Both checks can end in a dialog, and a login-item launch is sitting in
-    // the tray: a modal over whatever the user is doing, from an app they never
+    // The check can end in a dialog, and a login-item launch is sitting in the
+    // tray: a modal over whatever the user is doing, from an app they never
     // opened, belongs to no window on screen. It waits until one is asked for.
     if !window_is_visible(app) {
         PENDING_CHECK.store(true, Ordering::Relaxed);
@@ -335,8 +374,6 @@ fn check_for_updates(app: &tauri::AppHandle) {
         // every run.
         #[cfg(not(debug_assertions))]
         update::check_quietly(app);
-
-        dsh::check(app);
     });
 }
 
@@ -425,6 +462,11 @@ impl Splash {
     /// Update the status line.
     fn status(&self, window: &WebviewWindow, text: &str) {
         self.call(window, "dshStatus", &[text]);
+    }
+
+    /// Move the download bar. A negative percentage puts it away.
+    fn progress(&self, window: &WebviewWindow, percent: f64) {
+        self.call(window, "dshProgress", &[&format!("{percent:.1}")]);
     }
 
     /// Replace the spinner with an error the user can read and copy.

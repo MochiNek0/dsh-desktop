@@ -83,6 +83,25 @@
       #status {
         color: var(--muted);
       }
+      /* Shown only while a dsh download is running; see dshProgress below. */
+      #progress {
+        width: 260px;
+        height: 4px;
+        margin: 16px auto 0;
+        border-radius: 999px;
+        background: var(--line);
+        overflow: hidden;
+      }
+      #progress[hidden] {
+        display: none;
+      }
+      #progress-fill {
+        height: 100%;
+        width: 0;
+        border-radius: inherit;
+        background: var(--accent);
+        transition: width 240ms ease;
+      }
       #error {
         display: none;
         text-align: left;
@@ -106,7 +125,8 @@
         -webkit-user-select: text;
       }
       body.failed .spinner,
-      body.failed #status {
+      body.failed #status,
+      body.failed #progress {
         display: none;
       }
       body.failed #error {
@@ -119,6 +139,7 @@
       <div class="mark">d<span>s</span>h</div>
       <div class="spinner"></div>
       <p id="status">正在启动 dsh…</p>
+      <div id="progress" hidden><div id="progress-fill"></div></div>
       <div id="error">
         <h2 id="error-title"></h2>
         <pre id="error-detail"></pre>
@@ -128,6 +149,15 @@
       // Called from the Rust side via webview eval; see src-tauri/src/main.rs.
       window.dshStatus = function (text) {
         document.getElementById('status').textContent = text;
+      };
+      // A percentage while a dsh download runs, or a negative number to put the
+      // bar away. Arrives as a string — every splash call is serialized as one.
+      window.dshProgress = function (percent) {
+        var bar = document.getElementById('progress');
+        var value = Number(percent);
+        bar.hidden = !(value >= 0);
+        document.getElementById('progress-fill').style.width =
+          Math.min(100, Math.max(0, value)) + '%';
       };
       window.dshError = function (title, detail) {
         document.body.classList.add('failed');

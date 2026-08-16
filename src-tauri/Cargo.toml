@@ -11,7 +11,6 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
-tauri-plugin-window-state = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 serde_json = "1"
@@ -19,6 +18,9 @@ serde_json = "1"
 # how you end up shipping rc.10 as older than rc.9.
 semver = "1"
 tauri-plugin-autostart = "2.5.1"
+# One app per machine. Two of them would each spawn a `dsh web` against the same
+# $DSH_HOME, and a dsh update would rewrite the tree the other one is running.
+tauri-plugin-single-instance = "2"
 
 [target.'cfg(windows)'.dependencies]
 # Job objects: the kernel-side backstop that kills the dsh process tree when the

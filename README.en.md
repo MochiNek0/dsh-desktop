@@ -6,180 +6,118 @@
 >
 > **Unofficial**: a third-party desktop wrapper around DeepSeek Harness, not affiliated with DeepSeek. See the [disclaimer](#disclaimer).
 
-Launching the app starts a local `dsh web` server and loads its UI into a native window. No terminal, no port numbers, no tab management — and sessions, credentials, and settings are shared with the CLI, not stored separately.
+![dsh desktop](docs/thumbnail-en.png)
+
+Launching the app starts a local `dsh web` server and loads its UI into a native window. No terminal, no port numbers, no tab management — and sessions, credentials, and settings are shared with the CLI (all in `$DSH_HOME`, `~/.dsh` by default), not stored separately.
 
 ## Features
 
-- **Native window for dsh web**: starts the local server and navigates into it automatically, no manual browser setup
-- **Self-contained**: the installer ships a Node runtime and `@deepseek-ai/dsh`, so it runs on a machine with neither installed
-- **dsh stays current**: checks npm in the background and asks before downloading anything — no traffic behind your back, and the bundled copy is always there as a working floor
-- **No port conflicts**: starts with `--port 0` so the OS assigns a free loopback port — it won't clash with a `dsh web` (3080) you're running by hand, and both can coexist
+- **Works out of the box**: the installer ships a Node runtime and uses it to install `@deepseek-ai/dsh` into your user directory during setup, falling back through mirrors if the default registry is unreachable
+- **No port conflicts**: starts with `--port 0` so the OS assigns a free loopback port — a `dsh web` (3080) you run by hand can stay up alongside it
+- **Frameless window**: minimise, maximise and close are drawn into the top-left of the page as macOS's three dots (top-right belongs to dsh's own controls), translucent at rest and showing their glyphs on hover
+- **`dsh` in your terminal too**: after installing, plain `dsh` runs the copy the app manages. Only installed on a machine that has no dsh of its own — it never elbows aside one you installed yourself
+- **dsh stays current**: checks npm at startup and asks before downloading anything; a dsh you installed yourself is reported on, never modified
 - **Your session stays put**: the window never leaves the dsh server's origin; links to the outside world open in the system browser
-- **Clear boot & failure UX**: a loading page while the server starts; if `dsh` is missing or exits early, the error and its output tail are shown in-window
-- **Themed like dsh**: the title bar and the loading page take their light/dark from dsh's own setting, so a dark UI never arrives in a light window frame — and changing the theme in the UI moves the frame with it
-- **Clean lifecycle**: a normal exit kills the whole child process tree; a Windows Job Object backs that up when the app is force-killed, so no orphaned node processes are left behind either way
-- **Window memory & tray**: window geometry is remembered; closing the window parks the app in the tray instead of interrupting the session, and quitting goes through the tray menu
+- **Tray & login item**: closing the window parks the app in the tray instead of interrupting the session; the tray menu can add a login item, and a launch that comes from it waits quietly in the tray without dialogs or update checks
+- **Single instance, clean exit**: one per machine; exiting kills the whole child process tree, with a Windows Job Object backing that up when the app is force-killed, so no orphaned node processes are left behind
 - **Auto-update**: signed updates via the Tauri updater, asking before both the download and the restart
-- **Cross-platform**: verified on Windows; macOS / Linux work by the same design
-- **Data shared with the CLI**: sessions, credentials, and settings stay in `$DSH_HOME` (default `~/.dsh`) — the desktop app stores nothing extra
 
-## Prerequisites
+## Installing
 
-- **To run the installer**: nothing. Node and dsh are in the package. On Windows you also need the WebView2 runtime (built into Win11; the installer can bootstrap it)
-- **To build from source**: Rust stable + MSVC toolchain, Node 18+
+Grab an installer from [Releases](../../releases). You need a working internet connection — setup fetches dsh from npm (about 185 MB, a few minutes). Node is in the package; on Windows you also need the WebView2 runtime (built into Win11, and downloaded by the installer when it is missing).
 
-## Run & build
+Windows only for now; macOS / Linux bundle targets are not configured yet.
+
+## Development
+
+Requires Rust stable + MSVC toolchain and Node 18+.
 
 ```sh
 npm install
 npm run dev            # dev mode, with devtools (no bundled runtime; uses dsh on PATH)
-npm run bundle:runtime # stage the bundled runtime on its own (the build runs it for you)
 npm run build          # produces installers → src-tauri/target/release/bundle/
 ```
 
-`npm run build` runs `scripts/bundle-runtime.mjs` first: it downloads the official Node binary and
-installs `@deepseek-ai/dsh` into `src-tauri/resources/` before handing off to Tauri. It is skipped
-when the staged versions already match. That step builds for the **host platform only** — npm
-resolves native optional dependencies against the machine doing the install, so a Windows installer
-has to be built on Windows and a macOS one on macOS.
+`npm run build` runs `scripts/bundle-runtime.mjs` first to download the Node binary into `src-tauri/resources/`.
+It builds for the **host platform only** — npm resolves native optional dependencies against the machine doing the install, so a Windows installer has to be built on Windows.
 
-The bundle target is currently Windows NSIS; macOS (app/dmg) and Linux (deb/AppImage) targets can be added on top of `tauri.conf.json`.
+To ship a version others can auto-update to, pass the signing key (at `~/.tauri/dsh-desktop.key`, **not in the repo**):
 
-## Releasing & updates
+```sh
+TAURI_SIGNING_PRIVATE_KEY=~/.tauri/dsh-desktop.key TAURI_SIGNING_PRIVATE_KEY_PASSWORD= npm run build
+```
 
-Auto-update uses the Tauri updater: the app checks the endpoint configured in `tauri.conf.json` in
-the background at startup, and the tray menu's "检查更新…" triggers a check by hand. To ship a
-version that others can update to:
+> **Do not transcribe that line into PowerShell** — `$env:X = ""` *deletes* the variable there, so the password never reaches the CLI and the build hangs on its prompt. Use Git Bash.
+>
+> Quit the running app and any installer left open from a previous build first; both hold files open, and the failure reads a lot like success.
 
-1. The signing private key lives at `~/.tauri/dsh-desktop.key` (**not in the repo** — lose it and you
-   can no longer sign updates). Its public key is already in `plugins.updater.pubkey`.
-2. Pass the key at build time:
-
-   ```sh
-   TAURI_SIGNING_PRIVATE_KEY=~/.tauri/dsh-desktop.key npm run build
-   ```
-
-   That variable takes either the key itself or a path to it; there is no `..._PATH` variant. Leave it
-   out and the installer is still produced — the build just fails at the last step, with no `.sig`.
-
-   The key was generated without a password; to add one, generate a fresh pair and update the public
-   key in the config.
-3. Non-interactively (CI, a background job), pass the empty password too:
-
-   ```sh
-   TAURI_SIGNING_PRIVATE_KEY=~/.tauri/dsh-desktop.key TAURI_SIGNING_PRIVATE_KEY_PASSWORD= npm run build
-   ```
-
-   The key has no password, but the CLI asks for one anyway; with stdin not a terminal it waits
-   forever, which looks exactly like a hung compile (the last line is `expect a prompt for password`).
-4. Quit the running app before building. It holds `target/release/dsh-desktop.exe` open, which the
-   bundler has to read, so the build fails with `os error 32`. Note the installer has already been
-   written by then — unsigned — which reads a lot like success.
-5. Upload the installer, its `.sig`, and a `latest.json` to a GitHub Release so that
-   `releases/latest/download/latest.json` resolves.
+Then upload the installer, its `.sig`, and a `latest.json` to a GitHub Release.
 
 ## How it works
 
-1. Finds dsh in the order `DSH_BIN` → the app-managed dsh (bundled or downloaded, whichever is newer) → `dsh` on PATH, then starts `dsh web --port 0` with the user's home directory as the working directory, letting the OS pick a free loopback port — so it never fights your manually run `dsh web` (3080) for the port, and both can be up at once. This happens *before* the window is built: dsh takes a second or two to
-   come up and so does WebView2, and neither has anything to say to the other until the server is
-   listening.
-2. Reads the child's stdout, waiting for the line `dsh web: http://127.0.0.1:<port>` — that line is both the readiness signal and the URL to load. The window shows a loading page meanwhile; if startup fails or dsh exits early, the page shows the tail of its output.
-3. Once the URL is known, the window navigates to it. The window stays within that origin; links pointing outside are handed to the system browser so your session is never replaced.
-4. On exit, the entire child process tree is killed (`taskkill /T` — killing only the parent would orphan node). The child is also placed in a Windows Job Object with `KILL_ON_JOB_CLOSE` from the start: handles are closed by the kernel however a process dies, so the tree goes down with the app even when it is force-killed and no cleanup code ever runs.
+1. Builds the window and shows a loading page, then checks for a newer dsh in the background — the one moment it is safe to replace that directory is while no process holds it open.
+2. Finds dsh in the order `DSH_BIN` → the app-managed copy → `dsh` on PATH, then starts `dsh web --port 0`.
+3. Reads its stdout, waiting for `dsh web: http://127.0.0.1:<port>` — both the readiness signal and the URL to load. If startup fails, the loading page shows the tail of its output.
+4. Navigates the window to that URL and keeps it within that origin.
+5. On exit, kills the entire child process tree with `taskkill /T`; the child is put in a Windows Job Object with `KILL_ON_JOB_CLOSE` as soon as it starts, which takes the tree down even when the app is force-killed and no cleanup code runs.
 
-The working directory is just the initial default — pick the real project directory in the UI with the directory picker.
+The window's light/dark follows dsh's own theme setting (`ui-theme.preference` in `$DSH_HOME/settings.yaml`), read once at window creation, so the loading page never flashes the opposite colour first.
 
-The window's light/dark is not a setting of its own: dsh keeps the UI theme in
-`$DSH_HOME/settings.yaml` under `ui-theme.preference` (`light`/`dark`/`system`), and the window reads
-the same field — at creation, so neither the title bar nor the loading page flashes the opposite
-colour first. Its timestamp is then looked at every 50 ms, so switching the theme in the UI moves
-the frame without a restart — dsh writes the file on the click, so that interval is the whole gap
-between the page turning dark and the frame following, and a gap the eye can catch reads as two
-separate events.
+The window buttons do not use Tauri IPC — that would grant IPC to every line of JavaScript running inside dsh's pages. A press navigates to a custom scheme (`dsh-window://close`) which `on_navigation` recognises, acts on, and cancels.
 
-### The two dsh installations
+### Where dsh lives
 
-The app manages two copies of dsh and runs whichever has the higher version:
+One copy, at `%LOCALAPPDATA%\ai.deepseek.dsh.desktop\dsh\` — not `resources/`, which an app update would overwrite. The installer does not carry dsh; it installs it there during setup.
 
-| Location | Where it came from |
-| --- | --- |
-| `<install dir>/resources/dsh/` | Shipped in the installer. Always present, always works, never changes — the floor for offline first launches and for every failure path |
-| `%LOCALAPPDATA%\ai.deepseek.dsh.desktop\dsh\` | Downloaded later because npm had something newer |
+**If `dsh.cmd` is already on PATH, setup skips this entirely.** There is no point downloading 327 MB alongside a working dsh, and that copy stays yours: the update check reports on it but never writes to it, and the uninstaller leaves it alone.
 
-Once the UI is up — not at launch, where it would compete with the booting dsh for disk and network —
-it runs `npm view @deepseek-ai/dsh version` in the background — through npm rather than
-a request of our own, so the user's `.npmrc` still applies and private registries and corporate
-proxies keep working. If something newer exists, a dialog names the version and the download size and
-**waits for consent**. The install lands in `dsh.next/` and is swapped in on the **next launch**: a
-running server cannot be hot-replaced, and startup is the one moment nothing holds the directory
-open, which is what makes the rename safe on Windows.
+The update check runs at most once every six hours (15 s timeout). A newer version brings up a dialog naming the version and size; taking it downloads into `dsh.next/`, swaps it in on the next launch, and deletes the old tree in the background. "Skip this version" stops asking about that release.
 
-"Skip this version" records the version in `dsh-skipped` and stops asking about **that** release;
-a later one asks again. A 255 MB prompt on every single launch is how an app gets uninstalled.
-
-Any failure just leaves the bundled copy in charge. `DSH_BIN` still has the highest precedence and
-bypasses all of this.
-
-### The bundled runtime and profile dependencies
-
-The bundled dsh is installed under `resources/dsh/` and launched with the bundled
-`resources/runtime/node`. dsh itself links its dependency closure into
-`$DSH_HOME/profiles/node_modules` as junctions on every boot, and **re-points links whose
-installation moved** — so running the bundled dsh points the profile's dependencies at the install
-directory on its own, with no extra wiring and no network on first launch. Running the system CLI
-afterwards points them back.
+Uninstalling removes the dsh the app installed and the `dsh` command it put in your terminal, then **asks once** whether to delete `$DSH_HOME` too, defaulting to keeping it. App updates and manual reinstalls do not trigger that question.
 
 ## Environment variables
 
 | Variable | Purpose |
 | --- | --- |
-| `DSH_BIN` | Full path to the dsh executable. Highest precedence — use it to override the bundled runtime and run your own dsh instead. |
+| `DSH_BIN` | Full path to the dsh executable. Highest precedence — overrides the app-managed copy. |
+| `DSH_HOME` | dsh's data directory, `~/.dsh` by default. |
 
 ## Project layout
 
 ```
-dist/index.html            Loading / error page (no build step; Rust drives it via two eval'd hooks)
-scripts/bundle-runtime.mjs Stages the bundled node runtime and dsh before a build
-src-tauri/src/main.rs      Window, navigation policy, tray, lifecycle
-src-tauri/src/server.rs    Managed dsh web child process and the job object backstop
-src-tauri/src/dsh.rs       Choosing between the two dsh installs, version comparison, runtime updates
-src-tauri/src/update.rs    The app's own auto-update
+dist/index.html               Loading / error page (no build step; Rust drives it via eval'd hooks)
+scripts/bundle-runtime.mjs    Stages the node runtime and records the boot warm-up list
+scripts/boot-trace/           Traces one dsh boot to find out what it reads
+src-tauri/installer-hooks.nsh Handling of dsh and $DSH_HOME at install / uninstall
+src-tauri/src/main.rs         Window, navigation policy, tray, lifecycle
+src-tauri/src/controls.rs     The frameless window's injected buttons and drag strip
+src-tauri/src/theme.rs        Reads dsh's light/dark preference, once, at window creation
+src-tauri/src/server.rs       Managed dsh web child process and the job object backstop
+src-tauri/src/dsh.rs          Locating the dsh install, version comparison, runtime updates
+src-tauri/src/warm.rs         Parallel pre-reads from the warm-up list, against Defender's first scan
+src-tauri/src/update.rs       The app's own auto-update
 ```
 
-`cargo test` covers URL-line parsing.
+## Roadmap
 
-## Roadmap / TODO
-
-- [x] **Self-contained installer** — the Node runtime and `@deepseek-ai/dsh` now ship as bundled resources.
-- [x] **Job Object fallback** — force-killing the app no longer orphans node processes.
-- [x] **Window size/position memory, tray, auto-update**
-- [ ] **macOS / Linux bundle targets** — not configured yet; the staging script is already cross-platform
-      but has to run on the target platform.
-- [ ] **Release pipeline** — `latest.json` and the signed artifacts are uploaded to a Release by hand;
-      there is no CI workflow yet.
+- [x] No Node needed on the machine
+- [x] Job Object fallback, tray and login item, auto-update
+- [ ] macOS / Linux bundle targets
+- [ ] Release pipeline (`latest.json` and signed artifacts are uploaded by hand today)
 
 ## Known limitations
 
-- Self-containment has a price: the bundled resources unpack to roughly 350 MB (node 93 MB + dsh's
-  dependency tree at 255 MB across 33k files), which NSIS compresses into a ~55 MB installer
-- The first launch after installing is visibly slow: the bundled dsh is 33k files, and reading its
-  whole dependency tree from a path the scanner has never seen drags Windows Defender's real-time
-  protection into it for tens of seconds. Launching again from the same path is back to 1–2 s. If
-  that bothers you, exclude the install directory — elevated PowerShell, **with the path you
-  actually chose at install time** (`%LOCALAPPDATA%\dsh-desktop` by default):
+- **Installing needs the network, and it is not quick**: dsh's dependency tree is 587 packages, 185 MB compressed, 327 MB unpacked across 33k files — about four minutes on a 2 MB/s link. If every mirror fails the installer says so plainly rather than pretending it succeeded
+- **The first launch is slower than the rest**: the files dsh imports get scanned one by one the first time they are read from a path Defender has never seen — measured at 14 s cold against 1.6 s once the same files are warm. The app pre-reads them from several threads at startup, off a list recorded at build time, which brings the cold launch to around 4 s. To avoid it entirely, exclude the install directory (elevated PowerShell, **with the path you actually chose**):
 
   ```powershell
   Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\dsh-desktop", "$env:LOCALAPPDATA\ai.deepseek.dsh.desktop"
   ```
 
-  The installer does not do this for you: carving a directory out of real-time protection is the
-  user's own security trade-off, and a per-user install has no administrator rights to do it with
-- Only Windows has been systematically verified so far; macOS / Linux bundle targets are not configured yet
-- Installers must be built on the platform they target: npm resolves native optional dependencies against the machine doing the install
-- The node version is pinned in `scripts/bundle-runtime.mjs`, so bumping it means a code change and a new release. The **bundled** dsh version is pinned there too, but the app catches up to npm's latest at runtime, so that pin only decides the floor
-- A dsh update downloads ~255 MB and coexists with the bundled copy, peaking around 600 MB on disk
-- Uninstalling removes the install directory and the bundled runtime with it, but leaves `$DSH_HOME` (`~/.dsh`) alone by design — sessions, credentials, and settings are shared with the CLI and shouldn't leave with the desktop app. The side effect is that junctions in `~/.dsh/profiles/node_modules` pointing into the install directory go dangling; running any dsh installation once (the system CLI, or the desktop app reinstalled) re-points them automatically, so no manual cleanup is needed
-- The job object is attached just after the child starts, leaving a very short window in which a grandchild would escape it; the ordinary exit path covers the whole tree regardless
+- Only Windows has been verified so far; installers must be built on the platform they target
+- A dsh update downloads 185 MB and coexists with the outgoing copy while it lands, peaking around 650 MB on disk
+- `dsh.cmd` forwards arguments with `%*`, so arguments containing `&`, `|` or `^` are mangled by cmd's second pass when called from PowerShell (the Git Bash shim is unaffected)
+- If you keep `$DSH_HOME` at uninstall, junctions in it pointing at the removed tree go dangling; running any dsh once re-points them automatically
 
 ## Disclaimer
 

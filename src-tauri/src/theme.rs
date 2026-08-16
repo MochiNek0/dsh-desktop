@@ -1,28 +1,22 @@
 //! The light/dark preference, taken from dsh rather than invented here.
 //!
 //! The browser UI keeps its theme in `$DSH_HOME/settings.yaml` under
-//! `ui-theme.preference` — `light`, `dark`, or `system`. The shell around it
-//! reads the same field, so the window frame and the loading page open in the
-//! colour of the page they are about to show, and follows the file afterwards:
-//! switching the theme inside dsh is a write to it, which is a signal that
-//! needs nothing from the page itself.
+//! `ui-theme.preference` — `light`, `dark`, or `system`. It is read once, at
+//! startup, so that the window opens in the colour of the page it is about to
+//! show instead of flashing the other one.
+//!
+//! Only once: there is no frame left to repaint. The window controls live
+//! inside the page now (see [`crate::controls`]) and take their colours from
+//! it, so a theme switch inside dsh reaches them as part of the same repaint
+//! that changes everything else — nothing out here has to watch for it.
 //!
 //! `system` is not resolved here. The window follows the OS on its own once it
 //! is told to, and the loading page has a media query.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
 
 use tauri::window::Color;
-use tauri::{Manager, Theme, WebviewWindow};
-
-/// How often the settings file is looked at. It is one `stat` — the parse only
-/// happens when the timestamp moved — against the page next to it changing
-/// colour on the same click. dsh writes the file as the switch is clicked, so
-/// this interval is the whole of the gap between the page turning dark and the
-/// frame following; anything the eye can catch reads as two separate events.
-/// A cached metadata read costs microseconds, so twenty a second buys that.
-const POLL: Duration = Duration::from_millis(50);
+use tauri::{Theme, WebviewWindow};
 
 /// The loading page's background in each theme, matching the `--bg` it paints
 /// itself with (see `dist/index.html`). This is what the window shows in the
@@ -95,52 +89,6 @@ pub fn paint(window: &WebviewWindow, preference: Preference) {
         LIGHT_BG
     };
     let _ = window.set_background_color(Some(background));
-}
-
-/// Track the file for as long as the app runs, so a theme switch inside dsh
-/// reaches the frame without a restart.
-pub fn follow(window: WebviewWindow, painted: Preference) {
-    std::thread::spawn(move || {
-        // Start from the value the window was painted with rather than reading
-        // the file again: a write landing between the two reads would leave
-        // this thread agreeing with a file the frame does not match, and the
-        // repaint below would be skipped as a no-op. The timestamp starts unset
-        // for the same reason — the first tick re-reads and settles it.
-        let mut current = painted;
-        let mut stamp = None;
-
-        loop {
-            std::thread::sleep(POLL);
-
-            let now = modified();
-            if now == stamp {
-                continue;
-            }
-
-            // dsh replaces the file rather than rewriting it, so a read can
-            // land in the moment it does not exist. Leave the timestamp alone
-            // and look again next tick instead of reporting the default.
-            let Some(next) = read() else {
-                continue;
-            };
-            stamp = now;
-
-            // Every other setting shares this file; most writes to it are not
-            // about the theme.
-            if next == current {
-                continue;
-            }
-            current = next;
-
-            let window = window.clone();
-            let handle = window.app_handle().clone();
-            let _ = handle.run_on_main_thread(move || paint(&window, next));
-        }
-    });
-}
-
-fn modified() -> Option<SystemTime> {
-    std::fs::metadata(settings_file()?).ok()?.modified().ok()
 }
 
 fn settings_file() -> Option<PathBuf> {

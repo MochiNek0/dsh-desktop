@@ -177,10 +177,12 @@ impl Drop for Job {
 /// this machine actually has:
 ///
 /// 1. `DSH_BIN` — an explicit choice, so it wins outright.
-/// 2. The best dsh the app manages: whichever of the bundled copy and the
-///    downloaded one in app data has the higher version. Absent under
-///    `tauri dev`, where nothing has been staged.
-/// 3. `dsh` on PATH, for a build without a bundled runtime.
+/// 2. The dsh the app manages, in app data. Absent under `tauri dev`, and on an
+///    install whose download failed.
+/// 3. `dsh` on PATH, for a user who installed one themselves.
+///
+/// [`crate::dsh::installed`] walks the same three in the same order, so that the
+/// update check is about the copy this starts.
 fn command(app: &tauri::AppHandle) -> Command {
     let mut command = if let Some(bin) = std::env::var_os("DSH_BIN") {
         Command::new(bin)
@@ -201,7 +203,7 @@ fn command(app: &tauri::AppHandle) -> Command {
 /// `dsh` ships as an npm shim: `dsh.cmd` on Windows, a shell script elsewhere.
 /// Naming the extension is what lets std route the batch file through cmd.exe
 /// with the correct argument quoting.
-fn default_bin() -> &'static str {
+pub fn default_bin() -> &'static str {
     if cfg!(windows) {
         "dsh.cmd"
     } else {
