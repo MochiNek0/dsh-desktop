@@ -6,7 +6,11 @@
 >
 > **非官方项目**：基于 DeepSeek Harness 的第三方桌面封装，与 DeepSeek 官方无关。详见[声明](#声明)。
 
+<br>
+
 ![dsh desktop](docs/thumbnail.png)
+
+<br>
 
 启动应用即拉起一个本地 `dsh web` 服务，并把它的界面装进原生窗口。不用自己开终端、记端口、管浏览器标签页；会话、凭据与设置和 CLI 完全共用（都在 `$DSH_HOME`，默认 `~/.dsh`）。
 

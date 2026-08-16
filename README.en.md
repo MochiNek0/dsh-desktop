@@ -6,7 +6,11 @@
 >
 > **Unofficial**: a third-party desktop wrapper around DeepSeek Harness, not affiliated with DeepSeek. See the [disclaimer](#disclaimer).
 
+<br>
+
 ![dsh desktop](docs/thumbnail-en.png)
+
+<br>
 
 Launching the app starts a local `dsh web` server and loads its UI into a native window. No terminal, no port numbers, no tab management — and sessions, credentials, and settings are shared with the CLI (all in `$DSH_HOME`, `~/.dsh` by default), not stored separately.
 
