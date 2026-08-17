@@ -176,6 +176,7 @@ src-tauri/src/update.rs       应用自身的自动更新
 - **只在 Windows 上真机验证过**：macOS / Linux 的代码路径齐了，CI 保证三个平台都能编译、能打出包，但「装完真的能跑起来」还没有在那两个平台上验证过。碰到问题请提 issue
 - **macOS / Linux 没有内核级的兜底**：正常退出会杀掉整个进程组，但应用被强杀（`kill -9`、崩溃）时 dsh 会活下来。Windows 的 Job Object 在这些平台上没有对等物 —— Linux 的 `PR_SET_PDEATHSIG` 绑的是**创建线程**的生命周期，而那个线程在启动流程结束时就退出了，用了反而会误杀。下次启动会被单实例锁挡住，手动 `pkill -f 'dsh web'` 收拾
 - **macOS 的包没有签名和公证**：需要付费的 Apple 开发者账号。首次打开要右键「打开」或去掉隔离属性，见[安装](#安装)
+- **Linux 上只有 AppImage 能自动更新**：Tauri 的 updater 在 Linux 只认 AppImage。用 `.deb` 装的要自己去 Releases 下新版本 —— `latest.json` 里那条 deb 条目是打包工具顺手生成的，应用不会走它
 - 第一次启动的预热（`warm.rs`）是冲着 Windows Defender 去的，在 macOS / Linux 上只剩预热页缓存的那点收益
 - dsh 更新走 `npm install -g`，npm 在替换旧树期间新旧两份并存，磁盘峰值约 650 MB
 - 安装完 Node 后 PATH 的变更要等新开的终端才生效（macOS / Linux 上还得是会读 `~/.profile` 或 `~/.zshrc` 的那种）；应用自己不受影响 —— 它从 `bootstrap.json` 里读脚本记下的路径，不依赖继承来的 PATH
