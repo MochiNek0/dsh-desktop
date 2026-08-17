@@ -22,6 +22,7 @@
     }
   },
   "bundle": {
+    "publisher": "mochineko",
     "active": true,
     "targets": ["nsis"],
     "createUpdaterArtifacts": true,
