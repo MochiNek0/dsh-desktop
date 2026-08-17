@@ -43,24 +43,13 @@ use tauri::{AppHandle, Manager, Url, WebviewWindow};
 /// is cancelled the moment it is recognised.
 const SCHEME: &str = "dsh-window";
 
-/// The strip's height, and how far below the top edge it starts — the first few
-/// pixels belong to the window's own resize border, and taking them would cost
-/// the user the ability to resize from the top.
-const DRAG_HEIGHT: u32 = 10;
-const DRAG_INSET: u32 = 4;
+/// The dedicated titlebar height (in px).
+const TITLEBAR_HEIGHT: u32 = 36;
 
-/// One dot, the space between two of them, and the padding around the row. The
-/// row's total width is where the drag strip picks up.
+/// One dot, the space between two of them, and the padding around the row.
 const DOT: u32 = 12;
 const DOT_GAP: u32 = 8;
-const ROW_PAD: u32 = 12;
-const BUTTONS: u32 = 3;
-
-/// How far the drag strip starts from the left edge: past the whole row, so a
-/// press near a dot never turns into a window drag.
-const fn row_width() -> u32 {
-    ROW_PAD * 2 + DOT * BUTTONS + DOT_GAP * (BUTTONS - 1)
-}
+const ROW_PAD: u32 = 14;
 
 /// What the page can ask the window to do. Deliberately short: the page is
 /// dsh's, and this is the whole of what it is trusted with.
@@ -137,10 +126,7 @@ pub fn sync(window: &WebviewWindow) {
 /// rest of the window there is nothing here that has to follow dsh's theme —
 /// they read the same against a light page and a dark one.
 pub fn script() -> String {
-    let strip = DRAG_INSET;
-    let height = DRAG_HEIGHT;
-    let clear = row_width();
-    let row = DOT + ROW_PAD + DRAG_INSET;
+    let titlebar_height = TITLEBAR_HEIGHT;
     let dot = DOT;
     let gap = DOT_GAP;
     let pad = ROW_PAD;
@@ -178,9 +164,13 @@ pub fn script() -> String {
   function start() {{
     var style = document.createElement('style');
     style.textContent =
+      ':root{{--dsh-titlebar-height:{titlebar_height}px;}}' +
+      'html,body{{height:100%!important;margin:0!important;overflow:hidden!important;}}' +
+      '#root{{height:calc(100% - var(--dsh-titlebar-height))!important;margin-top:var(--dsh-titlebar-height)!important;box-sizing:border-box!important;}}' +
+      'body:not(:has(#root)){{padding-top:var(--dsh-titlebar-height)!important;box-sizing:border-box!important;}}' +
       '.dsh-wc{{position:fixed;top:0;left:0;z-index:2147483647;display:flex;' +
-      'align-items:center;gap:{gap}px;height:{row}px;padding:0 {pad}px;' +
-      'opacity:.6;transition:opacity .2s ease;pointer-events:none}}' +
+      'align-items:center;gap:{gap}px;height:{titlebar_height}px;padding:0 {pad}px;' +
+      'opacity:.85;transition:opacity .2s ease;pointer-events:none}}' +
       // `dsh-wc-on` is put on by the magnification below whenever the pointer
       // is near the row, so the glyphs come up as it approaches rather than
       // one at a time as it crosses each dot.
@@ -211,8 +201,8 @@ pub fn script() -> String {
       '.dsh-wc button.dsh-wc-close{{background:#ff5f57}}' +
       '.dsh-wc button.dsh-wc-min{{background:#febc2e}}' +
       '.dsh-wc button.dsh-wc-max{{background:#28c840}}' +
-      '.dsh-wc-drag{{position:fixed;top:{strip}px;left:{clear}px;right:{strip}px;' +
-      'height:{height}px;z-index:2147483646}}';
+      '.dsh-wc-drag{{position:fixed;top:0;left:0;right:0;' +
+      'height:{titlebar_height}px;z-index:2147483646}}';
     document.head.appendChild(style);
 
     var drag = document.createElement('div');
