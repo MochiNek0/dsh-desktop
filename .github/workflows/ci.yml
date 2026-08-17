@@ -1,12 +1,18 @@
 # Does it still compile, and do the unit tests still pass, on all three
 # platforms? The bundling itself is not run here — that is `release.yml`, and it
 # takes an order of magnitude longer.
+#
+# Never on a push. This is a repository worked on directly on main, where that
+# would mean a build for every commit including the ones that only touch prose.
+# Run it by hand — `gh workflow run ci.yml`, or the Run workflow button — when
+# something has changed that the two platforms this cannot be compiled on would
+# notice, and before cutting a tag, since a release build finds the same
+# breakage twenty minutes later.
 
 name: ci
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
   pull_request:
 
 jobs:
@@ -19,7 +25,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -47,7 +53,7 @@ jobs:
   script:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The bootstrap script has no test suite and cannot have much of one — it
       # downloads Node and installs dsh — so what is checked is that a stock

@@ -537,7 +537,10 @@ add_path() {
             continue
         fi
         # The single quotes keep `$PATH` a literal for the shell that will read
-        # this line, rather than baking in the one we happen to have now.
+        # this line, rather than baking in the one we happen to have now — which
+        # is exactly what SC2016 is there to warn about, and exactly what is
+        # wanted here.
+        # shellcheck disable=SC2016
         printf '\n%s\nexport PATH="%s:$PATH"\n%s\n' "$BEGIN_MARK" "$dir" "$END_MARK" >> "$file" 2>/dev/null ||
             say "无法写入 $file，终端里的 PATH 需要你自己加。"
     done

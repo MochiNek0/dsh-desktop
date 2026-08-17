@@ -142,7 +142,7 @@ scripts/install-deps.ps1      Detects and installs Node and dsh on Windows; shar
 scripts/install-deps.sh       The same thing for macOS and Linux, run by the app's first launch
 scripts/bundle-runtime.mjs    Stages both scripts into resources/ and records the boot warm-up list
 scripts/boot-trace/           Traces one dsh boot to find out what it reads
-.github/workflows/ci.yml      Compile and unit-test on all three platforms, plus a lint of the sh script
+.github/workflows/ci.yml      Compile and unit-test on all three platforms, plus an sh lint (run by hand)
 .github/workflows/release.yml On a v* tag: build all three, sign, upload to a draft release
 src-tauri/tauri.conf.json     Base configuration, and the NSIS target for Windows
 src-tauri/tauri.macos.conf.json   app + dmg targets (Tauri merges these per platform)

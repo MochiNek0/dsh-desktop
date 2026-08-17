@@ -141,7 +141,7 @@ scripts/install-deps.ps1      检测并安装 Node 与 dsh（Windows）；安装
 scripts/install-deps.sh       同一件事的 macOS / Linux 版，由应用首次启动时调用
 scripts/bundle-runtime.mjs    构建前把上面两个脚本放进 resources/，并生成启动预热清单
 scripts/boot-trace/           追踪一次 dsh 启动读了哪些文件，预热清单由此而来
-.github/workflows/ci.yml      三个平台上的编译与单元测试，外加安装脚本的静态检查
+.github/workflows/ci.yml      三平台编译与单元测试 + 脚本静态检查（手动触发）
 .github/workflows/release.yml v* tag 触发：三平台构建、签名、传草稿 Release
 src-tauri/tauri.conf.json     基础配置 + Windows 的 NSIS 目标
 src-tauri/tauri.macos.conf.json   app + dmg 目标（Tauri 按平台自动合并）
