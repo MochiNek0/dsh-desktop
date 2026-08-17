@@ -1,0 +1,59 @@
+# Does it still compile, and do the unit tests still pass, on all three
+# platforms? The bundling itself is not run here — that is `release.yml`, and it
+# takes an order of magnitude longer.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest, ubuntu-22.04]
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: install the Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential
+
+      # No `npm ci` and no `bundle:runtime`: the crate reads `dist/` and
+      # `resources/`, both of which are in the repository, and staging a warm-up
+      # list means installing 327 MB of dsh for a compile.
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  script:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The bootstrap script has no test suite and cannot have much of one — it
+      # downloads Node and installs dsh — so what is checked is that a stock
+      # `/bin/sh` can parse it and that shellcheck has nothing to say.
+      - name: check install-deps.sh
+        run: |
+          sudo apt-get update && sudo apt-get install -y dash shellcheck
+          dash -n scripts/install-deps.sh
+          shellcheck --shell=sh scripts/install-deps.sh

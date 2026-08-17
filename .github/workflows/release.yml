@@ -1,0 +1,105 @@
+# Build the installers for every platform on a version tag, sign them, and put
+# them — with the `latest.json` the updater reads — on a draft release.
+#
+# Draft, so that the release only goes out once someone has looked at it: the
+# updater endpoint points at `releases/latest`, which a published release starts
+# serving to every installed copy the moment it appears.
+#
+# What has to be configured for this to work, once, in the repository's
+# Settings → Secrets and variables → Actions:
+#
+#   TAURI_SIGNING_PRIVATE_KEY   the *contents* of ~/.tauri/dsh-desktop.key
+#
+# Without it the build fails outright rather than quietly shipping something
+# nothing can update to: the config carries a public key and asks for updater
+# artifacts, and Tauri refuses to produce them unsigned.
+#
+# There is deliberately no TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret. That key
+# has no password, GitHub will not store an empty secret, and a secret that does
+# not exist renders as the empty string — which is exactly what the signer wants.
+# Put a password on the key and this is where the secret to match it goes.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# tauri-action creates the release and uploads to it.
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    strategy:
+      # One platform failing should not throw away the others' hour of build.
+      fail-fast: false
+      matrix:
+        include:
+          # One macOS bundle for both architectures. Building the two separately
+          # would mean two of everything in the release and two entries per
+          # platform in `latest.json`, for a download that is a few MB larger.
+          - platform: macos-latest
+            target: universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+          # The oldest runner still supported: a .deb and an AppImage link
+          # against the glibc of the machine that built them, so building on the
+          # newest Ubuntu is what makes them refuse to start on anything else.
+          - platform: ubuntu-22.04
+            target: ''
+            rust-targets: ''
+          - platform: windows-latest
+            target: ''
+            rust-targets: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # webkit2gtk is the webview, libayatana-appindicator the tray, and patchelf
+      # is what the AppImage bundler rewrites the interpreter path with.
+      - name: install the Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            file \
+            wget
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: dsh desktop ${{ github.ref_name }}
+          releaseDraft: true
+          # Merged across the matrix, so the file the updater fetches carries an
+          # entry for every platform rather than whichever job finished last.
+          includeUpdaterJson: true
+          args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
