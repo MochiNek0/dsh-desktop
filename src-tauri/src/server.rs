@@ -14,6 +14,9 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 /// Keeps a spawned process off the console it would otherwise pop up.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -90,12 +93,49 @@ pub fn kill_tree(child: &mut Child) {
             .status();
     }
 
-    #[cfg(not(windows))]
+    // The long-running children are put in a process group of their own by
+    // `group_leader`, so the group is the tree and a negative pid takes all of
+    // it. The short-lived ones — a `dsh --version`, an `npm view` — are not,
+    // and would share ours: killing that group would kill the app, so the group
+    // is only signalled once it has been confirmed to be the child's own.
+    #[cfg(unix)]
     {
-        let _ = child.kill();
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: both are reads and a signal against a pid we own and have not
+        // reaped yet, so it cannot have been reused by another process.
+        unsafe {
+            if libc::getpgid(pid) == pid {
+                libc::kill(-pid, libc::SIGKILL);
+            } else {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
     }
 
     let _ = child.wait();
+}
+
+/// Put a child in a process group of its own, so that [`kill_tree`] can take
+/// down everything it goes on to spawn.
+///
+/// Windows has the job object below for this, which is also a backstop for the app dying
+/// without running any cleanup. There is no equivalent here: `PR_SET_PDEATHSIG`
+/// is Linux-only and fires when the spawning *thread* exits, which is a boot
+/// thread that finishes long before the app does. So on these platforms the
+/// group is the ordinary shutdown path only, and a force-killed app leaves the
+/// server behind — the single-instance lock is what a relaunch runs into.
+#[cfg(unix)]
+pub fn group_leader(command: &mut Command) {
+    // SAFETY: `setpgid(0, 0)` is async-signal-safe and touches nothing but the
+    // process group of the child that is about to exec. It cannot fail here:
+    // the child is a fresh fork, so it is neither a session leader nor already
+    // moved into another session.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
 }
 
 /// A Windows job object holding a child's process tree, configured to kill
@@ -196,6 +236,8 @@ fn command(app: &tauri::AppHandle) -> Command {
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
+    #[cfg(unix)]
+    group_leader(&mut command);
 
     command
 }

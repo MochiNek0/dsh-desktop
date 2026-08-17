@@ -1,0 +1,5 @@
+# A shell script with CRLF line endings does not run: `/bin/sh` reads the `\r`
+# as part of the shebang's path and of every word after it. This repository is
+# worked on from Windows, where the default `core.autocrlf=true` would hand out
+# exactly that on checkout, so the one file it matters for is pinned.
+*.sh text eol=lf

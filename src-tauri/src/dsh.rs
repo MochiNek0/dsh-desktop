@@ -7,12 +7,15 @@
 //! command rather than a download into a staging directory and a rename on the
 //! next launch.
 //!
-//! Both the installing and the updating live in `resources/install-deps.ps1`,
-//! which the NSIS installer also runs; see `src-tauri/installer-hooks.nsh`. This
-//! module decides *whether* to run it and reports what it prints onto the
-//! loading page. Keeping one implementation matters more than keeping it in
-//! Rust: the script has to detect Node, fetch and verify a Node zip, and walk a
-//! list of registry mirrors, and a second copy of all that would drift.
+//! Both the installing and the updating live in a script beside the app —
+//! `resources/install-deps.ps1` on Windows, which the NSIS installer also runs
+//! (see `src-tauri/installer-hooks.nsh`), and `resources/install-deps.sh` on
+//! macOS and Linux, where there is no installer hook to share it with and the
+//! first launch is the only thing that runs it. This module decides *whether* to
+//! run one and reports what it prints onto the loading page. Keeping one
+//! implementation per platform matters more than keeping it in Rust: the script
+//! has to detect Node, fetch and verify a Node archive, and walk a list of
+//! registry mirrors, and a second copy of all that would drift.
 //!
 //! Finding dsh cannot go through the process's own PATH. The installer adds
 //! Node's directory to the user's PATH and then launches this app, which
@@ -140,8 +143,19 @@ fn bootstrap(app: &AppHandle) -> Bootstrap {
 
 /// Every directory a command of ours might be in, most specific first: what the
 /// script installed, then whatever this process inherited.
+///
+/// npm puts a global package's shims in the prefix itself on Windows and in
+/// `<prefix>/bin` everywhere else, so what the marker records is npm's prefix
+/// and the directory to search for is derived from it.
 fn search_path(app: &AppHandle) -> Vec<PathBuf> {
     let state = bootstrap(app);
+    let shims = state.prefix.map(|prefix| {
+        if cfg!(windows) {
+            prefix
+        } else {
+            prefix.join("bin")
+        }
+    });
     let node_dir = state
         .node
         .as_deref()
@@ -149,7 +163,7 @@ fn search_path(app: &AppHandle) -> Vec<PathBuf> {
         .map(Path::to_path_buf);
 
     let inherited = std::env::var_os("PATH").unwrap_or_default();
-    [state.prefix, node_dir]
+    [shims, node_dir]
         .into_iter()
         .flatten()
         .chain(std::env::split_paths(&inherited))
@@ -194,12 +208,33 @@ pub fn current(app: &AppHandle) -> Option<Install> {
         None => look_up(app, &["dsh.cmd", "dsh"])?,
     };
 
-    // npm puts the shim in the prefix and the package under the `node_modules`
-    // beside it, so one is always the other's parent.
-    let root = bin.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let root = root_of(&bin);
     let version = manifest_version(&root).or_else(|| version_of(bin.as_os_str()))?;
 
     Some(Install { bin, root, version })
+}
+
+/// The directory holding the `node_modules` a global install put dsh in.
+///
+/// On Windows npm puts the shim in the prefix and the package under the
+/// `node_modules` beside it, so the shim's own directory is it. Everywhere else
+/// the shim is a symlink in `<prefix>/bin` and the package is under
+/// `<prefix>/lib/node_modules`, which is one level up and across.
+///
+/// Falling back to the shim's directory covers a `DSH_BIN` pointing at a tree
+/// laid out some third way; the callers all treat a root with nothing under it
+/// as nothing to do.
+fn root_of(bin: &Path) -> PathBuf {
+    let dir = bin.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+    #[cfg(not(windows))]
+    if let Some(lib) = dir.parent().map(|prefix| prefix.join("lib")) {
+        if lib.join("node_modules/@deepseek-ai/dsh").is_dir() {
+            return lib;
+        }
+    }
+
+    dir
 }
 
 /// The `version` field of the installed package's manifest — a file read rather
@@ -334,12 +369,10 @@ fn bootstrap_now(app: &AppHandle, report: &Report) -> bool {
 /// this, and everything else it prints is npm's own log, which goes to stderr
 /// for whoever is watching the app from a console.
 fn run(app: &AppHandle, args: &[&str], report: &Report) -> Result<bool, String> {
-    let script = script(app).ok_or("找不到安装脚本 install-deps.ps1")?;
+    let script = script(app).ok_or_else(|| format!("找不到安装脚本 {SCRIPT}"))?;
 
-    let mut command = Command::new("powershell.exe");
+    let mut command = interpreter(&script);
     command
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&script)
         .args(args)
         // Turns the plain log into `::` lines and switches stdout to UTF-8,
         // which is what the reader below expects.
@@ -350,6 +383,9 @@ fn run(app: &AppHandle, args: &[&str], report: &Report) -> Result<bool, String> 
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
+    // npm is a tree of its own, and this one runs for minutes.
+    #[cfg(unix)]
+    crate::server::group_leader(&mut command);
 
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let stdout = child.stdout.take().ok_or("无法读取脚本输出")?;
@@ -446,11 +482,18 @@ fn npm(app: &AppHandle) -> Option<Command> {
     let (node, cli) = match (state.node, state.npm) {
         (Some(node), Some(cli)) if node.is_file() && cli.is_file() => (node, cli),
         _ => {
+            // Beside the binary on Windows, and one level up under `lib`
+            // everywhere else — the same two layouts `root_of` covers.
             let node = look_up(app, &["node.exe", "node"])?;
-            let cli = node.parent()?.join("node_modules/npm/bin/npm-cli.js");
-            if !cli.is_file() {
-                return None;
-            }
+            let dir = node.parent()?;
+            let cli = [
+                dir.join("node_modules/npm/bin/npm-cli.js"),
+                dir.parent()
+                    .unwrap_or(dir)
+                    .join("lib/node_modules/npm/bin/npm-cli.js"),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.is_file())?;
             (node, cli)
         }
     };
@@ -606,9 +649,10 @@ fn checked_file(app: &AppHandle) -> Option<PathBuf> {
     Some(app_dir(app)?.join("dsh-checked"))
 }
 
-/// `%LOCALAPPDATA%\<identifier>`. `install-deps.ps1` and `installer-hooks.nsh`
-/// build the same path out of `$LOCALAPPDATA` and the bundle identifier; the
-/// three have to agree.
+/// `%LOCALAPPDATA%\<identifier>`, `~/Library/Application Support/<identifier>`,
+/// `~/.local/share/<identifier>`. Both bootstrap scripts and
+/// `installer-hooks.nsh` build the same path out of the platform's own variable
+/// and the bundle identifier; they all have to agree.
 fn app_dir(app: &AppHandle) -> Option<PathBuf> {
     Some(simplified(app.path().app_local_data_dir().ok()?))
 }
@@ -617,11 +661,37 @@ pub fn resources(app: &AppHandle) -> Option<PathBuf> {
     Some(simplified(app.path().resource_dir().ok()?).join("resources"))
 }
 
-/// The bootstrap script, staged into `resources/` by
-/// `scripts/bundle-runtime.mjs` and shipped by the bundler.
+/// The bootstrap script for this platform. Both are staged into `resources/` by
+/// `scripts/bundle-runtime.mjs` and shipped by the bundler; they take the same
+/// arguments and print the same `::` lines.
+#[cfg(windows)]
+const SCRIPT: &str = "install-deps.ps1";
+#[cfg(not(windows))]
+const SCRIPT: &str = "install-deps.sh";
+
 fn script(app: &AppHandle) -> Option<PathBuf> {
-    let script = resources(app)?.join("install-deps.ps1");
+    let script = resources(app)?.join(SCRIPT);
     script.is_file().then_some(script)
+}
+
+/// What to run the script with.
+#[cfg(windows)]
+fn interpreter(script: &Path) -> Command {
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(script);
+    command
+}
+
+/// `/bin/sh` rather than the script itself: a resource copied into a `.app` or
+/// unpacked from a `.deb` does not reliably keep its executable bit, and there
+/// is nothing in the script that a stock `/bin/sh` cannot run.
+#[cfg(not(windows))]
+fn interpreter(script: &Path) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command.arg(script);
+    command
 }
 
 fn note(app: &AppHandle, title: &str, detail: &str) {

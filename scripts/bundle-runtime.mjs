@@ -1,11 +1,13 @@
-// Stage what the installer ships beside the app: the bootstrap script, and the
-// warm-up list the app reads while dsh starts.
+// Stage what ships beside the app: the bootstrap scripts, and the warm-up list
+// the app reads while dsh starts.
 //
-// Neither Node nor dsh is shipped any more. The installer detects the machine's
-// Node, installs one under %LOCALAPPDATA% if there is none, and then reaches for
-// `npm install -g @deepseek-ai/dsh` — all of it in `scripts/install-deps.ps1`,
-// which is copied into `resources/` here so the bundler picks it up. See
-// `src-tauri/installer-hooks.nsh`.
+// Neither Node nor dsh is shipped any more. The machine's Node is detected, one
+// is installed under the app's data directory if there is none, and then comes
+// `npm install -g @deepseek-ai/dsh` — all of it in `scripts/install-deps.ps1`
+// and its counterpart `scripts/install-deps.sh`, both copied into `resources/`
+// here so the bundler picks them up. On Windows the installer runs the first at
+// install time (see `src-tauri/installer-hooks.nsh`); everywhere else there is
+// no installer hook and the app's first launch runs the second.
 //
 // What is left to build is the warm-up list, and that needs a dsh tree to record
 // against but not to ship one — the install goes to a temporary directory and is
@@ -50,11 +52,17 @@ async function main() {
   // resource glob would otherwise sweep straight into the installer.
   for (const stale of ['runtime', 'dsh']) rmSync(join(resources, stale), { recursive: true, force: true });
 
-  // Always copied rather than checked: it is one small file, and a stale copy
-  // of the thing that installs everything else is not worth the saved
+  // Always copied rather than checked: they are two small files, and a stale
+  // copy of the thing that installs everything else is not worth the saved
   // millisecond.
-  copyFileSync(join(root, 'scripts', 'install-deps.ps1'), join(resources, 'install-deps.ps1'));
-  console.log('[bundle] staged install-deps.ps1');
+  //
+  // Both go into every bundle. Which one runs is decided at runtime by
+  // `src-tauri/src/dsh.rs`, and a few kilobytes of the other one is cheaper
+  // than a platform switch in the resource glob.
+  for (const script of ['install-deps.ps1', 'install-deps.sh']) {
+    copyFileSync(join(root, 'scripts', script), join(resources, script));
+  }
+  console.log('[bundle] staged install-deps.ps1 and install-deps.sh');
 
   // Kept behind its own check rather than the stamp's: a trace that failed
   // leaves no list, and retrying it should not depend on anything else.

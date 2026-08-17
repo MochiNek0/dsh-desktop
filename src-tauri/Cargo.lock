@@ -878,6 +878,7 @@ dependencies = [
 name = "dsh-desktop"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "semver",
  "serde_json",
  "tauri",
