@@ -54,7 +54,7 @@ npm run build          # 打包 → src-tauri/target/release/bundle/
 
 ### 发布
 
-推一个 `v` 开头的 tag，`.github/workflows/release.yml` 会在三个平台上各构建一次，签名，把安装包和合并好的 `latest.json` 传到一个**草稿** Release：
+推一个 `v` 开头的 tag，`.github/workflows/release.yml` 会先跑检查（三个平台上的 `cargo test`，加上 `install-deps.sh` 的静态检查），过了才在三个平台上各构建一次，签名，把安装包和合并好的 `latest.json` 传到一个**草稿** Release：
 
 ```sh
 # 版本号有三处，改成一样的：package.json、src-tauri/tauri.conf.json、src-tauri/Cargo.toml
@@ -63,6 +63,8 @@ git commit -am 'chore: 0.2.0' && git tag v0.2.0 && git push --follow-tags
 ```
 
 草稿是故意的：更新端点指向 `releases/latest`，一旦发布，所有已安装的副本下次启动就会看到它。确认产物没问题再点发布。
+
+想在打 tag 之前先确认另外两个平台没问题，就手动触发一次同一个 workflow（Actions 页的 Run workflow，或 `gh workflow run release.yml`）—— 打包那步只在 ref 是 tag 时才跑，手动触发就只跑检查。
 
 签名私钥不在仓库里，走仓库的 Actions secrets —— 只有一个：
 
@@ -141,8 +143,7 @@ scripts/install-deps.ps1      检测并安装 Node 与 dsh（Windows）；安装
 scripts/install-deps.sh       同一件事的 macOS / Linux 版，由应用首次启动时调用
 scripts/bundle-runtime.mjs    构建前把上面两个脚本放进 resources/，并生成启动预热清单
 scripts/boot-trace/           追踪一次 dsh 启动读了哪些文件，预热清单由此而来
-.github/workflows/ci.yml      三平台编译与单元测试 + 脚本静态检查（手动触发）
-.github/workflows/release.yml v* tag 触发：三平台构建、签名、传草稿 Release
+.github/workflows/release.yml v* tag 触发：先查（三平台测试 + 脚本静态检查）再打包、签名、传草稿 Release
 src-tauri/tauri.conf.json     基础配置 + Windows 的 NSIS 目标
 src-tauri/tauri.macos.conf.json   app + dmg 目标（Tauri 按平台自动合并）
 src-tauri/tauri.linux.conf.json   deb + AppImage 目标

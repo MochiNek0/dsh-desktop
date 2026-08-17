@@ -54,7 +54,7 @@ The bundle targets are split by platform across `tauri.conf.json` (Windows, NSIS
 
 ### Releasing
 
-Push a tag starting with `v`. `.github/workflows/release.yml` builds on all three platforms, signs everything, and uploads the packages and a merged `latest.json` to a **draft** release:
+Push a tag starting with `v`. `.github/workflows/release.yml` runs the checks first (`cargo test` on all three platforms, and a lint of `install-deps.sh`), then builds on all three, signs everything, and uploads the packages and a merged `latest.json` to a **draft** release:
 
 ```sh
 # Three places carry the version; keep them equal: package.json,
@@ -64,6 +64,8 @@ git commit -am 'chore: 0.2.0' && git tag v0.2.0 && git push --follow-tags
 ```
 
 Draft on purpose: the updater endpoint points at `releases/latest`, so publishing is what puts the release in front of every installed copy on its next launch. Look the artifacts over first.
+
+To find out whether the other two platforms are still happy before committing to a tag, start the same workflow by hand (the Run workflow button, or `gh workflow run release.yml`) — the bundling is guarded on the ref being a tag, so a manual run stops after the checks.
 
 The signing key is not in the repo; it goes in the repository's Actions secrets — just the one:
 
@@ -142,8 +144,7 @@ scripts/install-deps.ps1      Detects and installs Node and dsh on Windows; shar
 scripts/install-deps.sh       The same thing for macOS and Linux, run by the app's first launch
 scripts/bundle-runtime.mjs    Stages both scripts into resources/ and records the boot warm-up list
 scripts/boot-trace/           Traces one dsh boot to find out what it reads
-.github/workflows/ci.yml      Compile and unit-test on all three platforms, plus an sh lint (run by hand)
-.github/workflows/release.yml On a v* tag: build all three, sign, upload to a draft release
+.github/workflows/release.yml On a v* tag: check, then build all three, sign, upload to a draft release
 src-tauri/tauri.conf.json     Base configuration, and the NSIS target for Windows
 src-tauri/tauri.macos.conf.json   app + dmg targets (Tauri merges these per platform)
 src-tauri/tauri.linux.conf.json   deb + AppImage targets
