@@ -42,6 +42,10 @@ pub fn start(app: &AppHandle) {
 
 /// The absolute path of every file in the warm-up list, against the install
 /// that is about to be started.
+///
+/// The list is recorded against a local `npm install`, whose paths start at
+/// `node_modules/`. A global install lays the same tree out under its prefix, so
+/// the root here is the directory holding dsh's `node_modules` either way.
 fn plan(app: &AppHandle) -> Option<Vec<PathBuf>> {
     let list = crate::dsh::resources(app)?.join("dsh-boot-set.txt");
     let root = crate::dsh::current(app)?.root;

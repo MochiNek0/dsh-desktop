@@ -15,7 +15,8 @@
 //! than pushing it down, because pushing dsh's layout down means guessing at how
 //! it measures itself, and that guess would break on a dsh release we do not
 //! control. The cost is that they sit on top of the page's own top-left corner,
-//! which is why they are dimmed, and show their glyphs only when pointed at.
+//! which is why they are dimmed, and show their glyphs only once the pointer
+//! comes near.
 //!
 //! ## Talking back
 //!
@@ -179,15 +180,31 @@ pub fn script() -> String {
     style.textContent =
       '.dsh-wc{{position:fixed;top:0;left:0;z-index:2147483647;display:flex;' +
       'align-items:center;gap:{gap}px;height:{row}px;padding:0 {pad}px;' +
-      'opacity:.6;transition:opacity .12s ease;pointer-events:none}}' +
-      '.dsh-wc:hover{{opacity:1}}' +
+      'opacity:.6;transition:opacity .2s ease;pointer-events:none}}' +
+      // `dsh-wc-on` is put on by the magnification below whenever the pointer
+      // is near the row, so the glyphs come up as it approaches rather than
+      // one at a time as it crosses each dot.
+      '.dsh-wc-on{{opacity:1}}' +
       // Only the dots take the pointer; the padding between and around them
       // lets clicks through to whatever dsh draws underneath.
+      //
+      // `will-change` is what keeps the motion smooth rather than crunchy: it
+      // puts each dot on its own compositor layer, so resizing one does not
+      // re-rasterize its ring and glyph a frame at a time.
+      //
+      // The transition is short because the transform is rewritten every frame
+      // the pointer moves — it is there to smooth the steps between frames,
+      // not to carry the animation. At rest it stretches out, so the row
+      // settles back gently once the pointer leaves.
       '.dsh-wc button{{all:unset;pointer-events:auto;width:{dot}px;height:{dot}px;' +
-      'border-radius:50%;display:grid;place-items:center;cursor:default;' +
-      'color:rgba(0,0,0,.55);box-shadow:inset 0 0 0 .5px rgba(0,0,0,.12)}}' +
-      '.dsh-wc button svg{{opacity:0;transition:opacity .12s ease}}' +
-      '.dsh-wc:hover button svg{{opacity:1}}' +
+      'border-radius:50%;display:grid;place-items:center;cursor:pointer;' +
+      'color:rgba(0,0,0,.55);box-shadow:inset 0 0 0 .5px rgba(0,0,0,.12);' +
+      'will-change:transform;transition:transform .13s cubic-bezier(.2,.9,.24,1),' +
+      'filter .2s ease}}' +
+      '.dsh-wc:not(.dsh-wc-on) button{{transition-duration:.34s}}' +
+      '.dsh-wc button svg{{opacity:0;will-change:transform;' +
+      'transition:opacity .2s ease,transform .13s cubic-bezier(.2,.9,.24,1)}}' +
+      '.dsh-wc-on button svg{{opacity:1}}' +
       '.dsh-wc button:active{{filter:brightness(.85)}}' +
       // Qualified by `.dsh-wc button` so they outweigh its `all:unset`, which
       // would otherwise take the colour straight back off again.
@@ -236,6 +253,101 @@ pub fn script() -> String {
 
     document.body.appendChild(drag);
     document.body.appendChild(bar);
+
+    // Dock-style magnification. Hover states would make this three separate
+    // on/off steps as the pointer crosses the row, which is what reads as
+    // stiff no matter how the easing is tuned. Instead every dot's size is a
+    // continuous function of how far the pointer is from its centre, so
+    // sliding along the row moves all three at once and nothing ever snaps.
+    var AMP = 0.2; // how much the dot under the pointer grows
+    var SPREAD = 10; // how hard the others are pushed aside, in px
+    var REACH = 34; // how far the influence carries sideways, in px
+    // Shorter than REACH, and deliberately: the row sits at the very top of
+    // the window, so the pointer nearly always arrives from below, across
+    // whatever dsh is drawing. A tall reach would have the dots stirring
+    // while the pointer is still busy somewhere else.
+    var LIFT = 22; // and how far it carries vertically
+
+    // Measured with `offsetLeft`, which is layout rather than paint and so is
+    // not thrown off by the transforms this then writes. The bar is fixed at
+    // the viewport's top-left corner with no border, so these come out in the
+    // same coordinates as a mouse event's `clientX`.
+    var dots = [].slice.call(bar.children).map(function (el) {{
+      return {{ el: el, x: 0 }};
+    }});
+    var mid = 0;
+    var near = false;
+
+    function measure() {{
+      mid = bar.offsetHeight / 2;
+      dots.forEach(function (dot) {{
+        dot.x = dot.el.offsetLeft + dot.el.offsetWidth / 2;
+      }});
+    }}
+
+    function place(px, py) {{
+      var ny = (mid - py) / LIFT;
+
+      // Distance is taken in two dimensions, not just along the row, so the
+      // dots come up as the pointer rises towards them instead of switching
+      // on the moment it crosses some line.
+      var pull = dots.map(function (dot) {{
+        var nx = (dot.x - px) / REACH;
+        var d = Math.sqrt(nx * nx + ny * ny);
+        // A raised cosine: 1 under the pointer, 0 at the edge of its reach,
+        // and flat at both ends, so a dot neither pops in nor pops out.
+        return d >= 1 ? 0 : (1 + Math.cos(d * Math.PI)) / 2;
+      }});
+
+      var any = pull.some(Boolean);
+      if (!any && !near) return;
+      if (any !== near) {{
+        near = any;
+        bar.classList.toggle('dsh-wc-on', any);
+      }}
+
+      dots.forEach(function (dot, i) {{
+        var f = pull[i];
+        var scale = 1 + AMP * f;
+        var nx = (dot.x - px) / REACH;
+        // Scale first, then shift, so SPREAD stays in real pixels. The shift
+        // is signed by which side of the pointer the dot is on and vanishes
+        // under it, which is what makes the row part rather than slide.
+        var shift = SPREAD * f * (nx < -1 ? -1 : nx > 1 ? 1 : nx);
+        dot.el.style.transform = f
+          ? 'translateX(' + shift.toFixed(2) + 'px) scale(' + scale.toFixed(3) + ')'
+          : '';
+        // Held at its drawn size while the dot around it grows, as macOS
+        // does. A glyph scaled off the pixel grid blurs, and a blurred glyph
+        // is most of what reads as a rough animation. Looked up rather than
+        // cached because `__dshMaximized` replaces the middle one's svg.
+        var glyph = dot.el.firstChild;
+        if (glyph) {{
+          glyph.style.transform = f ? 'scale(' + (1 / scale).toFixed(3) + ')' : '';
+        }}
+      }});
+    }}
+
+    measure();
+    window.addEventListener('resize', measure);
+
+    // Coalesced to one update per frame: the listener is on the document, so
+    // on dsh's page it sees every move of the pointer, not just moves over
+    // the row.
+    var queued = null;
+    var frame = 0;
+    function flush() {{
+      frame = 0;
+      place(queued.clientX, queued.clientY);
+    }}
+    document.addEventListener('mousemove', function (event) {{
+      queued = event;
+      if (!frame) frame = requestAnimationFrame(flush);
+    }}, {{ capture: true, passive: true }});
+    // The pointer can leave the window without ever passing the row.
+    document.addEventListener('mouseleave', function () {{
+      place(-1e4, -1e4);
+    }});
   }}
 
   if (document.body) start();

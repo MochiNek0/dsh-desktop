@@ -55,9 +55,6 @@ fn main() {
             Some(vec![AUTOSTART_FLAG]),
         ))
         .setup(move |app| {
-            // Before the first spawn, while nothing holds the directory open.
-            dsh::promote(app.handle());
-
             // Ahead of the boot below, so that the files dsh is about to read
             // are being read from a dozen threads while it reads them from one.
             // The update check it now overlaps with is the usual case — there is
@@ -307,14 +304,13 @@ fn boot(
         };
 
         // Skipped entirely on a login-item launch, which is sitting in the tray
-        // with nobody looking at it: a modal asking about a 185 MB download —
-        // from an app the user never opened — belongs to no window on screen,
-        // and the restart it leads to would be one nobody was expecting. The
+        // with nobody looking at it: a modal asking about a 185 MB download,
+        // from an app the user never opened, belongs to no window on screen. The
         // next launch someone actually asks for does the check.
         //
-        // False means the user took the update and the app is on its way to
-        // restarting into it. Starting a server now would be starting one for a
-        // process that is about to go away.
+        // False means the app is quitting and took the install running under
+        // this call down with it. Starting a server now would be starting one
+        // for a process that is already on its way out.
         if window_is_visible(&app) && !dsh::gate(&app, &report) {
             return;
         }
@@ -326,17 +322,19 @@ fn boot(
                 *server.lock().unwrap() = Some(child);
                 serve(&window, &origin, &splash, &events);
             }
-            // Most often this is an install whose dsh download failed: the
-            // installer fetches dsh rather than carrying it, and an app that
-            // got this far without one has nothing to run. Running the
-            // installer again is the fix, so it is what this leads with.
+            // Most often this is a machine where fetching dsh failed: neither
+            // the installer nor the boot above carries one, they download it,
+            // and an app that got this far without one has nothing to run. By
+            // now both have tried, so what is left to suggest is the network
+            // and doing it by hand.
             Err(error) => splash.fail(
                 &window,
                 "启动 dsh 失败",
                 &format!(
                     "无法执行 dsh：{error}\n\n\
-                     dsh 可能没有安装成功。请换一个网络或代理后重新运行安装程序。\n\n\
-                     如果你自己装过 dsh，也可以在终端里执行 `dsh --version` 确认，\
+                     dsh 没有安装成功，通常是网络或代理的问题。\
+                     换一个网络或代理后重启应用，它会再试一次。\n\n\
+                     也可以自己在终端里执行 `npm install -g @deepseek-ai/dsh` 安装，\
                      或用 DSH_BIN 环境变量指向 dsh 可执行文件的完整路径。"
                 ),
             ),

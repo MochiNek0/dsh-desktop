@@ -1,34 +1,33 @@
-// Stage the runtime the installer ships: a Node binary and npm, so the machine
-// has something to install and run dsh with.
+// Stage what the installer ships beside the app: the bootstrap script, and the
+// warm-up list the app reads while dsh starts.
 //
-// dsh itself is *not* shipped. The installer fetches it with the npm staged
-// here (see `src-tauri/installer-hooks.nsh`), and the app fetches it on first
-// launch if that did not work out. What is staged here instead is the warm-up
-// list, which needs a dsh tree to record against but not to ship one — that
-// install goes to a temporary directory and is thrown away.
+// Neither Node nor dsh is shipped any more. The installer detects the machine's
+// Node, installs one under %LOCALAPPDATA% if there is none, and then reaches for
+// `npm install -g @deepseek-ai/dsh` — all of it in `scripts/install-deps.ps1`,
+// which is copied into `resources/` here so the bundler picks it up. See
+// `src-tauri/installer-hooks.nsh`.
+//
+// What is left to build is the warm-up list, and that needs a dsh tree to record
+// against but not to ship one — the install goes to a temporary directory and is
+// thrown away. It runs against the host's own Node, so a machine building this
+// needs Node on PATH; the versions do not have to match what a user ends up
+// with, since all the list carries is paths.
 //
 // Runs from `beforeBuildCommand`, and by hand as `npm run bundle:runtime`.
-// Builds for the host platform only — npm resolves native optional
-// dependencies against the machine doing the install, so a Windows installer
-// has to be staged on Windows, a macOS one on macOS.
 //
 // Everything it writes lives under `src-tauri/resources/`, which is gitignored.
-// It is skipped entirely when that directory already holds the versions below.
 
 import { execFileSync, spawn } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-/** Pinned so a build is reproducible and an update is a visible commit. */
-const NODE_VERSION = '24.19.0';
-
 /**
  * The dsh the warm-up list is recorded against. Not what the user gets — the
  * installer asks npm for the newest release at the moment they install — so
- * this only has to be close enough that the two trees put the same files in
- * the same places. A path that moved between the two is one warm-up read that
+ * this only has to be close enough that the two trees put the same files in the
+ * same places. A path that moved between the two is one warm-up read that
  * misses, which `src-tauri/src/warm.rs` skips.
  */
 const DSH_VERSION = '0.1.0-rc.6';
@@ -40,62 +39,48 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const resources = join(root, 'src-tauri', 'resources');
 const stamp = join(resources, 'bundled.json');
 
-// `dsh` is in here even though no dsh is staged: it is what the warm-up list
-// below was recorded against, so bumping it has to invalidate that list.
-const want = { node: NODE_VERSION, dsh: DSH_VERSION, platform: process.platform, arch: process.arch };
+const want = { dsh: DSH_VERSION };
 
 await main();
 
 async function main() {
-  if (isStaged()) {
-    console.log(`[bundle] up to date: node ${NODE_VERSION}, dsh ${DSH_VERSION}`);
+  mkdirSync(resources, { recursive: true });
+
+  // A tree from a build that still bundled Node and dsh: 300-odd MB the
+  // resource glob would otherwise sweep straight into the installer.
+  for (const stale of ['runtime', 'dsh']) rmSync(join(resources, stale), { recursive: true, force: true });
+
+  // Always copied rather than checked: it is one small file, and a stale copy
+  // of the thing that installs everything else is not worth the saved
+  // millisecond.
+  copyFileSync(join(root, 'scripts', 'install-deps.ps1'), join(resources, 'install-deps.ps1'));
+  console.log('[bundle] staged install-deps.ps1');
+
+  // Kept behind its own check rather than the stamp's: a trace that failed
+  // leaves no list, and retrying it should not depend on anything else.
+  if (isStaged() && existsSync(bootSetTarget())) {
+    console.log(`[bundle] boot set up to date: dsh ${DSH_VERSION}`);
   } else {
-    // `dsh` is no longer staged, but a tree an older build left there is 255 MB
-    // that would otherwise be swept into the installer by the resource glob.
-    // `resources/` itself is tracked (`.gitkeep`) so that glob always matches.
-    for (const stale of ['runtime', 'dsh']) rmSync(join(resources, stale), { recursive: true, force: true });
-    rmSync(stamp, { force: true });
     rmSync(bootSetTarget(), { force: true });
-    mkdirSync(resources, { recursive: true });
-
-    stageNode();
-
-    writeFileSync(stamp, `${JSON.stringify(want, null, 2)}\n`);
+    await traceBootSet();
   }
 
-  // Kept out of the staging check: a trace that failed leaves no list, and
-  // retrying it should not mean downloading Node and dsh again.
-  if (!existsSync(bootSetTarget())) await traceBootSet();
+  // Rewritten whether or not the trace ran, so that a stamp left by an older
+  // scheme does not keep claiming a bundled Node this no longer stages.
+  if (existsSync(bootSetTarget())) writeFileSync(stamp, `${JSON.stringify(want, null, 2)}\n`);
 
   console.log('[bundle] done');
 }
 
-/** Whether a previous run already produced exactly what this one would. */
+/** Whether the list already on disk was recorded against the dsh above. */
 function isStaged() {
   if (!existsSync(stamp)) return false;
-  // A tree from a build that still bundled dsh. The stamp matches — same node,
-  // same dsh — so nothing else here would notice, and the resource glob would
-  // put all 255 MB of it into the installer.
-  if (existsSync(join(resources, 'dsh'))) return false;
   try {
     const have = JSON.parse(readFileSync(stamp, 'utf8'));
-    return (
-      Object.keys(want).every((key) => have[key] === want[key]) &&
-      existsSync(nodeTarget()) &&
-      existsSync(npmTarget())
-    );
+    return Object.keys(want).every((key) => have[key] === want[key]);
   } catch {
     return false;
   }
-}
-
-function nodeTarget() {
-  return join(resources, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node');
-}
-
-/** npm's own entry point, which the app runs to fetch newer dsh releases. */
-function npmTarget() {
-  return join(resources, 'runtime', 'node_modules', 'npm', 'bin', 'npm-cli.js');
 }
 
 /** The warm-up list `traceBootSet` records and src-tauri/src/warm.rs reads. */
@@ -109,67 +94,9 @@ function dshEntry(dir) {
 }
 
 /**
- * Download the official Node build and keep the executable and npm. The rest of
- * the archive — headers, docs, the corepack shims — is dead weight in an
- * installer. npm has to come along because the app installs dsh updates with it
- * at runtime, and doing that through npm inherits the user's registry and proxy
- * settings instead of ignoring them.
- */
-function stageNode() {
-  const { archive, inner, npm } = nodeArchive();
-  const url = `https://nodejs.org/dist/v${NODE_VERSION}/${archive}`;
-  const scratch = mkdtempSync(join(tmpdir(), 'dsh-node-'));
-
-  try {
-    console.log(`[bundle] downloading ${url}`);
-    execFileSync('curl', ['-fsSL', '-o', join(scratch, archive), url], { stdio: 'inherit' });
-
-    console.log('[bundle] extracting node');
-    execFileSync(tarBin(), ['-xf', archive], { cwd: scratch, stdio: 'inherit' });
-
-    mkdirSync(join(resources, 'runtime'), { recursive: true });
-    copyFileSync(join(scratch, inner), nodeTarget());
-    if (process.platform !== 'win32') chmodSync(nodeTarget(), 0o755);
-
-    cpSync(join(scratch, npm), join(resources, 'runtime', 'node_modules', 'npm'), { recursive: true });
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
-  }
-}
-
-/**
- * Windows ships bsdtar as `System32\tar.exe`, which reads the zip Node
- * publishes. A bare `tar` would find Git for Windows' GNU tar first on a
- * developer's PATH, and that one cannot, so name the system binary outright.
- */
-function tarBin() {
-  return process.platform === 'win32'
-    ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe')
-    : 'tar';
-}
-
-/** The official archive for this host, and the executable's path inside it. */
-function nodeArchive() {
-  const arch = { x64: 'x64', arm64: 'arm64' }[process.arch];
-  if (!arch) throw new Error(`[bundle] unsupported architecture: ${process.arch}`);
-
-  const build = { win32: `win-${arch}`, darwin: `darwin-${arch}`, linux: `linux-${arch}` }[process.platform];
-  if (!build) throw new Error(`[bundle] unsupported platform: ${process.platform}`);
-
-  const base = `node-v${NODE_VERSION}-${build}`;
-  return process.platform === 'win32'
-    ? { archive: `${base}.zip`, inner: join(base, 'node.exe'), npm: join(base, 'node_modules', 'npm') }
-    : {
-        archive: `${base}.tar.${process.platform === 'linux' ? 'xz' : 'gz'}`,
-        inner: join(base, 'bin', 'node'),
-        npm: join(base, 'lib', 'node_modules', 'npm'),
-      };
-}
-
-/**
- * Install dsh into `dir`, the same way the installer and the app do it at
- * runtime, so that the tree this traces against is laid out like the one the
- * user will end up with.
+ * Install dsh into `dir`, laid out the way the global install on a user's
+ * machine is: `node_modules/@deepseek-ai/dsh`, relative to a root. What differs
+ * is only where that root is, and the list records nothing absolute.
  */
 function installDsh(dir) {
   mkdirSync(dir, { recursive: true });
@@ -183,15 +110,20 @@ function installDsh(dir) {
   );
 
   console.log(`[bundle] installing @deepseek-ai/dsh@${DSH_VERSION}`);
-  // Run npm's own entry point on the Node staged above, rather than the `npm`
-  // command. On Windows that command is a .cmd shim, and Node refuses to spawn
-  // one without a shell; a shell in turn means unescaped argument
-  // concatenation. This has neither problem, needs no npm on the host, and is
-  // the same pair the app itself installs dsh updates with.
-  execFileSync(nodeTarget(), [npmTarget(), 'install', '--omit=dev', '--no-audit', '--no-fund'], {
+  // npm's own entry point on the host's Node, rather than the `npm` command. On
+  // Windows that command is a .cmd shim, and Node refuses to spawn one without a
+  // shell; a shell in turn means unescaped argument concatenation.
+  execFileSync(process.execPath, [npmCli(), 'install', '--omit=dev', '--no-audit', '--no-fund'], {
     cwd: dir,
     stdio: 'inherit',
   });
+}
+
+/** npm's entry point beside whatever Node is running this script. */
+function npmCli() {
+  const cli = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (!existsSync(cli)) throw new Error(`[bundle] no npm beside ${process.execPath}`);
+  return cli;
 }
 
 /**
@@ -255,7 +187,7 @@ async function traceBootSet() {
  */
 function bootOnce(dir, trace, home) {
   return new Promise((resolve, reject) => {
-    const child = spawn(nodeTarget(), ['--require', join(root, 'scripts', 'boot-trace', 'preload.cjs'), dshEntry(dir), 'web', '--port', '0'], {
+    const child = spawn(process.execPath, ['--require', join(root, 'scripts', 'boot-trace', 'preload.cjs'), dshEntry(dir), 'web', '--port', '0'], {
       cwd: home,
       env: { ...process.env, DSH_HOME: join(home, 'home'), DSH_BOOT_TRACE: trace },
       stdio: ['ignore', 'pipe', 'pipe'],

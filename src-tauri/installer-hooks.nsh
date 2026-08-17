@@ -1,20 +1,22 @@
-﻿; Installing and removing dsh itself, which the installer no longer carries.
+﻿; Getting the machine to a working dsh, and taking it back off on the way out.
 ;
-; The app ships a Node runtime and npm and nothing else: dsh is 327 MB unpacked
-; and compresses far better as an npm download than as part of this installer,
-; so it is fetched here instead. That puts the wait where a user expects one —
-; inside an installer's progress — rather than in front of a window they just
-; opened.
+; Neither is implemented here. `resources/install-deps.ps1` does the work —
+; detect Node, install one under %LOCALAPPDATA% if the machine has none, then
+; `npm install -g @deepseek-ai/dsh` — and this file is the installer's half of
+; calling it. The app calls the same script when a launch finds no dsh; see
+; `src-tauri/src/dsh.rs`. Doing it here in NSIS as well would mean a second
+; implementation of SHA256 verification and zip extraction on top of certutil
+; and tar, kept in step with the first one by hand.
 ;
-; There is no second chance at first launch. If every registry below fails the
-; install says so and asks the user to fix their network and run it again; an
-; app that quietly finished installing without the thing it runs would be worse
-; than one that says it did not.
+; The wait is put inside the installer's progress on purpose: an install pulls
+; 185 MB of dsh and possibly 35 MB of Node on top, and that is a wait a user
+; expects from an installer and does not expect from a window they just opened.
+; When it fails the install says so rather than quietly finishing without the
+; thing it runs — but it is no longer the only chance, because the app can now
+; run the same script itself.
 ;
-; It also puts a `dsh` command on PATH, so the terminal gets the same dsh the
-; app runs and the same updates — but only on a machine that has none of its
-; own. See `DshShimWrite` for what that command is and `DshPathAdd` for how it
-; gets there.
+; Nothing here needs elevation. The script writes under %LOCALAPPDATA% and to
+; HKCU\Environment, both of which the current user owns.
 ;
 ; Wired up by `tauri.conf.json` under `bundle.windows.nsis.installerHooks`.
 ; This file must stay UTF-8 with a BOM — the generated installer is built with
@@ -27,136 +29,35 @@
 ${Using:StrFunc} StrRep
 ${Using:StrFunc} UnStrRep
 
-!define DSH_PACKAGE "@deepseek-ai/dsh"
+; The bootstrap script, and where the uninstaller finds it once `$INSTDIR` is
+; gone. See `NSIS_HOOK_PREUNINSTALL`.
+!define DSH_SCRIPT "resources\install-deps.ps1"
 
-; Tried in order, and only until one works. The first attempt passes no
-; registry at all, so a user with an `.npmrc` — a private mirror, a corporate
-; proxy — gets what they configured rather than having it overridden. The rest
-; are public mirrors, for the case where the default is unreachable.
-!define DSH_MIRROR_1 "https://registry.npmmirror.com/"
-!define DSH_MIRROR_2 "https://mirrors.cloud.tencent.com/npm/"
-!define DSH_MIRROR_3 "https://mirrors.huaweicloud.com/repository/npm/"
+; `-NonInteractive` because there is nobody at a console to answer: everything
+; the script needs to ask is asked through NSIS, below. `-ExecutionPolicy
+; Bypass` applies to this one invocation and changes no machine policy.
+!define DSH_POWERSHELL "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File"
 
-; One `npm install` attempt. `registry` is either empty, for whatever npm
-; resolves on its own, or a `--registry=` argument.
-;
-; $R0 install directory   $R1 node.exe   $R2 npm-cli.js   $R3 done flag
-!macro DshInstallFrom label registry
-  ${If} $R3 == "0"
-    DetailPrint "正在安装 dsh（${label}）…"
-    nsExec::ExecToLog '"$R1" "$R2" install --omit=dev --no-audit --no-fund --loglevel=http ${registry} "${DSH_PACKAGE}@latest"'
-    Pop $0
-    ${If} $0 == "0"
-      StrCpy $R3 "1"
-      DetailPrint "dsh 安装完成（${label}）。"
-    ${Else}
-      DetailPrint "从 ${label} 安装失败（退出码 $0），换下一个源重试。"
-    ${EndIf}
-  ${EndIf}
-!macroend
-
-; The `dsh` command this app puts on PATH, in a directory of its own so that
-; adding it to PATH adds nothing else — the bundled Node sits one level up, and
-; putting *that* directory on PATH would shadow whatever `node` the user
-; already has.
-;
-; Both shims work out their own location at runtime — `%~dp0`, `dirname $0` —
-; rather than carrying `$INSTDIR` in their text. A batch file is bytes read in
-; the console's code page, and the default install directory contains the
-; user's name, which survives that trip only where the ANSI and OEM code pages
-; agree. What is written instead is ASCII: `%LOCALAPPDATA%` and the bundle
-; identifier, expanded by the shell out of an environment that is Unicode
-; whatever the code page says.
-!macro DshShimWrite dir
-  CreateDirectory "${dir}"
-
-  ; cmd.exe and PowerShell, which both find a bare `dsh` through PATHEXT.
-  FileOpen $0 "${dir}\dsh.cmd" w
-  FileWrite $0 "@echo off$\r$\n"
-  FileWrite $0 "setlocal$\r$\n"
-  ; dsh shells out to `node` for workers and plugin tooling; point those at the
-  ; runtime we shipped, exactly as `Install::command` does in `src/dsh.rs`.
-  FileWrite $0 "set $\"PATH=%~dp0..\resources\runtime;%PATH%$\"$\r$\n"
-  FileWrite $0 "$\"%~dp0..\resources\runtime\node.exe$\" $\"%LOCALAPPDATA%\${BUNDLEID}\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js$\" %*$\r$\n"
-  FileClose $0
-
-  ; Git Bash and anything else MSYS, which look for a name with no extension.
-  ; `$$` is a literal `$`: none of these are NSIS variables.
-  FileOpen $0 "${dir}\dsh" w
-  FileWrite $0 "#!/bin/sh$\n"
-  FileWrite $0 "here=$$(dirname $\"$$0$\")$\n"
-  FileWrite $0 "export PATH=$\"$$here/../resources/runtime:$$PATH$\"$\n"
-  FileWrite $0 "exec $\"$$here/../resources/runtime/node.exe$\" $\"$$LOCALAPPDATA/${BUNDLEID}/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js$\" $\"$$@$\"$\n"
-  FileClose $0
-
-  DetailPrint "已安装 dsh 命令：${dir}\dsh.cmd"
-!macroend
-
-!macro DshShimRemove dir
-  Delete "${dir}\dsh.cmd"
-  Delete "${dir}\dsh"
-  RMDir "${dir}"
-!macroend
-
-; Tell everything already running that the environment changed. Without it the
-; new PATH reaches nothing until the next sign-in.
+; Tell everything already running that the environment changed. The script
+; broadcasts this itself after touching PATH; this copy is for the entries the
+; migration below removes.
 !macro DshPathBroadcast
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 !macroend
 
-; Put `dir` on the user's own PATH — `HKCU\Environment`, the short one, never
-; the machine's. Written back as `REG_EXPAND_SZ`, which is what Windows' own
-; environment editor writes and what keeps a `%USERPROFILE%` in somebody else's
-; entry meaning what it says.
+; Take `dir` back off the user's own PATH. `un` is `Un` in the uninstaller,
+; where StrFunc's copies of its functions answer to their own names.
 ;
 ; $0 the PATH   $1 its length   $2 padded for the search   $3 what gets written
-!macro DshPathAdd dir
-  ReadRegStr $0 HKCU "Environment" "Path"
-
-  ; A PATH that already ends in a separator would otherwise come back with an
-  ; empty entry in the middle of it, and an empty entry is how PATH spells the
-  ; current directory. Trailing, it means nothing and drops harmlessly.
-  StrCpy $2 $0 "" -1
-  ${If} $2 == ";"
-    StrCpy $0 $0 -1
-  ${EndIf}
-
-  ; NSIS strings stop at 1024 characters, and `ReadRegStr` truncates to fit
-  ; without saying so. Writing that back would take everything past the cut
-  ; with it, so a PATH anywhere near the limit is left exactly as it is: the
-  ; cost is a convenience the user can add by hand, and the alternative is
-  ; destroying entries this installer has no business touching.
-  StrLen $1 $0
-  StrLen $2 "${dir}"
-  IntOp $1 $1 + $2
-  ${If} $1 >= 1000
-    DetailPrint "PATH 已接近长度上限，不作改动；dsh 命令未加入 PATH。"
-  ${Else}
-    ; Padded at both ends so the first and last entries match like any other.
-    StrCpy $2 ";$0;"
-    ${StrRep} $3 $2 ";${dir};" ";"
-    ${If} $3 == $2
-      ${If} $0 == ""
-        StrCpy $3 "${dir}"
-      ${Else}
-        StrCpy $3 "$0;${dir}"
-      ${EndIf}
-      WriteRegExpandStr HKCU "Environment" "Path" $3
-      !insertmacro DshPathBroadcast
-      DetailPrint "已把 dsh 命令加入 PATH。"
-    ${EndIf}
-  ${EndIf}
-!macroend
-
-; Take `dir` back off the user's PATH. `un` is `Un` in the uninstaller, where
-; StrFunc's copies of its functions answer to their own names.
 !macro DshPathDrop un dir
   ReadRegStr $0 HKCU "Environment" "Path"
 
+  ; NSIS strings stop at 1024 characters, and `ReadRegStr` truncates to fit
+  ; without saying so. Writing that back would take everything past the cut with
+  ; it, so a PATH anywhere near the limit is left exactly as it is.
   StrLen $1 $0
-  ${If} $1 >= 1000
-    DetailPrint "PATH 已接近长度上限，不作改动。"
-  ${Else}
+  ${If} $1 < 1000
+    ; Padded at both ends so the first and last entries match like any other.
     StrCpy $2 ";$0;"
     ${${un}StrRep} $3 $2 ";${dir};" ";"
     ${If} $3 != $2
@@ -169,114 +70,81 @@ ${Using:StrFunc} UnStrRep
         WriteRegExpandStr HKCU "Environment" "Path" $3
       ${EndIf}
       !insertmacro DshPathBroadcast
-      DetailPrint "已把 dsh 命令移出 PATH。"
+      DetailPrint "已移除旧版本留下的 PATH 条目：${dir}"
     ${EndIf}
   ${EndIf}
 !macroend
 
+; What an install before this one left behind.
+;
+; Until now the app shipped its own Node, installed dsh as a private tree under
+; `%LOCALAPPDATA%\${BUNDLEID}\dsh`, and put a `dsh` command of its own in
+; `$INSTDIR\bin` on PATH. None of that exists any more, and the shim is worse
+; than merely dead: it is still on PATH under the same name as the real `dsh`
+; this now installs, pointing at a tree that is about to be deleted.
+;
+; $R0 the old dsh tree   $R5 the old shim directory
+!macro DshMigrate
+  ${If} ${FileExists} "$R5\dsh.cmd"
+  ${OrIf} ${FileExists} "$R5\dsh"
+    DetailPrint "正在清理旧版本的 dsh 命令…"
+    Delete "$R5\dsh.cmd"
+    Delete "$R5\dsh"
+    RMDir "$R5"
+    !insertmacro DshPathDrop "" "$R5"
+  ${EndIf}
+
+  ${If} ${FileExists} "$R0\node_modules\@deepseek-ai\dsh\lib\bin.js"
+    DetailPrint "正在删除旧版本自带的 dsh（约 327 MB）…"
+    RMDir /r "$R0"
+  ${EndIf}
+
+  ; The old update check's two notes to itself, about a tree that is now gone.
+  RMDir /r "$R0.next"
+  RMDir /r "$R0.partial"
+  RMDir /r "$R0.old"
+  Delete "$LOCALAPPDATA\${BUNDLEID}\dsh-checked"
+  Delete "$LOCALAPPDATA\${BUNDLEID}\dsh-skipped"
+!macroend
+
 !macro NSIS_HOOK_POSTINSTALL
+  ; $1 through $3 are not used directly here, but `DshMigrate` reaches
+  ; `DshPathDrop`, which works in them.
   Push $0
   Push $1
   Push $2
   Push $3
   Push $R0
-  Push $R1
-  Push $R2
-  Push $R3
-  Push $R4
   Push $R5
 
   ; The same directory `src-tauri/src/dsh.rs` resolves through Tauri's
-  ; `app_local_data_dir()` — `%LOCALAPPDATA%\<identifier>`. The two have to agree.
+  ; `app_local_data_dir()` — `%LOCALAPPDATA%\<identifier>`. The three of them —
+  ; here, there, and `install-deps.ps1` — have to agree.
   StrCpy $R0 "$LOCALAPPDATA\${BUNDLEID}\dsh"
-  StrCpy $R1 "$INSTDIR\resources\runtime\node.exe"
-  StrCpy $R2 "$INSTDIR\resources\runtime\node_modules\npm\bin\npm-cli.js"
-  StrCpy $R3 "0"
   StrCpy $R5 "$INSTDIR\bin"
 
-  ; A dsh the user installed themselves. `npm install -g` puts `dsh.cmd` on
-  ; PATH, which is exactly what `server::default_bin` runs when the app finds no
-  ; copy of its own — so testing for that one name is testing for the thing that
-  ; would actually get used.
-  ;
-  ; It stays theirs: nothing below installs over it, the uninstaller leaves an
-  ; install it did not make alone, and the update check only tells the user
-  ; about a new version rather than reaching into someone else's npm prefix to
-  ; apply it.
-  ;
-  ; The shim this installer writes is on PATH under that same name, and is not
-  ; a dsh the user installed — so it does not count as one here. Without this
-  ; the second run would find our own command and read it as somebody else's.
-  SearchPath $R4 "dsh.cmd"
-  ${If} $R4 == "$R5\dsh.cmd"
-    StrCpy $R4 ""
-  ${EndIf}
+  !insertmacro DshMigrate
 
-  ; An app update runs this installer again, over a machine that already has a
-  ; dsh — and one that may be newer than what the registry called `latest` when
-  ; this installer was built. Leave it alone; the app checks for updates itself.
-  ${If} ${FileExists} "$R0\node_modules\@deepseek-ai\dsh\lib\bin.js"
-    DetailPrint "dsh 已安装，跳过。"
-    StrCpy $R3 "1"
-  ${ElseIf} $R4 != ""
-    ; Installing a second 327 MB tree next to a working dsh is 327 MB nobody
-    ; asked for.
-    DetailPrint "检测到系统里已有 dsh（$R4），跳过安装。"
-    StrCpy $R3 "1"
-  ${EndIf}
+  SetDetailsPrint both
+  DetailPrint "正在检查 Node 和 dsh…"
+  SetDetailsPrint lastused
 
-  ${If} $R3 == "0"
+  ; Everything the script does — what it found, what it decided to install, and
+  ; npm's own http log while it runs — goes into the details pane, which is the
+  ; only thing moving during a download that takes minutes.
+  nsExec::ExecToLog '${DSH_POWERSHELL} "$INSTDIR\${DSH_SCRIPT}" -Mode install'
+  Pop $0
+
+  ${If} $0 != "0"
     SetDetailsPrint both
-    DetailPrint "正在下载 dsh，约 185 MB，请耐心等待…"
-
-    CreateDirectory "$R0"
-    SetOutPath "$R0"
-
-    !insertmacro DshInstallFrom "默认源" ""
-    !insertmacro DshInstallFrom "npmmirror" "--registry=${DSH_MIRROR_1}"
-    !insertmacro DshInstallFrom "腾讯云" "--registry=${DSH_MIRROR_2}"
-    !insertmacro DshInstallFrom "华为云" "--registry=${DSH_MIRROR_3}"
-
-    ; Back out of the install directory before anything might remove it, and so
-    ; the uninstaller is not left with this as its working directory.
-    SetOutPath "$INSTDIR"
-
-    ${If} $R3 == "0"
-      ; Whatever npm managed to unpack is an incomplete tree. The app tests for
-      ; the entry point and would treat it as missing anyway, so this is only
-      ; about not leaving a few hundred megabytes of it behind.
-      RMDir /r "$R0"
-      ${IfNot} ${Silent}
-        MessageBox MB_OK|MB_ICONEXCLAMATION "dsh 下载失败。$\r$\n$\r$\n已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。$\r$\n$\r$\n请换一个网络或代理后重新运行安装程序。应用本身已经装好，但在 dsh 装上之前无法使用。"
-      ${EndIf}
-    ${EndIf}
-
+    DetailPrint "Node 或 dsh 安装失败（退出码 $0）。"
     SetDetailsPrint lastused
-  ${EndIf}
-
-  ; The terminal command, on the same terms as the install above: only where
-  ; the machine has no dsh of its own, and only when there is one of ours for
-  ; it to point at — an install that failed leaves nothing to run, and a `dsh`
-  ; that exits with a module-not-found is worse than no `dsh` at all.
-  ;
-  ; The other direction matters too. A user who ran `npm install -g` after
-  ; installing this app now has two commands answering to one name, and which
-  ; one wins is down to the order of their PATH; theirs is the one they typed
-  ; the command for, so ours gets out of the way.
-  ${If} $R4 == ""
-  ${AndIf} ${FileExists} "$R0\node_modules\@deepseek-ai\dsh\lib\bin.js"
-    !insertmacro DshShimWrite "$R5"
-    !insertmacro DshPathAdd "$R5"
-  ${Else}
-    !insertmacro DshShimRemove "$R5"
-    !insertmacro DshPathDrop "" "$R5"
+    ${IfNot} ${Silent}
+      MessageBox MB_OK|MB_ICONEXCLAMATION "dsh 没有安装成功。$\r$\n$\r$\n通常是网络或代理的问题 —— 安装过程需要从 nodejs.org 和 npm 下载。$\r$\n$\r$\n应用本身已经装好了，下次启动时它会再试一次；也可以换一个网络或代理后重新运行安装程序。"
+    ${EndIf}
   ${EndIf}
 
   Pop $R5
-  Pop $R4
-  Pop $R3
-  Pop $R2
-  Pop $R1
   Pop $R0
   Pop $3
   Pop $2
@@ -284,26 +152,37 @@ ${Using:StrFunc} UnStrRep
   Pop $0
 !macroend
 
-; Removing dsh runs last, not first.
+; The uninstaller runs the same script, and `$INSTDIR` will not be there when it
+; does — `NSIS_HOOK_POSTUNINSTALL` runs after the app's own files are deleted.
+; So the script is taken along now, into the temporary directory NSIS cleans up
+; on its own.
 ;
-; The generated script inserts `NSIS_HOOK_PREUNINSTALL` ahead of its own
-; `CheckIfAppIsRunning`, so a hook there would delete the tree the running app
-; is executing out of and only then offer to abort — leaving an installed app
-; with no dsh. By the time this one runs, the app's own files are already gone
-; and there is nothing left to change its mind about.
+; This hook runs ahead of the generated `CheckIfAppIsRunning`, so it may well be
+; running for an uninstall the user is about to abort. Copying a file costs
+; nothing in that case.
+!macro NSIS_HOOK_PREUNINSTALL
+  InitPluginsDir
+  ${If} ${FileExists} "$INSTDIR\${DSH_SCRIPT}"
+    CopyFiles /SILENT "$INSTDIR\${DSH_SCRIPT}" "$PLUGINSDIR\install-deps.ps1"
+  ${EndIf}
+!macroend
+
+; Removing Node and dsh runs last, not first.
 ;
-; It also runs after the template's `Delete app data` checkbox has had its turn
-; at `$LOCALAPPDATA\${BUNDLEID}`, which is where the dsh tree lives. That is why
-; the removal below is unconditional rather than tied to the checkbox: dsh is a
-; program this app installed, not the user's data, and it should go whether or
-; not they asked for their data to go with it.
+; A hook in `NSIS_HOOK_PREUNINSTALL` would run before the generated
+; `CheckIfAppIsRunning`, and so would tear down what the running app is
+; executing out of and only then offer to abort. By the time this one runs the
+; app's own files are already gone and there is nothing left to change its mind
+; about.
 !macro NSIS_HOOK_POSTUNINSTALL
   Push $0
   Push $1
   Push $2
   Push $3
   Push $R0
+  Push $R1
   Push $R4
+  Push $R5
 
   ; Not every run of this uninstaller is a removal, and the two that are not
   ; both end with the app still installed:
@@ -315,42 +194,79 @@ ${Using:StrFunc} UnStrRep
   ; does not copy the uninstaller to a temporary directory before running it, so
   ; that path is the path where `$EXEDIR` is still `$INSTDIR`.
   ;
-  ; Neither is a moment to throw away a 327 MB dsh the reinstall would only have
-  ; to fetch again — and certainly not one to ask about conversation history in
-  ; the middle of an update.
+  ; Neither is a moment to throw away a Node and a 327 MB dsh the reinstall
+  ; would only have to fetch again — and certainly not one to ask about any of
+  ; it in the middle of an update.
   ${If} $UpdateMode = 1
   ${OrIf} $EXEDIR == $INSTDIR
-    DetailPrint "这是更新或重装，保留已安装的 dsh。"
+    DetailPrint "这是更新或重装，保留已安装的 Node 和 dsh。"
     Goto uninstall_done
   ${EndIf}
 
-  ; The terminal command and the PATH entry that reaches it. The generated
-  ; uninstaller knows nothing about either — it deletes the files it shipped and
-  ; then tries `RMDir "$INSTDIR"`, which the shim directory has just made fail —
-  ; so removing them, and then the directory they were holding open, is ours.
-  !insertmacro DshShimRemove "$INSTDIR\bin"
-  RMDir "$INSTDIR"
-  !insertmacro DshPathDrop "Un" "$INSTDIR\bin"
-
-  ; The same directory `src-tauri/src/dsh.rs` resolves through Tauri's
-  ; `app_local_data_dir()` — `%LOCALAPPDATA%\<identifier>`. The two have to agree.
+  ; The old private tree, if an install from before this scheme left one and the
+  ; upgrade path above never ran.
+  StrCpy $R5 "$INSTDIR\bin"
   StrCpy $R0 "$LOCALAPPDATA\${BUNDLEID}\dsh"
-
-  ; dsh is a program this app installed, so it goes with it — including the
-  ; trees a download in flight or a completed swap left under other names (see
-  ; `staging_dir`, `partial_dir` and `swap` in `src-tauri/src/dsh.rs`).
-  DetailPrint "正在删除 dsh…"
+  !insertmacro DshPathDrop "Un" "$R5"
   RMDir /r "$R0"
   RMDir /r "$R0.next"
   RMDir /r "$R0.partial"
   RMDir /r "$R0.old"
+  ; `$INSTDIR` itself: the generated uninstaller already tried `RMDir` on it and
+  ; failed if the old shim directory was still holding it open.
+  RMDir "$R5"
+  RMDir "$INSTDIR"
 
-  ; The update check's two notes to itself, on the same reasoning: written by
-  ; this app about a dsh that is now gone, and meaningless without it. They sit
-  ; beside the tree rather than inside it so that promoting a download does not
-  ; take them with it — see `checked_file` and `skip_file` in `dsh.rs`.
-  Delete "$LOCALAPPDATA\${BUNDLEID}\dsh-checked"
-  Delete "$LOCALAPPDATA\${BUNDLEID}\dsh-skipped"
+  ; Nothing to ask about on a machine this app never installed anything on —
+  ; `bootstrap.json` is written by the script the moment it installs something.
+  ; The script is the final authority either way: it declines to remove a Node
+  ; or a dsh that was already there when it arrived.
+  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
+    Goto uninstall_data
+  ${EndIf}
+  ${If} ${Silent}
+    Goto uninstall_data
+  ${EndIf}
+  ${IfNot} ${FileExists} "$PLUGINSDIR\install-deps.ps1"
+    DetailPrint "找不到卸载脚本，Node 和 dsh 保持原样。"
+    Goto uninstall_data
+  ${EndIf}
+
+  StrCpy $R1 ""
+
+  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "是否同时卸载 dsh？$\r$\n$\r$\n选「否」会保留它，终端里的 dsh 命令仍然可用。" IDNO keep_dsh
+  StrCpy $R1 "$R1 -RemoveDsh"
+  keep_dsh:
+
+  ; Only worth asking where there is a Node of ours to remove. The directory
+  ; only exists because the script put it there.
+  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\node\node.exe"
+    Goto keep_node
+  ${EndIf}
+  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "是否同时卸载本应用安装的 Node.js？$\r$\n$\r$\n它装在 $LOCALAPPDATA\${BUNDLEID}\node，不影响你自己装的 Node。$\r$\n$\r$\n注意：dsh 依赖 Node 才能运行，删掉 Node 会连同 dsh 一起删除。" IDNO keep_node
+  StrCpy $R1 "$R1 -RemoveNode"
+  keep_node:
+
+  ${If} $R1 != ""
+    SetDetailsPrint both
+    DetailPrint "正在清理…"
+    SetDetailsPrint lastused
+    nsExec::ExecToLog '${DSH_POWERSHELL} "$PLUGINSDIR\install-deps.ps1" -Mode uninstall$R1'
+    Pop $0
+    ${If} $0 != "0"
+      DetailPrint "清理时出错（退出码 $0）。"
+    ${EndIf}
+  ${EndIf}
+
+  uninstall_data:
+  ; A Node of ours that is no longer there — removed just now, or taken out from
+  ; under us by the template's "delete app data" checkbox, which has already had
+  ; its turn at `%LOCALAPPDATA%\${BUNDLEID}` by the time this hook runs. Either
+  ; way its PATH entry now points at nothing. A Node the user chose to keep
+  ; still exists, and keeps its entry.
+  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\node\node.exe"
+    !insertmacro DshPathDrop "Un" "$LOCALAPPDATA\${BUNDLEID}\node"
+  ${EndIf}
 
   ; `$DSH_HOME` is the user's own: settings, profiles, conversation history.
   ; None of it is ours to throw away without being told to, and a reinstall
@@ -374,7 +290,9 @@ ${Using:StrFunc} UnStrRep
   RMDir /r "$R4"
 
   uninstall_done:
+  Pop $R5
   Pop $R4
+  Pop $R1
   Pop $R0
   Pop $3
   Pop $2

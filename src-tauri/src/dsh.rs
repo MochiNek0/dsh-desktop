@@ -1,29 +1,29 @@
-//! The dsh installation the app manages, and how it gets replaced.
+//! The dsh this app runs: finding it, and getting one onto the machine when
+//! there is none.
 //!
-//! One of it, in one place: `%LOCALAPPDATA%\<identifier>\dsh`, put there by the
-//! installer (see `src-tauri/installer-hooks.nsh`) and replaced in place by the
-//! updates below. Nothing about dsh ships inside the app, which is what keeps
-//! an app update from writing an older dsh over a newer one — the installer
-//! finds the directory already populated and leaves it alone.
+//! Nothing about dsh ships inside the app and nothing here unpacks it. dsh is a
+//! global npm install — `npm install -g @deepseek-ai/dsh` — so the copy the app
+//! starts is the same copy the user's terminal gets, and updating it is one npm
+//! command rather than a download into a staging directory and a rename on the
+//! next launch.
 //!
-//! Installing is the installer's job and only the installer's: a machine that
-//! reaches this code without a dsh is one where that failed, and it is told to
-//! run the installer again rather than quietly starting a 185 MB download in
-//! front of a window the user just opened. What is left here is the update.
+//! Both the installing and the updating live in `resources/install-deps.ps1`,
+//! which the NSIS installer also runs; see `src-tauri/installer-hooks.nsh`. This
+//! module decides *whether* to run it and reports what it prints onto the
+//! loading page. Keeping one implementation matters more than keeping it in
+//! Rust: the script has to detect Node, fetch and verify a Node zip, and walk a
+//! list of registry mirrors, and a second copy of all that would drift.
 //!
-//! A dsh the user installed themselves is checked too, and only checked: it is
-//! reported on and never written to. See [`tell`] for why applying that one is
-//! not this app's to do.
-//!
-//! The swap is a rename, and it happens in [`promote`] on the launch *after*
-//! the download, before anything opens the tree. A download that was cut short
-//! is sitting under another name and is never mistaken for a finished one, so
-//! every failure leaves a working dsh in place.
+//! Finding dsh cannot go through the process's own PATH. The installer adds
+//! Node's directory to the user's PATH and then launches this app, which
+//! inherited its environment before any of that happened — so the search below
+//! starts from what the script wrote down in `bootstrap.json` and falls back to
+//! PATH, rather than the other way round.
 
 use std::ffi::OsStr;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -44,39 +44,6 @@ const PACKAGE: &str = "@deepseek-ai/dsh";
 /// tarballs, four minutes on a 2 MB/s link.
 const DOWNLOAD_SIZE: &str = "约 185 MB";
 
-/// What the same install weighs once npm has unpacked it, which is the figure
-/// the progress bar divides by — npm reports nothing usable to drive one, so
-/// what fills the bar is the staging tree's own weight against where it is
-/// heading. Approximate by construction: the bar is held short of the end
-/// rather than allowed to claim more than it knows.
-const DOWNLOAD_BYTES: f64 = 327.0 * 1024.0 * 1024.0;
-
-/// Registries to fall back through, in order, when the one npm resolves on its
-/// own does not answer. Kept in step with `src-tauri/installer-hooks.nsh`,
-/// which works the same way for the install this updates.
-///
-/// The user's own configuration is always tried first and is never overridden —
-/// a private mirror or a corporate proxy is there for a reason. These only come
-/// out when that has already failed.
-const MIRRORS: [&str; 3] = [
-    "https://registry.npmmirror.com/",
-    "https://mirrors.cloud.tencent.com/npm/",
-    "https://mirrors.huaweicloud.com/repository/npm/",
-];
-
-/// The furthest the measured bar goes. The last stretch belongs to npm's own
-/// bookkeeping, which adds no bytes worth counting.
-const PROGRESS_CEILING: f64 = 99.0;
-
-/// How often the download thread looks in on npm. It runs for minutes, and the
-/// only thing waiting on the answer is a notification.
-const POLL: Duration = Duration::from_millis(200);
-
-/// How often the staging tree is weighed for the progress bar. Each sample
-/// walks tens of thousands of files, so it is deliberately far slower than
-/// [`POLL`], which only costs a `try_wait`.
-const WEIGH: Duration = Duration::from_secs(1);
-
 /// How long the startup check waits for npm before the app stops waiting on it.
 ///
 /// This one runs before dsh does, so it is time the user spends looking at the
@@ -84,15 +51,10 @@ const WEIGH: Duration = Duration::from_secs(1);
 /// would sit there for far longer than anyone will forgive — and the answer was
 /// never load-bearing: there is a working dsh on disk either way.
 ///
-/// It used to be three seconds, which was wrong in the expensive direction: a
-/// `npm view` that is merely slow rather than broken gets cut off, and the app
-/// then never offers an update that is genuinely there. Measured at 10s against
-/// registry.npmjs.org on a connection that was otherwise fine — most of it npm
-/// starting up — so this leaves half again as much headroom.
-///
-/// What it costs is bounded by the failure it is there for. Offline fails in
-/// well under a second, because the name does not resolve; the full wait only
-/// happens behind a proxy that accepts the connection and then says nothing.
+/// Measured at 10s against registry.npmjs.org on a connection that was
+/// otherwise fine — most of it npm starting up — so this leaves half again as
+/// much headroom. What it costs is bounded by the failure it is there for:
+/// offline fails in well under a second, because the name does not resolve.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long a dsh gets to answer `--version`. Nothing about it touches the
@@ -103,301 +65,361 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long an answer from the registry is treated as still true.
 ///
-/// Raising [`CHECK_TIMEOUT`] to something the registry can actually answer
-/// within had a cost the old three seconds hid: the check now usually *waits
-/// for the answer* — ten seconds of a loading page, before dsh has been allowed
-/// to start, on every single launch. Once every few hours is enough to put a
-/// new release in front of someone the same day they could have had it, and the
-/// other launches go straight through.
+/// Without this the check *waits for the answer* — up to [`CHECK_TIMEOUT`] of a
+/// loading page, before dsh has been allowed to start, on every single launch.
+/// Once every few hours is enough to put a new release in front of someone the
+/// same day they could have had it, and the other launches go straight through.
 ///
 /// Only a check that got an answer counts, so a failure retries on the next
 /// launch rather than being remembered for six hours.
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// The install running right now, if one is. Kept reachable so that quitting
-/// the app takes it down rather than leaving it writing to disk with no owner —
-/// see [`stop`].
-static INSTALLING: Mutex<Option<Installing>> = Mutex::new(None);
+/// How often a running child is looked in on. Nothing waits on the answer
+/// except a progress bar and, at the end, the boot.
+const POLL: Duration = Duration::from_millis(200);
 
-/// An npm process installing dsh, and what makes sure it does not outlive us.
-struct Installing {
+/// The bootstrap script running right now, if one is. Kept reachable so that
+/// quitting the app takes it down rather than leaving npm writing to disk with
+/// no owner — see [`stop`].
+static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
+
+/// A child of ours, and what makes sure it does not outlive us.
+struct Running {
     child: Child,
-    /// Held for as long as the install runs; see [`crate::server::Job`]. This is
-    /// the backstop for a crash or a force-kill, where [`stop`] never runs.
+    /// Held for as long as it runs; see [`crate::server::Job`]. This is the
+    /// backstop for a crash or a force-kill, where [`stop`] never runs.
     #[cfg(windows)]
     _job: Option<crate::server::Job>,
 }
 
-/// One dsh installation on disk.
+/// What `install-deps.ps1` wrote down about what it installed. Absent on a
+/// machine where it has never run, or has never had anything to do.
+///
+/// This is how the app finds a Node that is on the user's PATH but not on this
+/// process's — see the module docs — and how it tells a dsh it installed from
+/// one that was already there.
+#[derive(Default)]
+struct Bootstrap {
+    /// The Node the script settled on, ours or the machine's.
+    node: Option<PathBuf>,
+    /// npm's entry point beside it.
+    npm: Option<PathBuf>,
+    /// Where `npm install -g` puts things, which is also where `dsh.cmd` and
+    /// the `node_modules` holding dsh live.
+    prefix: Option<PathBuf>,
+    /// Whether the dsh on this machine is one the script installed. A dsh that
+    /// was already here is reported on and never written to; see [`tell`].
+    ours: bool,
+}
+
+fn bootstrap(app: &AppHandle) -> Bootstrap {
+    let Some(path) = app_dir(app).map(|dir| dir.join("bootstrap.json")) else {
+        return Bootstrap::default();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Bootstrap::default();
+    };
+    let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Bootstrap::default();
+    };
+
+    let read = |key: &str| {
+        state
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from)
+    };
+
+    Bootstrap {
+        node: read("nodeExe"),
+        npm: read("npmCli"),
+        prefix: read("prefix"),
+        ours: state.get("dsh").and_then(|value| value.as_str()) == Some("managed"),
+    }
+}
+
+/// Every directory a command of ours might be in, most specific first: what the
+/// script installed, then whatever this process inherited.
+fn search_path(app: &AppHandle) -> Vec<PathBuf> {
+    let state = bootstrap(app);
+    let node_dir = state
+        .node
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    [state.prefix, node_dir]
+        .into_iter()
+        .flatten()
+        .chain(std::env::split_paths(&inherited))
+        .collect()
+}
+
+/// The first of `names` that exists in [`search_path`], as an absolute path.
+///
+/// Resolved here rather than left to `Command::new`, which searches the PATH
+/// this process started with — the one that predates anything the installer did.
+fn look_up(app: &AppHandle, names: &[&str]) -> Option<PathBuf> {
+    search_path(app).into_iter().find_map(|dir| {
+        names
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+/// The dsh command this launch will run.
 pub struct Install {
-    /// The Node runtime that runs it — always the bundled one, since a machine
-    /// without dsh probably has no Node either.
-    node: PathBuf,
-    entry: PathBuf,
+    /// What to execute. On Windows this is npm's `dsh.cmd` shim, which std
+    /// routes through cmd.exe with the correct argument quoting.
+    pub bin: PathBuf,
     /// The directory holding `node_modules`, which the warm-up list's paths are
     /// relative to. See [`crate::warm`].
     pub root: PathBuf,
     pub version: Version,
 }
 
-impl Install {
-    /// Read the installation rooted at `dir`, where `dir/node_modules` is an
-    /// npm tree containing dsh. `None` if it is missing or half-written.
-    fn at(dir: &Path, node: &Path) -> Option<Self> {
-        let package = dir.join("node_modules/@deepseek-ai/dsh");
-        let entry = package.join("lib/bin.js");
-        if !entry.is_file() {
-            return None;
-        }
-
-        // The entry point is there, so this is meant to be a usable install. If
-        // the version will not read, something is wrong with it — say so, or
-        // the app silently falls through to the next candidate and the reason
-        // is invisible.
-        let Some(version) = Self::version(&package) else {
-            eprintln!(
-                "dsh-desktop: 读不出 {} 的版本号，忽略这份安装",
-                package.display()
-            );
-            return None;
-        };
-
-        Some(Self {
-            node: node.to_path_buf(),
-            entry,
-            root: dir.to_path_buf(),
-            version,
-        })
-    }
-
-    /// The `version` field of an npm package directory's manifest.
-    fn version(package: &Path) -> Option<Version> {
-        let manifest = std::fs::read_to_string(package.join("package.json")).ok()?;
-        let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
-        Version::parse(manifest.get("version")?.as_str()?).ok()
-    }
-
-    pub fn command(&self) -> Command {
-        let mut command = Command::new(&self.node);
-        command.arg(&self.entry);
-
-        // dsh shells out to `node` for workers and plugin tooling; point those
-        // at the runtime we shipped rather than whatever the machine has.
-        if let Some(dir) = self.node.parent() {
-            prepend_to_path(&mut command, dir);
-        }
-
-        command
-    }
-}
-
-/// The dsh this app manages, if the installer got one onto the machine.
+/// Find it, the same way for every caller, so that the version being checked is
+/// the version that will run.
 ///
-/// `None` is not the end of the road: [`crate::server`] goes on to try `DSH_BIN`
-/// and then whatever `dsh` is on PATH, so a user who installed dsh themselves
-/// keeps working — and keeps it exactly as it is, since nothing here writes to
-/// an install it did not make. See [`installed`].
+/// 1. `DSH_BIN` — an explicit choice, so it wins outright.
+/// 2. `dsh` in the npm prefix the bootstrap script recorded, or on PATH.
+///
+/// `None` means the machine has no dsh at all, which [`gate`] answers by
+/// installing one.
 pub fn current(app: &AppHandle) -> Option<Install> {
-    Install::at(&dsh_dir(app)?, &node(app)?)
+    let bin = match std::env::var_os("DSH_BIN") {
+        Some(bin) => PathBuf::from(bin),
+        None => look_up(app, &["dsh.cmd", "dsh"])?,
+    };
+
+    // npm puts the shim in the prefix and the package under the `node_modules`
+    // beside it, so one is always the other's parent.
+    let root = bin.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let version = manifest_version(&root).or_else(|| version_of(bin.as_os_str()))?;
+
+    Some(Install { bin, root, version })
 }
 
-/// The dsh this launch is about to run, and whether it belongs to this app.
-enum Installed {
-    /// Under [`dsh_dir`], put there by the installer and replaced in place by
-    /// the download below.
-    Managed(Version),
-    /// The user's own — `DSH_BIN`, or `dsh` on PATH. Reported on, never written
-    /// to.
-    Foreign(Version),
+/// The `version` field of the installed package's manifest — a file read rather
+/// than a `dsh --version`, which costs a Node startup.
+fn manifest_version(root: &Path) -> Option<Version> {
+    let manifest = root.join("node_modules/@deepseek-ai/dsh/package.json");
+    let manifest = std::fs::read_to_string(manifest).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+    Version::parse(manifest.get("version")?.as_str()?).ok()
 }
 
-impl Installed {
-    fn version(&self) -> &Version {
-        match self {
-            Self::Managed(version) | Self::Foreign(version) => version,
-        }
-    }
-}
-
-/// Find it the same way [`crate::server::command`] finds the one it starts, so
-/// that the version being checked is the version that will run. Getting this
-/// order wrong would mean offering an update to a copy nothing launches.
-fn installed(app: &AppHandle) -> Option<Installed> {
-    if let Some(bin) = std::env::var_os("DSH_BIN") {
-        return version_of(&bin).map(Installed::Foreign);
-    }
-    if let Some(install) = current(app) {
-        return Some(Installed::Managed(install.version));
-    }
-    version_of(crate::server::default_bin().as_ref()).map(Installed::Foreign)
-}
-
-/// Ask a dsh what version it is, rather than reading it off disk.
-///
-/// Where a foreign install keeps its files depends on what put it there — npm's
-/// global prefix, a version manager's shims, something that is not npm at all —
-/// and the name on PATH is the only part of that this app can count on knowing.
-/// `dsh --version` prints the bare version and exits 0.
+/// Ask a dsh what version it is. The fallback for a `DSH_BIN` pointing at
+/// something whose tree is laid out differently — a version manager's shim, a
+/// checkout — where the manifest is not where npm would have put it.
 fn version_of(bin: &OsStr) -> Option<Version> {
     let mut command = Command::new(bin);
     command.arg("--version").stdin(Stdio::null());
 
-    // On Windows this is `dsh.cmd`, which std runs through cmd.exe.
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
 
     Version::parse(&printed(command, VERSION_TIMEOUT)?).ok()
 }
 
-/// Move a finished download into place. Call this before anything launches dsh:
-/// at that point nothing holds the old directory open, which is the only moment
-/// swapping it is safe on Windows.
-///
-/// The staging directory existing is the whole test, because [`install`] only
-/// gives the tree that name once npm has exited cleanly. A download that was
-/// cut short is sitting under another name and is ignored here — swapping a
-/// half-written tree in would destroy a perfectly good one.
-///
-/// The target is [`dsh_dir`], the only dsh there is, so that a download replaces
-/// it rather than joining it.
-///
-/// The tree a previous promotion displaced is cleared here too, whether or not
-/// there is anything to promote this time.
-pub fn promote(app: &AppHandle) {
-    let (Some(staged), Some(live)) = (staging_dir(app), dsh_dir(app)) else {
-        return;
-    };
-
-    if !staged.is_dir() {
-        // Nothing to swap in, but [`discard`] dies with the app that started
-        // it, so a quit part-way through one leaves a few hundred megabytes
-        // behind. Nothing else ever comes back for it, so every launch does.
-        discard(live.with_extension("old"));
-        return;
-    }
-
-    if !swap(&staged, &live) {
-        eprintln!("dsh-desktop: 无法启用已下载的 dsh，继续使用当前版本");
-    }
-}
-
-/// Put `staged` where `live` is, keeping whatever was there until the new tree
-/// is in place. `false` if the directory could not be written, which on Windows
-/// is what a locked file or an unwritable install directory comes back as.
-fn swap(staged: &Path, live: &Path) -> bool {
-    let discarded = live.with_extension("old");
-
-    // Synchronous, unlike the discard below: the renames that follow need the
-    // name to be free.
-    let _ = std::fs::remove_dir_all(&discarded);
-
-    if live.is_dir() && std::fs::rename(live, &discarded).is_err() {
-        return false;
-    }
-    if std::fs::rename(staged, live).is_err() {
-        let _ = std::fs::rename(&discarded, live);
-        return false;
-    }
-
-    discard(discarded);
-    true
-}
-
-/// Delete a displaced dsh tree off the startup path. It is a couple of hundred
-/// megabytes of small files, and it is under a name nothing looks at, so
-/// nobody is waiting on it going away. Best effort: what this does not finish —
-/// because it was locked, or because the app quit out from under it — the
-/// [`promote`] on a later launch picks up.
-fn discard(dir: PathBuf) {
-    if !dir.is_dir() {
-        return;
-    }
-
-    std::thread::spawn(move || {
-        let _ = std::fs::remove_dir_all(&dir);
-    });
-}
-
-/// What the loading page is told while the check and the download it can lead
+/// What the loading page is told while the checks and the install they can lead
 /// to are running: a line of status text, and a percentage — negative to put
 /// the progress bar away.
 pub type Report<'a> = dyn Fn(&str, f64) + 'a;
 
 /// Settle which dsh this launch runs, before one is started.
 ///
-/// Returns `true` to go ahead and boot. `false` means the user took an update
-/// and the app is on its way to restarting into it — there is nothing left to
-/// start in this process.
+/// Returns `true` to go ahead and boot, which is every outcome except a user
+/// who quit while an install was still running.
 ///
 /// Everything that can hold this up is bounded except the user: the check has
 /// [`CHECK_TIMEOUT`], and a check that fails or times out boots what is already
 /// on disk. The dialogs block, so this must run off the main thread.
 pub fn gate(app: &AppHandle, report: &Report) -> bool {
+    let Some(installed) = current(app) else {
+        // Nothing to run. The installer either failed to get dsh onto the
+        // machine or never ran at all, and this is a `tauri dev` build — either
+        // way the fix is the same, and the machine has an npm by now or is
+        // about to get one.
+        return bootstrap_now(app, report);
+    };
+
     if checked_recently(app) {
         return true;
     }
 
     report("正在检查 dsh 更新…", -1.0);
 
-    let Some(installed) = installed(app) else {
-        // No dsh anywhere: the installer's fetch failed. Nothing to check and
-        // nothing to offer — the boot failure that follows is where that gets
-        // said, and it says to run the installer again.
-        return true;
-    };
-
     let Some(latest) = latest(app) else {
         eprintln!(
             "dsh-desktop: 无法查询 dsh 最新版本，使用已安装的 {}",
-            installed.version()
+            installed.version
         );
         return true;
     };
     mark_checked(app);
 
-    if latest <= *installed.version() || skipped(app).is_some_and(|skipped| skipped == latest) {
+    if latest <= installed.version || skipped(app).is_some_and(|skipped| skipped == latest) {
         return true;
     }
 
-    let installed = match installed {
-        Installed::Managed(installed) => installed,
-        // Not ours to replace, so telling the user is the whole of it — and
-        // recording it as skipped is what keeps it to once per release rather
-        // than every time the six hours are up.
-        Installed::Foreign(installed) => {
-            tell(app, &installed, &latest);
-            skip(app, &latest);
-            return true;
-        }
-    };
-
-    if !ask(app, &installed, &latest) {
+    // Not ours to replace, so telling the user is the whole of it — and
+    // recording it as skipped is what keeps it to once per release rather than
+    // every time the six hours are up.
+    if !bootstrap(app).ours {
+        tell(app, &installed.version, &latest);
         skip(app, &latest);
         return true;
     }
 
-    match install(app, &latest, report) {
+    if !ask(app, &installed.version, &latest) {
+        skip(app, &latest);
+        return true;
+    }
+
+    match run(app, &["-Mode", "update"], report) {
+        // The new version is in place already: npm replaced it while nothing
+        // was running, so there is nothing to swap in and nothing to restart
+        // for. The boot carries straight on into it.
         Ok(true) => {
-            report("下载完成，正在重启…", 100.0);
-            restart(app);
-            false
+            report("", -1.0);
+            true
         }
         // Cut short because the app is quitting. Nothing to report, and by now
         // nowhere left to report it.
         Ok(false) => false,
         Err(error) => {
-            eprintln!("dsh-desktop: 下载 dsh {latest} 失败：{error}");
+            eprintln!("dsh-desktop: 更新 dsh 到 {latest} 失败：{error}");
             report("", -1.0);
             note(
                 app,
                 "dsh 更新失败",
                 &format!(
-                    "下载 dsh {latest} 时出错，默认源和几个备用镜像都没有成功，\
-                     将继续使用当前的 {installed}。\n\n{error}"
+                    "更新到 dsh {latest} 时出错，将继续使用当前的 {}。\n\n{error}",
+                    installed.version
                 ),
             );
             true
         }
+    }
+}
+
+/// Get a dsh onto a machine that has none, which may mean getting it a Node
+/// first. `false` if the app quit while it was running.
+fn bootstrap_now(app: &AppHandle, report: &Report) -> bool {
+    report("正在准备运行环境…", -1.0);
+
+    match run(app, &["-Mode", "install"], report) {
+        Ok(true) => {
+            report("", -1.0);
+            true
+        }
+        Ok(false) => false,
+        Err(error) => {
+            eprintln!("dsh-desktop: 安装 dsh 失败：{error}");
+            report("", -1.0);
+            // Booting anyway: `server::start` is about to fail with a message
+            // that says what to do, and one failure report is better than two.
+            true
+        }
+    }
+}
+
+/// Run the bootstrap script with `args`, mirroring its progress onto the
+/// loading page. `Ok(false)` means the app quit while it was still working.
+///
+/// The script emits `::status <text>` and `::progress <percent>` lines for
+/// this, and everything else it prints is npm's own log, which goes to stderr
+/// for whoever is watching the app from a console.
+fn run(app: &AppHandle, args: &[&str], report: &Report) -> Result<bool, String> {
+    let script = script(app).ok_or("找不到安装脚本 install-deps.ps1")?;
+
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .args(args)
+        // Turns the plain log into `::` lines and switches stdout to UTF-8,
+        // which is what the reader below expects.
+        .arg("-Progress")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let stdout = child.stdout.take().ok_or("无法读取脚本输出")?;
+
+    #[cfg(windows)]
+    let job = crate::server::Job::hold(&child);
+
+    *RUNNING.lock().unwrap() = Some(Running {
+        child,
+        #[cfg(windows)]
+        _job: job,
+    });
+
+    // Read on this thread, so that the reporter does not have to be `Send` — it
+    // writes to the window, which the caller owns.
+    //
+    // The two kinds of line are independent: a status without a percentage must
+    // not disturb the bar, so the last one seen is repeated rather than made up.
+    let mut failure = None;
+    let mut percent = -1.0;
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if let Some(text) = line.strip_prefix("::status ") {
+            report(text, percent);
+        } else if let Some(reported) = line.strip_prefix("::progress ") {
+            if let Ok(reported) = reported.trim().parse() {
+                percent = reported;
+                report("", percent);
+            }
+        } else if let Some(text) = line.strip_prefix("::error ") {
+            failure = Some(text.to_string());
+        } else {
+            eprintln!("[bootstrap] {line}");
+        }
+    }
+
+    // The pipe closed, so the script is finished or a syscall away from it.
+    let status = loop {
+        let mut running = RUNNING.lock().unwrap();
+        // Taken by `stop`: the app is on its way out.
+        let Some(active) = running.as_mut() else {
+            return Ok(false);
+        };
+
+        let finished = match active.child.try_wait() {
+            Ok(Some(status)) => Some(Ok(status)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error.to_string())),
+        };
+        if let Some(result) = finished {
+            *running = None;
+            break result?;
+        }
+
+        drop(running);
+        std::thread::sleep(POLL);
+    };
+
+    if status.success() {
+        Ok(true)
+    } else {
+        Err(failure.unwrap_or_else(|| format!("脚本退出码 {status}")))
+    }
+}
+
+/// Kill a bootstrap that is still running. Called on the way out: npm holds no
+/// state worth saving, and left alone it would keep unpacking into a directory
+/// this process no longer owns.
+pub fn stop() {
+    if let Some(mut running) = RUNNING.lock().unwrap().take() {
+        crate::server::kill_tree(&mut running.child);
     }
 }
 
@@ -413,17 +435,41 @@ fn latest(app: &AppHandle) -> Option<Version> {
     Version::parse(&printed(npm, CHECK_TIMEOUT)?).ok()
 }
 
+/// npm, run through Node rather than its shell shim, so there is no console
+/// window and no dependency on how the machine resolves `npm`.
+///
+/// The pair the bootstrap script recorded comes first: on a machine where it
+/// installed a Node of its own, that Node is the one whose global prefix holds
+/// the dsh being asked about.
+fn npm(app: &AppHandle) -> Option<Command> {
+    let state = bootstrap(app);
+    let (node, cli) = match (state.node, state.npm) {
+        (Some(node), Some(cli)) if node.is_file() && cli.is_file() => (node, cli),
+        _ => {
+            let node = look_up(app, &["node.exe", "node"])?;
+            let cli = node.parent()?.join("node_modules/npm/bin/npm-cli.js");
+            if !cli.is_file() {
+                return None;
+            }
+            (node, cli)
+        }
+    };
+
+    let mut command = Command::new(node);
+    command.arg(cli).stdin(Stdio::null());
+
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    Some(command)
+}
+
 /// Run `command` and take the single line it prints, giving it `timeout` to do
 /// so. `None` if it would not start, failed, or was still going when the time
 /// ran out — every caller is asking a question it can do without an answer to.
 ///
-/// Both questions are asked with the loading page on screen, which is what the
-/// deadline is for: neither `npm view` nor a dsh that hangs on startup has a
-/// timeout of its own worth the name, and this is time the user spends waiting.
-///
-/// One short line is the whole contract, but only one of the two callers is
-/// asking a program this app shipped: [`version_of`] runs whatever `dsh` the
-/// user installed. So the pipe is drained on a thread of its own rather than
+/// One short line is the whole contract, but [`version_of`] runs whatever
+/// `DSH_BIN` names. So the pipe is drained on a thread of its own rather than
 /// after the wait below — a child that fills it would block on the write while
 /// this blocked on the exit, and nothing but the deadline would break the tie.
 fn printed(mut command: Command, timeout: Duration) -> Option<String> {
@@ -467,7 +513,7 @@ fn ask(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
     app.dialog()
         .message(&format!(
             "dsh 有新版本 {latest}（当前 {installed}）。\n\n\
-             下载约需 {DOWNLOAD_SIZE}。更新期间应用会等待，完成后自动重启。"
+             下载约需 {DOWNLOAD_SIZE}。更新期间应用会等待，完成后直接启动。"
         ))
         .title("dsh 有可用更新")
         .buttons(MessageDialogButtons::OkCancelCustom(
@@ -481,11 +527,11 @@ fn ask(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
 /// at that.
 ///
 /// Nothing here offers to apply it, because this app is in no position to.
-/// Whatever put that dsh there owns it — npm's global prefix, a version
-/// manager's shims, a package manager that is not npm — and the only npm at
-/// hand is the one beside the bundled Node, whose global prefix is somewhere
-/// else entirely. Running it would install a second dsh where PATH will never
-/// look, next to the working one it was supposed to replace.
+/// Whatever put that dsh there owns it — their own npm's global prefix, a
+/// version manager's shims, a package manager that is not npm — and running
+/// `npm install -g` with the npm this app has at hand would install a second
+/// dsh into a prefix PATH may never reach, next to the working one it was
+/// supposed to replace.
 ///
 /// So the command goes in the message instead, for the user to run against
 /// whatever they actually installed it with.
@@ -499,16 +545,6 @@ fn tell(app: &AppHandle, installed: &Version, latest: &Version) {
              在终端里执行：\n\nnpm install -g {PACKAGE}@latest"
         ),
     );
-}
-
-/// Restart into the dsh that was just downloaded, which [`promote`] swaps in on
-/// the way back up.
-///
-/// Nothing is running to shut down — this happens before the server starts —
-/// and `restart` skips the exit handler anyway.
-fn restart(app: &AppHandle) {
-    let restarting = app.clone();
-    let _ = app.run_on_main_thread(move || restarting.restart());
 }
 
 /// The version the user turned down. Re-asking on every launch for a download
@@ -532,7 +568,7 @@ fn skip(app: &AppHandle, version: &Version) {
 }
 
 fn skip_file(app: &AppHandle) -> Option<PathBuf> {
-    Some(simplified(app.path().app_local_data_dir().ok()?).join("dsh-skipped"))
+    Some(app_dir(app)?.join("dsh-skipped"))
 }
 
 /// Whether the registry was asked recently enough that asking again would only
@@ -567,242 +603,42 @@ fn mark_checked(app: &AppHandle) {
 }
 
 fn checked_file(app: &AppHandle) -> Option<PathBuf> {
-    Some(simplified(app.path().app_local_data_dir().ok()?).join("dsh-checked"))
+    Some(app_dir(app)?.join("dsh-checked"))
 }
 
-/// Run the install. npm writes into a directory [`promote`] does not look at,
-/// which is renamed to the one it does only after npm exits cleanly — so an
-/// interrupted download is never mistaken for a finished one.
-///
-/// `Ok(false)` means the app quit while npm was still working and the install
-/// was killed with it.
-fn install(app: &AppHandle, version: &Version, report: &Report) -> Result<bool, String> {
-    let (Some(partial), Some(staged)) = (partial_dir(app), staging_dir(app)) else {
-        return Err("找不到应用数据目录".into());
-    };
-
-    // `None` first: whatever npm resolves on its own, which is the user's
-    // configuration if they have one. The mirrors are only for when that fails.
-    let sources = std::iter::once(None).chain(MIRRORS.iter().copied().map(Some));
-    let mut failure = String::new();
-
-    for registry in sources {
-        match attempt(app, version, report, &partial, registry) {
-            Ok(true) => {
-                // Complete at last: give the tree the name `promote` acts on.
-                let _ = std::fs::remove_dir_all(&staged);
-                std::fs::rename(&partial, &staged).map_err(|error| error.to_string())?;
-                return Ok(true);
-            }
-            Ok(false) => return Ok(false),
-            Err(error) => {
-                eprintln!(
-                    "dsh-desktop: 从 {} 下载 dsh 失败：{error}",
-                    registry.unwrap_or("默认源")
-                );
-                failure = error;
-            }
-        }
-    }
-
-    // Every source failed. What the last one managed to unpack is a few hundred
-    // megabytes of tree that nothing will ever look at again.
-    let _ = std::fs::remove_dir_all(&partial);
-    Err(failure)
-}
-
-/// One `npm install` into `partial`, from one registry. `Ok(false)` means the
-/// app quit while it was running and there is nothing left to report to.
-///
-/// The tree is cleared first rather than resumed. A failed attempt can leave a
-/// partly-written `node_modules` behind, and npm handed one of those decides
-/// packages are already present — so a retry against a working mirror would
-/// otherwise inherit the hole the broken one left.
-fn attempt(
-    app: &AppHandle,
-    version: &Version,
-    report: &Report,
-    partial: &Path,
-    registry: Option<&str>,
-) -> Result<bool, String> {
-    let _ = std::fs::remove_dir_all(partial);
-    std::fs::create_dir_all(partial).map_err(|error| error.to_string())?;
-
-    let mut npm = npm(app).ok_or("内置的 npm 不可用")?;
-    npm.current_dir(partial)
-        .args(["install", "--omit=dev", "--no-audit", "--no-fund"]);
-    if let Some(registry) = registry {
-        npm.arg(format!("--registry={registry}"));
-    }
-
-    let child = npm
-        .arg(format!("{PACKAGE}@{version}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-
-    #[cfg(windows)]
-    let job = crate::server::Job::hold(&child);
-
-    *INSTALLING.lock().unwrap() = Some(Installing {
-        child,
-        #[cfg(windows)]
-        _job: job,
-    });
-
-    // Weighed from the polling loop rather than a thread of its own, so the
-    // reporter does not have to be `Send` — it writes to the window, which the
-    // caller owns.
-    let downloading = match registry {
-        Some(_) => format!("正在下载 dsh {version}（备用源）…"),
-        None => format!("正在下载 dsh {version}…"),
-    };
-    let weighed = std::cell::Cell::new(Instant::now());
-    report(&downloading, 0.0);
-
-    let Some(status) = wait(&|| {
-        if weighed.get().elapsed() < WEIGH {
-            return;
-        }
-        weighed.set(Instant::now());
-        report(&downloading, percent(partial));
-    }) else {
-        return Ok(false);
-    };
-
-    let status = status.map_err(|error| error.to_string())?;
-    if !status.success() {
-        return Err(format!("npm 退出码 {status}"));
-    }
-
-    Ok(true)
-}
-
-/// Wait for the tracked npm to finish, letting go of the lock between checks so
-/// [`stop`] can still reach it. `None` once it has: the app is on its way out.
-///
-/// `tick` runs once per poll, outside the lock, for whatever wants to watch the
-/// install go by.
-fn wait(tick: &dyn Fn()) -> Option<std::io::Result<ExitStatus>> {
-    loop {
-        {
-            let mut installing = INSTALLING.lock().unwrap();
-            let finished = match installing.as_mut()?.child.try_wait() {
-                Ok(None) => None,
-                Ok(Some(status)) => Some(Ok(status)),
-                Err(error) => Some(Err(error)),
-            };
-
-            if let Some(result) = finished {
-                *installing = None;
-                return Some(result);
-            }
-        }
-
-        tick();
-        std::thread::sleep(POLL);
-    }
-}
-
-/// How far along the install looks, from what it has written so far against
-/// [`DOWNLOAD_BYTES`]. Held under [`PROGRESS_CEILING`]: the estimate is rough
-/// in both directions, and a bar that sits at 100% while npm is still working
-/// reads as a hang.
-fn percent(partial: &Path) -> f64 {
-    (weigh(partial) as f64 / DOWNLOAD_BYTES * 100.0).min(PROGRESS_CEILING)
-}
-
-/// The total size of every file under `dir`. Best effort — this races npm
-/// writing into the same tree, and an entry that vanishes between the listing
-/// and the `metadata` call is one npm is still moving around.
-fn weigh(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-
-    entries
-        .flatten()
-        .map(|entry| match entry.file_type() {
-            Ok(kind) if kind.is_dir() => weigh(&entry.path()),
-            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |data| data.len()),
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Kill a download that is still running. Called on the way out: npm holds no
-/// state worth saving, and left alone it would keep unpacking into a directory
-/// this process no longer owns.
-pub fn stop() {
-    if let Some(mut installing) = INSTALLING.lock().unwrap().take() {
-        crate::server::kill_tree(&mut installing.child);
-    }
-}
-
-/// npm, run through the bundled Node rather than its shell shim, so there is no
-/// console window and no dependency on how the machine resolves `npm`.
-fn npm(app: &AppHandle) -> Option<Command> {
-    let node = node(app)?;
-    let cli = node.parent()?.join("node_modules/npm/bin/npm-cli.js");
-    if !cli.is_file() {
-        return None;
-    }
-
-    let mut command = Command::new(node);
-    command.arg(cli).stdin(Stdio::null());
-
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-
-    Some(command)
-}
-
-fn node(app: &AppHandle) -> Option<PathBuf> {
-    let node = resources(app)?
-        .join("runtime")
-        .join(if cfg!(windows) { "node.exe" } else { "node" });
-
-    node.is_file().then_some(node)
+/// `%LOCALAPPDATA%\<identifier>`. `install-deps.ps1` and `installer-hooks.nsh`
+/// build the same path out of `$LOCALAPPDATA` and the bundle identifier; the
+/// three have to agree.
+fn app_dir(app: &AppHandle) -> Option<PathBuf> {
+    Some(simplified(app.path().app_local_data_dir().ok()?))
 }
 
 pub fn resources(app: &AppHandle) -> Option<PathBuf> {
     Some(simplified(app.path().resource_dir().ok()?).join("resources"))
 }
 
-/// The one dsh, in app data rather than next to the app.
-///
-/// App data is what the app's own installer does not overwrite. Were this in
-/// `resources/`, every app update would put the dsh that installer was built
-/// against over whatever the user had — downgrading it, and making the check
-/// below immediately offer the 185 MB back again.
-///
-/// Everything a download touches is derived from this — [`staging_dir`] and
-/// [`partial_dir`] are its siblings — so that the promotion is a rename inside
-/// one directory. Across directories it would be a rename across volumes the
-/// moment app data and the app land on different drives, and Windows fails
-/// those outright rather than falling back to a copy.
-///
-/// `installer-hooks.nsh` builds this same path out of `$LOCALAPPDATA` and the
-/// bundle identifier; the two have to agree.
-fn dsh_dir(app: &AppHandle) -> Option<PathBuf> {
-    Some(simplified(app.path().app_local_data_dir().ok()?).join("dsh"))
-}
-
-/// A finished download, waiting for the [`promote`] that swaps it in.
-fn staging_dir(app: &AppHandle) -> Option<PathBuf> {
-    Some(dsh_dir(app)?.with_extension("next"))
-}
-
-/// Where npm actually writes. Only ever renamed to [`staging_dir`], and only
-/// once the install is complete; a leftover here is scrap the next download
-/// clears.
-fn partial_dir(app: &AppHandle) -> Option<PathBuf> {
-    Some(dsh_dir(app)?.with_extension("partial"))
+/// The bootstrap script, staged into `resources/` by
+/// `scripts/bundle-runtime.mjs` and shipped by the bundler.
+fn script(app: &AppHandle) -> Option<PathBuf> {
+    let script = resources(app)?.join("install-deps.ps1");
+    script.is_file().then_some(script)
 }
 
 fn note(app: &AppHandle, title: &str, detail: &str) {
     app.dialog().message(detail).title(title).show(|_| {});
+}
+
+/// Put the directories dsh needs at the front of a child's PATH.
+///
+/// Two things depend on this. The Node the bootstrap script may have installed
+/// is on the user's PATH but not on this process's, so without it `dsh.cmd`
+/// would run and fail to find the `node` it shells out to. And dsh shells out
+/// to `node` again for workers and plugin tooling, which should reach the same
+/// one the app is running it with.
+pub fn apply_path(app: &AppHandle, command: &mut Command) {
+    if let Ok(path) = std::env::join_paths(search_path(app)) {
+        command.env("PATH", path);
+    }
 }
 
 /// Drop the `\\?\` prefix Tauri's path APIs come back with on Windows. Rust's
@@ -820,14 +656,4 @@ fn simplified(path: PathBuf) -> PathBuf {
     }
 
     path
-}
-
-/// Put `dir` at the front of the child's PATH, keeping ours behind it.
-fn prepend_to_path(command: &mut Command, dir: &Path) {
-    let inherited = std::env::var_os("PATH").unwrap_or_default();
-    let entries = std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&inherited));
-
-    if let Ok(path) = std::env::join_paths(entries) {
-        command.env("PATH", path);
-    }
 }

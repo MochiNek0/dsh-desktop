@@ -173,42 +173,31 @@ impl Drop for Job {
     }
 }
 
-/// The command that boots the browser UI, from the first of three sources that
-/// this machine actually has:
+/// The command that boots the browser UI.
 ///
-/// 1. `DSH_BIN` — an explicit choice, so it wins outright.
-/// 2. The dsh the app manages, in app data. Absent under `tauri dev`, and on an
-///    install whose download failed.
-/// 3. `dsh` on PATH, for a user who installed one themselves.
+/// [`crate::dsh::current`] resolves it to an absolute path — `DSH_BIN`, or the
+/// npm shim in the global prefix — rather than leaving the lookup to
+/// `Command::new`, which would search the PATH this process started with. On a
+/// machine the installer has just put Node on, that PATH is already out of date.
 ///
-/// [`crate::dsh::installed`] walks the same three in the same order, so that the
-/// update check is about the copy this starts.
+/// Falling back to the bare name is for the case where nothing was found at
+/// all: the error from a failed spawn is what the loading page reports, and
+/// "dsh 不存在" is a better one than "找不到应用数据目录".
 fn command(app: &tauri::AppHandle) -> Command {
-    let mut command = if let Some(bin) = std::env::var_os("DSH_BIN") {
-        Command::new(bin)
-    } else if let Some(dsh) = crate::dsh::current(app) {
-        dsh.command()
-    } else {
-        Command::new(default_bin())
+    let mut command = match crate::dsh::current(app) {
+        Some(dsh) => Command::new(dsh.bin),
+        None => Command::new(if cfg!(windows) { "dsh.cmd" } else { "dsh" }),
     };
 
     command.args(["web", "--port", "0"]);
+    // dsh shells out to `node` for workers and plugin tooling, and the shim
+    // itself needs one. See `dsh::apply_path`.
+    crate::dsh::apply_path(app, &mut command);
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
 
     command
-}
-
-/// `dsh` ships as an npm shim: `dsh.cmd` on Windows, a shell script elsewhere.
-/// Naming the extension is what lets std route the batch file through cmd.exe
-/// with the correct argument quoting.
-pub fn default_bin() -> &'static str {
-    if cfg!(windows) {
-        "dsh.cmd"
-    } else {
-        "dsh"
-    }
 }
 
 /// The agent's initial working directory. The UI's directory picker changes it
