@@ -127,10 +127,19 @@ function installDsh(dir) {
   });
 }
 
-/** npm's entry point beside whatever Node is running this script. */
+/**
+ * npm's entry point, for whatever Node is running this script: beside the
+ * binary on Windows, and one level up under `lib` everywhere else — the same
+ * two layouts `dsh::root_of` and `install-deps.sh` have to cover.
+ */
 function npmCli() {
-  const cli = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
-  if (!existsSync(cli)) throw new Error(`[bundle] no npm beside ${process.execPath}`);
+  const dir = dirname(process.execPath);
+  const cli = [
+    join(dir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    join(dir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  ].find((candidate) => existsSync(candidate));
+
+  if (!cli) throw new Error(`[bundle] no npm beside ${process.execPath}`);
   return cli;
 }
 
