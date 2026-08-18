@@ -99,8 +99,7 @@ struct Running {
 /// machine where it has never run, or has never had anything to do.
 ///
 /// This is how the app finds a Node that is on the user's PATH but not on this
-/// process's — see the module docs — and how it tells a dsh it installed from
-/// one that was already there.
+/// process's — see the module docs.
 #[derive(Default)]
 struct Bootstrap {
     /// The Node the script settled on, ours or the machine's.
@@ -110,9 +109,6 @@ struct Bootstrap {
     /// Where `npm install -g` puts things, which is also where `dsh.cmd` and
     /// the `node_modules` holding dsh live.
     prefix: Option<PathBuf>,
-    /// Whether the dsh on this machine is one the script installed. A dsh that
-    /// was already here is reported on and never written to; see [`tell`].
-    ours: bool,
 }
 
 fn bootstrap(app: &AppHandle) -> Bootstrap {
@@ -137,7 +133,6 @@ fn bootstrap(app: &AppHandle) -> Bootstrap {
         node: read("nodeExe"),
         npm: read("npmCli"),
         prefix: read("prefix"),
-        ours: state.get("dsh").and_then(|value| value.as_str()) == Some("managed"),
     }
 }
 
@@ -189,6 +184,10 @@ pub struct Install {
     /// routes through cmd.exe with the correct argument quoting.
     pub bin: PathBuf,
     pub version: Version,
+    /// The npm global prefix this dsh sits in, when the tree around it is one
+    /// `npm install -g` built; see [`prefix_of`]. Whether an update can actually
+    /// be written there is [`updatable`]'s question.
+    prefix: Option<PathBuf>,
 }
 
 /// Find it, the same way for every caller, so that the version being checked is
@@ -206,8 +205,75 @@ pub fn current(app: &AppHandle) -> Option<Install> {
     };
 
     let version = manifest_version(&root_of(&bin)).or_else(|| version_of(bin.as_os_str()))?;
+    let prefix = prefix_of(&bin);
 
-    Some(Install { bin, version })
+    Some(Install {
+        bin,
+        version,
+        prefix,
+    })
+}
+
+/// The npm global prefix holding `bin`, if the tree around it is the one a
+/// global install builds.
+///
+/// On Windows the shim sits in the prefix with the package under the
+/// `node_modules` beside it; everywhere else the shim is in `<prefix>/bin` and
+/// the package under `<prefix>/lib/node_modules`. Something laid out a third way
+/// is a version manager's shim, a pnpm link, or a `DSH_BIN` pointing into a
+/// checkout, and `npm install -g --prefix` aimed at it would build a *second*
+/// dsh in a directory nothing on PATH looks at rather than replacing the one
+/// that is there.
+fn prefix_of(bin: &Path) -> Option<PathBuf> {
+    let dir = bin.parent()?;
+    let manifest = Path::new("node_modules").join(PACKAGE).join("package.json");
+
+    if dir.join(&manifest).is_file() {
+        return Some(dir.to_path_buf());
+    }
+
+    let prefix = dir.parent()?;
+    prefix
+        .join("lib")
+        .join(&manifest)
+        .is_file()
+        .then(|| prefix.to_path_buf())
+}
+
+/// The prefix to install an update into: the one this dsh is in, once npm has
+/// somewhere it can actually write. A `sudo npm i -g` into `/usr/local`, or a
+/// distribution's `/usr`, answers `None` — asking for a password is no more on
+/// the table here than it is in the install script.
+///
+/// Probed rather than read off a permission bit: Windows has ACLs rather than a
+/// mode, and on Unix the answer depends on the user's groups, so the only
+/// reliable form of the question is the one npm is about to ask anyway. It is
+/// not part of [`current`] because that one only wants to know where dsh is, and
+/// writing to answer it would be a side effect on every launch.
+fn updatable(installed: &Install) -> Option<&Path> {
+    let prefix = installed.prefix.as_deref()?;
+
+    // The pid keeps two copies of the app out of each other's way. There is only
+    // ever meant to be one — see the single-instance plugin — but a file left
+    // behind by a crash would otherwise be a permanent "no".
+    let probe = package_root(prefix).join(format!(".dsh-write-probe-{}", std::process::id()));
+    let allowed = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+
+    allowed.then_some(prefix)
+}
+
+/// The `node_modules` an update lands in: under `lib` on the layout npm uses
+/// everywhere but Windows, and directly under the prefix on that one. Answered
+/// by looking rather than by `cfg`, because it is the layout [`prefix_of`]
+/// matched that decides.
+fn package_root(prefix: &Path) -> PathBuf {
+    let lib = prefix.join("lib").join("node_modules");
+    if lib.join(PACKAGE).is_dir() {
+        lib
+    } else {
+        prefix.join("node_modules")
+    }
 }
 
 /// The directory holding the `node_modules` a global install put dsh in.
@@ -296,24 +362,107 @@ pub fn gate(app: &AppHandle, report: &Report) -> bool {
         return true;
     }
 
-    // Not ours to replace, so telling the user is the whole of it — and
-    // recording it as skipped is what keeps it to once per release rather than
-    // every time the six hours are up.
-    if !bootstrap(app).ours {
+    // Nothing here can aim an install at that tree, so telling the user is the
+    // whole of it — and recording it as skipped is what keeps that to once per
+    // release rather than every time the six hours are up.
+    let Some(prefix) = updatable(&installed) else {
         tell(app, &installed.version, &latest);
         skip(app, &latest);
         return true;
-    }
+    };
 
     if !ask(app, &installed.version, &latest) {
         skip(app, &latest);
         return true;
     }
 
-    match run(app, &["-Mode", "update"], report) {
-        // The new version is in place already: npm replaced it while nothing
-        // was running, so there is nothing to swap in and nothing to restart
-        // for. The boot carries straight on into it.
+    // Nothing is running yet, so there is nothing to stop and nothing to restart
+    // for: npm replaces the tree in place and the boot carries straight on into
+    // the new version.
+    update(app, prefix, &installed.version, report)
+}
+
+/// What the window shows while this is waiting on npm, and `""` when the wait is
+/// over. See [`crate::controls::busy`] — the caller owns the window, this only
+/// knows when there is something to wait for.
+pub type Saying<'a> = dyn Fn(&str) + 'a;
+
+/// A dsh update the user asked for from the menu, rather than one a launch
+/// happened to find. Answers with the prefix to install into once they have
+/// agreed to it, for the caller to hand to [`update`] with dsh stopped.
+///
+/// Every outcome is reported, including "nothing to do": a menu item that does
+/// nothing visible looks broken. A version turned down earlier is offered again
+/// — the whole point of this is being asked.
+pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)> {
+    // `latest` is a `npm view`, which is the network and up to CHECK_TIMEOUT of
+    // it. Everything after it is instant, so the line comes down here rather
+    // than in front of each of the dialogs below.
+    saying("正在检查 dsh 更新…");
+    let found = current(app).map(|installed| {
+        let latest = latest(app);
+        (installed, latest)
+    });
+    saying("");
+
+    let Some((installed, latest)) = found else {
+        note(
+            app,
+            "找不到 dsh",
+            "这台机器上还没有装好的 dsh。重启应用会再装一次。",
+        );
+        return None;
+    };
+
+    let Some(latest) = latest else {
+        note(
+            app,
+            "检查 dsh 更新失败",
+            "无法查询 dsh 的最新版本，通常是网络或代理的问题。",
+        );
+        return None;
+    };
+    mark_checked(app);
+
+    if latest <= installed.version {
+        note(
+            app,
+            "dsh 已是最新版本",
+            &format!("当前的 dsh {} 已经是最新的。", installed.version),
+        );
+        return None;
+    }
+
+    let Some(prefix) = updatable(&installed).map(Path::to_path_buf) else {
+        tell(app, &installed.version, &latest);
+        return None;
+    };
+
+    if !confirm(app, &installed.version, &latest) {
+        return None;
+    }
+
+    Some((prefix, installed.version))
+}
+
+/// Replace the dsh in `prefix` with the newest release, reporting progress onto
+/// the loading page. `false` means the app quit while npm was still running.
+///
+/// The prefix is passed to the script rather than left to the npm it runs with:
+/// a dsh the user installed themselves lives in their own global prefix, and an
+/// npm of ours would default to a different one and install a second copy there.
+///
+/// Failure is reported here and answers `true` all the same — there is a working
+/// dsh on disk either way, which is the one the caller goes on to run.
+pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Report) -> bool {
+    let args = [
+        OsStr::new("-Mode"),
+        OsStr::new("update"),
+        OsStr::new("-Prefix"),
+        prefix.as_os_str(),
+    ];
+
+    match run(app, &args, report) {
         Ok(true) => {
             report("", -1.0);
             true
@@ -322,15 +471,12 @@ pub fn gate(app: &AppHandle, report: &Report) -> bool {
         // nowhere left to report it.
         Ok(false) => false,
         Err(error) => {
-            eprintln!("dsh-desktop: 更新 dsh 到 {latest} 失败：{error}");
+            eprintln!("dsh-desktop: 更新 dsh 失败：{error}");
             report("", -1.0);
             note(
                 app,
                 "dsh 更新失败",
-                &format!(
-                    "更新到 dsh {latest} 时出错，将继续使用当前的 {}。\n\n{error}",
-                    installed.version
-                ),
+                &format!("更新 dsh 时出错，将继续使用当前的 {installed}。\n\n{error}"),
             );
             true
         }
@@ -342,7 +488,7 @@ pub fn gate(app: &AppHandle, report: &Report) -> bool {
 fn bootstrap_now(app: &AppHandle, report: &Report) -> bool {
     report("正在准备运行环境…", -1.0);
 
-    match run(app, &["-Mode", "install"], report) {
+    match run(app, &[OsStr::new("-Mode"), OsStr::new("install")], report) {
         Ok(true) => {
             report("", -1.0);
             true
@@ -364,7 +510,7 @@ fn bootstrap_now(app: &AppHandle, report: &Report) -> bool {
 /// The script emits `::status <text>` and `::progress <percent>` lines for
 /// this, and everything else it prints is npm's own log, which goes to stderr
 /// for whoever is watching the app from a console.
-fn run(app: &AppHandle, args: &[&str], report: &Report) -> Result<bool, String> {
+fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<bool, String> {
     let script = script(app).ok_or_else(|| format!("找不到安装脚本 {SCRIPT}"))?;
 
     let mut command = interpreter(&script);
@@ -383,17 +529,27 @@ fn run(app: &AppHandle, args: &[&str], report: &Report) -> Result<bool, String> 
     #[cfg(unix)]
     crate::server::group_leader(&mut command);
 
+    // Claimed before the spawn, so that two callers cannot both end up in the
+    // slot below with one of the children left unowned. `main` keeps them from
+    // reaching this at once at all; this is the backstop that makes the slot's
+    // invariant true rather than merely likely.
+    let mut running = RUNNING.lock().unwrap();
+    if running.is_some() {
+        return Err("已经有一个 dsh 安装或更新在进行中".to_string());
+    }
+
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let stdout = child.stdout.take().ok_or("无法读取脚本输出")?;
 
     #[cfg(windows)]
     let job = crate::server::Job::hold(&child);
 
-    *RUNNING.lock().unwrap() = Some(Running {
+    *running = Some(Running {
         child,
         #[cfg(windows)]
         _job: job,
     });
+    drop(running);
 
     // Read on this thread, so that the reporter does not have to be `Send` — it
     // writes to the window, which the caller owns.
@@ -562,26 +718,41 @@ fn ask(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
         .blocking_show()
 }
 
-/// Tell the user about an update to a dsh this app did not install, and leave it
-/// at that.
+/// The same question from the tray, where dsh is already serving the window.
 ///
-/// Nothing here offers to apply it, because this app is in no position to.
-/// Whatever put that dsh there owns it — their own npm's global prefix, a
-/// version manager's shims, a package manager that is not npm — and running
-/// `npm install -g` with the npm this app has at hand would install a second
-/// dsh into a prefix PATH may never reach, next to the working one it was
-/// supposed to replace.
+/// Also blocking: the answer decides whether the server comes down, and the
+/// caller has nothing to do until it arrives.
+fn confirm(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
+    app.dialog()
+        .message(&format!(
+            "dsh 有新版本 {latest}（当前 {installed}）。\n\n\
+             下载约需 {DOWNLOAD_SIZE}。更新前会先关闭正在运行的 dsh —— \
+             正在进行的会话会被中断 —— 完成后自动重新启动。"
+        ))
+        .title("更新 dsh")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "更新".into(),
+            "取消".into(),
+        ))
+        .blocking_show()
+}
+
+/// Tell the user about an update to a dsh that is not laid out as one
+/// `npm install -g` this app can point npm at, and leave it at that.
 ///
-/// So the command goes in the message instead, for the user to run against
-/// whatever they actually installed it with.
+/// Nothing here offers to apply it, because doing so would not land where the
+/// working copy is: see [`prefix_of`] for what rules a tree out. So the command
+/// goes in the message instead, for the user to run against whatever they
+/// actually installed it with.
 fn tell(app: &AppHandle, installed: &Version, latest: &Version) {
     note(
         app,
         "dsh 有可用更新",
         &format!(
             "dsh 有新版本 {latest}（当前 {installed}）。\n\n\
-             这份 dsh 是你自己装的，应用不会去改动它。要更新的话，\
-             在终端里执行：\n\nnpm install -g {PACKAGE}@latest"
+             这份 dsh 不在应用能写的 npm 全局目录里（比如用版本管理器装的，\
+             或者装在只有管理员能写的地方），应用不会去改动它。要更新的话，\
+             用你当初安装它的方式，在终端里执行：\n\nnpm install -g {PACKAGE}@latest"
         ),
     );
 }
@@ -690,7 +861,9 @@ fn interpreter(script: &Path) -> Command {
     command
 }
 
-fn note(app: &AppHandle, title: &str, detail: &str) {
+/// A dialog with nothing to answer. Public because the tray has one thing to say
+/// that this module knows nothing about — see `update_dsh` in `main.rs`.
+pub fn note(app: &AppHandle, title: &str, detail: &str) {
     app.dialog().message(detail).title(title).show(|_| {});
 }
 
@@ -722,4 +895,99 @@ fn simplified(path: PathBuf) -> PathBuf {
     }
 
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{package_root, prefix_of, PACKAGE};
+    use std::path::{Path, PathBuf};
+
+    /// A directory of this test's own, gone again when the test ends. Both
+    /// layouts below are built on disk, because what [`prefix_of`] answers is a
+    /// question about which files are where.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let unique = format!("dsh-prefix-{name}-{}", std::process::id());
+            let dir = std::env::temp_dir().join(unique);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch directory under the temp dir");
+            Self(dir)
+        }
+
+        /// An empty shim, and the package tree npm would have put beside it.
+        fn install(&self, shim: &str, root: &str) -> PathBuf {
+            let package = self.0.join(root).join("node_modules").join(PACKAGE);
+            std::fs::create_dir_all(&package).expect("the package directory");
+            std::fs::write(package.join("package.json"), b"{}").expect("the manifest");
+            self.shim(shim)
+        }
+
+        fn shim(&self, shim: &str) -> PathBuf {
+            let bin = self.0.join(shim);
+            std::fs::create_dir_all(bin.parent().expect("the shim has a directory"))
+                .expect("the shim directory");
+            std::fs::write(&bin, b"").expect("the shim");
+            bin
+        }
+
+        fn at(&self, path: &str) -> PathBuf {
+            self.0.join(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn takes_the_directory_a_windows_shim_sits_in() {
+        let scratch = Scratch::new("windows");
+        let shim = scratch.install("prefix/dsh.cmd", "prefix");
+
+        assert_eq!(prefix_of(&shim), Some(scratch.at("prefix")));
+    }
+
+    #[test]
+    fn takes_the_directory_above_a_unix_bin() {
+        let scratch = Scratch::new("unix");
+        let shim = scratch.install("prefix/bin/dsh", "prefix/lib");
+
+        assert_eq!(prefix_of(&shim), Some(scratch.at("prefix")));
+    }
+
+    /// A version manager's shim, or a `DSH_BIN` pointing into a checkout: there
+    /// is no global install around it for npm to replace.
+    #[test]
+    fn refuses_a_shim_with_no_package_around_it() {
+        let scratch = Scratch::new("bare");
+        let shim = scratch.shim("elsewhere/dsh");
+
+        assert_eq!(prefix_of(&shim), None);
+    }
+
+    #[test]
+    fn refuses_a_shim_at_the_root_of_the_filesystem() {
+        assert_eq!(prefix_of(Path::new("/")), None);
+    }
+
+    /// What the write probe is aimed at, which is the directory npm replaces.
+    #[test]
+    fn puts_the_package_root_where_the_package_is() {
+        let scratch = Scratch::new("root");
+        scratch.install("prefix/bin/dsh", "prefix/lib");
+
+        let prefix = scratch.at("prefix");
+        assert_eq!(
+            package_root(&prefix),
+            prefix.join("lib").join("node_modules")
+        );
+        assert_eq!(
+            package_root(&scratch.at("nothing-here")),
+            scratch.at("nothing-here").join("node_modules")
+        );
+    }
 }

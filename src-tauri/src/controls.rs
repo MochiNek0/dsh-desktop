@@ -18,25 +18,42 @@
 //! which is why they are dimmed, and show their glyphs only once the pointer
 //! comes near.
 //!
+//! ## The menu
+//!
+//! Beside them is the app's own menu — updating dsh, checking for a new app,
+//! the login item, quitting. It was all in the tray, where it could not be
+//! styled at all: a tray menu is drawn by the OS, and the app has no say over
+//! anything but the words in it. Drawn here it is ours, and it is also where
+//! the user is looking. The tray keeps the two items that are only ever wanted
+//! when there is no window to look at — show, and quit.
+//!
 //! ## Talking back
 //!
 //! A click has to reach Rust, and the ordinary way — Tauri's IPC — would mean
 //! granting IPC to `http://127.0.0.1:*`, which is to say to every line of
-//! JavaScript dsh and its plugins load. That is a large door to open for three
-//! buttons.
+//! JavaScript dsh and its plugins load. That is a large door to open for a
+//! handful of buttons.
 //!
 //! So the channel is a navigation instead: the page sets `location.href` to
 //! `dsh-window://<action>`, [`action`] recognises it in the navigation handler,
-//! and the navigation is cancelled before it goes anywhere. One-way, four verbs,
-//! no permissions. Dragging works the same way despite being continuous, because
-//! [`WebviewWindow::start_dragging`] hands the whole drag to the OS — the page
-//! only has to say when it starts.
+//! and the navigation is cancelled before it goes anywhere. One-way, a fixed
+//! list of verbs, no permissions. Dragging works the same way despite being
+//! continuous, because [`WebviewWindow::start_dragging`] hands the whole drag to
+//! the OS — the page only has to say when it starts.
 //!
-//! The one thing that travels the other way is whether the window is maximised,
-//! which is pushed with [`sync`]: the page cannot see a Win+Up or a snap, so it
-//! is told rather than left to guess.
+//! Everything the menu added to that list is something the user can already do
+//! from the tray, and none of it reads anything back — the widest of them starts
+//! an `npm install` of one hard-coded package, or quits. What the page cannot do
+//! is ask a question and get an answer, which is what the IPC door would have
+//! opened.
+//!
+//! Three things travel the other way, each pushed rather than asked for, because
+//! the page has no way to see any of them: whether the window is maximised
+//! ([`sync`]), whether the login item is on ([`sync_autostart`]), and whatever
+//! slow thing is running right now ([`busy`]).
 
 use tauri::{AppHandle, Manager, Url, WebviewWindow};
+use tauri_plugin_autostart::ManagerExt;
 
 /// The scheme the injected buttons signal on. Not registered with anything — it
 /// only has to be a scheme no real navigation would use, since the navigation
@@ -51,13 +68,22 @@ const DOT: u32 = 12;
 const DOT_GAP: u32 = 8;
 const ROW_PAD: u32 = 14;
 
-/// What the page can ask the window to do. Deliberately short: the page is
-/// dsh's, and this is the whole of what it is trusted with.
+/// The menu's typeface. Named rather than left to the webview, whose default for
+/// a bare `<button>` is a serif face at a size of its own choosing.
+const FONT: &str =
+    "-apple-system,BlinkMacSystemFont,\"Segoe UI\",\"Microsoft YaHei\",system-ui,sans-serif";
+
+/// What the page can ask the app to do. A fixed list, and every one of them is
+/// a menu item the tray offered first.
 pub enum Action {
     Minimize,
     Maximize,
     Close,
     Drag,
+    UpdateDsh,
+    CheckApp,
+    Autostart,
+    Quit,
 }
 
 /// Recognise a navigation as a button press. `None` for every ordinary URL,
@@ -73,6 +99,10 @@ pub fn action(url: &Url) -> Option<Action> {
         "maximize" => Some(Action::Maximize),
         "close" => Some(Action::Close),
         "drag" => Some(Action::Drag),
+        "update-dsh" => Some(Action::UpdateDsh),
+        "check-app" => Some(Action::CheckApp),
+        "autostart" => Some(Action::Autostart),
+        "quit" => Some(Action::Quit),
         other => {
             eprintln!("dsh-desktop: 忽略未知的窗口操作 {other}");
             None
@@ -82,7 +112,19 @@ pub fn action(url: &Url) -> Option<Action> {
 
 /// Do what the button asked. Every call is best effort — a window that will not
 /// minimise is not a reason to take the app down.
+///
+/// This runs inside the webview's navigation callback, on the main thread, with
+/// the webview waiting on it. So nothing here blocks: the menu items that lead
+/// to npm or to a shutdown hand themselves to a thread first.
 pub fn perform(app: &AppHandle, action: Action) {
+    match action {
+        Action::UpdateDsh => return crate::update_dsh(app),
+        Action::CheckApp => return crate::update::check_now(app),
+        Action::Autostart => return crate::toggle_autostart(app),
+        Action::Quit => return crate::quit(app),
+        _ => {}
+    }
+
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
@@ -99,13 +141,15 @@ pub fn perform(app: &AppHandle, action: Action) {
             };
         }
         // The same thing the frame's close button did: park in the tray rather
-        // than tear down an agent mid-task. Quitting goes through the tray menu.
+        // than tear down an agent mid-task. Quitting is its own menu item.
         Action::Close => {
             let _ = window.hide();
         }
         Action::Drag => {
             let _ = window.start_dragging();
         }
+        // Handled above, where they are the reason for the early return.
+        _ => {}
     }
 }
 
@@ -119,12 +163,49 @@ pub fn sync(window: &WebviewWindow) {
     ));
 }
 
+/// Put the checkmark on the login item, or take it off. Pushed after every
+/// toggle and on every page load, and it reports what the system actually ended
+/// up with rather than what was asked for.
+pub fn sync_autostart(app: &AppHandle) {
+    let enabled = app.autolaunch().is_enabled().unwrap_or(false);
+    eval(
+        app,
+        &format!("window.__dshAutostart && window.__dshAutostart({enabled})"),
+    );
+}
+
+/// Say what is running, or `""` when nothing is. Everything the menu starts
+/// reaches the network before it has anything to show — `npm view` can sit there
+/// for fifteen seconds — and a menu item that leads to nothing visible is a menu
+/// item the user clicks again.
+pub fn busy(app: &AppHandle, text: &str) {
+    let text = serde_json::to_string(text).expect("a string is always serializable");
+    eval(
+        app,
+        &format!("window.__dshBusy && window.__dshBusy({text})"),
+    );
+}
+
+/// Both of the above are calls into the injected script, which may not be there:
+/// the window can be gone, and a document that has not finished loading has no
+/// `__dsh*` on it yet — hence the guard in each. Every one of them repaints
+/// something the next page load pushes again, so a call that lands nowhere
+/// costs nothing.
+fn eval(app: &AppHandle, call: &str) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.eval(call);
+    }
+}
+
 /// The script that draws all of it, injected into every document the window
 /// loads.
 ///
-/// The dots carry their own colour, the same three macOS uses, so unlike the
-/// rest of the window there is nothing here that has to follow dsh's theme —
-/// they read the same against a light page and a dark one.
+/// The dots carry their own colour, the same three macOS uses, so there is
+/// nothing about them that has to follow dsh's theme — they read the same
+/// against a light page and a dark one. The menu does not have that luxury: it
+/// is text on a panel, so its colours come from a `prefers-color-scheme` block,
+/// which is the same thing the loading page resolves against and is set from
+/// dsh's own preference when the window is built (see `theme`).
 pub fn script() -> String {
     let titlebar_height = TITLEBAR_HEIGHT;
     let dot = DOT;
@@ -150,6 +231,24 @@ pub fn script() -> String {
     close: '<path d="M2.9 2.9l4.2 4.2m0-4.2l-4.2 4.2"/>'
   }};
 
+  // The menu, top to bottom. `check` marks the one item that carries state.
+  var ITEMS = [
+    {{ verb: 'update-dsh', label: '更新 dsh…' }},
+    {{ verb: 'check-app', label: '检查应用更新…' }},
+    {{ separator: true }},
+    {{ verb: 'autostart', label: '开机自启动', check: true }},
+    {{ separator: true }},
+    {{ verb: 'quit', label: '退出 dsh' }}
+  ];
+
+  var MENU_GLYPH = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.4" stroke-linecap="round">' +
+    '<path d="M3 4.5h8M3 7h8M3 9.5h8"/></svg>';
+
+  var TICK = '<svg class="dsh-wc-tick" width="11" height="11" viewBox="0 0 12 12" ' +
+    'fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" ' +
+    'stroke-linejoin="round"><path d="M2.4 6.4l2.3 2.3 4.9-5.1"/></svg>';
+
   function svg(shape) {{
     return '<svg width="8" height="8" viewBox="0 0 10 10" fill="none" ' +
       'stroke="currentColor" stroke-width="1.3" stroke-linecap="round">' + shape + '</svg>';
@@ -164,13 +263,24 @@ pub fn script() -> String {
   function start() {{
     var style = document.createElement('style');
     style.textContent =
-      ':root{{--dsh-titlebar-height:{titlebar_height}px;}}' +
+      ':root{{--dsh-titlebar-height:{titlebar_height}px;' +
+      // Everything the menu is drawn out of, in one place and in both themes.
+      '--dsh-wc-fg:rgba(0,0,0,.55);--dsh-wc-fg-hi:rgba(0,0,0,.85);' +
+      '--dsh-wc-panel:rgba(255,255,255,.96);--dsh-wc-line:rgba(0,0,0,.09);' +
+      '--dsh-wc-hover:rgba(0,0,0,.06);' +
+      '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.18),0 0 0 .5px rgba(0,0,0,.09);}}' +
+      '@media (prefers-color-scheme:dark){{:root{{' +
+      '--dsh-wc-fg:rgba(255,255,255,.62);--dsh-wc-fg-hi:rgba(255,255,255,.94);' +
+      '--dsh-wc-panel:rgba(42,42,46,.96);--dsh-wc-line:rgba(255,255,255,.11);' +
+      '--dsh-wc-hover:rgba(255,255,255,.09);' +
+      '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.5),0 0 0 .5px rgba(255,255,255,.09);}}}}' +
       'html,body{{height:100%!important;margin:0!important;overflow:hidden!important;}}' +
       '#root{{height:calc(100% - var(--dsh-titlebar-height))!important;margin-top:var(--dsh-titlebar-height)!important;box-sizing:border-box!important;}}' +
       'body:not(:has(#root)){{padding-top:var(--dsh-titlebar-height)!important;box-sizing:border-box!important;}}' +
       '.dsh-wc{{position:fixed;top:0;left:0;z-index:2147483647;display:flex;' +
-      'align-items:center;gap:{gap}px;height:{titlebar_height}px;padding:0 {pad}px;' +
+      'align-items:center;height:{titlebar_height}px;padding:0 {pad}px;' +
       'opacity:.85;transition:opacity .2s ease;pointer-events:none}}' +
+      '.dsh-wc-dots{{display:flex;align-items:center;gap:{gap}px}}' +
       // `dsh-wc-on` is put on by the magnification below whenever the pointer
       // is near the row, so the glyphs come up as it approaches rather than
       // one at a time as it crosses each dot.
@@ -201,6 +311,47 @@ pub fn script() -> String {
       '.dsh-wc button.dsh-wc-close{{background:#ff5f57}}' +
       '.dsh-wc button.dsh-wc-min{{background:#febc2e}}' +
       '.dsh-wc button.dsh-wc-max{{background:#28c840}}' +
+      // The menu button. Enough room from the dots that the magnification below
+      // can push the green one sideways without the two touching.
+      '.dsh-wc button.dsh-wc-menu{{width:24px;height:24px;margin-left:16px;' +
+      'border-radius:7px;background:none;box-shadow:none;color:var(--dsh-wc-fg);' +
+      'transition:background .15s ease,color .15s ease}}' +
+      '.dsh-wc button.dsh-wc-menu:hover,.dsh-wc button.dsh-wc-menu.dsh-wc-shown{{' +
+      'background:var(--dsh-wc-hover);color:var(--dsh-wc-fg-hi)}}' +
+      '.dsh-wc button.dsh-wc-menu:active{{filter:none}}' +
+      '.dsh-wc-menu svg{{opacity:1!important;transform:none!important}}' +
+      // The panel. `visibility` rather than `display` so the fade has something
+      // to fade, with its own transition delayed until the opacity is done.
+      '.dsh-wc-pop{{position:absolute;top:calc(100% - 3px);left:0;min-width:184px;' +
+      'padding:6px;box-sizing:border-box;background:var(--dsh-wc-panel);' +
+      'border-radius:12px;box-shadow:var(--dsh-wc-shadow);' +
+      '-webkit-backdrop-filter:blur(24px) saturate(180%);' +
+      'backdrop-filter:blur(24px) saturate(180%);' +
+      'opacity:0;visibility:hidden;transform:translateY(-6px) scale(.97);' +
+      'transform-origin:16px top;pointer-events:none;' +
+      'transition:opacity .14s ease,transform .14s cubic-bezier(.2,.9,.24,1),' +
+      'visibility 0s .14s}}' +
+      '.dsh-wc-pop.dsh-wc-shown{{opacity:1;visibility:visible;transform:none;' +
+      'pointer-events:auto;transition-delay:0s}}' +
+      '.dsh-wc-pop button{{all:unset;box-sizing:border-box;pointer-events:auto;' +
+      'display:flex;align-items:center;gap:10px;width:100%;height:30px;' +
+      'padding:0 10px;border-radius:7px;cursor:pointer;white-space:nowrap;' +
+      'color:var(--dsh-wc-fg-hi);font:13px/1 {FONT}}}' +
+      '.dsh-wc-pop button:hover{{background:var(--dsh-wc-hover)}}' +
+      '.dsh-wc-pop hr{{border:0;height:1px;margin:5px 8px;' +
+      'background:var(--dsh-wc-line)}}' +
+      '.dsh-wc-tick{{margin-left:auto;opacity:0;transition:opacity .12s ease}}' +
+      '.dsh-wc-pop button.dsh-wc-checked .dsh-wc-tick{{opacity:1}}' +
+      // What is running right now, beside the menu button that started it.
+      '.dsh-wc-toast{{display:flex;align-items:center;gap:7px;margin-left:12px;' +
+      'color:var(--dsh-wc-fg);font:12px/1 {FONT};white-space:nowrap;' +
+      'opacity:0;transform:translateX(-4px);' +
+      'transition:opacity .2s ease,transform .2s ease}}' +
+      '.dsh-wc-toast.dsh-wc-shown{{opacity:1;transform:none}}' +
+      '.dsh-wc-spin{{width:11px;height:11px;border-radius:50%;flex:none;' +
+      'border:1.5px solid var(--dsh-wc-line);border-top-color:var(--dsh-wc-fg);' +
+      'animation:dsh-wc-spin .7s linear infinite}}' +
+      '@keyframes dsh-wc-spin{{to{{transform:rotate(360deg)}}}}' +
       '.dsh-wc-drag{{position:fixed;top:0;left:0;right:0;' +
       'height:{titlebar_height}px;z-index:2147483646}}';
     document.head.appendChild(style);
@@ -219,6 +370,10 @@ pub fn script() -> String {
     var bar = document.createElement('div');
     bar.className = 'dsh-wc';
 
+    var row = document.createElement('div');
+    row.className = 'dsh-wc-dots';
+    bar.appendChild(row);
+
     function add(verb, shape, extra) {{
       var button = document.createElement('button');
       button.type = 'button';
@@ -227,7 +382,7 @@ pub fn script() -> String {
       button.addEventListener('click', function () {{
         signal(verb);
       }});
-      bar.appendChild(button);
+      row.appendChild(button);
       return button;
     }}
 
@@ -239,6 +394,95 @@ pub fn script() -> String {
     // Called from Rust on every resize; see `sync`.
     window.__dshMaximized = function (maximized) {{
       zoom.innerHTML = svg(maximized ? ICONS.restore : ICONS.maximize);
+    }};
+
+    // ------------------------------------------------------------- the menu --
+
+    var opener = document.createElement('button');
+    opener.type = 'button';
+    opener.className = 'dsh-wc-menu';
+    opener.innerHTML = MENU_GLYPH;
+    bar.appendChild(opener);
+
+    var toast = document.createElement('div');
+    toast.className = 'dsh-wc-toast';
+    var spinner = document.createElement('div');
+    spinner.className = 'dsh-wc-spin';
+    var said = document.createElement('span');
+    toast.appendChild(spinner);
+    toast.appendChild(said);
+    bar.appendChild(toast);
+
+    var pop = document.createElement('div');
+    pop.className = 'dsh-wc-pop';
+    var checks = {{}};
+
+    ITEMS.forEach(function (item) {{
+      if (item.separator) {{
+        pop.appendChild(document.createElement('hr'));
+        return;
+      }}
+
+      var entry = document.createElement('button');
+      entry.type = 'button';
+      var label = document.createElement('span');
+      label.textContent = item.label;
+      entry.appendChild(label);
+      if (item.check) {{
+        entry.insertAdjacentHTML('beforeend', TICK);
+        checks[item.verb] = entry;
+      }}
+      entry.addEventListener('click', function () {{
+        // Closed first: the verb can end in a modal, and a menu still hanging
+        // open behind it is a menu that is open again when the modal goes.
+        shut();
+        signal(item.verb);
+      }});
+      pop.appendChild(entry);
+    }});
+
+    bar.appendChild(pop);
+
+    var open = false;
+
+    function shut() {{
+      open = false;
+      pop.classList.remove('dsh-wc-shown');
+      opener.classList.remove('dsh-wc-shown');
+    }}
+
+    opener.addEventListener('click', function (event) {{
+      event.stopPropagation();
+      if (open) return shut();
+      open = true;
+      // Under the button wherever the row has put it, rather than at a measured
+      // offset this would have to be kept in step with.
+      pop.style.left = opener.offsetLeft + 'px';
+      pop.classList.add('dsh-wc-shown');
+      opener.classList.add('dsh-wc-shown');
+    }});
+
+    // Capturing, so a page that stops the event on its own elements cannot
+    // leave the menu stuck open.
+    document.addEventListener('mousedown', function (event) {{
+      if (open && !pop.contains(event.target) && !opener.contains(event.target)) shut();
+    }}, true);
+    document.addEventListener('keydown', function (event) {{
+      if (open && event.key === 'Escape') shut();
+    }});
+    // A dialog taking the focus is one of the ways a click here ends.
+    window.addEventListener('blur', function () {{
+      if (open) shut();
+    }});
+
+    // Called from Rust; see `sync_autostart` and `busy`.
+    window.__dshAutostart = function (on) {{
+      var entry = checks['autostart'];
+      if (entry) entry.classList.toggle('dsh-wc-checked', !!on);
+    }};
+    window.__dshBusy = function (text) {{
+      said.textContent = text || '';
+      toast.classList.toggle('dsh-wc-shown', !!text);
     }};
 
     document.body.appendChild(drag);
@@ -262,7 +506,7 @@ pub fn script() -> String {
     // not thrown off by the transforms this then writes. The bar is fixed at
     // the viewport's top-left corner with no border, so these come out in the
     // same coordinates as a mouse event's `clientX`.
-    var dots = [].slice.call(bar.children).map(function (el) {{
+    var dots = [].slice.call(row.children).map(function (el) {{
       return {{ el: el, x: 0 }};
     }});
     var mid = 0;

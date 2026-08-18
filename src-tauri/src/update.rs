@@ -15,9 +15,11 @@ pub fn check_quietly(app: &AppHandle) {
     check(app.clone(), false);
 }
 
-/// Check from the tray menu: reports the outcome either way, because a menu
-/// item that does nothing visible looks broken.
+/// Check from the menu: reports the outcome either way, because a menu item that
+/// does nothing visible looks broken — including while it is still working, which
+/// is a request to a release feed and takes as long as that takes.
 pub fn check_now(app: &AppHandle) {
+    crate::controls::busy(app, "正在检查应用更新…");
     check(app.clone(), true);
 }
 
@@ -27,6 +29,11 @@ fn check(app: AppHandle, verbose: bool) {
             Ok(updater) => updater.check().await,
             Err(error) => Err(error),
         };
+        // Only the one `check_now` put up: the quiet check runs behind a boot,
+        // and taking the line down would take down whatever *that* is saying.
+        if verbose {
+            crate::controls::busy(&app, "");
+        }
 
         match found {
             Ok(Some(update)) => offer(&app, update),

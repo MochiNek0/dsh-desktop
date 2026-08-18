@@ -18,11 +18,11 @@ Launching the app starts a local `dsh web` server and loads its UI into a native
 
 - **Works out of the box**: Windows does it during setup and macOS / Linux on the first launch — the machine's Node.js is detected, one is installed into your user directory if there is none (or it is older than 22.22.3), and then comes `npm install -g @deepseek-ai/dsh`, falling back through mirrors if the default registry is unreachable. No administrator rights needed at any point
 - **No port conflicts**: starts with `--port 0` so the OS assigns a free loopback port — a `dsh web` (3080) you run by hand can stay up alongside it
-- **Frameless window**: minimise, maximise and close are drawn into the top-left of the page as macOS's three dots (top-right belongs to dsh's own controls), translucent at rest and showing their glyphs on hover
+- **Frameless window**: minimise, maximise and close are drawn into the top-left of the page as macOS's three dots (top-right belongs to dsh's own controls), translucent at rest and showing their glyphs on hover; the app's own menu sits beside them and follows dsh's light/dark theme
 - **`dsh` in your terminal too**: after installing, plain `dsh` runs the copy the app manages. Only installed on a machine that has no dsh of its own — it never elbows aside one you installed yourself
-- **dsh stays current**: checks npm at startup and asks before downloading anything; a dsh you installed yourself is reported on, never modified
+- **dsh stays current**: checks npm at startup and asks before downloading anything, updating a dsh you installed yourself in place just the same; turn it down and the window's menu is where it comes back
 - **Your session stays put**: the window never leaves the dsh server's origin; links to the outside world open in the system browser
-- **Tray & login item**: closing the window parks the app in the tray instead of interrupting the session; the tray menu can add a login item, and a launch that comes from it waits quietly in the tray without dialogs or update checks
+- **Window menu & tray**: everything the app can be asked to do lives in the titlebar's menu — "更新 dsh…", "检查应用更新…", the login item (a launch that comes from it waits quietly in the tray without dialogs or update checks), and quit; closing the window parks the app in the tray instead of interrupting the session, and the tray keeps only show and quit, the two things wanted when there is no window to look at
 - **Single instance, clean exit**: one per machine; exiting kills the whole child process tree — `taskkill /T` on Windows, the whole process group on macOS and Linux — with a Windows Job Object backing that up when the app is force-killed, so no orphaned node processes are left behind
 - **Auto-update**: signed updates via the Tauri updater, asking before both the download and the restart, off one `latest.json` covering all three platforms
 
@@ -115,11 +115,15 @@ The package carries neither. Both are put in place by one install script — `sc
 
 The prefix's binary directory is prepended to PATH, so the `dsh` in your terminal is the same copy the app runs. On Windows that means `HKCU\Environment`; on macOS and Linux, a block marked with `# >>> dsh desktop >>>` appended to `~/.profile` (plus `~/.zshrc` for a zsh user, and `~/.bashrc` if it already exists), taken back out by the same marker at uninstall.
 
-**If `dsh` is already on PATH, setup skips this entirely.** There is no point downloading 327 MB alongside a working dsh, and that copy stays yours: the update check reports on it but never writes to it.
+**If `dsh` is already on PATH, installation skips this entirely** — there is no point downloading 327 MB alongside a working dsh. **Updating makes no such distinction**: yours or ours, it is one global npm package, and updating it is another `npm install -g` into the prefix it already lives in.
 
-The update check runs at most once every six hours (15 s timeout). A newer version brings up a dialog naming the version and size; taking it runs `npm install -g @deepseek-ai/dsh@latest` in place and carries straight on into the boot — no restart. "Skip this version" stops asking about that release.
+The update check runs at most once every six hours (15 s timeout). A newer version brings up a dialog naming the version and size; taking it runs `npm install -g @deepseek-ai/dsh@latest --prefix <the prefix dsh is in>` and carries straight on into the boot — no restart. "Skip this version" stops asking about that release; "更新 dsh…" in the titlebar's menu is how you ask for it again later, which stops the running dsh first (interrupting the session), puts the window back on the loading page for the progress, and starts it again when the install lands.
 
-Uninstalling on Windows **asks separately** about dsh and about the Node.js this app installed (removing Node takes dsh with it — a dsh without a Node cannot run), then asks once more about `$DSH_HOME`, all defaulting to keeping things. A Node or dsh you installed yourself is never touched. App updates and manual reinstalls trigger none of these questions.
+The npm an update runs is the one beside whatever Node installed that dsh, **whatever version it is**: the 22.22.3 minimum decides whether the machine needs a Node of ours installed, and an update installs nothing — it replaces a dsh that is already here. Holding updates to that minimum instead leaves a dsh installed by a slightly older Node permanently un-updatable.
+
+The one case that is still only reported is a dsh that does not sit in an npm global prefix this app can write to — a pnpm or volta link, or a `sudo npm i -g` into `/usr/local`. There is nowhere right to install it (only somewhere else to leave a second 327 MB), so the dialog names the command to run instead.
+
+Uninstalling on Windows **asks separately** about dsh and about the Node.js this app installed (removing Node takes dsh with it — a dsh without a Node cannot run), then asks once more about `$DSH_HOME`, all defaulting to keeping things. dsh goes if you say it goes — again, it is one global npm package — while a Node you installed yourself is never touched. App updates and manual reinstalls trigger none of these questions.
 
 macOS and Linux have no uninstaller to ask anything: deleting the .app or removing the .deb takes only the app itself. To clear out what it installed, run the same script by hand (on macOS, from `/Applications/dsh-desktop.app/Contents/Resources/resources/install-deps.sh`):
 
@@ -127,7 +131,7 @@ macOS and Linux have no uninstaller to ask anything: deleting the .app or removi
 sh /usr/lib/dsh-desktop/resources/install-deps.sh -Mode uninstall -RemoveDsh -RemoveNode
 ```
 
-It follows the same rules the Windows uninstaller does: only what it installed itself, and `$DSH_HOME` left alone. The copy inside an AppImage goes away with the mount, so use `scripts/install-deps.sh` from the repository instead.
+It follows the same rules the Windows uninstaller does: only a Node it installed itself, dsh whenever the switch says so (uninstalled from the npm prefix it is actually in), and `$DSH_HOME` left alone. The copy inside an AppImage goes away with the mount, so use `scripts/install-deps.sh` from the repository instead.
 
 ## Environment variables
 
@@ -149,7 +153,7 @@ src-tauri/tauri.macos.conf.json   app + dmg targets (Tauri merges these per plat
 src-tauri/tauri.linux.conf.json   deb + AppImage targets
 src-tauri/installer-hooks.nsh Calls install-deps.ps1 at install / uninstall, and handles $DSH_HOME
 src-tauri/src/main.rs         Window, navigation policy, tray, lifecycle
-src-tauri/src/controls.rs     The frameless window's injected buttons and drag strip
+src-tauri/src/controls.rs     The injected window buttons, drag strip and app menu
 src-tauri/src/theme.rs        Reads dsh's light/dark preference, once, at window creation
 src-tauri/src/server.rs       Managed dsh web child process, the job object backstop, process groups
 src-tauri/src/dsh.rs          Locating the dsh install, version comparison, runtime updates

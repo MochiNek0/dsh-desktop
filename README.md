@@ -18,11 +18,11 @@
 
 - **开箱即用**：Windows 在安装时、macOS / Linux 在首次启动时检测机器上的 Node.js，没有（或低于 22.22.3）就装一份到用户目录，再用 `npm install -g @deepseek-ai/dsh` 装 dsh，默认源不通会自动换镜像；全程不需要管理员权限
 - **不抢端口**：以 `--port 0` 启动，系统分配空闲的 loopback 端口，和你手动跑的 `dsh web`（3080）可以同时开着
-- **无边框窗口**：最小化/最大化/关闭以 macOS 那三颗圆点画在页面左上角（右上角留给 dsh 自己的控件），静止时半透明、hover 才显出图标
+- **无边框窗口**：最小化/最大化/关闭以 macOS 那三颗圆点画在页面左上角（右上角留给 dsh 自己的控件），静止时半透明、hover 才显出图标；旁边是应用自己的菜单，跟着 dsh 的明暗主题走
 - **终端里也有 `dsh`**：dsh 是全局 npm 包，装完后终端里直接敲 `dsh` 就能用，和 app 跑的是同一份。只在机器上原本没有 dsh 时才装，绝不挤占你自己装的那份
-- **dsh 保持最新**：启动时查 npm，有新版先征求同意再下载；你自己装的那份只提醒、不代劳
+- **dsh 保持最新**：启动时查 npm，有新版先征求同意再下载，你自己装的那份也一样就地更新；不想更新就跳过，之后随时能从窗口菜单里再叫出来
 - **会话不被顶掉**：窗口只停留在 dsh 服务所在的 origin 内，站外链接交给系统浏览器
-- **托盘与开机自启动**：关闭窗口收进托盘而不是中断会话；托盘菜单里可以开启开机自启动，这样启动的那次会静默待在托盘里，不弹窗也不查更新
+- **窗口菜单与托盘**：应用能做的事都在标题栏那个菜单里 —— 「更新 dsh…」「检查应用更新…」「开机自启动」「退出 dsh」（自启动那次会静默待在托盘里，不弹窗也不查更新）；关闭窗口收进托盘而不是中断会话，托盘只留「显示窗口」和「退出」，也就是没窗口可看时才需要的那两个
 - **单实例 + 干净退出**：一台机器只跑一个；退出时结束整棵子进程树（Windows 用 `taskkill /T`，macOS / Linux 杀整个进程组），Windows 上被强杀还有 Job Object 兜底，不残留孤儿 node
 - **自动更新**：基于 Tauri updater 的签名更新，下载与重启都会先征求同意，三个平台共用一份 `latest.json`
 
@@ -114,11 +114,15 @@ TAURI_SIGNING_PRIVATE_KEY=~/.tauri/dsh-desktop.key TAURI_SIGNING_PRIVATE_KEY_PAS
 
 前缀里的可执行目录会被加进 PATH（前置），所以终端里的 `dsh` 和 app 跑的是同一份。Windows 改的是 `HKCU\Environment`；macOS / Linux 是往 `~/.profile`（zsh 还有 `~/.zshrc`，已存在的 `~/.bashrc`）追加一段带 `# >>> dsh desktop >>>` 标记的块，卸载时按标记原样删掉。
 
-**PATH 上已经有 `dsh` 就整个跳过** —— 已经有一份能用的 dsh，再装 327 MB 没有意义，那份始终归你管，更新检查只提醒、不代劳。
+**PATH 上已经有 `dsh` 就整个跳过安装** —— 已经有一份能用的，再装 327 MB 没有意义。**更新则不分你我**：不管是你装的还是它装的，都是一个全局 npm 包，更新就是往它所在的那个前缀里再跑一次 `npm install -g`。
 
-更新检查最多每 6 小时一次（超时 15 秒），发现新版会弹窗告知版本号和体积，同意后就地跑一次 `npm install -g @deepseek-ai/dsh@latest`，装完直接继续启动，不需要重启应用。点「跳过此版本」之后不再为这个版本打扰。
+更新检查最多每 6 小时一次（超时 15 秒），发现新版会弹窗告知版本号和体积，同意后就地跑一次 `npm install -g @deepseek-ai/dsh@latest --prefix <dsh 所在的前缀>`，装完直接继续启动，不需要重启应用。点「跳过此版本」之后不再为这个版本打扰，想起来再更新就从标题栏菜单点「更新 dsh…」—— 那条路径会先关掉正在跑的 dsh（会话会中断），窗口退回加载页显示进度，装完自动重新启动。
 
-卸载时，Windows 的卸载程序**分别问**要不要卸载 dsh、要不要卸载本应用装的 Node.js（选了删 Node 就会连 dsh 一起删，没有 Node 的 dsh 跑不起来），最后再问一次要不要连 `$DSH_HOME` 一起删，默认都保留。你自己装的 Node 或 dsh 永远不会被动。app 更新和手动重装不会触发这些询问。
+更新用的 npm 就是当初装下这份 dsh 的那个 Node 旁边的那个，**不问版本**：22.22.3 那条下限只用来决定要不要替你装一份 Node，而更新什么都不装，只是把已经在机器上的那份换掉 —— 拿下限去挑 Node 的结果是比它旧一点的 Node 装的 dsh 永远更新不了。
+
+唯一不代劳的情况是那份 dsh 压根不在应用能写的 npm 全局目录里 —— 比如 pnpm/volta 那种链接过去的布局，或者当初用 `sudo` 装到了 `/usr/local`。那时候往哪儿装都不对（只会在别处多出一份 327 MB），所以只弹窗告知，并把该跑的命令写在里面。
+
+卸载时，Windows 的卸载程序**分别问**要不要卸载 dsh、要不要卸载本应用装的 Node.js（选了删 Node 就会连 dsh 一起删，没有 Node 的 dsh 跑不起来），最后再问一次要不要连 `$DSH_HOME` 一起删，默认都保留。dsh 你说删就删 —— 同样因为它就是个全局 npm 包 —— 但你自己装的 Node 永远不会被动。app 更新和手动重装不会触发这些询问。
 
 macOS / Linux 上没有卸载程序可以问 —— 删掉 .app / 卸掉 .deb 只会删掉应用本身。要把它装的东西一起清掉，手动跑同一个脚本（macOS 把路径换成 `/Applications/dsh-desktop.app/Contents/Resources/resources/install-deps.sh`）：
 
@@ -126,7 +130,7 @@ macOS / Linux 上没有卸载程序可以问 —— 删掉 .app / 卸掉 .deb �
 sh /usr/lib/dsh-desktop/resources/install-deps.sh -Mode uninstall -RemoveDsh -RemoveNode
 ```
 
-它遵守和 Windows 卸载程序一样的规矩：只删自己装的那份，`$DSH_HOME` 不动。AppImage 里的那份随镜像挂载，用完就没了，直接拿仓库里的 `scripts/install-deps.sh` 跑效果一样。
+它遵守和 Windows 卸载程序一样的规矩：Node 只删自己装的那份，dsh 按开关删（在它实际所在的 npm 前缀里卸载），`$DSH_HOME` 不动。AppImage 里的那份随镜像挂载，用完就没了，直接拿仓库里的 `scripts/install-deps.sh` 跑效果一样。
 
 ## 环境变量
 
@@ -148,7 +152,7 @@ src-tauri/tauri.macos.conf.json   app + dmg 目标（Tauri 按平台自动合并
 src-tauri/tauri.linux.conf.json   deb + AppImage 目标
 src-tauri/installer-hooks.nsh 安装/卸载时调用 install-deps.ps1，以及对 $DSH_HOME 的处理
 src-tauri/src/main.rs         窗口、导航策略、托盘、生命周期
-src-tauri/src/controls.rs     注入页面的无边框窗口按钮与拖拽带
+src-tauri/src/controls.rs     注入页面的无边框窗口按钮、拖拽带与应用菜单
 src-tauri/src/theme.rs        从 dsh 的设置里读亮/暗，开窗时用一次
 src-tauri/src/server.rs       托管的 dsh web 子进程；Job Object 兜底与进程组
 src-tauri/src/dsh.rs          dsh 的定位与版本比较，以及何时调安装脚本

@@ -5,7 +5,8 @@
   "identifier": "ai.deepseek.dsh.desktop",
   "build": {
     "frontendDist": "../dist",
-    "beforeBuildCommand": "npm run bundle:runtime"
+    "beforeBuildCommand": "npm run bundle:runtime",
+    "beforeDevCommand": "npm run bundle:runtime"
   },
   "app": {
     "windows": [],

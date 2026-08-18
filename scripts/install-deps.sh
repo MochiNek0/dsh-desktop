@@ -14,14 +14,18 @@
 # block appended to the user's shell profile.
 #
 # A Node the machine already has is used as it is and never replaced; the same
-# goes for a dsh already on PATH. What this script installed is written down in
-# `bootstrap.json` so that uninstalling can tell the difference — see
-# `uninstall_all`.
+# goes for a dsh already on PATH — installing a second copy beside it would be
+# 327 MB nobody asked for. Updating one is a different matter: whoever installed
+# it, it is one `npm install -g` in some prefix, so `update` replaces it in place
+# in the prefix it is actually in. What this script installed is written down in
+# `bootstrap.json`, which is what keeps `uninstall` off a Node it did not put
+# there.
 #
 # The flags are spelled the way `install-deps.ps1` spells them, because
 # `src-tauri/src/dsh.rs` calls both with the same arguments:
 #
-#   sh install-deps.sh -Mode install|update|uninstall [-RemoveDsh] [-RemoveNode] [-Progress]
+#   sh install-deps.sh -Mode install|update|uninstall [-Prefix <dir>]
+#                      [-RemoveDsh] [-RemoveNode] [-Progress]
 #
 # Output is a plain log. Pass `-Progress` and it also emits `::status <text>`,
 # `::progress <percent>` and `::error <text>` lines for the app's loading page to
@@ -35,6 +39,7 @@ set -u
 # ------------------------------------------------------------------ options --
 
 MODE=install
+PREFIX=''
 REMOVE_DSH=0
 REMOVE_NODE=0
 PROGRESS=0
@@ -44,6 +49,16 @@ while [ $# -gt 0 ]; do
         -Mode)
             [ $# -ge 2 ] || { echo "-Mode 后面要跟 install、update 或 uninstall" >&2; exit 2; }
             MODE=$2
+            shift 2
+            ;;
+        # `update` only: the npm global prefix holding the dsh to replace. The
+        # app resolves it from the copy it is actually running — see `prefix_of`
+        # in `src-tauri/src/dsh.rs` — because a dsh the user installed themselves
+        # sits in their own prefix, not in the one this script would pick. Empty
+        # falls back to the marker's prefix, and then to `find_prefix`.
+        -Prefix)
+            [ $# -ge 2 ] || { echo "-Prefix 后面要跟一个目录" >&2; exit 2; }
+            PREFIX=$2
             shift 2
             ;;
         -RemoveDsh) REMOVE_DSH=1; shift ;;
@@ -239,6 +254,24 @@ find_node() {
     fi
 
     return 1
+}
+
+# The Node an update runs npm with, when the marker's pair is gone or was never
+# written. Unlike `find_node` this asks no version question: the minimum decides
+# whether the machine needs a Node of ours *installed*, and an update installs
+# nothing — it replaces a dsh that is already here, with the npm beside whatever
+# Node put it there. Refusing a Node a few releases short of the minimum would
+# leave exactly that install permanently un-updatable, which is the case this
+# whole path exists for.
+find_any_node() {
+    if [ -x "$NODE_DIR/bin/node" ]; then
+        printf '%s' "$NODE_DIR/bin/node"
+        return 0
+    fi
+
+    found=$(command -v node 2>/dev/null) || return 1
+    [ -n "$found" ] || return 1
+    printf '%s' "$found"
 }
 
 # What the server says the body will be, for the bar to divide by. Its own
@@ -582,6 +615,27 @@ find_dsh() {
     printf '%s' "$found"
 }
 
+# The npm global prefix a dsh lives in, for `npm uninstall -g --prefix` to
+# unpick. Prints nothing and fails when there is no prefix to point npm at.
+#
+# The marker's prefix first — that is where this script installed — and then the
+# dsh on PATH, whose prefix is read off the layout `npm install -g` leaves: the
+# shim in `<prefix>/bin`, the package under `<prefix>/lib/node_modules`. Anything
+# else is not an npm global install, and npm cannot remove it.
+find_dsh_prefix() {
+    manifest="lib/node_modules/$PACKAGE/package.json"
+
+    if [ -n "$M_PREFIX" ] && [ -f "$M_PREFIX/$manifest" ]; then
+        printf '%s' "$M_PREFIX"
+        return 0
+    fi
+
+    found=$(find_dsh) || return 1
+    prefix=$(cd "$(dirname "$found")/.." 2>/dev/null && pwd) || return 1
+    [ -f "$prefix/$manifest" ] || return 1
+    printf '%s' "$prefix"
+}
+
 install_all() {
     read_marker
 
@@ -629,18 +683,21 @@ install_all() {
 update_all() {
     read_marker
 
-    # The npm that installed dsh, not whichever one this run happens to find:
-    # `npm install -g` writes to the prefix it is given, and a different pair
-    # would put a second dsh somewhere nothing looks rather than replacing the
-    # one that is there.
+    # The pair that installed dsh, if it is still there: any npm can write into
+    # the prefix it is handed, but this one is known to work on this machine.
     node=$M_NODE_EXE
     cli=$M_NPM_CLI
     if [ ! -x "${node:-/nonexistent}" ] || [ ! -f "${cli:-/nonexistent}" ]; then
-        node=$(find_node) || fail '找不到 Node，无法更新 dsh。'
+        node=$(find_any_node) || fail '这台机器上找不到 Node，无法更新 dsh。'
         cli=$(find_npm "$node") || fail "这个 Node 旁边没有 npm（$node）。"
+        say "用 $node 更新 dsh。"
     fi
 
-    prefix=$M_PREFIX
+    # The prefix the dsh being replaced actually lives in — `-Prefix` from the
+    # app, or the one this script installed into. Without either, the one an
+    # install would pick, which is only right when dsh is already there.
+    prefix=$PREFIX
+    [ -n "$prefix" ] || prefix=$M_PREFIX
     [ -n "$prefix" ] || prefix=$(find_prefix "$node" "$cli")
 
     step '正在更新 dsh…' 0
@@ -653,32 +710,44 @@ update_all() {
 uninstall_all() {
     read_marker
 
-    # Node is a Node program's only way to run. Taking it away while leaving dsh
-    # behind would leave a `dsh` command that cannot start.
+    # Only a Node of ours goes: one the machine already had is not this script's
+    # to take, whatever the flags say. dsh has no such reservation — it is one
+    # `npm install -g` either way, and the caller has just been asked about it by
+    # name.
+    #
+    # Node is also a Node program's only way to run, so taking it away while
+    # leaving dsh behind would leave a `dsh` command that cannot start.
     drop_node=0
     drop_dsh=0
     [ "$REMOVE_NODE" = 1 ] && [ "$M_NODE" = managed ] && drop_node=1
-    { [ "$REMOVE_DSH" = 1 ] || [ "$drop_node" = 1 ]; } && [ "$M_DSH" = managed ] && drop_dsh=1
+    { [ "$REMOVE_DSH" = 1 ] || [ "$drop_node" = 1 ]; } && drop_dsh=1
 
     if [ "$REMOVE_NODE" = 1 ] && [ "$drop_node" = 0 ]; then
         say 'Node 是你自己装的，不会动它。'
     fi
-    if { [ "$REMOVE_DSH" = 1 ] || [ "$drop_node" = 1 ]; } && [ "$drop_dsh" = 0 ]; then
-        say 'dsh 是你自己装的，不会动它。'
-    fi
 
-    if [ "$drop_dsh" = 1 ] && [ "$drop_node" = 0 ]; then
-        # With the Node staying, npm has to unpick its own tree. When it is
-        # going, the whole prefix lives inside the directory about to be deleted
-        # and asking npm to walk 33k files first would only be slower.
-        if [ -x "${M_NODE_EXE:-/nonexistent}" ] && [ -f "${M_NPM_CLI:-/nonexistent}" ] &&
-            [ -n "$M_PREFIX" ]
-        then
-            say '正在卸载 dsh…'
-            "$M_NODE_EXE" "$M_NPM_CLI" uninstall -g --prefix "$M_PREFIX" \
+    if [ "$drop_dsh" = 1 ]; then
+        prefix=$(find_dsh_prefix) || prefix=''
+
+        # Both of these are deleted outright when the Node goes; see below.
+        inside=0
+        case "$prefix" in "$NODE_DIR" | "$NODE_DIR"/* | "$APP_DIR"/*) inside=1 ;; esac
+
+        if [ -z "$prefix" ]; then
+            say '找不到 dsh 装在哪里（不是 npm 全局安装？），跳过卸载 dsh。'
+        elif [ "$drop_node" = 1 ] && [ "$inside" = 1 ]; then
+            # It lives inside the directory about to be deleted, and asking npm
+            # to walk 33k files first would only be slower.
+            say 'dsh 装在即将删除的 Node 目录里，会随它一起删掉。'
+        elif [ -x "${M_NODE_EXE:-/nonexistent}" ] && [ -f "${M_NPM_CLI:-/nonexistent}" ]; then
+            # npm has to unpick its own tree, pointed at the prefix holding it
+            # rather than at whatever this run would default to.
+            [ "$M_DSH" = managed ] || say '这份 dsh 不是本应用装的，按你的选择一并卸载。'
+            say "正在卸载 dsh（$prefix）…"
+            "$M_NODE_EXE" "$M_NPM_CLI" uninstall -g --prefix "$prefix" \
                 --loglevel=error "$PACKAGE" 2>&1 | while IFS= read -r line; do say "$line"; done
         else
-            say '找不到当初安装 dsh 用的 npm，跳过卸载 dsh。'
+            say '找不到可用的 npm，跳过卸载 dsh。'
         fi
     fi
 

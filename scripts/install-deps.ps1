@@ -11,9 +11,12 @@
 # thing touched outside our own directory is HKCU\Environment's Path.
 #
 # A Node the machine already has is used as it is and never replaced; the same
-# goes for a dsh already on PATH. What this script installed is written down in
-# `bootstrap.json` so that uninstalling can tell the difference — see
-# `Uninstall-All`.
+# goes for a dsh already on PATH — installing a second copy beside it would be
+# 327 MB nobody asked for. Updating one is a different matter: whoever installed
+# it, it is one `npm install -g` in some prefix, so `update` replaces it in place
+# in the prefix it is actually in. What this script installed is written down in
+# `bootstrap.json`, which is what keeps `uninstall` off a Node it did not put
+# there.
 #
 # Output is plain text for the installer's detail log. Pass `-Progress` and it
 # also emits `::status <text>` and `::progress <percent>` lines for the app's
@@ -31,6 +34,13 @@ param(
     # what the switches below name, and only what this script installed.
     [ValidateSet('install', 'update', 'uninstall')]
     [string] $Mode = 'install',
+
+    # `update` only: the npm global prefix holding the dsh to replace. The app
+    # resolves it from the copy it is actually running — see `prefix_of` in
+    # `src-tauri/src/dsh.rs` — because a dsh the user installed themselves sits
+    # in their own prefix, not in the one this script would default to. Empty
+    # falls back to the marker's prefix, and then to npm's own default.
+    [string] $Prefix = '',
 
     # `uninstall` only. Node cannot go without dsh going too: dsh is a Node
     # program, and leaving it behind would leave a command that cannot run.
@@ -200,6 +210,25 @@ function Find-Node {
     return $null
 }
 
+# The Node an update runs npm with, when the marker's pair is gone or was never
+# written. Unlike `Find-Node` this asks no version question: the minimum decides
+# whether the machine needs a Node of ours *installed*, and an update installs
+# nothing — it replaces a dsh that is already here, with the npm beside whatever
+# Node put it there. Refusing a Node a few releases short of the minimum would
+# leave exactly that install permanently un-updatable, which is the case this
+# whole path exists for.
+function Find-AnyNode {
+    $ours = Join-Path $NodeDir 'node.exe'
+    if (Test-Path -LiteralPath $ours) { return $ours }
+
+    Sync-Path
+    $found = Get-Command node -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($found) { return $found.Source }
+
+    return $null
+}
+
 function Test-NodeVersion([string] $Exe) {
     try {
         $printed = & $Exe --version
@@ -346,11 +375,13 @@ function Get-Prefix([string] $Exe, [string] $Cli) {
     return (Split-Path -Parent $Exe)
 }
 
-# One `npm install -g`, from one registry. npm's http log is read as it goes:
-# every tarball that comes back moves the bar, which is the only progress signal
-# npm offers that means anything.
-function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, $Source, [double] $From, [double] $To) {
+# One `npm install -g`, from one registry, into `$Prefix` when one is given and
+# npm's own default when it is not. npm's http log is read as it goes: every
+# tarball that comes back moves the bar, which is the only progress signal npm
+# offers that means anything.
+function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string] $Prefix, $Source, [double] $From, [double] $To) {
     $arguments = @($Cli, 'install', '-g', '--no-audit', '--no-fund', '--loglevel=http')
+    if ($Prefix) { $arguments += "--prefix=$Prefix" }
     if ($Source.Url) { $arguments += "--registry=$($Source.Url)" }
     $arguments += $Spec
 
@@ -372,9 +403,9 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, $Source
 }
 
 # Install `Spec` through the first registry that works.
-function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [double] $From, [double] $To) {
+function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [string] $Prefix, [double] $From, [double] $To) {
     foreach ($source in $Registries) {
-        if (Invoke-NpmInstall $Exe $Cli $Spec $source $From $To) {
+        if (Invoke-NpmInstall $Exe $Cli $Spec $Prefix $source $From $To) {
             Say "dsh 安装完成（$($source.Label)）。"
             return $true
         }
@@ -384,6 +415,16 @@ function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [double] 
 }
 
 # --------------------------------------------------------------------- path --
+
+# Rebuild `$env:Path` from the registry. Whatever the installer just did — a Node
+# unpacked, a prefix prepended — is on the user's PATH and not on this process's,
+# which inherited its environment before any of it happened. The same goes for
+# the app, which the installer launches and which then runs this script.
+function Sync-Path {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = (@($machine, $user, $env:Path) | Where-Object { $_ }) -join ';'
+}
 
 # Tell everything already running that the environment changed. Without it the
 # new PATH reaches nothing until the next sign-in — and the app the installer is
@@ -441,9 +482,7 @@ function Remove-Path([string] $Dir) {
 # is on the user's PATH but not on this process's, which inherited its
 # environment before any of that happened.
 function Find-Dsh {
-    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $env:Path = (@($machine, $user, $env:Path) | Where-Object { $_ }) -join ';'
+    Sync-Path
 
     $found = Get-Command dsh -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
@@ -483,7 +522,8 @@ function Install-All {
     }
 
     Step '正在下载 dsh，约 185 MB，请耐心等待…' 36
-    if (-not (Install-Package $node $cli "$Package@latest" 36 $ProgressCeiling)) {
+    # No prefix: npm's own default is what `Get-Prefix` then writes down.
+    if (-not (Install-Package $node $cli "$Package@latest" '' 36 $ProgressCeiling)) {
         Fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
     }
 
@@ -500,52 +540,95 @@ function Install-All {
 function Update-All {
     $state = Read-Marker
 
-    # The npm that installed dsh, not whichever one this run happens to find:
-    # `npm install -g` writes to the prefix of the npm it is run with, and a
-    # different one would put a second dsh somewhere nothing looks rather than
-    # replacing the one that is there.
+    # The pair that installed dsh, if it is still there: any npm can write into
+    # the prefix it is handed, but this one is known to work on this machine.
     $node = $state['nodeExe']
     $cli = $state['npmCli']
     if (-not ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli))) {
-        $node = Find-Node
-        if (-not $node) { Fail '找不到 Node，无法更新 dsh。' }
+        $node = Find-AnyNode
+        if (-not $node) { Fail '这台机器上找不到 Node，无法更新 dsh。' }
         $cli = Find-Npm $node
         if (-not $cli) { Fail "这个 Node 旁边没有 npm（$node）。" }
+        Say "用 $node 更新 dsh。"
     }
 
+    # The prefix the dsh being replaced actually lives in — `-Prefix` from the
+    # app, or the one this script installed into. Without one, npm's default,
+    # which is only the right answer when it is also where dsh already is.
+    $prefix = $Prefix
+    if (-not $prefix) { $prefix = [string] $state['prefix'] }
+
     Step '正在更新 dsh…' 0
-    if (-not (Install-Package $node $cli "$Package@latest" 0 $ProgressCeiling)) {
+    if (-not (Install-Package $node $cli "$Package@latest" $prefix 0 $ProgressCeiling)) {
         Fail 'dsh 更新失败，默认源和几个备用镜像都没有成功。'
     }
     Step 'dsh 更新完成。' 100
 }
 
+# The npm global prefix a dsh lives in, for `npm uninstall -g --prefix` to
+# unpick, or `$null` if there is nothing here to point npm at.
+#
+# The marker's prefix first — that is where this script installed — and then the
+# dsh on PATH, whose prefix is read off the layout `npm install -g` leaves on
+# Windows: the shim in the prefix, the package under the `node_modules` beside
+# it. Anything else is not an npm global install, and npm cannot remove it.
+function Find-DshPrefix([hashtable] $State) {
+    $manifest = "node_modules\$Package\package.json"
+
+    $recorded = [string] $State['prefix']
+    if ($recorded -and (Test-Path -LiteralPath (Join-Path $recorded $manifest))) {
+        return $recorded
+    }
+
+    $dsh = Find-Dsh
+    if ($dsh) {
+        $dir = Split-Path -Parent $dsh
+        if (Test-Path -LiteralPath (Join-Path $dir $manifest)) { return $dir }
+    }
+
+    return $null
+}
+
 function Uninstall-All {
     $state = Read-Marker
 
-    # Node is a Node program's only way to run. Taking it away while leaving dsh
-    # behind would leave a `dsh` command that cannot start.
+    # Only a Node of ours goes: one the machine already had is not this
+    # uninstaller's to take, whatever the answer was. dsh has no such
+    # reservation — it is one `npm install -g` either way, and the user has just
+    # been asked about it by name.
+    #
+    # Node is also a Node program's only way to run, so taking it away while
+    # leaving dsh behind would leave a `dsh` command that cannot start.
     $dropNode = $RemoveNode -and ($state['node'] -eq 'managed')
-    $dropDsh = ($RemoveDsh -or $dropNode) -and ($state['dsh'] -eq 'managed')
+    $dropDsh = $RemoveDsh -or $dropNode
 
     if ($RemoveNode -and -not $dropNode) {
         Say 'Node 是你自己装的，不会动它。'
     }
-    if (($RemoveDsh -or $dropNode) -and -not $dropDsh) {
-        Say 'dsh 是你自己装的，不会动它。'
-    }
 
-    if ($dropDsh -and -not $dropNode) {
-        # With the Node staying, npm has to unpick its own tree. When it is
-        # going, the whole prefix lives inside the directory about to be
-        # deleted and asking npm to walk 33k files first would only be slower.
-        $node = $state['nodeExe']
-        $cli = $state['npmCli']
-        if ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli)) {
-            Say '正在卸载 dsh…'
-            Invoke-Native $node @($cli, 'uninstall', '-g', '--loglevel=error', $Package) $null | Out-Null
+    if ($dropDsh) {
+        $prefix = Find-DshPrefix $state
+
+        if (-not $prefix) {
+            Say '找不到 dsh 装在哪里（不是 npm 全局安装？），跳过卸载 dsh。'
+        } elseif ($dropNode -and $prefix.StartsWith($NodeDir, 'OrdinalIgnoreCase')) {
+            # It lives inside the directory about to be deleted, and asking npm
+            # to walk 33k files first would only be slower.
+            Say 'dsh 装在即将删除的 Node 目录里，会随它一起删掉。'
         } else {
-            Say '找不到当初安装 dsh 用的 npm，跳过卸载 dsh。'
+            # npm has to unpick its own tree, and it has to be pointed at the
+            # prefix holding it rather than at whatever this run would default to.
+            $node = $state['nodeExe']
+            $cli = $state['npmCli']
+            if ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli)) {
+                if ($state['dsh'] -ne 'managed') {
+                    Say '这份 dsh 不是本应用装的，按你的选择一并卸载。'
+                }
+                Say "正在卸载 dsh（$prefix）…"
+                Invoke-Native $node @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null | Out-Null
+            } else {
+                Say '找不到可用的 npm，跳过卸载 dsh。'
+            }
         }
     }
 

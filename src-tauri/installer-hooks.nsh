@@ -217,10 +217,12 @@ ${Using:StrFunc} UnStrRep
   RMDir "$R5"
   RMDir "$INSTDIR"
 
-  ; Nothing to ask about on a machine this app never installed anything on —
-  ; `bootstrap.json` is written by the script the moment it installs something.
-  ; The script is the final authority either way: it declines to remove a Node
-  ; or a dsh that was already there when it arrived.
+  ; `bootstrap.json` is what the script writes down about this machine, and
+  ; without it there is nothing to ask: no record of which Node is ours, and no
+  ; npm recorded to take dsh back off with. The script is still the final
+  ; authority on the Node — it declines to remove one that was already there when
+  ; it arrived — while dsh goes if the user says it goes, whoever installed it:
+  ; either way it is one `npm install -g`, and the question below names it.
   ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
     Goto uninstall_data
   ${EndIf}

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, RwLock};
 use std::time::Duration;
 
-use tauri::menu::{CheckMenuItem, Menu, MenuItem};
+use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::PageLoadEvent;
 use tauri::{Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -23,6 +23,17 @@ use tauri_plugin_opener::OpenerExt;
 /// window; anything else is a link to the outside world.
 type Origin = Arc<RwLock<Option<String>>>;
 
+/// Where the bundled loading page is, learned from the first page load rather
+/// than asked for when the window is built.
+///
+/// There is no other way to name it — it is `http://tauri.localhost` in a release
+/// build and the dev server under `tauri dev` — and asking the webview is not one:
+/// `WebviewWindow::url()` reads what the webview has navigated to, and inside
+/// `setup` it has not navigated yet, so the answer is `about:blank`. Sending the
+/// window *there* for an update's progress is a blank window, which is what this
+/// exists to have got wrong once.
+type Home = Arc<RwLock<Option<Url>>>;
+
 /// How long to sit on the boot message before telling the user it is slow.
 const SLOW_BOOT: Duration = Duration::from_secs(20);
 
@@ -31,11 +42,26 @@ const SLOW_BOOT: Duration = Duration::from_secs(20);
 /// with dsh already running behind it.
 const AUTOSTART_FLAG: &str = "--autostart";
 
-fn main() {
-    let origin: Origin = Arc::new(RwLock::new(None));
-    let server: Arc<Mutex<Option<server::Server>>> = Arc::new(Mutex::new(None));
+/// What the boot and a dsh update both work on: the window's loading page, the
+/// origin navigation is judged against, and the server that is running or about
+/// to be.
+///
+/// Cloned rather than borrowed — every field is already shared, and both users
+/// are threads that outlive the call that spawned them. A clone also lives in
+/// Tauri's state, which is how a click in the window's own menu reaches it: the
+/// navigation handler that receives one has an `AppHandle` and nothing else.
+#[derive(Clone)]
+struct Session {
+    origin: Origin,
+    splash: Splash,
+    server: Arc<Mutex<Option<server::Server>>>,
+    /// Somewhere to put the window back to when dsh has to come down for an
+    /// update; see [`Home`].
+    home: Home,
+}
 
-    let setup_origin = origin.clone();
+fn main() {
+    let server: Arc<Mutex<Option<server::Server>>> = Arc::new(Mutex::new(None));
     let setup_server = server.clone();
 
     let app = tauri::Builder::default()
@@ -55,6 +81,8 @@ fn main() {
         ))
         .setup(move |app| {
             let preference = theme::preference();
+            let origin: Origin = Arc::new(RwLock::new(None));
+            let home: Home = Arc::new(RwLock::new(None));
             let splash = Splash::default();
             let visible = !std::env::args().any(|argument| argument == AUTOSTART_FLAG);
 
@@ -63,22 +91,26 @@ fn main() {
             // of which has anywhere to go without a window.
             let window = build_window(
                 app.handle(),
-                setup_origin.clone(),
+                origin.clone(),
+                home.clone(),
                 splash.clone(),
                 preference,
                 visible,
             )?;
+
+            let session = Session {
+                origin,
+                splash,
+                server: setup_server.clone(),
+                home,
+            };
+            app.manage(session.clone());
+
             build_tray(app.handle())?;
 
             theme::paint(&window, preference);
 
-            boot(
-                app.handle().clone(),
-                window,
-                setup_origin.clone(),
-                splash,
-                setup_server.clone(),
-            );
+            boot(app.handle().clone(), window, session);
 
             Ok(())
         })
@@ -101,6 +133,7 @@ fn main() {
 fn build_window(
     app: &tauri::AppHandle,
     origin: Origin,
+    home: Home,
     splash: Splash,
     preference: theme::Preference,
     visible: bool,
@@ -129,13 +162,23 @@ fn build_window(
         .initialization_script(theme::script(preference))
         .initialization_script(controls::script())
         .on_page_load(move |webview, payload| {
+            // The first page this window ever loads is the bundled loading page,
+            // and this is the one place its address is stated by something that
+            // knows it. See [`Home`].
+            let mut first = home.write().unwrap();
+            if first.is_none() {
+                *first = Some(payload.url().clone());
+            }
+            drop(first);
+
             if payload.event() == PageLoadEvent::Finished {
                 splash.flush(&webview);
-                // The buttons were just drawn by a fresh document that has no
-                // way of knowing the window is maximised — nothing resized to
-                // tell it. Every navigation lands here, so every navigation
-                // gets the answer.
+                // The chrome was just drawn by a fresh document that has no way
+                // of knowing whether the window is maximised or the login item
+                // is on — nothing resized to tell it, and nothing was toggled.
+                // Every navigation lands here, so every navigation gets both.
                 controls::sync(&webview);
+                controls::sync_autostart(webview.app_handle());
             }
         })
         .on_navigation(move |url| {
@@ -177,20 +220,16 @@ fn build_window(
 }
 
 /// The tray icon: how the window comes back once it has been closed, and the
-/// only way to actually quit.
+/// only way to actually quit while it is away.
+///
+/// Two items, and deliberately: everything else the app can be asked to do is in
+/// the window's own menu (see [`controls`]), where it can be drawn to look like
+/// the app rather than like a system context menu. What is left here is what is
+/// only ever wanted when there is no window to look at.
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
-    let autostart = CheckMenuItem::with_id(
-        app,
-        "autostart",
-        "开机自启动",
-        true,
-        app.autolaunch().is_enabled().unwrap_or(false),
-        None::<&str>,
-    )?;
-    let check = MenuItem::with_id(app, "check", "检查更新…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出 dsh", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &autostart, &check, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
 
     let mut tray = TrayIconBuilder::new()
         .tooltip("dsh desktop")
@@ -199,8 +238,6 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "show" => reveal(app),
-            "autostart" => toggle_autostart(app, &autostart),
-            "check" => update::check_now(app),
             // Exits the run loop, which stops the dsh server on the way out.
             "quit" => app.exit(0),
             _ => {}
@@ -226,7 +263,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
 /// Add or remove the login item, and leave the checkmark showing what the
 /// system actually ended up with rather than what was asked for.
-fn toggle_autostart(app: &tauri::AppHandle, item: &CheckMenuItem<tauri::Wry>) {
+fn toggle_autostart(app: &tauri::AppHandle) {
     let manager = app.autolaunch();
     let was = manager.is_enabled().unwrap_or(false);
 
@@ -235,7 +272,18 @@ fn toggle_autostart(app: &tauri::AppHandle, item: &CheckMenuItem<tauri::Wry>) {
         eprintln!("dsh-desktop: 无法设置开机自启动：{error}");
     }
 
-    let _ = item.set_checked(manager.is_enabled().unwrap_or(was));
+    controls::sync_autostart(app);
+}
+
+/// Quit, from the window's own menu rather than the tray.
+///
+/// On a thread, unlike the tray's: the click arrives inside the webview's
+/// navigation callback, and the way out from here stops dsh and waits on its
+/// process tree. That is not work to do while a webview is blocked waiting for
+/// an answer about where it is allowed to navigate.
+fn quit(app: &tauri::AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || app.exit(0));
 }
 
 /// Bring the window back to the front, whatever it was hidden behind.
@@ -273,6 +321,25 @@ fn is_ours(url: &Url, origin: &Origin) -> bool {
         .is_some_and(|ours| url.origin().ascii_serialization() == ours)
 }
 
+/// Whether a boot or a dsh update owns the window and the server right now.
+///
+/// The two do the same things in the same order — settle which dsh runs, then
+/// start it and hand the window over — and both take minutes. Running them at
+/// once would be two npms writing one tree and two `dsh web` children racing for
+/// the one slot in [`Session`], so the second one is turned away rather than
+/// joining in.
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`BUSY`] however the thread holding it ends, including the early
+/// returns for an app that is quitting.
+struct Busy;
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Settle which dsh this launch runs, start it, and hand the window over to it.
 ///
 /// One background thread for the whole sequence, because the whole sequence is
@@ -280,21 +347,13 @@ fn is_ours(url: &Url, origin: &Origin) -> bool {
 /// raise waits on the user, the download that may follow runs for minutes, and
 /// only once all of that is behind us is there a server to wait for. None of it
 /// belongs on the main thread.
-fn boot(
-    app: tauri::AppHandle,
-    window: WebviewWindow,
-    origin: Origin,
-    splash: Splash,
-    server: Arc<Mutex<Option<server::Server>>>,
-) {
-    std::thread::spawn(move || {
-        let report = |text: &str, percent: f64| {
-            if !text.is_empty() {
-                splash.status(&window, text);
-            }
-            splash.progress(&window, percent);
-        };
+fn boot(app: tauri::AppHandle, window: WebviewWindow, session: Session) {
+    // Nothing else can have it yet: this runs from `setup`, before the event
+    // loop that would deliver a click on the tray's update item.
+    BUSY.store(true, Ordering::SeqCst);
 
+    std::thread::spawn(move || {
+        let _busy = Busy;
         // Skipped entirely on a login-item launch, which is sitting in the tray
         // with nobody looking at it: a modal asking about a 185 MB download,
         // from an app the user never opened, belongs to no window on screen. The
@@ -303,37 +362,124 @@ fn boot(
         // False means the app is quitting and took the install running under
         // this call down with it. Starting a server now would be starting one
         // for a process that is already on its way out.
-        if window_is_visible(&app) && !dsh::gate(&app, &report) {
+        if window_is_visible(&app) && !dsh::gate(&app, &reporter(&session.splash, &window)) {
             return;
         }
 
-        report("正在启动 dsh…", -1.0);
-
-        match server::start(&app) {
-            Ok((child, events)) => {
-                *server.lock().unwrap() = Some(child);
-                serve(&window, &origin, &splash, &events);
-            }
-            // Most often this is a machine where fetching dsh failed: neither
-            // the installer nor the boot above carries one, they download it,
-            // and an app that got this far without one has nothing to run. By
-            // now both have tried, so what is left to suggest is the network
-            // and doing it by hand.
-            Err(error) => splash.fail(
-                &window,
-                "启动 dsh 失败",
-                &format!(
-                    "无法执行 dsh：{error}\n\n\
-                     dsh 没有安装成功，通常是网络或代理的问题。\
-                     换一个网络或代理后重启应用，它会再试一次。\n\n\
-                     也可以自己在终端里执行 `npm install -g @deepseek-ai/dsh` 安装，\
-                     或用 DSH_BIN 环境变量指向 dsh 可执行文件的完整路径。"
-                ),
-            ),
-        }
-
+        start_serving(&app, &window, &session);
         check_for_updates(&app);
     });
+}
+
+/// Update dsh because the user asked for it, with the server down for the
+/// duration: npm is about to replace the tree `dsh web` is running out of, and a
+/// half-swapped one underneath a live server is worse than a wait.
+///
+/// One thread for the whole sequence, for the reasons [`boot`] runs on one — the
+/// check waits on npm, the question waits on the user, and the install runs for
+/// minutes — and the window goes back to the loading page for it, because that
+/// is the only page of ours with anywhere to put the progress.
+fn update_dsh(app: &tauri::AppHandle) {
+    // Held from before the first dialog: two of these would ask twice and then
+    // stop, update and restart the server twice over each other.
+    if BUSY.swap(true, Ordering::SeqCst) {
+        dsh::note(app, "请稍等", "dsh 正在启动或更新中，等它忙完再试。");
+        return;
+    }
+
+    let session = app.state::<Session>().inner().clone();
+    let app = app.clone();
+
+    std::thread::spawn(move || {
+        let _busy = Busy;
+
+        // Before the first thing that reaches the network. Until the answer is
+        // in there is nothing to show but the page the user was already on, and
+        // fifteen seconds of that is a menu item that did nothing.
+        let saying = |text: &str| controls::busy(&app, text);
+        let Some((prefix, installed)) = dsh::requested(&app, &saying) else {
+            return;
+        };
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+
+        if let Some(mut running) = session.server.lock().unwrap().take() {
+            running.stop();
+        }
+        // The dsh page is gone with it, so nothing may be treated as ours until
+        // a new server says otherwise.
+        *session.origin.write().unwrap() = None;
+        // Back to queueing until the loading page below has loaded; the reports
+        // that follow would otherwise be evaluated into the outgoing document.
+        session.splash.rearm();
+
+        let handle = app.clone();
+        let back = window.clone();
+        // Recorded by the first page load, which is long over: the click that got
+        // here came from a menu drawn by the page that replaced it.
+        let home = session.home.read().unwrap().clone();
+        let _ = app.run_on_main_thread(move || {
+            // The window may well be hidden in the tray, which is no place for
+            // an update the user is waiting on.
+            reveal(&handle);
+            match home {
+                Some(home) => {
+                    if let Err(error) = back.navigate(home) {
+                        eprintln!("dsh-desktop: 无法回到加载页：{error}");
+                    }
+                }
+                None => eprintln!("dsh-desktop: 还不知道加载页在哪里，更新期间没有进度可显示"),
+            }
+        });
+
+        // False means the app is quitting and took npm down with it.
+        let report = reporter(&session.splash, &window);
+        if !dsh::update(&app, &prefix, &installed, &report) {
+            return;
+        }
+
+        start_serving(&app, &window, &session);
+    });
+}
+
+/// Start `dsh web` and hand the window over to it. Blocks until it is serving or
+/// has given up, reporting either onto the loading page.
+fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Session) {
+    session.splash.status(window, "正在启动 dsh…");
+    session.splash.progress(window, -1.0);
+
+    match server::start(app) {
+        Ok((child, events)) => {
+            *session.server.lock().unwrap() = Some(child);
+            serve(window, &session.origin, &session.splash, &events);
+        }
+        // Most often this is a machine where fetching dsh failed: neither the
+        // installer nor the boot above carries one, they download it, and an app
+        // that got this far without one has nothing to run. By now both have
+        // tried, so what is left to suggest is the network and doing it by hand.
+        Err(error) => session.splash.fail(
+            window,
+            "启动 dsh 失败",
+            &format!(
+                "无法执行 dsh：{error}\n\n\
+                 dsh 没有安装成功，通常是网络或代理的问题。\
+                 换一个网络或代理后重启应用，它会再试一次。\n\n\
+                 也可以自己在终端里执行 `npm install -g @deepseek-ai/dsh` 安装，\
+                 或用 DSH_BIN 环境变量指向 dsh 可执行文件的完整路径。"
+            ),
+        ),
+    }
+}
+
+/// What [`dsh::gate`] and [`dsh::update`] write their progress through.
+fn reporter<'a>(splash: &'a Splash, window: &'a WebviewWindow) -> impl Fn(&str, f64) + 'a {
+    move |text: &str, percent: f64| {
+        if !text.is_empty() {
+            splash.status(window, text);
+        }
+        splash.progress(window, percent);
+    }
 }
 
 /// A check the boot finished with while the window was still hidden in the
@@ -470,6 +616,13 @@ impl Splash {
         let handle = window.app_handle().clone();
         let target = handle.clone();
         let _ = handle.run_on_main_thread(move || reveal(&target));
+    }
+
+    /// Back to queueing, for a window on its way to a fresh loading page: a call
+    /// evaluated into the document being navigated away from is lost the same way
+    /// one made before the first load is, and the next load flushes both.
+    fn rearm(&self) {
+        self.state.lock().unwrap().loaded = false;
     }
 
     /// Run the calls that were made before the page could receive them.
