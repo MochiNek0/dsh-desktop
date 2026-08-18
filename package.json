@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Desktop client for the DeepSeek Harness browser UI (dsh web)",
   "scripts": {
