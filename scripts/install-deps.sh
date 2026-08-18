@@ -177,6 +177,9 @@ resolve() {
     [ -x "$shell" ] || return 1
 
     out=$(mktemp "${TMPDIR:-/tmp}/dsh-path-XXXXXX") || return 1
+    # Single-quoted on purpose: `$PATH` has to expand inside the login shell
+    # this starts, once its rc files have had their say, not here.
+    # shellcheck disable=SC2016
     "$shell" -ilc 'printf %s "$PATH"' >"$out" 2>/dev/null &
     pid=$!
 
