@@ -90,9 +90,10 @@ MARKER="$APP_DIR/bootstrap.json"
 NODE_VERSION='24.19.0'
 
 # What an existing Node has to be for us to use it instead of installing our
-# own. dsh declares no `engines` field, so this is a judgement call rather than
-# something read off the package.
-NODE_MINIMUM='22.22.3'
+# own. dsh declares no `engines` field itself, but its direct dependency
+# commander@15 does — `>=22.12.0` — so anything under that will not run dsh at
+# all. Kept a little above that floor rather than pinned to it exactly.
+NODE_MINIMUM='22.19.0'
 
 # nodejs.org first, then the mirrors that carry the same layout — same paths,
 # same SHASUMS256.txt — for the networks where the first one does not answer.
@@ -157,6 +158,48 @@ fail() {
 
 have() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# `command -v "$1"`, and then the same question asked of a login, interactive
+# shell if that came up empty. A version manager like nvm adds itself in
+# `~/.bashrc` or `~/.zshrc`; a GUI launch of this app inherits neither, so a
+# node or dsh installed that way is otherwise invisible to this script even
+# though a terminal on the same machine finds it fine. Bounded to a few
+# seconds in case an rc file hangs on something.
+resolve() {
+    found=$(command -v "$1" 2>/dev/null)
+    if [ -n "$found" ]; then
+        printf '%s' "$found"
+        return 0
+    fi
+
+    shell=${SHELL:-}
+    [ -x "$shell" ] || return 1
+
+    out=$(mktemp "${TMPDIR:-/tmp}/dsh-path-XXXXXX") || return 1
+    "$shell" -ilc 'printf %s "$PATH"' >"$out" 2>/dev/null &
+    pid=$!
+
+    n=0
+    while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 5 ]; do
+        sleep 1
+        n=$((n + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        rm -f "$out"
+        return 1
+    fi
+    wait "$pid" 2>/dev/null
+
+    extra=$(cat "$out" 2>/dev/null)
+    rm -f "$out"
+    [ -n "$extra" ] || return 1
+
+    found=$(PATH="$extra" command -v "$1" 2>/dev/null)
+    [ -n "$found" ] || return 1
+    printf '%s' "$found"
 }
 
 # ------------------------------------------------------------------- marker --
@@ -247,7 +290,7 @@ find_node() {
         return 0
     fi
 
-    found=$(command -v node 2>/dev/null) || return 1
+    found=$(resolve node) || return 1
     if [ -n "$found" ] && node_is_new_enough "$found"; then
         printf '%s' "$found"
         return 0
@@ -269,8 +312,7 @@ find_any_node() {
         return 0
     fi
 
-    found=$(command -v node 2>/dev/null) || return 1
-    [ -n "$found" ] || return 1
+    found=$(resolve node) || return 1
     printf '%s' "$found"
 }
 
@@ -610,8 +652,7 @@ find_dsh() {
         return 0
     fi
 
-    found=$(command -v dsh 2>/dev/null) || return 1
-    [ -n "$found" ] || return 1
+    found=$(resolve dsh) || return 1
     printf '%s' "$found"
 }
 
