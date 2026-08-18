@@ -1,13 +1,25 @@
 //! Self-update against the release feed named in `tauri.conf.json`.
 //!
 //! Everything here is optional and never blocks the app: a check that fails is
-//! a check that did not happen. The user is asked before anything is downloaded
-//! and again before the app restarts, because a restart drops a session the
-//! agent may be in the middle of.
+//! a check that did not happen. The user is asked before anything is downloaded,
+//! and — everywhere but Windows, where the installer takes the decision out of
+//! our hands — again before the app restarts, because a restart drops a session
+//! the agent may be in the middle of.
+//!
+//! The download itself reports into the titlebar's status line rather than onto
+//! the loading page: the user is on dsh's own page when they ask for this, and
+//! navigating away from it to draw a progress bar would drop the session the
+//! restart is being so careful about.
+
+use std::time::{Duration, Instant};
 
 use tauri::AppHandle;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_updater::{Update, UpdaterExt};
+
+/// How often the download may repaint the status line. Every chunk would be a
+/// `window.eval` every few milliseconds.
+const REPORT_EVERY: Duration = Duration::from_millis(250);
 
 /// Check on startup: silent unless there is something to install.
 #[cfg_attr(debug_assertions, allow(dead_code))] // dev builds never auto-check
@@ -76,27 +88,86 @@ fn offer(app: &AppHandle, update: Update) {
 
 fn install(app: AppHandle, update: Update) {
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = update.download_and_install(|_, _| {}, || {}).await {
+        // Before the first chunk, which is a request to a release feed away: the
+        // dialog has just closed, and until something arrives there is nothing on
+        // screen to say the answer was heard.
+        crate::controls::busy(&app, "正在下载新版本…");
+
+        let downloading = app.clone();
+        let installing = app.clone();
+
+        // How much has come down, and when it was last said out loud. Both live
+        // in the closure, which the updater calls once per chunk.
+        let mut done: u64 = 0;
+        let mut said: Option<Instant> = None;
+
+        let finished = update
+            .download_and_install(
+                move |chunk, total| {
+                    done += chunk as u64;
+                    if said.is_some_and(|at| at.elapsed() < REPORT_EVERY) {
+                        return;
+                    }
+                    said = Some(Instant::now());
+                    crate::controls::busy(&downloading, &downloaded(done, total));
+                },
+                move || {
+                    // On Windows this is the last thing the app says: `install`
+                    // hands the installer to ShellExecute and ends the process,
+                    // and the installer draws its own progress from there.
+                    crate::controls::busy(&installing, "正在安装新版本，应用即将重启…");
+                },
+            )
+            .await;
+
+        if let Err(error) = finished {
+            crate::controls::busy(&app, "");
             note(&app, "更新失败", &error.to_string());
             return;
         }
 
-        let restarting = app.clone();
-        app.dialog()
-            .message("新版本已安装，重启后生效。正在进行的会话会被中断。")
-            .title("更新就绪")
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "立即重启".into(),
-                "稍后".into(),
-            ))
-            .show(move |now| {
-                if now {
-                    // Skips the ordinary shutdown path, so the dsh process tree
-                    // is left to the job object backstop in `server`.
-                    restarting.restart();
-                }
-            });
+        // Windows never reaches this: `Update::install` there ends in
+        // `std::process::exit(0)` after starting the NSIS installer, which is
+        // passed `/P /R` and so restarts the app itself. Everywhere else the
+        // install returns and the restart is ours to ask about.
+        #[cfg(not(windows))]
+        {
+            crate::controls::busy(&app, "");
+
+            let restarting = app.clone();
+            app.dialog()
+                .message("新版本已安装，重启后生效。正在进行的会话会被中断。")
+                .title("更新就绪")
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "立即重启".into(),
+                    "稍后".into(),
+                ))
+                .show(move |now| {
+                    if now {
+                        // Skips the ordinary shutdown path, so the dsh process
+                        // tree is left to the job object backstop in `server`.
+                        restarting.restart();
+                    }
+                });
+        }
     });
+}
+
+/// What the status line says while the new version comes down. The total is what
+/// the server declared, which it need not have.
+fn downloaded(done: u64, total: Option<u64>) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let megabytes = done as f64 / MB;
+
+    match total {
+        Some(total) if total > 0 => format!(
+            "正在下载新版本 {:.1} MB / {:.1} MB（{:.0}%）",
+            megabytes,
+            total as f64 / MB,
+            done as f64 / total as f64 * 100.0
+        ),
+        _ => format!("正在下载新版本 {megabytes:.1} MB"),
+    }
 }
 
 fn note(app: &AppHandle, title: &str, detail: &str) {
