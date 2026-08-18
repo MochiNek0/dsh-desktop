@@ -1,6 +1,6 @@
 # dsh desktop
 
-> DeepSeek Harness（`dsh web`）的 Tauri 桌面客户端 —— 把浏览器里的 dsh 界面装进原生窗口。
+> DeepSeek Harness（`dsh web`）的跨平台 Tauri 桌面客户端。
 >
 > [English](README.en.md) · 中文
 >
@@ -12,189 +12,67 @@
 
 <br>
 
-启动应用即拉起一个本地 `dsh web` 服务，并把它的界面装进原生窗口。不用自己开终端、记端口、管浏览器标签页；会话、凭据与设置和 CLI 完全共用（都在 `$DSH_HOME`，默认 `~/.dsh`）。
+启动应用即可自动拉起本地 `dsh web` 服务并内嵌至原生窗口。无需手动打开终端或管理端口，会话、凭证与配置均和 CLI 完全共享（位于 `$DSH_HOME`，默认 `~/.dsh`）。
 
-## 特性
+## ✨ 特性
 
-- **开箱即用**：Windows 在安装时、macOS / Linux 在首次启动时检测机器上的 Node.js，没有（或低于 22.22.3）就装一份到用户目录，再用 `npm install -g @deepseek-ai/dsh` 装 dsh，默认源不通会自动换镜像；全程不需要管理员权限
-- **不抢端口**：以 `--port 0` 启动，系统分配空闲的 loopback 端口，和你手动跑的 `dsh web`（3080）可以同时开着
-- **无边框窗口**：最小化/最大化/关闭以 macOS 那三颗圆点画在页面左上角（右上角留给 dsh 自己的控件），静止时半透明、hover 才显出图标；旁边是应用自己的菜单，跟着 dsh 的明暗主题走
-- **终端里也有 `dsh`**：dsh 是全局 npm 包，装完后终端里直接敲 `dsh` 就能用，和 app 跑的是同一份。只在机器上原本没有 dsh 时才装，绝不挤占你自己装的那份
-- **dsh 保持最新**：启动时查 npm，有新版先征求同意再下载，你自己装的那份也一样就地更新；不想更新就跳过，之后随时能从窗口菜单里再叫出来
-- **会话不被顶掉**：窗口只停留在 dsh 服务所在的 origin 内，站外链接交给系统浏览器
-- **窗口菜单与托盘**：应用能做的事都在标题栏那个菜单里 —— 「更新 dsh…」「检查应用更新…」「开机自启动」「退出 dsh」（自启动那次会静默待在托盘里，不弹窗也不查更新）；关闭窗口收进托盘而不是中断会话，托盘只留「显示窗口」和「退出」，也就是没窗口可看时才需要的那两个
-- **单实例 + 干净退出**：一台机器只跑一个；退出时结束整棵子进程树（Windows 用 `taskkill /T`，macOS / Linux 杀整个进程组），Windows 上被强杀还有 Job Object 兜底，不残留孤儿 node
-- **自动更新**：基于 Tauri updater 的签名更新，下载与重启都会先征求同意，三个平台共用一份 `latest.json`
+- **开箱即用**：自动检测并配置 Node.js 及 `dsh` 环境，无需管理员权限。
+- **无感共存**：随机分配端口启动，与手动运行的 `dsh web` 互不干扰。
+- **轻量原生**：无边框现代 UI、跟随主题、支持系统托盘及开机自启。
+- **完整共享**：终端全局可用同一 `dsh` 命令，支持启动检查与一键更新。
+- **优雅退出**：单实例运行，退出时自动清理所有子进程。
 
-## 安装
+## 📦 安装
 
-从 [Releases](../../releases) 下载对应平台的包：Windows 是 `.exe` 安装程序，macOS 是 `.dmg`（同一份同时支持 Apple Silicon 和 Intel），Linux 是 `.deb` 或 `.AppImage`。
+前往 [Releases](https://github.com/MochiNek0/dsh-desktop/releases) 下载对应平台的安装包：
+- **Windows**: `.exe` 安装包（需 WebView2，系统缺失会自动下载）
+- **macOS**: `.dmg`（通用二进制，支持 Intel 与 Apple Silicon）
+- **Linux**: `.AppImage` / `.deb`
 
-需要能联网 —— 安装过程要从 npm 拉 dsh（约 185 MB，几分钟），机器上没有 Node.js 的话还要再拉一个 Node（约 36 MB）。Windows 还需要 WebView2 运行时（Win11 自带，缺失时安装程序会自动下载）；Linux 需要 WebKitGTK 4.1 与 libayatana-appindicator（`.deb` 会声明依赖，AppImage 需要自己装）。
+> **macOS 提示**：首次打开如遇拦截，请右键选择「打开」，或在终端执行：
+> ```sh
+> xattr -dr com.apple.quarantine /Applications/dsh-desktop.app
+> ```
 
-macOS 的包**没有签名也没有公证**（那需要付费的 Apple 开发者账号），第一次打开会被 Gatekeeper 拦下。绕过的办法是右键点图标选「打开」，或者：
+## 🛠️ 开发与构建
 
-```sh
-xattr -dr com.apple.quarantine /Applications/dsh-desktop.app
-```
+### 运行环境
+- Rust stable
+- Node.js 18+
 
-## 开发
-
-需要 Rust stable、Node 18+，以及各平台的构建依赖：Windows 是 MSVC 工具链，macOS 是 Xcode 命令行工具，Linux 是 `libwebkit2gtk-4.1-dev`、`libayatana-appindicator3-dev`、`librsvg2-dev`、`patchelf`。
-
+### 常用命令
 ```sh
 npm install
-npm run dev            # 开发模式，带 devtools（用 PATH 上的 dsh；没有的话首次启动会自己装）
-npm run build          # 打包 → src-tauri/target/release/bundle/
+npm run dev    # 开发模式（带 DevTools）
+npm run build  # 构建安装包（输出至 src-tauri/target/release/bundle/）
 ```
 
-打包目标按平台分在 `tauri.conf.json`（Windows，NSIS）、`tauri.macos.conf.json`（app + dmg）和 `tauri.linux.conf.json`（deb + AppImage）里，Tauri 会自己按当前系统合并。**只能给自己所在的平台打包** —— 交叉编译要一整套目标系统的 sysroot，所以三个平台的包由 CI 分别构建。
+## ⚙️ 环境变量
 
-`npm run build` 会先跑 `scripts/bundle-runtime.mjs`，它把两份安装脚本复制进 `src-tauri/resources/`。安装包本身不带 Node 也不带 dsh。
+| 变量 | 说明 | 默认值 |
+| --- | --- | --- |
+| `DSH_BIN` | 指定 `dsh` 可执行文件的完整路径（优先级最高） | - |
+| `DSH_HOME` | `dsh` 数据与配置目录 | `~/.dsh` |
 
-### 发布
+## 📂 项目结构
 
-推一个 `v` 开头的 tag，`.github/workflows/release.yml` 会先跑检查（三个平台上的 `cargo test`，加上 `install-deps.sh` 的静态检查），过了才在三个平台上各构建一次，签名，把安装包和合并好的 `latest.json` 传到一个**草稿** Release：
-
-```sh
-# 版本号有三处，改成一样的：package.json、src-tauri/tauri.conf.json、src-tauri/Cargo.toml
-# 装包和 latest.json 用的是 tauri.conf.json 里的那个
-git commit -am 'chore: 0.2.0' && git tag v0.2.0 && git push --follow-tags
+```text
+dist/index.html               加载与错误页
+scripts/                      依赖安装脚本与运行时打包脚本
+src-tauri/tauri.*.conf.json   多平台 Tauri 配置
+src-tauri/src/                Rust 后端源码（窗口、进程托管、托盘、更新）
 ```
 
-草稿是故意的：更新端点指向 `releases/latest`，一旦发布，所有已安装的副本下次启动就会看到它。确认产物没问题再点发布。
+## ⚠️ 注意事项
 
-想在打 tag 之前先确认另外两个平台没问题，就手动触发一次同一个 workflow（Actions 页的 Run workflow，或 `gh workflow run release.yml`）—— 打包那步只在 ref 是 tag 时才跑，手动触发就只跑检查。
+- **首次安装/启动**：应用需要联网拉取 `dsh` 及运行环境，请保持网络畅通。
+- **自动更新**：支持应用自更新（Linux 仅限 AppImage 格式）。
 
-签名私钥不在仓库里，走仓库的 Actions secrets —— 只有一个：
+## 📄 声明
 
-| Secret | 内容 |
-| --- | --- |
-| `TAURI_SIGNING_PRIVATE_KEY` | `~/.tauri/dsh-desktop.key` 的**文件内容**（不是路径） |
+本项目是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的第三方客户端，由个人开发者维护，与 DeepSeek 无隶属或合作关系。
+问题反馈请在本仓库提交 Issue。
 
-**没有** `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 是故意的：这把 key 没有密码，而 GitHub 不接受空值的 secret；workflow 里引用一个不存在的 secret 会渲染成空字符串，环境变量照样被定义为空，签名器要的正是这个。哪天给 key 加了密码，再把这个 secret 建上。
-
-要在本地出一个能被自动更新到的版本，构建时把私钥传进去：
-
-```sh
-TAURI_SIGNING_PRIVATE_KEY=~/.tauri/dsh-desktop.key TAURI_SIGNING_PRIVATE_KEY_PASSWORD= npm run build
-```
-
-> 这一行**不能照抄进 PowerShell** —— `$env:X = ""` 在 PowerShell 里是删除变量，密码传不进去，构建会卡在密码提示上。用 Git Bash 跑。
->
-> 构建前记得退出正在运行的 app 和上一次构建出来的安装程序，两者都锁着文件，失败信息很容易被当成构建成功。
-
-## 工作原理
-
-1. 先把窗口建出来显示加载页，后台检查 dsh 有没有新版（这时还没有 dsh 进程在跑，替换它最安全）；机器上要是压根没有 dsh，就在这里装一份，进度显示在加载页上。
-2. 按 `DSH_BIN` → npm 全局前缀里的 `dsh` 的顺序找到 dsh，启动 `dsh web --port 0`。
-3. 读它的 stdout，等 `dsh web: http://127.0.0.1:<port>` —— 这一行既是就绪信号也是要加载的地址。启动失败时加载页会显示输出尾部。
-4. 窗口导航到该 URL，并保持在这个 origin 内。
-5. 退出时结束整棵子进程树。Windows 上用 `taskkill /T`，子进程一起来就被挂进一个设了 `KILL_ON_JOB_CLOSE` 的 Job Object，应用被强杀、根本走不到清理代码时由它兜底；macOS / Linux 上子进程在 exec 前 `setpgid` 成自己那组的组长，退出时一个负 PID 把整组带走 —— 但没有内核级的兜底，见[已知边界](#已知边界)。
-
-窗口的亮/暗跟随 dsh 自己的主题设置（`$DSH_HOME/settings.yaml` 的 `ui-theme.preference`），窗口建出来时读一次，加载页不会先闪一下相反的颜色。
-
-窗口按钮不走 Tauri IPC（那等于把 IPC 权限交给 dsh 页面里的每一行 JS），而是导航到 `dsh-window://close` 这样的自定义 scheme，在 `on_navigation` 里认出来、执行、取消掉这次导航。
-
-### Node 和 dsh 装在哪
-
-安装包既不带 Node 也不带 dsh，两者都由一份安装脚本装上：Windows 是 `scripts/install-deps.ps1`，macOS / Linux 是 `scripts/install-deps.sh`。两份脚本的参数、输出格式和逻辑一一对应，应用在启动时发现缺东西跑的也是它们，所以每个平台只有一份实现。全程不需要管理员权限。
-
-时机上有个区别：Windows 由安装程序在安装时跑一次（`installer-hooks.nsh`），macOS / Linux 上没有可用的安装钩子 —— `.dmg` 和 `.AppImage` 压根没有，`.deb` 的钩子以 root 身份跑，而这是要给**当前用户**装的东西 —— 所以那边由首次启动来做，进度显示在加载页上，和 Windows 联网失败后的回退路径是同一条。
-
-**Node**：机器上有 22.22.3 或更高版本就直接用，绝不动它。没有的话从 nodejs.org 下载官方 standalone 包（失败依次换 npmmirror、阿里云、华为云），校验 SHA256 后解压到应用的数据目录：
-
-| 平台 | 位置 |
-| --- | --- |
-| Windows | `%LOCALAPPDATA%\ai.deepseek.dsh.desktop\node\` |
-| macOS | `~/Library/Application Support/ai.deepseek.dsh.desktop/node/` |
-| Linux | `~/.local/share/ai.deepseek.dsh.desktop/node/` |
-
-**dsh**：`npm install -g @deepseek-ai/dsh`，落在上面那个 Node 的全局前缀里；用系统 Node 时就落在你自己的 npm 前缀里 —— 除非那个前缀只有 root 能写（Linux 发行版自带的 Node 通常如此），这时会退到应用数据目录下的 `npm/` 前缀，绝不去要密码。
-
-前缀里的可执行目录会被加进 PATH（前置），所以终端里的 `dsh` 和 app 跑的是同一份。Windows 改的是 `HKCU\Environment`；macOS / Linux 是往 `~/.profile`（zsh 还有 `~/.zshrc`，已存在的 `~/.bashrc`）追加一段带 `# >>> dsh desktop >>>` 标记的块，卸载时按标记原样删掉。
-
-**PATH 上已经有 `dsh` 就整个跳过安装** —— 已经有一份能用的，再装 327 MB 没有意义。**更新则不分你我**：不管是你装的还是它装的，都是一个全局 npm 包，更新就是往它所在的那个前缀里再跑一次 `npm install -g`。
-
-更新检查最多每 6 小时一次（超时 15 秒），发现新版会弹窗告知版本号和体积，同意后就地跑一次 `npm install -g @deepseek-ai/dsh@latest --prefix <dsh 所在的前缀>`，装完直接继续启动，不需要重启应用。点「跳过此版本」之后不再为这个版本打扰，想起来再更新就从标题栏菜单点「更新 dsh…」—— 那条路径会先关掉正在跑的 dsh（会话会中断），窗口退回加载页显示进度，装完自动重新启动。
-
-更新用的 npm 就是当初装下这份 dsh 的那个 Node 旁边的那个，**不问版本**：22.22.3 那条下限只用来决定要不要替你装一份 Node，而更新什么都不装，只是把已经在机器上的那份换掉 —— 拿下限去挑 Node 的结果是比它旧一点的 Node 装的 dsh 永远更新不了。
-
-唯一不代劳的情况是那份 dsh 压根不在应用能写的 npm 全局目录里 —— 比如 pnpm/volta 那种链接过去的布局，或者当初用 `sudo` 装到了 `/usr/local`。那时候往哪儿装都不对（只会在别处多出一份 327 MB），所以只弹窗告知，并把该跑的命令写在里面。
-
-卸载时，Windows 的卸载程序**分别问**要不要卸载 dsh、要不要卸载本应用装的 Node.js（选了删 Node 就会连 dsh 一起删，没有 Node 的 dsh 跑不起来），最后再问一次要不要连 `$DSH_HOME` 一起删，默认都保留。dsh 你说删就删 —— 同样因为它就是个全局 npm 包 —— 但你自己装的 Node 永远不会被动。app 更新和手动重装不会触发这些询问。
-
-macOS / Linux 上没有卸载程序可以问 —— 删掉 .app / 卸掉 .deb 只会删掉应用本身。要把它装的东西一起清掉，手动跑同一个脚本（macOS 把路径换成 `/Applications/dsh-desktop.app/Contents/Resources/resources/install-deps.sh`）：
-
-```sh
-sh /usr/lib/dsh-desktop/resources/install-deps.sh -Mode uninstall -RemoveDsh -RemoveNode
-```
-
-它遵守和 Windows 卸载程序一样的规矩：Node 只删自己装的那份，dsh 按开关删（在它实际所在的 npm 前缀里卸载），`$DSH_HOME` 不动。AppImage 里的那份随镜像挂载，用完就没了，直接拿仓库里的 `scripts/install-deps.sh` 跑效果一样。
-
-## 环境变量
-
-| 变量 | 作用 |
-| --- | --- |
-| `DSH_BIN` | dsh 可执行文件的完整路径。优先级最高，用来盖掉 PATH 上的那份。 |
-| `DSH_HOME` | dsh 的数据目录，默认 `~/.dsh`。 |
-
-## 代码结构
-
-```
-dist/index.html               加载页 / 错误页（无构建步骤，Rust 侧通过 eval 调它的钩子）
-scripts/install-deps.ps1      检测并安装 Node 与 dsh（Windows）；安装程序和应用共用这一份
-scripts/install-deps.sh       同一件事的 macOS / Linux 版，由应用首次启动时调用
-scripts/bundle-runtime.mjs    构建前把上面两个脚本放进 resources/
-.github/workflows/release.yml v* tag 触发：先查（三平台测试 + 脚本静态检查）再打包、签名、传草稿 Release
-src-tauri/tauri.conf.json     基础配置 + Windows 的 NSIS 目标
-src-tauri/tauri.macos.conf.json   app + dmg 目标（Tauri 按平台自动合并）
-src-tauri/tauri.linux.conf.json   deb + AppImage 目标
-src-tauri/installer-hooks.nsh 安装/卸载时调用 install-deps.ps1，以及对 $DSH_HOME 的处理
-src-tauri/src/main.rs         窗口、导航策略、托盘、生命周期
-src-tauri/src/controls.rs     注入页面的无边框窗口按钮、拖拽带与应用菜单
-src-tauri/src/theme.rs        从 dsh 的设置里读亮/暗，开窗时用一次
-src-tauri/src/server.rs       托管的 dsh web 子进程；Job Object 兜底与进程组
-src-tauri/src/dsh.rs          dsh 的定位与版本比较，以及何时调安装脚本
-src-tauri/src/update.rs       应用自身的自动更新
-```
-
-## 路线图
-
-- [x] 机器上没有 Node 也能装（安装时检测，缺了就装一份到用户目录）
-- [x] Job Object 兜底、托盘与开机自启动、自动更新
-- [x] macOS / Linux 的 bundle 目标（dmg、deb、AppImage，以及对应的安装脚本与进程组清理）
-- [x] 发布流水线（推 tag 即三平台构建、签名、传草稿 Release）
-
-## 已知边界
-
-- **安装要联网，而且不快**：dsh 的依赖树是 587 个包 / 185 MB 压缩流量 / 解压后 327 MB / 33k 文件，2 MB/s 的连接上约 4 分钟；机器上没有 Node 的话前面还要再下 36 MB。全部镜像都失败的话安装程序会明说，不会假装装好了 —— 下次启动应用时它会再试一次
-- **第一次启动比之后慢**：dsh 要 import 的文件第一次从杀软没见过的路径读过去，Defender 会逐个扫描 —— 实测冷启动 14 秒，文件热了之后 1.6 秒。想避开的话给安装目录加排除项（管理员 PowerShell，**路径换成你实际装的那个**）：
-
-  ```powershell
-  Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\dsh-desktop", "$env:LOCALAPPDATA\ai.deepseek.dsh.desktop"
-  ```
-
-- **只在 Windows 上真机验证过**：macOS / Linux 的代码路径齐了，CI 保证三个平台都能编译、能打出包，但「装完真的能跑起来」还没有在那两个平台上验证过。碰到问题请提 issue
-- **macOS / Linux 没有内核级的兜底**：正常退出会杀掉整个进程组，但应用被强杀（`kill -9`、崩溃）时 dsh 会活下来。Windows 的 Job Object 在这些平台上没有对等物 —— Linux 的 `PR_SET_PDEATHSIG` 绑的是**创建线程**的生命周期，而那个线程在启动流程结束时就退出了，用了反而会误杀。下次启动会被单实例锁挡住，手动 `pkill -f 'dsh web'` 收拾
-- **macOS 的包没有签名和公证**：需要付费的 Apple 开发者账号。首次打开要右键「打开」或去掉隔离属性，见[安装](#安装)
-- **Linux 上只有 AppImage 能自动更新**：Tauri 的 updater 在 Linux 只认 AppImage。用 `.deb` 装的要自己去 Releases 下新版本 —— `latest.json` 里那条 deb 条目是打包工具顺手生成的，应用不会走它
-- dsh 更新走 `npm install -g`，npm 在替换旧树期间新旧两份并存，磁盘峰值约 650 MB
-- 安装完 Node 后 PATH 的变更要等新开的终端才生效（macOS / Linux 上还得是会读 `~/.profile` 或 `~/.zshrc` 的那种）；应用自己不受影响 —— 它从 `bootstrap.json` 里读脚本记下的路径，不依赖继承来的 PATH
-- `dsh.cmd` 用 `%*` 转发参数，从 PowerShell 传入带 `&` `|` `^` 的参数会被 cmd 二次解析弄坏（Git Bash 的 shim 没这问题）
-- 卸载若保留 `$DSH_HOME`，其中指向已删目录的 junction 会变成死链；再跑一次任意 dsh 就会自动修好
-
-## 声明
-
-本项目是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的**第三方**桌面客户端，
-由个人开发者维护，与 DeepSeek 没有任何隶属、合作或背书关系，**不是 DeepSeek 的官方产品**。
-它只做桌面封装 —— 进程管理、窗口与托盘、系统集成，不改动 dsh 本身的功能。
-
-「DeepSeek」是 DeepSeek 的商标，本项目仅在说明用途时指代性地使用该名称。
-应用图标是本项目自己画的，没有使用 DeepSeek 的任何标识。
-
-使用本项目遇到的问题请在本仓库提 issue，不要提给 DeepSeek 官方。
-
-## 许可证
+## 📜 许可证
 
 [MIT](LICENSE) © 2026 MochiNek0

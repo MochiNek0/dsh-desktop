@@ -152,18 +152,29 @@ ${Using:StrFunc} UnStrRep
   Pop $0
 !macroend
 
-; The uninstaller runs the same script, and `$INSTDIR` will not be there when it
-; does — `NSIS_HOOK_POSTUNINSTALL` runs after the app's own files are deleted.
-; So the script is taken along now, into the temporary directory NSIS cleans up
-; on its own.
+; The uninstaller runs the same script, and by the time it does, neither the
+; script nor what it wrote down is still where it was.
+;
+; `$INSTDIR` is gone: `NSIS_HOOK_POSTUNINSTALL` runs after the app's own files
+; are deleted. And `bootstrap.json` may be gone with it — the template's "delete
+; app data" checkbox does `RMDir /r` on `%LOCALAPPDATA%\${BUNDLEID}`, the
+; directory the marker lives in, in the same section and a few lines earlier.
+; The marker is the only place the script reads its state from, so losing it
+; means losing the answers to questions the user has not been asked yet.
+;
+; Both are therefore taken along now, into the temporary directory NSIS cleans
+; up on its own.
 ;
 ; This hook runs ahead of the generated `CheckIfAppIsRunning`, so it may well be
-; running for an uninstall the user is about to abort. Copying a file costs
+; running for an uninstall the user is about to abort. Copying two files costs
 ; nothing in that case.
 !macro NSIS_HOOK_PREUNINSTALL
   InitPluginsDir
   ${If} ${FileExists} "$INSTDIR\${DSH_SCRIPT}"
     CopyFiles /SILENT "$INSTDIR\${DSH_SCRIPT}" "$PLUGINSDIR\install-deps.ps1"
+  ${EndIf}
+  ${If} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
+    CopyFiles /SILENT "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json" "$PLUGINSDIR\bootstrap.json"
   ${EndIf}
 !macroend
 
@@ -181,8 +192,14 @@ ${Using:StrFunc} UnStrRep
   Push $3
   Push $R0
   Push $R1
+  Push $R2
   Push $R4
   Push $R5
+
+  ; Whether the marker below is a copy this hook put back, and so a copy this
+  ; hook takes away again. Set here because `uninstall_done` reads it on every
+  ; path through this macro, including the one that leaves right now.
+  StrCpy $R2 ""
 
   ; Not every run of this uninstaller is a removal, and the two that are not
   ; both end with the app still installed:
@@ -216,6 +233,18 @@ ${Using:StrFunc} UnStrRep
   ; failed if the old shim directory was still holding it open.
   RMDir "$R5"
   RMDir "$INSTDIR"
+
+  ; The marker back where the script reads it, if the "delete app data" checkbox
+  ; took it out from under us. `NSIS_HOOK_PREUNINSTALL` kept a copy for exactly
+  ; this. It goes away again at `uninstall_done` — restoring it here is for the
+  ; length of this uninstall and no longer, and a user who asked for the app data
+  ; to be deleted gets that.
+  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
+  ${AndIf} ${FileExists} "$PLUGINSDIR\bootstrap.json"
+    CreateDirectory "$LOCALAPPDATA\${BUNDLEID}"
+    CopyFiles /SILENT "$PLUGINSDIR\bootstrap.json" "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
+    StrCpy $R2 "1"
+  ${EndIf}
 
   ; `bootstrap.json` is what the script writes down about this machine, and
   ; without it there is nothing to ask: no record of which Node is ours, and no
@@ -292,8 +321,17 @@ ${Using:StrFunc} UnStrRep
   RMDir /r "$R4"
 
   uninstall_done:
+  ; `RMDir` and not `RMDir /r`: the directory goes only if the marker was the
+  ; last thing in it, which is the case the checkbox left behind. Anything the
+  ; script wrote back into it is the script's to keep.
+  ${If} $R2 == "1"
+    Delete "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
+    RMDir "$LOCALAPPDATA\${BUNDLEID}"
+  ${EndIf}
+
   Pop $R5
   Pop $R4
+  Pop $R2
   Pop $R1
   Pop $R0
   Pop $3
