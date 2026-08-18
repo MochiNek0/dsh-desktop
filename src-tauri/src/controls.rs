@@ -203,9 +203,10 @@ fn eval(app: &AppHandle, call: &str) {
 /// The dots carry their own colour, the same three macOS uses, so there is
 /// nothing about them that has to follow dsh's theme — they read the same
 /// against a light page and a dark one. The menu does not have that luxury: it
-/// is text on a panel, so its colours come from a `prefers-color-scheme` block,
-/// which is the same thing the loading page resolves against and is set from
-/// dsh's own preference when the window is built (see `theme`).
+/// is text on a panel, so it follows the theme of the page it is drawn over,
+/// watching the two things dsh's own theme writes onto the document rather than
+/// the webview's `prefers-color-scheme` — which is settled when the window is
+/// built (see `theme`) and does not move when the theme is switched inside dsh.
 pub fn script() -> String {
     let titlebar_height = TITLEBAR_HEIGHT;
     let dot = DOT;
@@ -263,17 +264,20 @@ pub fn script() -> String {
   function start() {{
     var style = document.createElement('style');
     style.textContent =
-      ':root{{--dsh-titlebar-height:{titlebar_height}px;' +
+      ':root{{--dsh-titlebar-height:{titlebar_height}px;}}' +
       // Everything the menu is drawn out of, in one place and in both themes.
-      '--dsh-wc-fg:rgba(0,0,0,.55);--dsh-wc-fg-hi:rgba(0,0,0,.85);' +
+      // On the bar rather than on `:root`, so `dsh-wc-dark` -- put on by
+      // `repaint` below out of what the page says, not out of the media query
+      // -- is all it takes to swap the set.
+      '.dsh-wc{{--dsh-wc-fg:rgba(0,0,0,.55);--dsh-wc-fg-hi:rgba(0,0,0,.85);' +
       '--dsh-wc-panel:rgba(255,255,255,.96);--dsh-wc-line:rgba(0,0,0,.09);' +
       '--dsh-wc-hover:rgba(0,0,0,.06);' +
       '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.18),0 0 0 .5px rgba(0,0,0,.09);}}' +
-      '@media (prefers-color-scheme:dark){{:root{{' +
+      '.dsh-wc.dsh-wc-dark{{' +
       '--dsh-wc-fg:rgba(255,255,255,.62);--dsh-wc-fg-hi:rgba(255,255,255,.94);' +
       '--dsh-wc-panel:rgba(42,42,46,.96);--dsh-wc-line:rgba(255,255,255,.11);' +
       '--dsh-wc-hover:rgba(255,255,255,.09);' +
-      '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.5),0 0 0 .5px rgba(255,255,255,.09);}}}}' +
+      '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.5),0 0 0 .5px rgba(255,255,255,.09);}}' +
       'html,body{{height:100%!important;margin:0!important;overflow:hidden!important;}}' +
       '#root{{height:calc(100% - var(--dsh-titlebar-height))!important;margin-top:var(--dsh-titlebar-height)!important;box-sizing:border-box!important;}}' +
       'body:not(:has(#root)){{padding-top:var(--dsh-titlebar-height)!important;box-sizing:border-box!important;}}' +
@@ -301,10 +305,17 @@ pub fn script() -> String {
       'color:rgba(0,0,0,.55);box-shadow:inset 0 0 0 .5px rgba(0,0,0,.12);' +
       'will-change:transform;transition:transform .13s cubic-bezier(.2,.9,.24,1),' +
       'filter .2s ease}}' +
-      '.dsh-wc:not(.dsh-wc-on) button{{transition-duration:.34s}}' +
-      '.dsh-wc button svg{{opacity:0;will-change:transform;' +
+      //
+      // Down to the dots, these three, rather than to every button in the bar:
+      // the menu's panel hangs off the bar too, and a rule that hides — or
+      // reveals — the glyph in any button reaches the checkmark in a menu item
+      // as well. `dsh-wc-on` comes on while the pointer is anywhere near the
+      // row, which is where it is when the menu is opened, so an unchecked
+      // login item wore a tick until the pointer moved off down the panel.
+      '.dsh-wc:not(.dsh-wc-on) .dsh-wc-dots button{{transition-duration:.34s}}' +
+      '.dsh-wc-dots button svg{{opacity:0;will-change:transform;' +
       'transition:opacity .2s ease,transform .13s cubic-bezier(.2,.9,.24,1)}}' +
-      '.dsh-wc-on button svg{{opacity:1}}' +
+      '.dsh-wc-on .dsh-wc-dots button svg{{opacity:1}}' +
       '.dsh-wc button:active{{filter:brightness(.85)}}' +
       // Qualified by `.dsh-wc button` so they outweigh its `all:unset`, which
       // would otherwise take the colour straight back off again.
@@ -319,7 +330,6 @@ pub fn script() -> String {
       '.dsh-wc button.dsh-wc-menu:hover,.dsh-wc button.dsh-wc-menu.dsh-wc-shown{{' +
       'background:var(--dsh-wc-hover);color:var(--dsh-wc-fg-hi)}}' +
       '.dsh-wc button.dsh-wc-menu:active{{filter:none}}' +
-      '.dsh-wc-menu svg{{opacity:1!important;transform:none!important}}' +
       // The panel. `visibility` rather than `display` so the fade has something
       // to fade, with its own transition delayed until the opacity is done.
       '.dsh-wc-pop{{position:absolute;top:calc(100% - 3px);left:0;min-width:184px;' +
@@ -484,6 +494,41 @@ pub fn script() -> String {
       said.textContent = text || '';
       toast.classList.toggle('dsh-wc-shown', !!text);
     }};
+
+    // ----------------------------------------------------------- the theme --
+
+    // dsh's theme is the page's, not the window's: it writes `color-scheme` on
+    // the root element and `data-ds-dark-theme` on the body, and switching it
+    // inside the UI changes both without anything reaching the webview's own
+    // `prefers-color-scheme` -- which is fixed when the window is built and has
+    // nothing to move it afterwards. So the menu reads the page, and falls back
+    // to the media query only where the page says nothing either way: the
+    // loading page, whose `color-scheme` is the bare `light dark`.
+    var media = window.matchMedia('(prefers-color-scheme:dark)');
+
+    function dark() {{
+      if (document.body.hasAttribute('data-ds-dark-theme')) return true;
+      var declared = getComputedStyle(document.documentElement).colorScheme || '';
+      var light = declared.indexOf('light') !== -1;
+      var night = declared.indexOf('dark') !== -1;
+      return night !== light ? night : media.matches;
+    }}
+
+    function repaint() {{
+      bar.classList.toggle('dsh-wc-dark', dark());
+    }}
+
+    // Before the bar is in the document, so it is never painted the wrong
+    // colour first.
+    repaint();
+    var watch = new MutationObserver(repaint);
+    watch.observe(document.documentElement, {{
+      attributes: true, attributeFilter: ['style', 'class', 'data-theme']
+    }});
+    watch.observe(document.body, {{
+      attributes: true, attributeFilter: ['style', 'class', 'data-ds-dark-theme']
+    }});
+    media.addEventListener('change', repaint);
 
     document.body.appendChild(drag);
     document.body.appendChild(bar);
