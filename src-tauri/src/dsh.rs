@@ -188,9 +188,6 @@ pub struct Install {
     /// What to execute. On Windows this is npm's `dsh.cmd` shim, which std
     /// routes through cmd.exe with the correct argument quoting.
     pub bin: PathBuf,
-    /// The directory holding `node_modules`, which the warm-up list's paths are
-    /// relative to. See [`crate::warm`].
-    pub root: PathBuf,
     pub version: Version,
 }
 
@@ -208,10 +205,9 @@ pub fn current(app: &AppHandle) -> Option<Install> {
         None => look_up(app, &["dsh.cmd", "dsh"])?,
     };
 
-    let root = root_of(&bin);
-    let version = manifest_version(&root).or_else(|| version_of(bin.as_os_str()))?;
+    let version = manifest_version(&root_of(&bin)).or_else(|| version_of(bin.as_os_str()))?;
 
-    Some(Install { bin, root, version })
+    Some(Install { bin, version })
 }
 
 /// The directory holding the `node_modules` a global install put dsh in.

@@ -6,7 +6,6 @@ mod dsh;
 mod server;
 mod theme;
 mod update;
-mod warm;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,13 +54,6 @@ fn main() {
             Some(vec![AUTOSTART_FLAG]),
         ))
         .setup(move |app| {
-            // Ahead of the boot below, so that the files dsh is about to read
-            // are being read from a dozen threads while it reads them from one.
-            // The update check it now overlaps with is the usual case — there is
-            // most often nothing newer to fetch — so this is still time the user
-            // would otherwise spend waiting.
-            warm::start(app.handle());
-
             let preference = theme::preference();
             let splash = Splash::default();
             let visible = !std::env::args().any(|argument| argument == AUTOSTART_FLAG);

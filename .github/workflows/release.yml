@@ -49,7 +49,7 @@ permissions:
 jobs:
   # Does it still compile, and do the unit tests still pass, on all three?
   # `dist/` and `resources/` are both in the repository, so this needs neither
-  # `npm ci` nor `bundle:runtime` — the latter installs 327 MB of dsh.
+  # `npm ci` nor `bundle:runtime`.
   test:
     strategy:
       fail-fast: false

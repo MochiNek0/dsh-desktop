@@ -50,7 +50,7 @@ npm run build          # 打包 → src-tauri/target/release/bundle/
 
 打包目标按平台分在 `tauri.conf.json`（Windows，NSIS）、`tauri.macos.conf.json`（app + dmg）和 `tauri.linux.conf.json`（deb + AppImage）里，Tauri 会自己按当前系统合并。**只能给自己所在的平台打包** —— 交叉编译要一整套目标系统的 sysroot，所以三个平台的包由 CI 分别构建。
 
-`npm run build` 会先跑 `scripts/bundle-runtime.mjs`，它把两份安装脚本复制进 `src-tauri/resources/`，并（在缺失时）跑一次带追踪的 dsh 启动来生成预热清单。安装包本身不带 Node 也不带 dsh。
+`npm run build` 会先跑 `scripts/bundle-runtime.mjs`，它把两份安装脚本复制进 `src-tauri/resources/`。安装包本身不带 Node 也不带 dsh。
 
 ### 发布
 
@@ -141,8 +141,7 @@ sh /usr/lib/dsh-desktop/resources/install-deps.sh -Mode uninstall -RemoveDsh -Re
 dist/index.html               加载页 / 错误页（无构建步骤，Rust 侧通过 eval 调它的钩子）
 scripts/install-deps.ps1      检测并安装 Node 与 dsh（Windows）；安装程序和应用共用这一份
 scripts/install-deps.sh       同一件事的 macOS / Linux 版，由应用首次启动时调用
-scripts/bundle-runtime.mjs    构建前把上面两个脚本放进 resources/，并生成启动预热清单
-scripts/boot-trace/           追踪一次 dsh 启动读了哪些文件，预热清单由此而来
+scripts/bundle-runtime.mjs    构建前把上面两个脚本放进 resources/
 .github/workflows/release.yml v* tag 触发：先查（三平台测试 + 脚本静态检查）再打包、签名、传草稿 Release
 src-tauri/tauri.conf.json     基础配置 + Windows 的 NSIS 目标
 src-tauri/tauri.macos.conf.json   app + dmg 目标（Tauri 按平台自动合并）
@@ -153,7 +152,6 @@ src-tauri/src/controls.rs     注入页面的无边框窗口按钮与拖拽带
 src-tauri/src/theme.rs        从 dsh 的设置里读亮/暗，开窗时用一次
 src-tauri/src/server.rs       托管的 dsh web 子进程；Job Object 兜底与进程组
 src-tauri/src/dsh.rs          dsh 的定位与版本比较，以及何时调安装脚本
-src-tauri/src/warm.rs         按预热清单并行预读，抵消 Defender 首次扫描
 src-tauri/src/update.rs       应用自身的自动更新
 ```
 
@@ -167,7 +165,7 @@ src-tauri/src/update.rs       应用自身的自动更新
 ## 已知边界
 
 - **安装要联网，而且不快**：dsh 的依赖树是 587 个包 / 185 MB 压缩流量 / 解压后 327 MB / 33k 文件，2 MB/s 的连接上约 4 分钟；机器上没有 Node 的话前面还要再下 36 MB。全部镜像都失败的话安装程序会明说，不会假装装好了 —— 下次启动应用时它会再试一次
-- **第一次启动比之后慢**：dsh 要 import 的文件第一次从杀软没见过的路径读过去，Defender 会逐个扫描 —— 实测冷启动 14 秒，文件热了之后 1.6 秒。应用启动时会按预热清单多线程预读那批文件，把冷启动压到 4 秒上下；想彻底避开的话给安装目录加排除项（管理员 PowerShell，**路径换成你实际装的那个**）：
+- **第一次启动比之后慢**：dsh 要 import 的文件第一次从杀软没见过的路径读过去，Defender 会逐个扫描 —— 实测冷启动 14 秒，文件热了之后 1.6 秒。想避开的话给安装目录加排除项（管理员 PowerShell，**路径换成你实际装的那个**）：
 
   ```powershell
   Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\dsh-desktop", "$env:LOCALAPPDATA\ai.deepseek.dsh.desktop"
@@ -177,7 +175,6 @@ src-tauri/src/update.rs       应用自身的自动更新
 - **macOS / Linux 没有内核级的兜底**：正常退出会杀掉整个进程组，但应用被强杀（`kill -9`、崩溃）时 dsh 会活下来。Windows 的 Job Object 在这些平台上没有对等物 —— Linux 的 `PR_SET_PDEATHSIG` 绑的是**创建线程**的生命周期，而那个线程在启动流程结束时就退出了，用了反而会误杀。下次启动会被单实例锁挡住，手动 `pkill -f 'dsh web'` 收拾
 - **macOS 的包没有签名和公证**：需要付费的 Apple 开发者账号。首次打开要右键「打开」或去掉隔离属性，见[安装](#安装)
 - **Linux 上只有 AppImage 能自动更新**：Tauri 的 updater 在 Linux 只认 AppImage。用 `.deb` 装的要自己去 Releases 下新版本 —— `latest.json` 里那条 deb 条目是打包工具顺手生成的，应用不会走它
-- 第一次启动的预热（`warm.rs`）是冲着 Windows Defender 去的，在 macOS / Linux 上只剩预热页缓存的那点收益
 - dsh 更新走 `npm install -g`，npm 在替换旧树期间新旧两份并存，磁盘峰值约 650 MB
 - 安装完 Node 后 PATH 的变更要等新开的终端才生效（macOS / Linux 上还得是会读 `~/.profile` 或 `~/.zshrc` 的那种）；应用自己不受影响 —— 它从 `bootstrap.json` 里读脚本记下的路径，不依赖继承来的 PATH
 - `dsh.cmd` 用 `%*` 转发参数，从 PowerShell 传入带 `&` `|` `^` 的参数会被 cmd 二次解析弄坏（Git Bash 的 shim 没这问题）

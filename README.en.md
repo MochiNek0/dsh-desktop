@@ -50,7 +50,7 @@ npm run build          # produces packages → src-tauri/target/release/bundle/
 
 The bundle targets are split by platform across `tauri.conf.json` (Windows, NSIS), `tauri.macos.conf.json` (app + dmg) and `tauri.linux.conf.json` (deb + AppImage), which Tauri merges according to the host it is building on. It builds for the **host platform only** — cross-compiling would take a full sysroot of the target — so the three platforms' packages are built separately, in CI.
 
-`npm run build` runs `scripts/bundle-runtime.mjs` first, which copies both install scripts into `src-tauri/resources/` and — when it is missing — records the boot warm-up list by tracing one dsh startup. The package itself carries neither Node nor dsh.
+`npm run build` runs `scripts/bundle-runtime.mjs` first, which copies both install scripts into `src-tauri/resources/`. The package itself carries neither Node nor dsh.
 
 ### Releasing
 
@@ -142,8 +142,7 @@ It follows the same rules the Windows uninstaller does: only what it installed i
 dist/index.html               Loading / error page (no build step; Rust drives it via eval'd hooks)
 scripts/install-deps.ps1      Detects and installs Node and dsh on Windows; shared by installer and app
 scripts/install-deps.sh       The same thing for macOS and Linux, run by the app's first launch
-scripts/bundle-runtime.mjs    Stages both scripts into resources/ and records the boot warm-up list
-scripts/boot-trace/           Traces one dsh boot to find out what it reads
+scripts/bundle-runtime.mjs    Stages both scripts into resources/
 .github/workflows/release.yml On a v* tag: check, then build all three, sign, upload to a draft release
 src-tauri/tauri.conf.json     Base configuration, and the NSIS target for Windows
 src-tauri/tauri.macos.conf.json   app + dmg targets (Tauri merges these per platform)
@@ -154,7 +153,6 @@ src-tauri/src/controls.rs     The frameless window's injected buttons and drag s
 src-tauri/src/theme.rs        Reads dsh's light/dark preference, once, at window creation
 src-tauri/src/server.rs       Managed dsh web child process, the job object backstop, process groups
 src-tauri/src/dsh.rs          Locating the dsh install, version comparison, runtime updates
-src-tauri/src/warm.rs         Parallel pre-reads from the warm-up list, against Defender's first scan
 src-tauri/src/update.rs       The app's own auto-update
 ```
 
@@ -168,7 +166,7 @@ src-tauri/src/update.rs       The app's own auto-update
 ## Known limitations
 
 - **Installing needs the network, and it is not quick**: dsh's dependency tree is 587 packages, 185 MB compressed, 327 MB unpacked across 33k files — about four minutes on a 2 MB/s link, preceded by another 36 MB if the machine has no Node. If every mirror fails the installer says so plainly rather than pretending it succeeded — and the next app launch tries again
-- **The first launch is slower than the rest**: the files dsh imports get scanned one by one the first time they are read from a path Defender has never seen — measured at 14 s cold against 1.6 s once the same files are warm. The app pre-reads them from several threads at startup, off a list recorded at build time, which brings the cold launch to around 4 s. To avoid it entirely, exclude the install directory (elevated PowerShell, **with the path you actually chose**):
+- **The first launch is slower than the rest**: the files dsh imports get scanned one by one the first time they are read from a path Defender has never seen — measured at 14 s cold against 1.6 s once the same files are warm. To avoid it, exclude the install directory (elevated PowerShell, **with the path you actually chose**):
 
   ```powershell
   Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\dsh-desktop", "$env:LOCALAPPDATA\ai.deepseek.dsh.desktop"
@@ -178,7 +176,6 @@ src-tauri/src/update.rs       The app's own auto-update
 - **No kernel-side backstop on macOS or Linux**: an ordinary exit takes the process group down, but a force-killed app (`kill -9`, a crash) leaves dsh running. There is no equivalent of the Windows Job Object — Linux's `PR_SET_PDEATHSIG` is tied to the lifetime of the *thread* that spawned the child, which is a boot thread that finishes long before the app does, so using it would kill the server mid-session. The next launch runs into the single-instance lock; `pkill -f 'dsh web'` clears it
 - **The macOS build is unsigned and unnotarised**: that needs a paid Apple developer account. The first launch takes a right-click → Open, or clearing the quarantine attribute — see [Installing](#installing)
 - **Only the AppImage updates itself on Linux**: Tauri's updater supports no other Linux format. A `.deb` install has to be replaced from Releases by hand — the deb entry in `latest.json` is something the bundler writes anyway, and nothing reads it
-- The first-launch warm-up (`warm.rs`) is aimed at Windows Defender; on macOS and Linux all that is left of it is the page cache
 - Packages must be built on the platform they target
 - A dsh update goes through `npm install -g`, which coexists with the outgoing tree while it lands, peaking around 650 MB on disk
 - PATH changes from installing Node only reach newly opened terminals — and on macOS and Linux, only ones that read `~/.profile` or `~/.zshrc`; the app itself is unaffected, since it reads the paths the script recorded in `bootstrap.json` rather than trusting the PATH it inherited
