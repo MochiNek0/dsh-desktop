@@ -1,8 +1,8 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.0"
+version = "0.1.1"
 description = "Desktop client for the DeepSeek Harness browser UI"
-edition = "2021"
+edition = "2026"
 rust-version = "1.82"
 
 [build-dependencies]
