@@ -82,13 +82,15 @@ $NodeVersion = '24.19.0'
 # something read off the package.
 $NodeMinimum = [version] '22.22.3'
 
-# nodejs.org first, then the mirrors that carry the same layout — same paths,
-# same SHASUMS256.txt — for the networks where the first one does not answer.
-# Each of these was checked against `v$NodeVersion`, sums included; Tsinghua's
-# `nodejs-release` was left out because it does not carry that version.
+# The mirrors that carry Node's own layout — same paths, same SHASUMS256.txt.
+# Which one is used is decided by measuring them (see `Sort-Mirrors`); this order
+# is only what a machine where nothing could be measured falls back to. Each was
+# checked against `v$NodeVersion`, sums included; Tsinghua's `nodejs-release` was
+# left out because it does not carry that version.
 #
-# Aliyun answers GET but refuses HEAD, which costs nothing here — `Fetch` only
-# ever issues a GET — but is worth knowing before probing it by hand.
+# Aliyun answers GET but refuses HEAD, which costs nothing here — `Fetch` and
+# `Measure-Mirror` only ever issue a GET — but is worth knowing before probing it
+# by hand.
 $NodeMirrors = @(
     'https://nodejs.org/dist'
     'https://registry.npmmirror.com/-/binary/node'
@@ -96,9 +98,12 @@ $NodeMirrors = @(
     'https://mirrors.huaweicloud.com/nodejs'
 )
 
-# `$null` first: whatever npm resolves on its own, which is the user's own
-# `.npmrc` if they have one — a private mirror or a corporate proxy is there for
-# a reason and is never overridden. The rest only come out once that has failed.
+# `$null` is whatever npm resolves on its own, which is the user's own `.npmrc`
+# if they have one. Which of these is used is decided by measuring them (see
+# `Sort-Registries`), with the one exception that keeps a `.npmrc` pointing
+# somewhere of the user's own choosing: a private mirror or a corporate proxy is
+# there for a reason, may be the only route out of the network at all, and so is
+# never raced against anything.
 #
 # There is no Aliyun entry because there is no Aliyun registry left to point at:
 # `mirrors.aliyun.com/npm/` 404s even for unscoped packages, and
@@ -110,6 +115,24 @@ $Registries = @(
     @{ Label = '腾讯云'; Url = 'https://mirrors.cloud.tencent.com/npm/' }
     @{ Label = '华为云'; Url = 'https://mirrors.huaweicloud.com/repository/npm/' }
 )
+
+# What `$null` above resolves to when npm is left to itself and has nothing
+# configured. Recognised rather than assumed: it is the difference between a
+# default worth racing and a choice worth respecting.
+$PublicRegistry = 'https://registry.npmjs.org/'
+
+# How long one probe request may take before that source is written off. Two
+# requests per source and four sources, so this is a quarter of the worst case a
+# measurement can cost — and a source that cannot serve 5 KB of metadata inside it
+# is not the one to start 185 MB with.
+$ProbeTimeout = 4000
+
+# How long to keep reading from a Node mirror before deciding how fast it is, and
+# how much to read at most. The bytes are thrown away, so the cap is what bounds
+# the cost: four mirrors on a fast connection spend a second or two and 8 MB to
+# choose between 30 MB downloads that can differ by minutes.
+$ProbeSeconds = 1.2
+$ProbeBytes = 2MB
 
 # How many packages a dsh install pulls, for the progress bar to divide by. npm
 # reports nothing usable to drive one, so what fills the bar is how many
@@ -193,6 +216,217 @@ function Read-Marker {
 function Write-Marker([hashtable] $State) {
     New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
     ($State | ConvertTo-Json) | Out-File -LiteralPath $Marker -Encoding utf8
+}
+
+# ------------------------------------------------------------------ probing --
+
+# Which source to use, measured rather than assumed.
+#
+# Before this the lists above were tried in order and only ever moved on from
+# when one had *failed*, so a source that answered slowly was used to the end.
+# What follows measures each of them first and starts with the fastest — and
+# keeps the rest, in that order, as what to fall back to when the fastest one
+# turns out not to work after all.
+#
+# The two measurements are deliberately different, because the two downloads
+# are. Node is one 30 MB archive, where bandwidth is the whole story, so a
+# mirror is judged by how fast it actually serves that archive. dsh is 600
+# requests of which its own tarball is 32 KB, where the answer time of each
+# request is the story, so a registry is judged by how quickly it serves a fixed
+# small workload rather than by a bandwidth figure that would not predict much.
+
+# One probe request, read to the end and handed back. Nothing is written to disk
+# and nothing is cached: the timing is the result, and the body is only read
+# because a response nobody reads is not a response that has arrived.
+function Read-Probe([string] $Url) {
+    $request = [Net.HttpWebRequest]::Create($Url)
+    $request.Timeout = $ProbeTimeout
+    $request.ReadWriteTimeout = $ProbeTimeout
+    $request.UserAgent = 'dsh-desktop-installer'
+
+    $reply = $request.GetResponse()
+    try {
+        $reader = [IO.StreamReader]::new($reply.GetResponseStream())
+        try {
+            return $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+    } finally {
+        $reply.Dispose()
+    }
+}
+
+# How long a registry takes over a fixed workload: dsh's own metadata, and then
+# the tarball that metadata names. Both are small — the dsh package is 32 KB, the
+# 185 MB is its dependencies — so what comes out is how quickly this source
+# answers, which for an install that makes 600 requests of exactly this shape is
+# the number that matters. Around 40 KB per source, against the several MB a
+# bandwidth test would have cost.
+#
+# Seconds, or `$null` for a source that failed or timed out — either way not one
+# to start with.
+function Measure-Source([string] $Url) {
+    $base = $Url.TrimEnd('/') + '/'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $meta = Read-Probe "$base$Package/latest"
+        # `dist.tarball` as this source itself published it: every mirror rewrites
+        # that field onto its own host or CDN, which is where npm would then go,
+        # so following it measures the path the install actually takes.
+        #
+        # Resolved against the registry, because Huawei's is a path rather than a
+        # URL — `/@deepseek-ai/dsh/-/dsh-0.1.0-rc.7.tgz` — which npm reads
+        # relative to the registry it asked, and so does this.
+        #
+        # The leading slash comes off first, or the registry's own path would come
+        # off with it: rooted at the host, Huawei's answers 200 with an 11 KB page
+        # that is not the tarball, and a probe measuring that is not measuring the
+        # same workload as the others. An absolute URL is unaffected and stays
+        # exactly as it was published.
+        $tarball = (ConvertFrom-Json $meta).dist.tarball
+        if (-not $tarball) { return $null }
+        Read-Probe ([Uri]::new([Uri] $base, $tarball.TrimStart('/'))).AbsoluteUri | Out-Null
+    } catch {
+        return $null
+    }
+    return $clock.Elapsed.TotalSeconds
+}
+
+# How fast a Node mirror serves the very archive that is about to be downloaded,
+# in bytes per second. The read is abandoned after `$ProbeSeconds` or
+# `$ProbeBytes`, whichever comes first, so a fast mirror is measured on a couple
+# of megabytes and a slow one costs a second.
+#
+# Connecting counts against the mirror — the clock starts before the request —
+# but the read window does not, so a mirror that answers slowly and then serves
+# quickly is marked down rather than written off.
+#
+# `$null` for a mirror that never answered.
+function Measure-Mirror([string] $Url) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $request = [Net.HttpWebRequest]::Create($Url)
+        $request.Timeout = $ProbeTimeout
+        $request.ReadWriteTimeout = $ProbeTimeout
+        $request.UserAgent = 'dsh-desktop-installer'
+        $reply = $request.GetResponse()
+    } catch {
+        return $null
+    }
+
+    $answered = $clock.Elapsed.TotalSeconds
+    try {
+        $stream = $reply.GetResponseStream()
+        $buffer = [byte[]]::new(128 * 1024)
+        $done = 0L
+
+        while ($done -lt $ProbeBytes -and
+            ($clock.Elapsed.TotalSeconds - $answered) -lt $ProbeSeconds) {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+            $done += $read
+        }
+
+        if ($done -le 0) { return $null }
+        return $done / $clock.Elapsed.TotalSeconds
+    } catch {
+        return $null
+    } finally {
+        # Abandoned mid-body, so the connection is dropped rather than left to
+        # read out the remaining 30 MB of an archive nobody wanted.
+        $request.Abort()
+        $reply.Dispose()
+    }
+}
+
+# A speed a human reads without counting decimal places: MB/s once there is more
+# than one of them, and KB/s below that, where `0.0 MB/s` would be the whole
+# answer for every mirror worth ranking against each other.
+function Format-Speed([double] $BytesPerSecond) {
+    if ($BytesPerSecond -ge 1MB) {
+        return ('{0:N1} MB/s' -f ($BytesPerSecond / 1MB))
+    }
+    return ('{0:N0} KB/s' -f ($BytesPerSecond / 1KB))
+}
+
+# The Node mirrors in the order to try them, fastest first, with the ones that
+# never answered at the back — still there, because a mirror that refuses a probe
+# can be the one that ends up serving the file.
+function Sort-Mirrors([string] $Name) {
+    Step '正在测试 Node 镜像的速度…' 0
+
+    # `Order` is what keeps mirrors that measured the same — the ones that
+    # measured nothing at all, usually — in the order they are declared above.
+    # Sort-Object is not a stable sort before PowerShell 6.2, and without a second
+    # key it shuffles them.
+    $order = 0
+    $timed = foreach ($mirror in $NodeMirrors) {
+        # Not `$host`, which is PowerShell's own read-only variable for the shell
+        # it is running in.
+        $where = [Uri]::new($mirror).Host
+        $speed = Measure-Mirror "$mirror/v$NodeVersion/$Name.zip"
+        if ($null -eq $speed) {
+            Say "$where：太慢或连不上"
+        } else {
+            Say "$where：约 $(Format-Speed $speed)"
+        }
+        $entry = [pscustomobject]@{ Mirror = $mirror; Speed = $speed; Order = $order }
+        $order++
+        $entry
+    }
+
+    $sorted = @($timed | Sort-Object `
+            -Property @{ Expression = { if ($null -eq $_.Speed) { -1 } else { $_.Speed } }; Descending = $true },
+        @{ Expression = 'Order'; Descending = $false })
+    if ($null -ne $sorted[0].Speed) {
+        Say "最快的是 $([Uri]::new($sorted[0].Mirror).Host)，就用它。"
+    }
+    return @($sorted | ForEach-Object { $_.Mirror })
+}
+
+# The registries in the order to try them, fastest first.
+#
+# Not measured at all when npm is configured to a registry of the user's own:
+# that one is used first whatever it would have scored, and racing three mirrors
+# it is going to beat anyway would only add its own timeouts to an install on a
+# network where they are all blocked.
+function Sort-Registries([string] $Exe, [string] $Cli, [double] $At) {
+    $configured = Get-Registry $Exe $Cli
+    if ($configured -and $configured.TrimEnd('/') -ne $PublicRegistry.TrimEnd('/')) {
+        Say "检测到你自己配置的 npm 源（$configured），优先用它，不参与测速。"
+        return $Registries
+    }
+
+    Step '正在测试各个源的速度…' $At
+
+    $order = 0
+    $timed = foreach ($source in $Registries) {
+        # The default source is npm's own, and npm's own is the public registry —
+        # the branch above is what handles it being anything else.
+        $url = if ($source.Url) { $source.Url } else { $PublicRegistry }
+        $seconds = Measure-Source $url
+        if ($null -eq $seconds) {
+            Say "$($source.Label)：太慢或连不上"
+        } else {
+            Say ('{0}：{1:N1} 秒' -f $source.Label, $seconds)
+        }
+        $entry = [pscustomobject]@{ Source = $source; Seconds = $seconds; Order = $order }
+        $order++
+        $entry
+    }
+
+    # A source that could not be measured goes to the back rather than out: the
+    # measurement decides what to start with, not what is allowed to work. `Order`
+    # is the tie-break that keeps those in the order declared above; see
+    # `Sort-Mirrors` for why it has to be spelled out.
+    $sorted = @($timed | Sort-Object `
+            -Property @{ Expression = { if ($null -eq $_.Seconds) { [double]::MaxValue } else { $_.Seconds } } },
+        Order)
+    if ($null -ne $sorted[0].Seconds) {
+        Say "最快的是 $($sorted[0].Source.Label)，就用它。"
+    }
+    return @($sorted | ForEach-Object { $_.Source })
 }
 
 # --------------------------------------------------------------------- node --
@@ -283,7 +517,7 @@ function Fetch([string] $Url, [string] $Path, [double] $From, [double] $To) {
     }
 }
 
-# Put a Node under `$NodeDir`, from the first mirror that answers with an
+# Put a Node under `$NodeDir`, from the fastest mirror that answers with an
 # archive whose hash matches what that same mirror published.
 function Install-Node {
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
@@ -293,7 +527,7 @@ function Install-Node {
 
     try {
         $installed = $false
-        foreach ($mirror in $NodeMirrors) {
+        foreach ($mirror in (Sort-Mirrors $name)) {
             $base = "$mirror/v$NodeVersion"
             $zip = Join-Path $scratch "$name.zip"
 
@@ -375,6 +609,19 @@ function Get-Prefix([string] $Exe, [string] $Cli) {
     return (Split-Path -Parent $Exe)
 }
 
+# What npm resolves `registry` to, which is the user's own `.npmrc` if they have
+# one. Empty when npm cannot be asked, which `Sort-Registries` reads as nothing
+# configured.
+function Get-Registry([string] $Exe, [string] $Cli) {
+    try {
+        $printed = & $Exe $Cli config get registry
+        if ($LASTEXITCODE -eq 0 -and $printed) { return ([string] $printed).Trim() }
+    } catch {
+        # Same answer as npm printing nothing: race the defaults.
+    }
+    return ''
+}
+
 # One `npm install -g`, from one registry, into `$Prefix` when one is given and
 # npm's own default when it is not. npm's http log is read as it goes: every
 # tarball that comes back moves the bar, which is the only progress signal npm
@@ -402,9 +649,9 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
         })
 }
 
-# Install `Spec` through the first registry that works.
+# Install `Spec` through the fastest registry that works.
 function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [string] $Prefix, [double] $From, [double] $To) {
-    foreach ($source in $Registries) {
+    foreach ($source in (Sort-Registries $Exe $Cli $From)) {
         if (Invoke-NpmInstall $Exe $Cli $Spec $Prefix $source $From $To) {
             Say "dsh 安装完成（$($source.Label)）。"
             return $true

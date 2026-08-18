@@ -14,8 +14,9 @@
 //! first launch is the only thing that runs it. This module decides *whether* to
 //! run one and reports what it prints onto the loading page. Keeping one
 //! implementation per platform matters more than keeping it in Rust: the script
-//! has to detect Node, fetch and verify a Node archive, and walk a list of
-//! registry mirrors, and a second copy of all that would drift.
+//! has to detect Node, fetch and verify a Node archive, and measure a list of
+//! registry mirrors before walking it, and a second copy of all that would
+//! drift.
 //!
 //! Finding dsh cannot go through the process's own PATH. The installer adds
 //! Node's directory to the user's PATH and then launches this app, which

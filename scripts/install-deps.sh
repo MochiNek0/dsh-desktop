@@ -95,20 +95,48 @@ NODE_VERSION='24.19.0'
 # all. Kept a little above that floor rather than pinned to it exactly.
 NODE_MINIMUM='22.19.0'
 
-# nodejs.org first, then the mirrors that carry the same layout — same paths,
-# same SHASUMS256.txt — for the networks where the first one does not answer.
+# The mirrors that carry Node's own layout — same paths, same SHASUMS256.txt.
+# Which one is used is decided by measuring them (see `rank_mirrors`); this order
+# is only what a machine where nothing could be measured falls back to.
 NODE_MIRRORS='https://nodejs.org/dist
 https://registry.npmmirror.com/-/binary/node
 https://mirrors.aliyun.com/nodejs-release
 https://mirrors.huaweicloud.com/nodejs'
 
-# An empty URL first: whatever npm resolves on its own, which is the user's own
-# `.npmrc` if they have one — a private mirror or a corporate proxy is there for
-# a reason and is never overridden. The rest only come out once that has failed.
+# An empty URL is whatever npm resolves on its own, which is the user's own
+# `.npmrc` if they have one. Which of these is used is decided by measuring them
+# (see `rank_registries`), with the one exception that keeps a `.npmrc` pointing
+# somewhere of the user's own choosing: a private mirror or a corporate proxy is
+# there for a reason, may be the only route out of the network at all, and so is
+# never raced against anything.
 REGISTRIES='默认源|
 npmmirror|https://registry.npmmirror.com/
 腾讯云|https://mirrors.cloud.tencent.com/npm/
 华为云|https://mirrors.huaweicloud.com/repository/npm/'
+
+# What an empty URL above resolves to when npm is left to itself and has nothing
+# configured. Recognised rather than assumed: it is the difference between a
+# default worth racing and a choice worth respecting.
+PUBLIC_REGISTRY='https://registry.npmjs.org'
+
+# How long one probe request to a registry may take before that source is written
+# off. Two requests per registry and four registries, so this is a quarter of the
+# worst case a measurement can cost — and a source that cannot serve 5 KB of
+# metadata inside it is not the one to start 185 MB with.
+#
+# The seconds and bytes below are the Node mirrors', which are measured by how
+# fast they serve rather than by how quickly they answer: the whole budget for one
+# measurement, and the most it may read. The seconds cover connecting as well as
+# reading, because curl's `--max-time` does; a mirror that spends most of them
+# answering is marked down by that alone, which is the right answer for a single
+# 30 MB download.
+#
+# The bytes are thrown away, so the cap is what bounds the cost: four mirrors on a
+# fast connection spend a few seconds and 8 MB to choose between 30 MB downloads
+# that can differ by minutes.
+PROBE_TIMEOUT=4
+PROBE_SECONDS=3
+PROBE_BYTES=2097152
 
 # How many packages a dsh install pulls, for the progress bar to divide by. npm
 # reports nothing usable to drive one, so what fills the bar is how many
@@ -272,6 +300,185 @@ version_ge() {
     }'
 }
 
+# ------------------------------------------------------------------ probing --
+
+# Which source to use, measured rather than assumed.
+#
+# Before this the lists above were tried in order and only ever moved on from
+# when one had *failed*, so a source that answered slowly was used to the end.
+# What follows measures each of them first and starts with the fastest — and
+# keeps the rest, in that order, as what to fall back to when the fastest one
+# turns out not to work after all.
+#
+# The two measurements are deliberately different, because the two downloads
+# are. Node is one 30 MB archive, where bandwidth is the whole story, so a mirror
+# is judged by how fast it actually serves that archive. dsh is 600 requests of
+# which its own tarball is 32 KB, where the answer time of each request is the
+# story, so a registry is judged by how quickly it serves a fixed small workload
+# rather than by a bandwidth figure that would not predict much.
+#
+# All of it needs curl: wget reports neither a transfer time nor a byte count in
+# any form worth parsing, and `date` on a BSD userland has no sub-second field to
+# time it by hand with. Without curl the declared order stands, which is what this
+# script did all along.
+#
+# Both ranking functions write their answer to `$RANKED` rather than printing it,
+# because they also log while they work and the two must not come back down one
+# pipe together.
+RANKED=''
+
+# Milliseconds a registry takes over a fixed workload: dsh's own metadata, and
+# the tarball that metadata names. Both are small — the dsh package is 32 KB, the
+# 185 MB is its dependencies — so what comes out is how quickly this source
+# answers, which for an install that makes 600 requests of exactly this shape is
+# the number that matters. Around 40 KB per source, against the several MB a
+# bandwidth test would have cost. Prints nothing when the source failed.
+measure_source() {
+    base=${1%/}
+
+    body=$(curl -fsSL --max-time "$PROBE_TIMEOUT" -w '\n%{time_total}' \
+        "$base/$PACKAGE/latest" 2>/dev/null) || return 1
+    meta_time=$(printf '%s\n' "$body" | tail -n 1)
+
+    # `dist.tarball` as this source itself published it: every mirror rewrites
+    # that field onto its own host or CDN, which is where npm would then go, so
+    # following it measures the path the install actually takes.
+    tarball=$(printf '%s\n' "$body" |
+        sed -n 's|.*"tarball"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' | head -n 1)
+    [ -n "$tarball" ] || return 1
+
+    # Huawei publishes a path rather than a URL — `/@deepseek-ai/dsh/-/dsh-…tgz`
+    # — which npm reads relative to the registry it asked. Relative to the
+    # registry and not to its host: rooted at the host, Huawei's answers 200 with
+    # an 11 KB page that is not the tarball, and a probe measuring that is not
+    # measuring the same workload as the others.
+    case "$tarball" in
+        http*) ;;
+        *) tarball="$base/${tarball#/}" ;;
+    esac
+
+    tarball_time=$(curl -fsSL --max-time "$PROBE_TIMEOUT" -o /dev/null \
+        -w '%{time_total}' "$tarball" 2>/dev/null) || return 1
+
+    awk -v a="$meta_time" -v b="$tarball_time" 'BEGIN { printf "%d", (a + b) * 1000 }'
+}
+
+# Bytes per second a Node mirror serves the very archive that is about to be
+# downloaded. The read is abandoned after `$PROBE_SECONDS` or `$PROBE_BYTES`,
+# whichever comes first — the byte cap is a range request, and a mirror that
+# ignores it is stopped by the clock instead. Connecting counts against the
+# mirror, since `%{time_total}` covers all of it. Prints nothing when nothing
+# arrived.
+measure_mirror() {
+    # `--max-time` makes curl exit 28 rather than 0, so the exit code says
+    # nothing here and the byte count is what decides.
+    measured=$(curl -sL --max-time "$PROBE_SECONDS" -r "0-$((PROBE_BYTES - 1))" \
+        -o /dev/null -w '%{size_download} %{time_total}' "$1" 2>/dev/null)
+
+    printf '%s\n' "$measured" | awk '{
+        if ($1 + 0 <= 0 || $2 + 0 <= 0) exit 1
+        printf "%d", $1 / $2
+    }'
+}
+
+# The Node mirrors in the order to try them, fastest first, with the ones that
+# never answered at the back — still there, because a mirror that refuses a probe
+# can be the one that ends up serving the file.
+rank_mirrors() {
+    RANKED=$NODE_MIRRORS
+    have curl || return 0
+
+    step '正在测试 Node 镜像的速度…' 0
+
+    scored=''
+    while IFS= read -r mirror; do
+        host=$(printf '%s' "$mirror" | sed -e 's|^[a-z]*://||' -e 's|/.*$||')
+        speed=$(measure_mirror "$mirror/v$NODE_VERSION/$1")
+        if [ -z "$speed" ]; then
+            say "$host：太慢或连不上"
+            speed=0
+        else
+            # MB/s once there is more than one of them, KB/s below that, where
+            # `0.0 MB/s` would be the whole answer for every mirror worth ranking
+            # against each other.
+            say "$host：约 $(awk -v s="$speed" 'BEGIN {
+                if (s >= 1048576) printf "%.1f MB/s", s / 1048576
+                else printf "%d KB/s", s / 1024
+            }')"
+        fi
+        scored="$scored$speed|$mirror
+"
+    done <<MIRRORS
+$NODE_MIRRORS
+MIRRORS
+
+    # Fastest first, and then the score dropped back off. A mirror that answered
+    # with nothing scored zero and so sorts to the back, which is as far as it
+    # goes: it is still a mirror to fall back to.
+    ordered=$(printf '%s' "$scored" | sort -s -t'|' -k1,1rn)
+    RANKED=$(printf '%s\n' "$ordered" | cut -d'|' -f2-)
+
+    best=$(printf '%s\n' "$ordered" | head -n 1)
+    if [ "${best%%|*}" != 0 ]; then
+        say "最快的是 $(printf '%s' "${best#*|}" | sed -e 's|^[a-z]*://||' -e 's|/.*$||')，就用它。"
+    fi
+}
+
+# The registries in the order to try them, fastest first.
+#
+# Not measured at all when npm is configured to a registry of the user's own:
+# that one is used first whatever it would have scored, and racing three mirrors
+# it is going to beat anyway would only add its own timeouts to an install on a
+# network where they are all blocked.
+rank_registries() {
+    RANKED=$REGISTRIES
+
+    # `$1` and `$2` rather than names of its own: the caller's `node` and `cli` are
+    # what would be assigned, and this runs in the middle of its loop.
+    configured=$("$1" "$2" config get registry 2>/dev/null | tr -d '\r' | tail -n 1)
+    case "${configured%/}" in
+        ''|"$PUBLIC_REGISTRY") ;;
+        *)
+            say "检测到你自己配置的 npm 源（$configured），优先用它，不参与测速。"
+            return 0
+            ;;
+    esac
+
+    have curl || return 0
+
+    step '正在测试各个源的速度…' "$3"
+
+    scored=''
+    while IFS= read -r source; do
+        label=${source%%|*}
+        url=${source#*|}
+        # The default source is npm's own, and npm's own is the public registry —
+        # the case above is what handles it being anything else.
+        ms=$(measure_source "${url:-$PUBLIC_REGISTRY}")
+        if [ -z "$ms" ]; then
+            say "$label：太慢或连不上"
+            # Sorted last rather than dropped: the measurement decides what to
+            # start with, not what is allowed to work.
+            ms=999999
+        else
+            say "$label：$(awk -v ms="$ms" 'BEGIN { printf "%.1f", ms / 1000 }') 秒"
+        fi
+        scored="$scored$ms|$source
+"
+    done <<SOURCES
+$REGISTRIES
+SOURCES
+
+    ordered=$(printf '%s' "$scored" | sort -s -t'|' -k1,1n)
+    RANKED=$(printf '%s\n' "$ordered" | cut -d'|' -f2-)
+
+    best=$(printf '%s\n' "$ordered" | head -n 1)
+    if [ "${best%%|*}" != 999999 ]; then
+        # `999999|默认源|` — the label is the field between the score and the URL.
+        say "最快的是 $(printf '%s' "$best" | cut -d'|' -f2)，就用它。"
+    fi
+}
+
 # ---------------------------------------------------------------------- node --
 
 node_is_new_enough() {
@@ -396,6 +603,11 @@ install_node() {
     name="node-v$NODE_VERSION-$os-$arch"
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/dsh-node-XXXXXX") || fail '无法创建临时目录。'
 
+    # Fastest first; `$RANKED` is the declared order on a machine where nothing
+    # could be measured.
+    rank_mirrors "$name.tar.gz"
+    mirrors=$RANKED
+
     # Fed by a here-document rather than a pipe, so the loop is not a subshell
     # and `installed` survives it.
     installed=0
@@ -446,7 +658,7 @@ install_node() {
         installed=1
         break
     done <<MIRRORS
-$NODE_MIRRORS
+$mirrors
 MIRRORS
 
     rm -rf "$scratch"
@@ -560,13 +772,16 @@ npm_install() {
     [ "${code:-1}" = 0 ]
 }
 
-# Install through the first registry that works.
+# Install through the fastest registry that works.
 install_package() {
     node=$1
     cli=$2
     prefix=$3
     from=$4
     to=$5
+
+    rank_registries "$node" "$cli" "$from"
+    sources=$RANKED
 
     while IFS= read -r source; do
         label=${source%%|*}
@@ -579,7 +794,7 @@ install_package() {
         fi
         say "从 $label 安装失败，换下一个源重试。"
     done <<SOURCES
-$REGISTRIES
+$sources
 SOURCES
 
     return 1
