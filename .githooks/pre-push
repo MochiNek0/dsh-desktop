@@ -1,0 +1,32 @@
+#!/bin/sh
+# Runs the same checks as the `lint` job in `.github/workflows/release.yml`,
+# so a push that would fail CI fails here first instead — the failure that
+# went out with the v0.1.2 tag was exactly this, caught only after the tag
+# was already pushed.
+#
+# Not wired in by default: git does not enable a hooks directory on its own.
+# Once per clone:
+#   git config core.hooksPath .githooks
+
+set -u
+status=0
+
+if [ -f scripts/install-deps.sh ]; then
+    if command -v dash >/dev/null 2>&1; then
+        dash -n scripts/install-deps.sh || status=1
+    else
+        sh -n scripts/install-deps.sh || status=1
+    fi
+
+    if command -v shellcheck >/dev/null 2>&1; then
+        shellcheck --shell=sh scripts/install-deps.sh || status=1
+    else
+        echo "pre-push: 没有 shellcheck，跳过这一项（CI 上还是会查）。" >&2
+    fi
+fi
+
+if [ "$status" != 0 ]; then
+    echo "pre-push: 校验没通过，推送已被阻止。" >&2
+fi
+
+exit "$status"
