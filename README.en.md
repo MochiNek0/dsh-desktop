@@ -1,78 +1,111 @@
+<div align="center">
+
 # dsh desktop
 
-> A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`).
->
-> [中文](README.md) · English
->
-> **Unofficial**: A third-party desktop wrapper for DeepSeek Harness, not affiliated with DeepSeek. See [Disclaimer](#disclaimer).
+A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 
-<br>
+**English** · [简体中文](README.md)
 
-![dsh desktop](docs/thumbnail-en.png)
+<br/>
 
-<br>
+[![Release](https://img.shields.io/github/v/release/MochiNek0/dsh-desktop?color=blue)](https://github.com/MochiNek0/dsh-desktop/releases)
+[![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Launches a local `dsh web` server and embeds the interface into a native window. No need to manage terminal sessions or ports. Sessions, credentials, and settings are fully shared with the CLI (`$DSH_HOME`, default `~/.dsh`).
+<br/>
+<br/>
 
-## ✨ Features
+<img src="docs/thumbnail-en.png" alt="dsh desktop preview" width="850" />
 
-- **Out of the Box**: Automatically detects and sets up Node.js and `dsh` without requiring administrator privileges.
+</div>
+
+<br/>
+
+> **Disclaimer**: This is a third-party desktop client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It is not affiliated with, sponsored, or endorsed by DeepSeek.
+
+---
+
+## Overview
+
+**dsh desktop** automatically starts the local `dsh web` service in the background and embeds it into a native window upon launch. There is no need to manually manage terminal sessions or port allocations. Sessions, credentials, and configurations are shared seamlessly with the CLI (`$DSH_HOME`, default `~/.dsh`).
+
+## Features
+
+- **Out of the Box**: Automatically detects and sets up Node.js and `dsh` runtime without requiring administrator privileges.
 - **Port Conflict-Free**: Starts on an auto-assigned loopback port, coexisting seamlessly with manual `dsh web` instances.
-- **Native Experience**: Modern frameless UI, theme synchronization, system tray, and auto-start support.
-- **Shared Environment**: Terminal uses the same global `dsh`, with automatic update checks and one-click upgrades.
+- **Native Experience**: Modern frameless UI, theme synchronization, system tray integration, and auto-start support.
+- **Shared Environment**: Shares the same global `dsh` CLI environment, with startup checks and one-click upgrades.
 - **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit.
 
-## 📦 Installation
+## Installation
 
-Download the installer for your platform from [Releases](https://github.com/MochiNek0/dsh-desktop/releases):
-- **Windows**: `.exe` installer (requires WebView2, auto-downloaded if missing)
-- **macOS**: `.dmg` (Universal binary for Apple Silicon & Intel)
-- **Linux**: `.AppImage` / `.deb`
+Download the latest release package for your operating system from the [Releases page](https://github.com/MochiNek0/dsh-desktop/releases):
 
-> **macOS Note**: If blocked by Gatekeeper on first launch, right-click and select "Open", or run:
+| Operating System | Package Format | Details |
+| :--- | :--- | :--- |
+| **Windows** | `.exe` installer | Requires WebView2 (automatically prompted/downloaded if missing) |
+| **macOS** | `.dmg` image | Universal binary supporting both Apple Silicon and Intel |
+| **Linux** | `.AppImage` / `.deb` | `.AppImage` is recommended for built-in self-updater support |
+
+> **macOS First-Launch Note**
+>
+> If blocked by macOS Gatekeeper on first launch, right-click the app in Finder and select "Open", or run the following command in terminal:
 > ```sh
 > xattr -dr com.apple.quarantine /Applications/dsh-desktop.app
 > ```
 
-## 🛠️ Development
+## Configuration & Environment Variables
 
-### Prerequisites
-- Rust stable
-- Node.js 18+
-
-### Commands
-```sh
-npm install
-npm run dev    # Start in dev mode with DevTools
-npm run build  # Build production bundles (output in src-tauri/target/release/bundle/)
-```
-
-## ⚙️ Environment Variables
+The application behavior can be customized via environment variables:
 
 | Variable | Description | Default |
-| --- | --- | --- |
-| `DSH_BIN` | Full path to the `dsh` executable (highest priority) | - |
-| `DSH_HOME` | `dsh` data and configuration directory | `~/.dsh` |
+| :--- | :--- | :--- |
+| `DSH_BIN` | Absolute path to the `dsh` executable (highest priority) | Auto-detected from `PATH` |
+| `DSH_HOME` | Directory for storing `dsh` data, credentials, and configs | `~/.dsh` |
 
-## 📂 Project Structure
+## Development & Build
 
-```text
-dist/index.html               Loading and error pages
-scripts/                      Dependency setup and runtime bundling scripts
-src-tauri/tauri.*.conf.json   Platform-specific Tauri configurations
-src-tauri/src/                Rust core (window management, process supervisor, tray, updater)
+### Prerequisites
+
+- **Rust**: Stable toolchain (`stable`)
+- **Node.js**: 18.0 or higher
+
+### Commands
+
+```sh
+# Install dependencies
+npm install
+
+# Start in development mode (with DevTools)
+npm run dev
+
+# Build production installer (output to src-tauri/target/release/bundle/)
+npm run build
 ```
 
-## ⚠️ Notes
+## Project Structure
 
-- **Initial Setup**: The app downloads `dsh` and required runtimes during first install/launch; internet connection is required.
-- **Auto Update**: Built-in self-updater (Linux supports AppImage only).
+```text
+dsh-desktop/
+├── dist/index.html               # Frontend loading and error feedback page
+├── scripts/                      # Dependency setup and runtime packaging scripts
+├── src-tauri/
+│   ├── tauri.*.conf.json         # Platform-specific Tauri configurations
+│   └── src/                      # Rust core (window management, process supervisor, tray, updater)
+├── package.json
+└── Cargo.toml
+```
 
-## 📄 Disclaimer
+## Notes
 
-This is a third-party desktop client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), maintained by individual contributors. It is not affiliated with, sponsored, or endorsed by DeepSeek.
-For issues or feedback, please file an issue in this repository.
+- **Network on First Launch**: The app requires an active internet connection on first launch if local components need to be downloaded.
+- **Auto Update**: Integrated auto-updater support (Linux supports AppImage format only).
 
-## 📜 License
+## Disclaimer
 
-[MIT](LICENSE) © 2026 MochiNek0
+This is a third-party open-source client intended for convenience and personal use. If you encounter any problems or have suggestions, please feel free to open an [Issue](https://github.com/MochiNek0/dsh-desktop/issues) or submit a Pull Request.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
