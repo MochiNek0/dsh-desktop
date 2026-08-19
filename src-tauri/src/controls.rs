@@ -58,7 +58,7 @@ use tauri_plugin_autostart::ManagerExt;
 /// The scheme the injected buttons signal on. Not registered with anything — it
 /// only has to be a scheme no real navigation would use, since the navigation
 /// is cancelled the moment it is recognised.
-const SCHEME: &str = "dsh-window";
+pub const SCHEME: &str = "dsh-window";
 
 /// The dedicated titlebar height (in px).
 const TITLEBAR_HEIGHT: u32 = 36;
@@ -70,7 +70,7 @@ const ROW_PAD: u32 = 14;
 
 /// The menu's typeface. Named rather than left to the webview, whose default for
 /// a bare `<button>` is a serif face at a size of its own choosing.
-const FONT: &str =
+pub(crate) const FONT: &str =
     "-apple-system,BlinkMacSystemFont,\"Segoe UI\",\"Microsoft YaHei\",system-ui,sans-serif";
 
 /// What the page can ask the app to do. A fixed list, and every one of them is
@@ -84,6 +84,24 @@ pub enum Action {
     CheckApp,
     Autostart,
     Quit,
+    /// Open the plugin panel on the loading page.
+    Plugins,
+    /// Install what was ticked in it, and whatever was typed into its box.
+    PluginsInstall(Vec<String>, Option<String>),
+    /// Take the ticked ones back out again.
+    PluginsRemove(Vec<String>),
+    /// Leave the panel: back to dsh, starting it if the panel was shown before
+    /// the boot ever got that far.
+    PluginsDone,
+    /// Show the profile directory in the file manager — the one step the panel
+    /// does not take on the user's behalf. See [`crate::plugins`].
+    PluginsDirectory,
+    /// A shell with dsh on its PATH.
+    Terminal,
+    /// Start `dsh web` again after it exited on its own.
+    RestartDsh,
+    /// A notification the page raised; see [`crate::notify`].
+    Notify(crate::notify::Notice),
 }
 
 /// Recognise a navigation as a button press. `None` for every ordinary URL,
@@ -103,8 +121,22 @@ pub fn action(url: &Url) -> Option<Action> {
         "check-app" => Some(Action::CheckApp),
         "autostart" => Some(Action::Autostart),
         "quit" => Some(Action::Quit),
+        "plugins" => Some(Action::Plugins),
+        "plugins-install" => {
+            let (ids, spec) = crate::plugins::requested(url);
+            Some(Action::PluginsInstall(ids, spec))
+        }
+        "plugins-remove" => Some(Action::PluginsRemove(crate::plugins::wanted_gone(url))),
+        "plugins-done" => Some(Action::PluginsDone),
+        "plugins-directory" => Some(Action::PluginsDirectory),
+        "terminal" => Some(Action::Terminal),
+        "restart-dsh" => Some(Action::RestartDsh),
+        // The only one carrying a payload the app reads rather than acts on,
+        // and the only one that can decline: an empty notification is dropped
+        // here rather than raised as a blank toast.
+        "notify" => crate::notify::received(url).map(Action::Notify),
         other => {
-            eprintln!("dsh-desktop: 忽略未知的窗口操作 {other}");
+            eprintln!("dsh-desktop: ignoring unknown window action {other}");
             None
         }
     }
@@ -122,6 +154,27 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::CheckApp => return crate::update::check_now(app),
         Action::Autostart => return crate::toggle_autostart(app),
         Action::Quit => return crate::quit(app),
+        Action::Plugins => return crate::open_plugins(app),
+        Action::PluginsInstall(ids, spec) => return crate::install_plugins(app, ids, spec),
+        Action::PluginsRemove(names) => return crate::remove_plugins(app, names),
+        Action::PluginsDone => return crate::leave_plugins(app),
+        Action::PluginsDirectory => return crate::plugins::open_directory(app),
+        Action::RestartDsh => return crate::restart_dsh(app),
+        Action::Notify(notice) => return crate::notify::show(app, notice),
+        Action::Terminal => {
+            if let Err(error) = crate::dsh::terminal(app) {
+                crate::dsh::note(
+                    app,
+                    t!("打不开终端", "Could not open a terminal"),
+                    &t!(
+                        "没能启动终端程序：{}",
+                        "The terminal could not be started: {}",
+                        error
+                    ),
+                );
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -213,6 +266,17 @@ pub fn script() -> String {
     let gap = DOT_GAP;
     let pad = ROW_PAD;
 
+    // JSON rather than the bare text: these are pasted into a JavaScript
+    // literal, and a label is one apostrophe away from being a syntax error
+    // that takes the whole titlebar with it.
+    let label = |text: &str| serde_json::to_string(text).expect("a string is always serializable");
+    let plugins = label(t!("插件…", "Plugins…"));
+    let terminal = label(t!("打开终端", "Open a terminal"));
+    let update_dsh = label(t!("更新 dsh…", "Update dsh…"));
+    let check_app = label(t!("检查应用更新…", "Check for app updates…"));
+    let autostart = label(t!("开机自启动", "Start at login"));
+    let quit = label(t!("退出 dsh", "Quit dsh"));
+
     format!(
         r#"(function () {{
   if (window.__dshWindowControls) return;
@@ -233,13 +297,18 @@ pub fn script() -> String {
   }};
 
   // The menu, top to bottom. `check` marks the one item that carries state.
+  // The labels come from Rust so there is one place the two languages live;
+  // see `i18n`.
   var ITEMS = [
-    {{ verb: 'update-dsh', label: '更新 dsh…' }},
-    {{ verb: 'check-app', label: '检查应用更新…' }},
+    {{ verb: 'plugins', label: {plugins} }},
+    {{ verb: 'terminal', label: {terminal} }},
     {{ separator: true }},
-    {{ verb: 'autostart', label: '开机自启动', check: true }},
+    {{ verb: 'update-dsh', label: {update_dsh} }},
+    {{ verb: 'check-app', label: {check_app} }},
     {{ separator: true }},
-    {{ verb: 'quit', label: '退出 dsh' }}
+    {{ verb: 'autostart', label: {autostart}, check: true }},
+    {{ separator: true }},
+    {{ verb: 'quit', label: {quit} }}
   ];
 
   var MENU_GLYPH = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" ' +

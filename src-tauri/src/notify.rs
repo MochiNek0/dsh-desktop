@@ -1,0 +1,251 @@
+//! System notifications, from the notifications the page already raises.
+//!
+//! dsh's plugins announce a finished turn through the browser's `Notification`
+//! API. In a webview that goes nowhere: there is no notification permission
+//! prompt to grant and nothing behind the API to draw a toast, so a plugin that
+//! calls it succeeds silently and the user — who closed the window into the
+//! tray precisely because the turn was going to take a while — is told nothing.
+//!
+//! So the API is replaced. An initialization script puts a shim in front of
+//! `window.Notification` on every document the window loads, and the shim hands
+//! each notification to Rust, which raises a real one. Any plugin using the
+//! standard API is covered without knowing this app exists; there is no bridge
+//! for it to speak and no bridge to break when dsh changes.
+//!
+//! ## Over the same channel as everything else
+//!
+//! The payload travels as a navigation to `dsh-window://notify?title=…`, the
+//! channel [`crate::controls`] already opened, rather than over Tauri's IPC —
+//! for the reason set out there: granting IPC to `http://127.0.0.1:*` grants it
+//! to every line of JavaScript dsh and its plugins load, and this is a toast,
+//! not a reason to open that door. The query is one-way and carries three
+//! strings, all of which end up as text in a notification.
+//!
+//! ## What a click does
+//!
+//! Nothing. Routing a click on a native toast back into the page is not
+//! portable — the three platforms disagree about whether an activation is even
+//! delivered to a running process — and a handler that fires on one of them is
+//! worse than none, because the plugin author cannot tell which. So the shim
+//! keeps the `Notification` object and its `onclick` intact and simply never
+//! fires it, which is exactly what happens today, and the notification itself is
+//! the part that was missing.
+
+use tauri::{AppHandle, Manager, Url};
+use tauri_plugin_notification::NotificationExt;
+
+/// How much of each string survives the trip. A notification is two lines on
+/// screen wherever it is drawn; the rest would only make the URL longer.
+const LIMIT: usize = 200;
+
+/// One notification, as it arrived from the page.
+pub struct Notice {
+    title: String,
+    body: String,
+}
+
+/// Read a `dsh-window://notify` navigation. `None` for a query with nothing in
+/// it to show — a notification with neither title nor body is a toast the user
+/// cannot act on and cannot dismiss the cause of.
+pub fn received(url: &Url) -> Option<Notice> {
+    let mut title = String::new();
+    let mut body = String::new();
+
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "title" => title = clamp(&value),
+            "body" => body = clamp(&value),
+            _ => {}
+        }
+    }
+
+    if title.is_empty() && body.is_empty() {
+        return None;
+    }
+    // A notification with a body and no title reads as an orphan on Windows,
+    // where the title is the bold first line; the app's own name is what would
+    // have been there had the page passed one.
+    if title.is_empty() {
+        title = "dsh".to_string();
+    }
+
+    Some(Notice { title, body })
+}
+
+/// Raise it, unless the user is already looking at the thing it is about.
+///
+/// A toast over the window it is announcing something in is noise — the user can
+/// see the turn finish. Suppressed here rather than in the shim because the page
+/// cannot tell: a webview's `document.hidden` follows the tab, and this window
+/// has no tabs, so it reads visible while the window is buried behind three
+/// others or sitting in the tray.
+pub fn show(app: &AppHandle, notice: Notice) {
+    if watching(app) {
+        return;
+    }
+
+    let mut builder = app.notification().builder().title(notice.title);
+    if !notice.body.is_empty() {
+        builder = builder.body(notice.body);
+    }
+
+    if let Err(error) = builder.show() {
+        // The whole feature is a courtesy; a platform that will not raise one is
+        // not a reason to interrupt anybody.
+        eprintln!("dsh-desktop: could not raise a notification: {error}");
+    }
+}
+
+/// Whether the window is on screen and has the user's attention. Anything less —
+/// minimised, hidden in the tray, behind another app — counts as away.
+fn watching(app: &AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        return false;
+    };
+
+    window.is_visible().unwrap_or(false)
+        && !window.is_minimized().unwrap_or(false)
+        && window.is_focused().unwrap_or(false)
+}
+
+/// One string, trimmed to something a toast can hold, on a character boundary.
+fn clamp(text: &str) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
+/// The shim, injected into every document the window loads.
+///
+/// It is deliberately a small class rather than a wrapper around the real
+/// `Notification`: there is no real one to wrap. What it has to get right is the
+/// shape callers check before they commit to using it — `permission`, which
+/// gates most call sites, and `requestPermission`, which the careful ones await
+/// first.
+pub fn script() -> String {
+    let scheme = crate::controls::SCHEME;
+    let limit = LIMIT;
+
+    format!(
+        r#"(function () {{
+  if (window.__dshNotify) return;
+  window.__dshNotify = true;
+
+  // The channel back to Rust; see controls.rs. The navigation is cancelled
+  // there, so raising a notification never moves the page.
+  function signal(title, body) {{
+    var query = 'title=' + encodeURIComponent(title) + '&body=' + encodeURIComponent(body);
+    window.location.href = '{scheme}://notify?' + query;
+  }}
+
+  function text(value) {{
+    if (value === undefined || value === null) return '';
+    return String(value).slice(0, {limit});
+  }}
+
+  // An EventTarget, so `addEventListener('close', …)` and the `onclose` the
+  // shim fires below both behave. No event is ever dispatched for a click —
+  // see the module docs in notify.rs.
+  function DshNotification(title, options) {{
+    if (!(this instanceof DshNotification)) {{
+      throw new TypeError("Failed to construct 'Notification': please use the 'new' operator");
+    }}
+    var settings = options || {{}};
+    var target = new EventTarget();
+
+    this.title = text(title);
+    this.body = text(settings.body);
+    this.tag = text(settings.tag);
+    this.data = settings.data;
+    this.icon = text(settings.icon);
+    this.onclick = null;
+    this.onclose = null;
+    this.onerror = null;
+    this.onshow = null;
+    this.addEventListener = target.addEventListener.bind(target);
+    this.removeEventListener = target.removeEventListener.bind(target);
+    this.dispatchEvent = target.dispatchEvent.bind(target);
+
+    signal(this.title, this.body);
+
+    // The OS owns it from here, so there is nothing left to close. `close()` is
+    // called by plugins that clear their own notifications on a timer, and one
+    // that throws would take the timer's callback down with it.
+    var self = this;
+    this.close = function () {{
+      var event = new Event('close');
+      if (typeof self.onclose === 'function') self.onclose(event);
+      target.dispatchEvent(event);
+    }};
+  }}
+
+  DshNotification.permission = 'granted';
+  DshNotification.maxActions = 0;
+  DshNotification.requestPermission = function (callback) {{
+    if (typeof callback === 'function') callback('granted');
+    return Promise.resolve('granted');
+  }};
+
+  try {{
+    Object.defineProperty(window, 'Notification', {{
+      value: DshNotification,
+      writable: true,
+      configurable: true
+    }});
+  }} catch (error) {{
+    window.Notification = DshNotification;
+  }}
+}})();"#
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp, received, LIMIT};
+    use tauri::Url;
+
+    fn parse(query: &str) -> Option<super::Notice> {
+        received(&Url::parse(&format!("dsh-window://notify?{query}")).expect("a valid test URL"))
+    }
+
+    #[test]
+    fn reads_both_halves() {
+        let notice = parse("title=Turn%20finished&body=all%20done").expect("a notice");
+
+        assert_eq!(notice.title, "Turn finished");
+        assert_eq!(notice.body, "all done");
+    }
+
+    /// Windows draws the title as the first line; a toast without one is an
+    /// orphaned sentence.
+    #[test]
+    fn stands_in_for_a_missing_title() {
+        let notice = parse("body=all%20done").expect("a notice");
+
+        assert_eq!(notice.title, "dsh");
+    }
+
+    #[test]
+    fn refuses_a_notification_with_nothing_in_it() {
+        assert!(parse("title=&body=%20").is_none());
+        assert!(parse("").is_none());
+    }
+
+    /// The cut lands on a character boundary, which for the scripts this app is
+    /// read in is every third byte.
+    #[test]
+    fn clamps_without_splitting_a_character() {
+        let long = "会话完成".repeat(LIMIT);
+        let clamped = clamp(&long);
+
+        assert_eq!(clamped.chars().count(), LIMIT + 1);
+        assert!(clamped.ends_with('…'));
+    }
+
+    #[test]
+    fn leaves_a_short_string_alone() {
+        assert_eq!(clamp("  done  "), "done");
+    }
+}

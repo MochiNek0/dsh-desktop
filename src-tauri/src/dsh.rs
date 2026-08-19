@@ -46,7 +46,9 @@ const PACKAGE: &str = "@deepseek-ai/dsh";
 /// What a dsh install costs over the wire. Quoted to the user before they agree
 /// to it, because it is a lot. Measured, not estimated: 587 packages, 185 MB of
 /// tarballs, four minutes on a 2 MB/s link.
-const DOWNLOAD_SIZE: &str = "约 185 MB";
+fn download_size() -> &'static str {
+    t!("约 185 MB", "about 185 MB")
+}
 
 /// How long the startup check waits for npm before the app stops waiting on it.
 ///
@@ -170,7 +172,7 @@ fn search_path(app: &AppHandle) -> Vec<PathBuf> {
 ///
 /// Resolved here rather than left to `Command::new`, which searches the PATH
 /// this process started with — the one that predates anything the installer did.
-fn look_up(app: &AppHandle, names: &[&str]) -> Option<PathBuf> {
+pub fn look_up(app: &AppHandle, names: &[&str]) -> Option<PathBuf> {
     search_path(app).into_iter().find_map(|dir| {
         names
             .iter()
@@ -348,11 +350,11 @@ pub fn gate(app: &AppHandle, report: &Report) -> bool {
         return true;
     }
 
-    report("正在检查 dsh 更新…", -1.0);
+    report(t!("正在检查 dsh 更新…", "Checking for a dsh update…"), -1.0);
 
     let Some(latest) = latest(app) else {
         eprintln!(
-            "dsh-desktop: 无法查询 dsh 最新版本，使用已安装的 {}",
+            "dsh-desktop: could not ask for the latest dsh; using the installed {}",
             installed.version
         );
         return true;
@@ -399,7 +401,7 @@ pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)>
     // `latest` is a `npm view`, which is the network and up to CHECK_TIMEOUT of
     // it. Everything after it is instant, so the line comes down here rather
     // than in front of each of the dialogs below.
-    saying("正在检查 dsh 更新…");
+    saying(t!("正在检查 dsh 更新…", "Checking for a dsh update…"));
     let found = current(app).map(|installed| {
         let latest = latest(app);
         (installed, latest)
@@ -409,8 +411,11 @@ pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)>
     let Some((installed, latest)) = found else {
         note(
             app,
-            "找不到 dsh",
-            "这台机器上还没有装好的 dsh。重启应用会再装一次。",
+            t!("找不到 dsh", "No dsh found"),
+            t!(
+                "这台机器上还没有装好的 dsh。重启应用会再装一次。",
+                "There is no working dsh on this machine. Restarting the app installs one."
+            ),
         );
         return None;
     };
@@ -418,8 +423,11 @@ pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)>
     let Some(latest) = latest else {
         note(
             app,
-            "检查 dsh 更新失败",
-            "无法查询 dsh 的最新版本，通常是网络或代理的问题。",
+            t!("检查 dsh 更新失败", "Could not check for a dsh update"),
+            t!(
+                "无法查询 dsh 的最新版本，通常是网络或代理的问题。",
+                "The latest dsh version could not be looked up, which is usually the network or a proxy."
+            ),
         );
         return None;
     };
@@ -428,8 +436,12 @@ pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)>
     if latest <= installed.version {
         note(
             app,
-            "dsh 已是最新版本",
-            &format!("当前的 dsh {} 已经是最新的。", installed.version),
+            t!("dsh 已是最新版本", "dsh is up to date"),
+            &t!(
+                "当前的 dsh {} 已经是最新的。",
+                "The installed dsh {} is the latest there is.",
+                installed.version
+            ),
         );
         return None;
     }
@@ -472,12 +484,17 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
         // nowhere left to report it.
         Ok(false) => false,
         Err(error) => {
-            eprintln!("dsh-desktop: 更新 dsh 失败：{error}");
+            eprintln!("dsh-desktop: updating dsh failed: {error}");
             report("", -1.0);
             note(
                 app,
-                "dsh 更新失败",
-                &format!("更新 dsh 时出错，将继续使用当前的 {installed}。\n\n{error}"),
+                t!("dsh 更新失败", "Updating dsh failed"),
+                &t!(
+                    "更新 dsh 时出错，将继续使用当前的 {}。\n\n{}",
+                    "Something went wrong updating dsh; the installed {} stays in use.\n\n{}",
+                    installed,
+                    error
+                ),
             );
             true
         }
@@ -487,7 +504,7 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
 /// Get a dsh onto a machine that has none, which may mean getting it a Node
 /// first. `false` if the app quit while it was running.
 fn bootstrap_now(app: &AppHandle, report: &Report) -> bool {
-    report("正在准备运行环境…", -1.0);
+    report(t!("正在准备运行环境…", "Preparing the runtime…"), -1.0);
 
     match run(app, &[OsStr::new("-Mode"), OsStr::new("install")], report) {
         Ok(true) => {
@@ -496,7 +513,7 @@ fn bootstrap_now(app: &AppHandle, report: &Report) -> bool {
         }
         Ok(false) => false,
         Err(error) => {
-            eprintln!("dsh-desktop: 安装 dsh 失败：{error}");
+            eprintln!("dsh-desktop: installing dsh failed: {error}");
             report("", -1.0);
             // Booting anyway: `server::start` is about to fail with a message
             // that says what to do, and one failure report is better than two.
@@ -536,11 +553,18 @@ fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<bool, String
     // invariant true rather than merely likely.
     let mut running = RUNNING.lock().unwrap();
     if running.is_some() {
-        return Err("已经有一个 dsh 安装或更新在进行中".to_string());
+        return Err(t!(
+            "已经有一个 dsh 安装或更新在进行中",
+            "a dsh install or update is already running"
+        )
+        .to_string());
     }
 
     let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let stdout = child.stdout.take().ok_or("无法读取脚本输出")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(t!("无法读取脚本输出", "the script's output cannot be read"))?;
 
     #[cfg(windows)]
     let job = crate::server::Job::hold(&child);
@@ -630,7 +654,7 @@ fn latest(app: &AppHandle) -> Option<Version> {
 /// The pair the bootstrap script recorded comes first: on a machine where it
 /// installed a Node of its own, that Node is the one whose global prefix holds
 /// the dsh being asked about.
-fn npm(app: &AppHandle) -> Option<Command> {
+pub fn npm(app: &AppHandle) -> Option<Command> {
     let state = bootstrap(app);
     let (node, cli) = match (state.node, state.npm) {
         (Some(node), Some(cli)) if node.is_file() && cli.is_file() => (node, cli),
@@ -707,14 +731,19 @@ fn printed(mut command: Command, timeout: Duration) -> Option<String> {
 /// launch does next, and there is nothing sensible to do until it arrives.
 fn ask(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
     app.dialog()
-        .message(&format!(
-            "dsh 有新版本 {latest}（当前 {installed}）。\n\n\
-             下载约需 {DOWNLOAD_SIZE}。更新期间应用会等待，完成后直接启动。"
+        .message(&t!(
+            "dsh 有新版本 {}（当前 {}）。\n\n\
+             下载约需 {}。更新期间应用会等待，完成后直接启动。",
+            "dsh {} is available (this machine has {}).\n\n\
+             The download is {}. The app waits for it and then starts.",
+            latest,
+            installed,
+            download_size()
         ))
-        .title("dsh 有可用更新")
+        .title(t!("dsh 有可用更新", "A dsh update is available"))
         .buttons(MessageDialogButtons::OkCancelCustom(
-            "更新".into(),
-            "跳过此版本".into(),
+            t!("更新", "Update").into(),
+            t!("跳过此版本", "Skip this version").into(),
         ))
         .blocking_show()
 }
@@ -725,15 +754,21 @@ fn ask(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
 /// caller has nothing to do until it arrives.
 fn confirm(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
     app.dialog()
-        .message(&format!(
-            "dsh 有新版本 {latest}（当前 {installed}）。\n\n\
-             下载约需 {DOWNLOAD_SIZE}。更新前会先关闭正在运行的 dsh —— \
-             正在进行的会话会被中断 —— 完成后自动重新启动。"
+        .message(&t!(
+            "dsh 有新版本 {}（当前 {}）。\n\n\
+             下载约需 {}。更新前会先关闭正在运行的 dsh —— \
+             正在进行的会话会被中断 —— 完成后自动重新启动。",
+            "dsh {} is available (this machine has {}).\n\n\
+             The download is {}. The running dsh is stopped first — a session in \
+             progress will be interrupted — and started again when it is done.",
+            latest,
+            installed,
+            download_size()
         ))
-        .title("更新 dsh")
+        .title(t!("更新 dsh", "Update dsh"))
         .buttons(MessageDialogButtons::OkCancelCustom(
-            "更新".into(),
-            "取消".into(),
+            t!("更新", "Update").into(),
+            t!("取消", "Cancel").into(),
         ))
         .blocking_show()
 }
@@ -748,12 +783,20 @@ fn confirm(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
 fn tell(app: &AppHandle, installed: &Version, latest: &Version) {
     note(
         app,
-        "dsh 有可用更新",
-        &format!(
-            "dsh 有新版本 {latest}（当前 {installed}）。\n\n\
+        t!("dsh 有可用更新", "A dsh update is available"),
+        &t!(
+            "dsh 有新版本 {}（当前 {}）。\n\n\
              这份 dsh 不在应用能写的 npm 全局目录里（比如用版本管理器装的，\
              或者装在只有管理员能写的地方），应用不会去改动它。要更新的话，\
-             用你当初安装它的方式，在终端里执行：\n\nnpm install -g {PACKAGE}@latest"
+             用你当初安装它的方式，在终端里执行：\n\nnpm install -g {}@latest",
+            "dsh {} is available (this machine has {}).\n\n\
+             This dsh is not in an npm global directory the app can write to — a \
+             version manager put it there, or it needs administrator rights — so \
+             the app will not touch it. To update it, use whatever you installed \
+             it with:\n\nnpm install -g {}@latest",
+            latest,
+            installed,
+            PACKAGE
         ),
     );
 }
@@ -774,7 +817,7 @@ fn skip(app: &AppHandle, version: &Version) {
     }
     if let Err(error) = std::fs::write(&path, version.to_string()) {
         // Not worth interrupting anyone over; the cost is being asked again.
-        eprintln!("dsh-desktop: 无法记住跳过的 dsh 版本：{error}");
+        eprintln!("dsh-desktop: could not remember the skipped dsh version: {error}");
     }
 }
 
@@ -809,7 +852,7 @@ fn mark_checked(app: &AppHandle) {
     if let Err(error) = std::fs::write(&path, b"") {
         // The cost is checking again next launch, which is what would have
         // happened anyway before any of this existed.
-        eprintln!("dsh-desktop: 无法记录 dsh 更新检查时间：{error}");
+        eprintln!("dsh-desktop: could not record the dsh update check: {error}");
     }
 }
 
@@ -821,7 +864,7 @@ fn checked_file(app: &AppHandle) -> Option<PathBuf> {
 /// `~/.local/share/<identifier>`. Both bootstrap scripts and
 /// `installer-hooks.nsh` build the same path out of the platform's own variable
 /// and the bundle identifier; they all have to agree.
-fn app_dir(app: &AppHandle) -> Option<PathBuf> {
+pub fn app_dir(app: &AppHandle) -> Option<PathBuf> {
     Some(simplified(app.path().app_local_data_dir().ok()?))
 }
 
@@ -896,6 +939,109 @@ fn simplified(path: PathBuf) -> PathBuf {
     }
 
     path
+}
+
+/// Open a terminal that has dsh in it.
+///
+/// The app knows where dsh and its Node are — it resolved them at startup and
+/// hands them to every child it runs (see [`apply_path`]). The user's shell does
+/// not, and deliberately: nothing here writes to their PATH, because a desktop
+/// app editing the environment of every terminal on the machine is a change they
+/// did not ask for and cannot see. The cost of that decision is that on a machine
+/// where this app installed Node itself, `dsh` is a command the user cannot type.
+///
+/// This is the way out. One terminal with the same PATH the app's own children
+/// get, for as long as it is open, and nothing left behind when it closes. It is
+/// how the CLI gets used at all on such a machine — `dsh plugin`, `dsh` itself,
+/// anything the window does not put a button on.
+///
+/// The environment travels by inheritance rather than as a command to run: the
+/// child is spawned with the PATH already set and the shell it opens inherits
+/// it. Writing it into a command line instead would mean quoting a list of
+/// Windows paths through two levels of `cmd`.
+pub fn terminal(app: &AppHandle) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // `start` reads its first quoted argument as a window title, so it is
+        // given one rather than eating the command. `dsh --version` is the
+        // greeting: ASCII, instant, and it answers the only question this
+        // terminal was opened to settle.
+        let mut command = Command::new("cmd");
+        command.args(["/c", "start", "dsh", "cmd", "/k", "dsh --version"]);
+        apply_path(app, &mut command);
+        command.spawn().map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Terminal.app takes a file to run, not an environment, so the
+        // environment is the file. Rewritten on every open rather than cached:
+        // the paths move when dsh is reinstalled somewhere else.
+        let script = app_dir(app)
+            .ok_or_else(|| t!("找不到应用数据目录", "no application data directory").to_string())?
+            .join("dsh-shell.command");
+        if let Some(parent) = script.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let path = std::env::join_paths(search_path(app))
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .into_owned();
+        // Not a login shell: one would re-read the user's profile, which is
+        // free to put its own Node back in front of ours.
+        let body = format!(
+            "#!/bin/sh\nPATH={}\nexport PATH\nexec \"${{SHELL:-/bin/sh}}\"\n",
+            shell_quote(&path)
+        );
+        std::fs::write(&script, body).map_err(|error| error.to_string())?;
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+
+        Command::new("open")
+            .args([OsStr::new("-a"), OsStr::new("Terminal"), script.as_os_str()])
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No single answer here, so the list is walked until one of them
+        // starts. `x-terminal-emulator` comes first because on Debian it is
+        // whatever the user already chose.
+        const TERMINALS: [&str; 6] = [
+            "x-terminal-emulator",
+            "gnome-terminal",
+            "konsole",
+            "xfce4-terminal",
+            "alacritty",
+            "xterm",
+        ];
+
+        for name in TERMINALS {
+            let mut command = Command::new(name);
+            apply_path(app, &mut command);
+            if command.spawn().is_ok() {
+                return Ok(());
+            }
+        }
+
+        Err(t!(
+            "没有找到可用的终端程序。",
+            "no terminal emulator could be started."
+        )
+        .to_string())
+    }
+}
+
+/// One argument, safe to paste into a `sh` script. Single quotes take everything
+/// literally, and the only thing they cannot hold is a single quote.
+#[cfg(target_os = "macos")]
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]

@@ -18,6 +18,14 @@ serde_json = "1"
 # how you end up shipping rc.10 as older than rc.9.
 semver = "1"
 tauri-plugin-autostart = "2.5.1"
+# Turns the browser Notification API the dsh page calls into a real one; see
+# `notify`. Nothing in the webview is granted it — every notification is raised
+# from Rust, from a payload that arrived over the navigation channel.
+tauri-plugin-notification = "2"
+# Which of the two halves of every string to show; see `i18n`. One function and
+# no dependencies of its own — the platform calls it wraps are three different
+# ones, which is the whole reason not to write them here.
+sys-locale = "0.3"
 # One app per machine. Two of them would each spawn a `dsh web` against the same
 # $DSH_HOME, and a dsh update would rewrite the tree the other one is running.
 tauri-plugin-single-instance = "2"

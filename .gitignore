@@ -6,4 +6,7 @@ src-tauri/gen/
 # a build without a staged runtime falls back to `dsh` on PATH.
 src-tauri/resources/*
 !src-tauri/resources/.gitkeep
+# Not staged: source, which happens to live where the resources go so that one
+# path serves both a bundled build and `tauri dev`. See src-tauri/src/plugins.rs.
+!src-tauri/resources/preset-plugins.json
 bash.exe.stackdump

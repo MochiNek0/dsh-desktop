@@ -31,7 +31,7 @@ pub fn check_quietly(app: &AppHandle) {
 /// does nothing visible looks broken — including while it is still working, which
 /// is a request to a release feed and takes as long as that takes.
 pub fn check_now(app: &AppHandle) {
-    crate::controls::busy(app, "正在检查应用更新…");
+    crate::controls::busy(app, t!("正在检查应用更新…", "Checking for app updates…"));
     check(app.clone(), true);
 }
 
@@ -51,12 +51,20 @@ fn check(app: AppHandle, verbose: bool) {
             Ok(Some(update)) => offer(&app, update),
             Ok(None) if verbose => note(
                 &app,
-                "已是最新版本",
-                &format!("当前版本 {} 已经是最新的。", app.package_info().version),
+                t!("已是最新版本", "Up to date"),
+                &t!(
+                    "当前版本 {} 已经是最新的。",
+                    "Version {} is the latest there is.",
+                    app.package_info().version
+                ),
             ),
             Ok(None) => {}
-            Err(error) if verbose => note(&app, "检查更新失败", &error.to_string()),
-            Err(error) => eprintln!("dsh-desktop: 检查更新失败：{error}"),
+            Err(error) if verbose => note(
+                &app,
+                t!("检查更新失败", "Update check failed"),
+                &error.to_string(),
+            ),
+            Err(error) => eprintln!("dsh-desktop: the update check failed: {error}"),
         }
     });
 }
@@ -70,14 +78,23 @@ fn offer(app: &AppHandle, update: Update) {
     app.clone()
         .dialog()
         .message(&if notes.is_empty() {
-            format!("发现新版本 {version}，是否现在下载并安装？")
+            t!(
+                "发现新版本 {}，是否现在下载并安装？",
+                "Version {} is available. Download and install it now?",
+                version
+            )
         } else {
-            format!("发现新版本 {version}，是否现在下载并安装？\n\n{notes}")
+            t!(
+                "发现新版本 {}，是否现在下载并安装？\n\n{}",
+                "Version {} is available. Download and install it now?\n\n{}",
+                version,
+                notes
+            )
         })
-        .title("有可用更新")
+        .title(t!("有可用更新", "Update available"))
         .buttons(MessageDialogButtons::OkCancelCustom(
-            "现在更新".into(),
-            "稍后".into(),
+            t!("现在更新", "Update now").into(),
+            t!("稍后", "Later").into(),
         ))
         .show(move |accepted| {
             if accepted {
@@ -91,7 +108,7 @@ fn install(app: AppHandle, update: Update) {
         // Before the first chunk, which is a request to a release feed away: the
         // dialog has just closed, and until something arrives there is nothing on
         // screen to say the answer was heard.
-        crate::controls::busy(&app, "正在下载新版本…");
+        crate::controls::busy(&app, t!("正在下载新版本…", "Downloading the update…"));
 
         let downloading = app.clone();
         let installing = app.clone();
@@ -115,14 +132,20 @@ fn install(app: AppHandle, update: Update) {
                     // On Windows this is the last thing the app says: `install`
                     // hands the installer to ShellExecute and ends the process,
                     // and the installer draws its own progress from there.
-                    crate::controls::busy(&installing, "正在安装新版本，应用即将重启…");
+                    crate::controls::busy(
+                        &installing,
+                        t!(
+                            "正在安装新版本，应用即将重启…",
+                            "Installing the update; the app is about to restart…"
+                        ),
+                    );
                 },
             )
             .await;
 
         if let Err(error) = finished {
             crate::controls::busy(&app, "");
-            note(&app, "更新失败", &error.to_string());
+            note(&app, t!("更新失败", "Update failed"), &error.to_string());
             return;
         }
 
@@ -136,11 +159,15 @@ fn install(app: AppHandle, update: Update) {
 
             let restarting = app.clone();
             app.dialog()
-                .message("新版本已安装，重启后生效。正在进行的会话会被中断。")
-                .title("更新就绪")
+                .message(t!(
+                    "新版本已安装，重启后生效。正在进行的会话会被中断。",
+                    "The update is installed and takes effect on restart. \
+                     A session in progress will be interrupted."
+                ))
+                .title(t!("更新就绪", "Update ready"))
                 .buttons(MessageDialogButtons::OkCancelCustom(
-                    "立即重启".into(),
-                    "稍后".into(),
+                    t!("立即重启", "Restart now").into(),
+                    t!("稍后", "Later").into(),
                 ))
                 .show(move |now| {
                     if now {
@@ -160,13 +187,18 @@ fn downloaded(done: u64, total: Option<u64>) -> String {
     let megabytes = done as f64 / MB;
 
     match total {
-        Some(total) if total > 0 => format!(
+        Some(total) if total > 0 => t!(
             "正在下载新版本 {:.1} MB / {:.1} MB（{:.0}%）",
+            "Downloading the update: {:.1} MB / {:.1} MB ({:.0}%)",
             megabytes,
             total as f64 / MB,
             done as f64 / total as f64 * 100.0
         ),
-        _ => format!("正在下载新版本 {megabytes:.1} MB"),
+        _ => t!(
+            "正在下载新版本 {:.1} MB",
+            "Downloading the update: {:.1} MB",
+            megabytes
+        ),
     }
 }
 

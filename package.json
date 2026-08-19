@@ -7,6 +7,7 @@
     "dev": "tauri dev",
     "build": "tauri build",
     "bundle:runtime": "node scripts/bundle-runtime.mjs",
+    "version": "node scripts/sync-version.mjs && git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock",
     "tauri": "tauri"
   },
   "devDependencies": {

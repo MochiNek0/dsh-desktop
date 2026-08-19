@@ -8,6 +8,11 @@
 // install time (see `src-tauri/installer-hooks.nsh`); everywhere else there is
 // no installer hook and the app's first launch runs the second.
 //
+// One more file ships from that directory without passing through here:
+// `preset-plugins.json`, which is source rather than staged output and is
+// tracked in place — see the exception in `.gitignore`. Nothing below touches
+// it; the deletions are all by name.
+//
 // Runs from `beforeBuildCommand`, and by hand as `npm run bundle:runtime`. It
 // copies two files and never touches the network.
 //

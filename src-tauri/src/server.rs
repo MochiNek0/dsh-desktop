@@ -28,8 +28,17 @@ const TAIL_LINES: usize = 30;
 pub enum Event {
     /// The server is listening on this URL.
     Ready(String),
-    /// The server exited (or never printed a URL); carries its output tail.
+    /// The server exited before it ever printed one; carries its output tail.
     Failed(String),
+    /// The server was serving and then stopped. Same tail, and the same EOF
+    /// underneath it — what separates the two is whether a URL came first.
+    ///
+    /// This is the only warning anything gets that dsh is gone: the window is
+    /// showing a page served by a process that no longer exists, and left alone
+    /// it would sit there looking fine until the user clicked something. Told
+    /// apart from a stop this app asked for by [`crate::Session::epoch`], not
+    /// here — from inside the pipe the two are the same event.
+    Exited(String),
 }
 
 pub struct Server {
@@ -253,7 +262,8 @@ fn working_dir() -> std::path::PathBuf {
 
 /// Read one child stream to EOF, mirroring it to our own log and remembering the
 /// tail. When `tx` is present, the first URL line resolves the channel and EOF
-/// without one means the server died before it could serve.
+/// ends it — as a [`Event::Failed`] if no URL ever came, and as an
+/// [`Event::Exited`] if one did.
 fn pump<R: Read + Send + 'static>(
     stream: R,
     tail: Arc<Mutex<Vec<String>>>,
@@ -277,8 +287,16 @@ fn pump<R: Read + Send + 'static>(
             tail.push(line);
         }
 
-        if let (false, Some(tx)) = (ready, tx) {
-            let _ = tx.send(Event::Failed(tail.lock().unwrap().join("\n")));
+        // EOF on stdout: the process is gone, or close enough that it will never
+        // print again. Which of the two events that is depends on whether it got
+        // as far as serving.
+        if let Some(tx) = tx {
+            let output = tail.lock().unwrap().join("\n");
+            let _ = tx.send(if ready {
+                Event::Exited(output)
+            } else {
+                Event::Failed(output)
+            });
         }
     });
 }

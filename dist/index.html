@@ -27,6 +27,7 @@
         --line: #e5e7eb;
         --accent: #4d6bfe;
         --danger: #b42318;
+        --panel: #f7f8fa;
       }
       :root[data-theme='dark'] {
         color-scheme: dark;
@@ -35,6 +36,7 @@
         --muted: #9aa0ac;
         --line: #26262e;
         --danger: #f97066;
+        --panel: #17171d;
       }
       :root[data-theme='light'] {
         color-scheme: light;
@@ -113,7 +115,6 @@
       }
       #error pre {
         margin: 0;
-        max-height: 40vh;
         overflow: auto;
         padding: 12px 14px;
         border: 1px solid var(--line);
@@ -121,8 +122,10 @@
         font: 12px/1.5 ui-monospace, Consolas, monospace;
         color: var(--muted);
         white-space: pre-wrap;
+        word-break: break-word;
         user-select: text;
         -webkit-user-select: text;
+        max-height: 40vh;
       }
       body.failed .spinner,
       body.failed #status,
@@ -132,38 +135,113 @@
       body.failed #error {
         display: block;
       }
+      #error-retry {
+        display: none;
+        margin-top: 14px;
+      }
+      body.failed.retryable #error-retry {
+        display: inline-flex;
+      }
+      button {
+        all: unset;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        height: 32px;
+        padding: 0 15px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        cursor: pointer;
+        font: 13px/1 inherit;
+        color: var(--fg);
+        white-space: nowrap;
+      }
+      button:hover {
+        background: var(--panel);
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+      }
+      button.primary:hover {
+        filter: brightness(1.08);
+      }
+      button[disabled] {
+        opacity: 0.45;
+        cursor: default;
+        pointer-events: none;
+      }
+      button[hidden] {
+        display: none;
+      }
     </style>
   </head>
   <body>
     <main>
       <div class="mark">d<span>s</span>h</div>
       <div class="spinner"></div>
-      <p id="status">正在启动 dsh…</p>
+      <p id="status"></p>
       <div id="progress" hidden><div id="progress-fill"></div></div>
       <div id="error">
         <h2 id="error-title"></h2>
         <pre id="error-detail"></pre>
+        <button id="error-retry" class="primary"></button>
       </div>
     </main>
+
     <script>
-      // Called from the Rust side via webview eval; see src-tauri/src/main.rs.
-      window.dshStatus = function (text) {
-        document.getElementById('status').textContent = text;
-      };
-      // A percentage while a dsh download runs, or a negative number to put the
-      // bar away. Arrives as a string — every splash call is serialized as one.
-      window.dshProgress = function (percent) {
-        var bar = document.getElementById('progress');
-        var value = Number(percent);
-        bar.hidden = !(value >= 0);
-        document.getElementById('progress-fill').style.width =
-          Math.min(100, Math.max(0, value)) + '%';
-      };
-      window.dshError = function (title, detail) {
-        document.body.classList.add('failed');
-        document.getElementById('error-title').textContent = title;
-        document.getElementById('error-detail').textContent = detail || '';
-      };
+      (function () {
+        // Which half of each pair to use; pushed in by Rust before this page
+        // parses, out of the same system locale everything else reads. See
+        // src-tauri/src/i18n.rs — the two languages live inline there too.
+        var zh = (window.__DSH_LANG__ || 'zh') === 'zh';
+        function t(chinese, english) {
+          return zh ? chinese : english;
+        }
+
+        // The channel back to Rust: a navigation the app cancels the moment it
+        // recognises it. See controls.rs — there is no IPC in this window, and
+        // this page uses the same door the titlebar buttons do.
+        function signal(verb) {
+          window.location.href = 'dsh-window://' + verb;
+        }
+
+        var id = function (name) {
+          return document.getElementById(name);
+        };
+
+        // ----------------------------------------------------- the boot --
+
+        id('status').textContent = t('正在启动 dsh…', 'Starting dsh…');
+        id('error-retry').textContent = t('重启 dsh', 'Restart dsh');
+        id('error-retry').addEventListener('click', function () {
+          document.body.classList.remove('failed', 'retryable');
+          id('status').textContent = t('正在启动 dsh…', 'Starting dsh…');
+          signal('restart-dsh');
+        });
+
+        // Called from the Rust side via webview eval; see src-tauri/src/main.rs.
+        window.dshStatus = function (text) {
+          id('status').textContent = text;
+        };
+        // A percentage while a dsh download runs, or a negative number to put
+        // the bar away. Arrives as a string — every splash call is serialized
+        // as one.
+        window.dshProgress = function (percent) {
+          var bar = id('progress');
+          var value = Number(percent);
+          bar.hidden = !(value >= 0);
+          id('progress-fill').style.width =
+            Math.min(100, Math.max(0, value)) + '%';
+        };
+        window.dshError = function (title, detail, retry) {
+          document.body.classList.add('failed');
+          document.body.classList.toggle('retryable', retry === 'retry');
+          id('error-title').textContent = title;
+          id('error-detail').textContent = detail || '';
+        };
+      })();
     </script>
   </body>
 </html>

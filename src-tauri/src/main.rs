@@ -1,14 +1,22 @@
 // The release build is a GUI app: no console window behind it.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// First, and out of alphabetical order: it defines `t!`, and a macro is only
+// in scope for the modules declared after it.
+#[macro_use]
+mod i18n;
+
 mod controls;
 mod dsh;
+mod notify;
+mod panel;
+mod plugins;
 mod server;
 mod theme;
 mod update;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, RwLock};
 use std::time::Duration;
 
@@ -58,6 +66,15 @@ struct Session {
     /// Somewhere to put the window back to when dsh has to come down for an
     /// update; see [`Home`].
     home: Home,
+    /// Which server the watcher in [`watch`] is watching.
+    ///
+    /// A `dsh web` that exits is worth interrupting the user over — unless it
+    /// exited because this app stopped it, which is how an update and a plugin
+    /// install both begin. The two are indistinguishable from the child's side:
+    /// the pipes close either way. So every deliberate stop moves this on, and
+    /// a watcher whose number is no longer current knows the exit was ours and
+    /// says nothing.
+    epoch: Arc<AtomicU64>,
 }
 
 fn main() {
@@ -74,6 +91,9 @@ fn main() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Raised from Rust only; nothing in the webview is granted it. See
+        // `notify`.
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -103,6 +123,7 @@ fn main() {
                 splash,
                 server: setup_server.clone(),
                 home,
+                epoch: Arc::new(AtomicU64::new(0)),
             };
             app.manage(session.clone());
 
@@ -120,6 +141,7 @@ fn main() {
     app.run(move |_handle, event| {
         if let tauri::RunEvent::Exit = event {
             dsh::stop();
+            plugins::stop();
             if let Some(child) = server.lock().unwrap().as_mut() {
                 child.stop();
             }
@@ -161,6 +183,16 @@ fn build_window(
         .theme(preference.window())
         .initialization_script(theme::script(preference))
         .initialization_script(controls::script())
+        // Turns the page's own `Notification` calls into real ones.
+        .initialization_script(notify::script())
+        // The plugin panel, drawn over whatever page is showing when it is
+        // asked for — dsh's included, which is the point of it being here.
+        .initialization_script(panel::script())
+        // Which language the pages pick their own strings out of; see `i18n`.
+        .initialization_script(format!(
+            "window.__DSH_LANG__ = {:?};",
+            crate::i18n::tag()
+        ))
         .on_page_load(move |webview, payload| {
             // The first page this window ever loads is the bundled loading page,
             // and this is the one place its address is stated by something that
@@ -227,8 +259,14 @@ fn build_window(
 /// the app rather than like a system context menu. What is left here is what is
 /// only ever wanted when there is no window to look at.
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出 dsh", true, None::<&str>)?;
+    let show = MenuItem::with_id(
+        app,
+        "show",
+        t!("显示窗口", "Show window"),
+        true,
+        None::<&str>,
+    )?;
+    let quit = MenuItem::with_id(app, "quit", t!("退出 dsh", "Quit dsh"), true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
 
     let mut tray = TrayIconBuilder::new()
@@ -269,7 +307,7 @@ fn toggle_autostart(app: &tauri::AppHandle) {
 
     let changed = if was { manager.disable() } else { manager.enable() };
     if let Err(error) = changed {
-        eprintln!("dsh-desktop: 无法设置开机自启动：{error}");
+        eprintln!("dsh-desktop: could not change the login item: {error}");
     }
 
     controls::sync_autostart(app);
@@ -366,6 +404,21 @@ fn boot(app: tauri::AppHandle, window: WebviewWindow, session: Session) {
             return;
         }
 
+        // Once, on the launch that first has a dsh to add plugins to — and once
+        // more for an install that predates the panel existing. It is shown
+        // before the server starts rather than after, because installing a
+        // plugin means stopping the server again, and the user has just watched
+        // it start.
+        //
+        // Marked as shown before it is shown: a panel that crashes the launch it
+        // appears on should not appear on the next one too. What happens next is
+        // the panel's — see [`leave_plugins`].
+        if window_is_visible(&app) && !plugins::guided(&app) {
+            plugins::mark_guided(&app);
+            show_plugins(&app, &session, true);
+            return;
+        }
+
         start_serving(&app, &window, &session);
         check_for_updates(&app);
     });
@@ -383,7 +436,14 @@ fn update_dsh(app: &tauri::AppHandle) {
     // Held from before the first dialog: two of these would ask twice and then
     // stop, update and restart the server twice over each other.
     if BUSY.swap(true, Ordering::SeqCst) {
-        dsh::note(app, "请稍等", "dsh 正在启动或更新中，等它忙完再试。");
+        dsh::note(
+            app,
+            t!("请稍等", "One moment"),
+            t!(
+                "dsh 正在启动或更新中，等它忙完再试。",
+                "dsh is starting or updating; try again once it has finished."
+            ),
+        );
         return;
     }
 
@@ -404,12 +464,7 @@ fn update_dsh(app: &tauri::AppHandle) {
             return;
         };
 
-        if let Some(mut running) = session.server.lock().unwrap().take() {
-            running.stop();
-        }
-        // The dsh page is gone with it, so nothing may be treated as ours until
-        // a new server says otherwise.
-        *session.origin.write().unwrap() = None;
+        stop_server(&session);
         // Back to queueing until the loading page below has loaded; the reports
         // that follow would otherwise be evaluated into the outgoing document.
         session.splash.rearm();
@@ -426,10 +481,13 @@ fn update_dsh(app: &tauri::AppHandle) {
             match home {
                 Some(home) => {
                     if let Err(error) = back.navigate(home) {
-                        eprintln!("dsh-desktop: 无法回到加载页：{error}");
+                        eprintln!("dsh-desktop: could not return to the loading page: {error}");
                     }
                 }
-                None => eprintln!("dsh-desktop: 还不知道加载页在哪里，更新期间没有进度可显示"),
+                None => eprintln!(
+                    "dsh-desktop: the loading page's address is not known yet; \
+                     the update has nowhere to report progress"
+                ),
             }
         });
 
@@ -446,13 +504,15 @@ fn update_dsh(app: &tauri::AppHandle) {
 /// Start `dsh web` and hand the window over to it. Blocks until it is serving or
 /// has given up, reporting either onto the loading page.
 fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Session) {
-    session.splash.status(window, "正在启动 dsh…");
+    session.splash.status(window, t!("正在启动 dsh…", "Starting dsh…"));
     session.splash.progress(window, -1.0);
 
     match server::start(app) {
         Ok((child, events)) => {
             *session.server.lock().unwrap() = Some(child);
-            serve(window, &session.origin, &session.splash, &events);
+            if serve(window, &session.origin, &session.splash, &events) {
+                watch(window, session, events);
+            }
         }
         // Most often this is a machine where fetching dsh failed: neither the
         // installer nor the boot above carries one, they download it, and an app
@@ -460,13 +520,20 @@ fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Sessi
         // tried, so what is left to suggest is the network and doing it by hand.
         Err(error) => session.splash.fail(
             window,
-            "启动 dsh 失败",
-            &format!(
-                "无法执行 dsh：{error}\n\n\
+            t!("启动 dsh 失败", "Could not start dsh"),
+            &t!(
+                "无法执行 dsh：{}\n\n\
                  dsh 没有安装成功，通常是网络或代理的问题。\
                  换一个网络或代理后重启应用，它会再试一次。\n\n\
                  也可以自己在终端里执行 `npm install -g @deepseek-ai/dsh` 安装，\
-                 或用 DSH_BIN 环境变量指向 dsh 可执行文件的完整路径。"
+                 或用 DSH_BIN 环境变量指向 dsh 可执行文件的完整路径。",
+                "dsh could not be executed: {}\n\n\
+                 It did not install, which is usually the network or a proxy. \
+                 Restart the app on a different connection and it will try again.\n\n\
+                 You can also install it yourself with \
+                 `npm install -g @deepseek-ai/dsh`, or point the DSH_BIN \
+                 environment variable at the dsh executable.",
+                error
             ),
         ),
     }
@@ -480,6 +547,310 @@ fn reporter<'a>(splash: &'a Splash, window: &'a WebviewWindow) -> impl Fn(&str, 
         }
         splash.progress(window, percent);
     }
+}
+
+/// Take the running server down on purpose, and say so.
+///
+/// The saying is [`Session::epoch`]: the watcher started for this server is
+/// about to see it exit, and this is what tells it the exit was asked for. Moved
+/// before the child is killed, so there is no window in which the watcher could
+/// read the old number.
+fn stop_server(session: &Session) {
+    session.epoch.fetch_add(1, Ordering::SeqCst);
+
+    if let Some(mut running) = session.server.lock().unwrap().take() {
+        running.stop();
+    }
+    // The dsh page went with it, so nothing may be treated as ours until a new
+    // server says otherwise.
+    *session.origin.write().unwrap() = None;
+}
+
+/// Wait for the running server to exit, and put the window somewhere the user
+/// can see that it did.
+///
+/// Without this the failure is silent in the worst way: `dsh web` dies, the
+/// window goes on showing the page it served, and every click on it fails in
+/// whatever way that page fails when its backend is gone. The process exiting is
+/// the signal — not a port probe on a timer, which is a second thing that can be
+/// wrong about a question the pipe already answers exactly.
+fn watch(window: &WebviewWindow, session: &Session, events: Receiver<server::Event>) {
+    let epoch = session.epoch.load(Ordering::SeqCst);
+    let session = session.clone();
+    let window = window.clone();
+
+    std::thread::spawn(move || {
+        // Every other event is behind us — this loop starts after `serve`
+        // returned on a `Ready`.
+        let Some(output) = events.into_iter().find_map(|event| match event {
+            server::Event::Exited(output) => Some(output),
+            _ => None,
+        }) else {
+            // The channel closed without an exit, which is the app shutting
+            // down. Nothing to report and nowhere left to report it.
+            return;
+        };
+
+        if session.epoch.load(Ordering::SeqCst) != epoch {
+            // We stopped it: an update or a plugin install, either of which is
+            // already showing the user what it is doing.
+            return;
+        }
+
+        // The parent is gone but the slot still holds it, and on Unix an
+        // unreaped child is a zombie until something waits on it. `stop` waits,
+        // and takes down any of the tree that outlived its parent while it is
+        // there.
+        if let Some(mut dead) = session.server.lock().unwrap().take() {
+            dead.stop();
+        }
+        *session.origin.write().unwrap() = None;
+        session.splash.rearm();
+
+        let handle = window.app_handle().clone();
+        let target = handle.clone();
+        let back = window.clone();
+        let home = session.home.read().unwrap().clone();
+        let _ = handle.run_on_main_thread(move || {
+            reveal(&target);
+            if let Some(home) = home {
+                if let Err(error) = back.navigate(home) {
+                    eprintln!("dsh-desktop: could not return to the loading page: {error}");
+                }
+            }
+        });
+
+        // Queued by `rearm` until the loading page above has loaded.
+        session.splash.fail_retry(
+            &window,
+            t!("dsh 已退出", "dsh exited"),
+            &if output.is_empty() {
+                t!(
+                    "dsh 意外退出了，且没有留下任何输出。",
+                    "dsh exited unexpectedly, without printing anything."
+                )
+                .to_string()
+            } else {
+                t!(
+                    "dsh 意外退出了。它最后的输出：\n\n{}",
+                    "dsh exited unexpectedly. Its last output:\n\n{}",
+                    output
+                )
+            },
+        );
+    });
+}
+
+/// Start `dsh web` again after it exited on its own, from the button the
+/// watcher's error page draws.
+fn restart_dsh(app: &tauri::AppHandle) {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let session = app.state::<Session>().inner().clone();
+    let app = app.clone();
+
+    std::thread::spawn(move || {
+        let _busy = Busy;
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+
+        start_serving(&app, &window, &session);
+    });
+}
+
+/// Open the plugin panel, from the menu.
+fn open_plugins(app: &tauri::AppHandle) {
+    let session = app.state::<Session>().inner().clone();
+    let app = app.clone();
+
+    // Off the navigation callback that delivered the click: this navigates the
+    // window, and the webview is currently blocked waiting for an answer about
+    // where it is allowed to go.
+    std::thread::spawn(move || show_plugins(&app, &session, false));
+}
+
+/// Put the panel up over whatever the window is showing.
+///
+/// It is drawn into that page rather than being a page — or a window — of its
+/// own; `panel` says why, and the short of it is that looking at a list should
+/// not cost the harness underneath a reload. dsh keeps running behind it.
+/// Nothing is installed until the user asks, and only then does the server have
+/// to come down.
+///
+/// `first` is the one-time guide on a first launch rather than the menu. The
+/// panel is the same either way; what differs is the way out of it — the guide
+/// is a step to skip, and the menu is somewhere to come back from.
+fn show_plugins(app: &tauri::AppHandle, session: &Session, first: bool) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+
+    session.splash.plugins(&window, &plugins::listing(app), first);
+}
+
+/// Install what the panel asked for, with `dsh web` down for the duration.
+///
+/// It has to come down: pnpm is about to rewrite the profile directory the
+/// running server read its plugins out of. It also has to come back up
+/// afterwards, which is what leaving the panel does — the new plugins are only
+/// in the window once dsh has been started again to load them.
+fn install_plugins(app: &tauri::AppHandle, ids: Vec<String>, spec: Option<String>) {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        dsh::note(
+            app,
+            t!("请稍等", "One moment"),
+            t!(
+                "dsh 正在启动或更新中，等它忙完再装插件。",
+                "dsh is starting or updating; wait for that to finish before installing plugins."
+            ),
+        );
+        return;
+    }
+
+    let session = app.state::<Session>().inner().clone();
+    let app = app.clone();
+
+    std::thread::spawn(move || {
+        let _busy = Busy;
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+
+        stop_server(&session);
+
+        let log = |line: &str| session.splash.plugin_log(&window, line);
+        match plugins::install(&app, &ids, spec.as_deref(), &log) {
+            Ok(()) => {
+                session.splash.plugin_lists(&window, &plugins::listing(&app));
+                session.splash.plugin_done(
+                    &window,
+                    true,
+                    t!(
+                        "装好了。回到 dsh 时会重新启动它，插件在那之后生效。",
+                        "Done. dsh restarts on the way back, and the plugins take effect then."
+                    ),
+                );
+            }
+            Err(error) => session.splash.plugin_done(&window, false, &error),
+        }
+    });
+}
+
+/// Take the ticked plugins out again, with `dsh web` down for the duration and
+/// for the same reason the install takes it down: pnpm is about to rewrite the
+/// directory the running server read them out of.
+fn remove_plugins(app: &tauri::AppHandle, names: Vec<String>) {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        dsh::note(
+            app,
+            t!("请稍等", "One moment"),
+            t!(
+                "dsh 正在启动或更新中，等它忙完再动插件。",
+                "dsh is starting or updating; wait for that to finish before changing plugins."
+            ),
+        );
+        return;
+    }
+
+    let session = app.state::<Session>().inner().clone();
+    let app = app.clone();
+
+    std::thread::spawn(move || {
+        let _busy = Busy;
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+
+        stop_server(&session);
+
+        let log = |line: &str| session.splash.plugin_log(&window, line);
+        match plugins::remove(&app, &names, &log) {
+            Ok(()) => {
+                session.splash.plugin_lists(&window, &plugins::listing(&app));
+                session.splash.plugin_done(
+                    &window,
+                    true,
+                    t!(
+                        "卸载完成。回到 dsh 时会重新启动它。",
+                        "Removed. dsh restarts on the way back."
+                    ),
+                );
+            }
+            Err(error) => session.splash.plugin_done(&window, false, &error),
+        }
+    });
+}
+
+/// Leave the panel: back to dsh, starting it if it is not running.
+///
+/// Both cases happen. The panel opened from the menu left the server up, and
+/// the page it was drawn over is still underneath it — taking it away is the
+/// whole of going back. The panel that opened on a first launch, or that has
+/// just installed something, has no server to go back to, and that is the one
+/// case that costs a page load.
+fn leave_plugins(app: &tauri::AppHandle) {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        dsh::note(
+            app,
+            t!("请稍等", "One moment"),
+            t!(
+                "插件还在安装中，装完会自动回到 dsh。",
+                "The install is still running; it returns to dsh when it finishes."
+            ),
+        );
+        return;
+    }
+
+    let session = app.state::<Session>().inner().clone();
+    let app = app.clone();
+
+    std::thread::spawn(move || {
+        let _busy = Busy;
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+
+        let serving = session
+            .origin
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|_| session.server.lock().unwrap().is_some());
+
+        session.splash.plugin_hide(&window);
+
+        if serving.is_some() {
+            return;
+        }
+
+        // No server: the window is either on the loading page it started on, or
+        // on the dead page of the dsh an install just stopped. The second has no
+        // status line for a start to be reported on, so it goes back to ours.
+        let home = session.home.read().unwrap().clone();
+        let arrived = home
+            .as_ref()
+            .is_some_and(|home| window.url().is_ok_and(|showing| &showing == home));
+
+        if !arrived {
+            session.splash.rearm();
+
+            let back = window.clone();
+            let target = home.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(home) = target {
+                    if let Err(error) = back.navigate(home) {
+                        eprintln!("dsh-desktop: could not return to the loading page: {error}");
+                    }
+                }
+            });
+        }
+
+        start_serving(&app, &window, &session);
+        check_for_updates(&app);
+    });
 }
 
 /// A check the boot finished with while the window was still hidden in the
@@ -523,59 +894,82 @@ fn window_is_visible(app: &tauri::AppHandle) -> bool {
 }
 
 /// Block until the server is serving or has given up, reporting either into the
-/// loading page.
+/// loading page. `true` once the window has been handed over to it, which is
+/// also when there is something left to watch; see [`watch`].
 fn serve(
     window: &WebviewWindow,
     origin: &Origin,
     splash: &Splash,
     events: &Receiver<server::Event>,
-) {
+) -> bool {
     loop {
         match events.recv_timeout(SLOW_BOOT) {
             Ok(server::Event::Ready(url)) => {
                 let Ok(url) = Url::parse(&url) else {
                     splash.fail(
                         window,
-                        "启动 dsh 失败",
-                        &format!("无法解析 dsh 输出的地址：{url}"),
+                        t!("启动 dsh 失败", "Could not start dsh"),
+                        &t!(
+                            "无法解析 dsh 输出的地址：{}",
+                            "dsh printed an address that cannot be parsed: {}",
+                            url
+                        ),
                     );
-                    return;
+                    return false;
                 };
 
                 *origin.write().unwrap() = Some(url.origin().ascii_serialization());
-                splash.status(window, "正在打开界面…");
+                splash.status(window, t!("正在打开界面…", "Opening the interface…"));
 
                 let handle = window.app_handle().clone();
                 let window = window.clone();
                 let splash = splash.clone();
                 let _ = handle.run_on_main_thread(move || {
                     if let Err(error) = window.navigate(url) {
-                        splash.fail(&window, "打开界面失败", &error.to_string());
+                        splash.fail(
+                            &window,
+                            t!("打开界面失败", "Could not open the interface"),
+                            &error.to_string(),
+                        );
                     }
                 });
-                return;
+                return true;
             }
             Ok(server::Event::Failed(output)) => {
                 splash.fail(
                     window,
-                    "dsh 已退出",
+                    t!("dsh 已退出", "dsh exited"),
                     &if output.is_empty() {
-                        "dsh 在开始服务前就退出了，且没有任何输出。".to_string()
+                        t!(
+                            "dsh 在开始服务前就退出了，且没有任何输出。",
+                            "dsh exited before it began serving, without printing anything."
+                        )
+                        .to_string()
                     } else {
-                        format!("dsh 在开始服务前就退出了。它的输出：\n\n{output}")
+                        t!(
+                            "dsh 在开始服务前就退出了。它的输出：\n\n{}",
+                            "dsh exited before it began serving. Its output:\n\n{}",
+                            output
+                        )
                     },
                 );
-                return;
+                return false;
             }
+            // Only the deliberate stops reach here after a `Ready`, and those
+            // are the watcher's business rather than this one's; see [`watch`].
+            Ok(server::Event::Exited(_)) => return false,
             Err(RecvTimeoutError::Timeout) => {
-                splash.status(window, "dsh 启动较慢，仍在等待…");
+                splash.status(
+                    window,
+                    t!("dsh 启动较慢，仍在等待…", "dsh is slow to start; still waiting…"),
+                );
                 // A dsh that neither serves nor exits would otherwise keep the
                 // checks out of reach for as long as it hangs — and an update
                 // is one of the things that fixes that. They run once, so the
                 // timeouts after this one cost nothing.
                 check_for_updates(window.app_handle());
             }
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => return false,
         }
     }
 }
@@ -605,10 +999,66 @@ impl Splash {
         self.call(window, "dshProgress", &[&format!("{percent:.1}")]);
     }
 
+    /// Show the plugin panel, with the presets and what is already installed.
+    /// The first argument is the JSON [`plugins::listing`] built; the second
+    /// tells it whether this is the first-launch guide or a visit from the
+    /// menu, which is the difference between skipping it and leaving it.
+    fn plugins(&self, window: &WebviewWindow, listing: &str, first: bool) {
+        self.call(
+            window,
+            "__dshPlugins",
+            &[listing, if first { "first" } else { "" }],
+        );
+    }
+
+    /// Redraw the two lists — what can go in, and what is in — leaving the log
+    /// and the message above them where they are. An install or a removal makes
+    /// both lists wrong the moment it succeeds.
+    fn plugin_lists(&self, window: &WebviewWindow, listing: &str) {
+        self.call(window, "__dshPluginLists", &[listing]);
+    }
+
+    /// Take it away again. What it was drawn over was never navigated away
+    /// from, so this is the whole of putting the user back where they were.
+    fn plugin_hide(&self, window: &WebviewWindow) {
+        self.call(window, "__dshPluginHide", &[]);
+    }
+
+    /// One line of an install's output, verbatim. There is a lot of it — this is
+    /// pnpm's own log — and all of it goes on screen: when this fails, what it
+    /// printed is the whole of what the user has to go on.
+    fn plugin_log(&self, window: &WebviewWindow, line: &str) {
+        self.call(window, "__dshPluginLog", &[line]);
+    }
+
+    /// How the install ended, and what to say about it.
+    fn plugin_done(&self, window: &WebviewWindow, ok: bool, text: &str) {
+        self.call(
+            window,
+            "__dshPluginDone",
+            &[if ok { "ok" } else { "failed" }, text],
+        );
+    }
+
     /// Replace the spinner with an error the user can read and copy.
     fn fail(&self, window: &WebviewWindow, title: &str, detail: &str) {
+        self.failed(window, title, detail, false);
+    }
+
+    /// The same, for the one failure the user can do something about from here:
+    /// a dsh that was serving and stopped. The page draws a button that starts
+    /// it again.
+    fn fail_retry(&self, window: &WebviewWindow, title: &str, detail: &str) {
+        self.failed(window, title, detail, true);
+    }
+
+    fn failed(&self, window: &WebviewWindow, title: &str, detail: &str, retry: bool) {
         eprintln!("dsh-desktop: {title}: {detail}");
-        self.call(window, "dshError", &[title, detail]);
+        self.call(
+            window,
+            "dshError",
+            &[title, detail, if retry { "retry" } else { "" }],
+        );
 
         // A login-item launch leaves the window hidden in the tray, where an
         // error report is written to a page the user has no reason to open. The

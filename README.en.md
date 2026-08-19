@@ -36,7 +36,10 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 - **Port Conflict-Free**: Starts on an auto-assigned loopback port, coexisting seamlessly with manual `dsh web` instances.
 - **Native Experience**: Modern frameless UI, theme synchronization, system tray integration, and auto-start support.
 - **Shared Environment**: Shares the same global `dsh` CLI environment, with startup checks and one-click upgrades.
-- **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit.
+- **Plugins Without a Terminal**: A built-in plugin panel installs dsh plugins, and an "Open a terminal" menu item opens a shell that already has `dsh` on its PATH.
+- **System Notifications**: Notifications raised by the dsh page become real system notifications, and are suppressed while the window has focus.
+- **Bilingual UI**: Follows the system locale between Chinese and English.
+- **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit; if `dsh web` exits on its own, the window returns to the loading page and offers a restart.
 
 ## Installation
 
@@ -56,6 +59,18 @@ Download the latest release package for your operating system from the [Releases
 > ```sh
 > xattr -dr com.apple.quarantine /Applications/dsh-desktop.app
 > ```
+
+## Plugins
+
+dsh plugins live in `$DSH_HOME/profiles/web`, and the command is `dsh plugin --profile web add <package>` — which is a thin forwarder to **pnpm**. Installing one by hand therefore needs both `dsh` and `pnpm` on your PATH, and if this app installed Node for you, neither is there: it does not rewrite the user's PATH.
+
+So installing is built in: **Menu → Plugins…**. The panel is drawn over whatever is on screen, so opening and closing it never reloads dsh. Tick what you want, install. The box below the list takes anything pnpm understands — a package name, or `github:owner/repo`. What is installed is listed below the suggestions, where ticking a row offers to remove it — neither direction needs a terminal. If pnpm is missing, npm installs it first. dsh stops for the install and starts again on the way back, which is when the plugins take effect.
+
+The preset list is `src-tauri/resources/preset-plugins.json`. Adding or removing an entry is a pull request against that file, not a code change.
+
+> **About `github:` plugins**: these build on install, and pnpm 10 and later refuse to run build scripts until the package is listed under `allowBuilds` in `$DSH_HOME/profiles/web/pnpm-workspace.yaml`. When that happens the panel shows pnpm's own instruction verbatim and offers to open the folder — the app will not allow a repository's build scripts on your behalf.
+
+To use the CLI directly, **Menu → Open a terminal** opens a shell with that PATH already set, so `dsh` and `dsh plugin` work in it, without touching your system PATH.
 
 ## Configuration & Environment Variables
 
