@@ -45,7 +45,7 @@ jobs:
 
       - name: check install-deps.sh
         run: |
-          sudo apt-get update && sudo apt-get install -y dash shellcheck
+          sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dash shellcheck
           dash -n scripts/install-deps.sh
           shellcheck --shell=sh scripts/install-deps.sh
 
