@@ -746,7 +746,15 @@ npm_install() {
         # stdin off the null device, not inherited: the caller's loop is reading
         # its registry list from a here-document, and a child that touched stdin
         # would eat the rest of it.
-        "$node" "$@" 2>&1 < /dev/null
+        #
+        # PATH, because npm runs a dependency's `install` script through `sh -c`
+        # and the ones that build something spell it `node ...` — resolved off
+        # PATH, not from the Node running npm. A GUI launch inherits neither a
+        # version manager's PATH nor, of course, the Node this script just
+        # unpacked, so without this every package with a build step dies with
+        # `sh: 1: node: not found`; koffi and node-pty both do, and npm then
+        # rolls the whole install back.
+        PATH="$(dirname "$node"):$PATH" "$node" "$@" 2>&1 < /dev/null
         printf '%s\n' "$?" > "$code_file"
     } | {
         # A subshell of its own: the count only has to live as long as the pipe,

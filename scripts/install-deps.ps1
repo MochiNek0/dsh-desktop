@@ -637,16 +637,29 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
     # Script scope, and reset here rather than left over: a retry against the
     # next registry starts its count from zero, the same as its bar does.
     $script:fetched = 0
-    return (Invoke-Native $Exe $arguments {
-            param($line)
-            # `fetch GET 200` is a package coming off the network, `cache` one
-            # npm already had. Counting both keeps the bar moving on a machine
-            # that has installed dsh before — an update, or a reinstall.
-            if ($line -match 'npm http (fetch GET 200|cache) ') {
-                $script:fetched++
-                Report ([Math]::Min($From + ($To - $From) * ($script:fetched / $PackageCount), $ProgressCeiling))
-            }
-        })
+
+    # npm runs a dependency's `install` script through the shell, and the ones
+    # that build something spell it `node ...` — resolved off PATH, not from the
+    # Node running npm. Both callers start with a PATH that predates this Node:
+    # the installer hook runs before anything was unpacked, and the app inherits
+    # whatever it was launched with. Without this every package with a build step
+    # dies with `node` not found and npm rolls the whole install back.
+    $was = $env:Path
+    $env:Path = (Split-Path -Parent $Exe) + [IO.Path]::PathSeparator + $env:Path
+    try {
+        return (Invoke-Native $Exe $arguments {
+                param($line)
+                # `fetch GET 200` is a package coming off the network, `cache` one
+                # npm already had. Counting both keeps the bar moving on a machine
+                # that has installed dsh before — an update, or a reinstall.
+                if ($line -match 'npm http (fetch GET 200|cache) ') {
+                    $script:fetched++
+                    Report ([Math]::Min($From + ($To - $From) * ($script:fetched / $PackageCount), $ProgressCeiling))
+                }
+            })
+    } finally {
+        $env:Path = $was
+    }
 }
 
 # Install `Spec` through the fastest registry that works.
