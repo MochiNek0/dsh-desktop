@@ -146,8 +146,9 @@ PROBE_BYTES=2097152
 PACKAGE_COUNT=600
 PROGRESS_CEILING=99
 
-# The block appended to the user's shell profile, and how it is found again to
-# take it back out.
+# The block versions up to 0.1.2 appended to the user's shell profile, and how
+# it is found again to take it back out. Nothing writes one any more — see
+# `clean_path` — but the ones already out there have to be removable.
 BEGIN_MARK='# >>> dsh desktop >>>'
 END_MARK='# <<< dsh desktop <<<'
 
@@ -810,13 +811,30 @@ SOURCES
 
 # ---------------------------------------------------------------------- path --
 
+# Nothing here writes to the user's PATH, and that is deliberate.
+#
+# The app does not need it: `dsh.rs` finds Node and dsh through `bootstrap.json`
+# and puts them in front of the PATH it hands the child itself — see
+# `search_path` and `apply_path` there. The only thing a PATH entry ever bought
+# was a bare `dsh` working in the user's own terminal, and the price was steep:
+# the directory that had to go on it is the Node directory, so it shadowed
+# whatever `node`, `npm` and `npx` a version manager like nvm had put there, and
+# a shim resolving `node` off PATH could then be paired with a Node of a
+# different major version than the one its native modules were built for.
+#
+# It was also written and never taken back. `-Mode uninstall` has no caller on
+# these platforms — the .deb's uninstall runs as root and neither the .dmg nor
+# the .AppImage has one at all — so up to 0.1.2 the block went into the profile
+# and stayed there forever.
+#
+# What replaces it is a line of output saying where dsh is, for a user who wants
+# it in their terminal to act on themselves.
+
 # The files a login or interactive shell of the user's actually reads.
 #
-# `~/.profile` always, created if it is not there. `~/.zshrc` as well for a zsh
-# user, since that is what macOS runs and a stock account has no `~/.profile` in
-# the loop. `~/.bashrc` only if it already exists — writing `~/.bash_profile`
-# would stop bash reading `~/.profile` at all, which is somebody else's setup to
-# break.
+# `~/.profile` always. `~/.zshrc` as well for a zsh user, since that is what
+# macOS runs and a stock account has no `~/.profile` in the loop. `~/.bashrc`
+# only if it already exists.
 profile_files() {
     printf '%s\n' "$HOME/.profile"
     case "${SHELL:-}" in
@@ -827,28 +845,9 @@ profile_files() {
     fi
 }
 
-# Put `$1` on the user's PATH, so that the dsh this installed is the one a bare
-# `dsh` finds in their terminal — the same copy the app runs, and the same
-# updates. Prepended for the same reason `install-deps.ps1` prepends it.
-add_path() {
-    dir=$1
-
-    profile_files | while IFS= read -r file; do
-        if [ -f "$file" ] && grep -qF "$BEGIN_MARK" "$file"; then
-            continue
-        fi
-        # The single quotes keep `$PATH` a literal for the shell that will read
-        # this line, rather than baking in the one we happen to have now — which
-        # is exactly what SC2016 is there to warn about, and exactly what is
-        # wanted here.
-        # shellcheck disable=SC2016
-        printf '\n%s\nexport PATH="%s:$PATH"\n%s\n' "$BEGIN_MARK" "$dir" "$END_MARK" >> "$file" 2>/dev/null ||
-            say "无法写入 $file，终端里的 PATH 需要你自己加。"
-    done
-
-    say "已把 $dir 加入 PATH（新开的终端生效）。"
-}
-
+# Take out the block a version up to 0.1.2 left behind. Run on every install
+# rather than only on uninstall, because on these platforms uninstall never
+# runs: an upgrade is the one moment this is reachable at all.
 remove_path() {
     profile_files | while IFS= read -r file; do
         [ -f "$file" ] || continue
@@ -897,7 +896,10 @@ find_dsh_prefix() {
         return 0
     fi
 
-    found=$(find_dsh) || return 1
+    # `$1` when the caller already has one. `find_dsh` can cost a login shell,
+    # and `install_all` has just paid for it.
+    found=${1:-}
+    [ -n "$found" ] || found=$(find_dsh) || return 1
     prefix=$(cd "$(dirname "$found")/.." 2>/dev/null && pwd) || return 1
     [ -f "$prefix/$manifest" ] || return 1
     printf '%s' "$prefix"
@@ -905,6 +907,52 @@ find_dsh_prefix() {
 
 install_all() {
     read_marker
+
+    # Anything a previous version wrote into the user's shell profile, taken
+    # back out. See the note above `profile_files`.
+    remove_path
+
+    # dsh first, and a Node only if there turns out to be something to install
+    # it with. A Node is not a thing this app wants on the machine for its own
+    # sake — it is what `npm install -g` needs — so a machine that already has a
+    # dsh, whoever put it there, needs no Node of ours and gets none. Doing this
+    # the other way round is how a machine with an nvm Node a few releases under
+    # the floor ends up with 120 MB of Node it never runs.
+    #
+    # The pairing matters as much as the download. dsh's native modules — koffi
+    # and node-pty — are built against one Node's ABI and refuse to load on
+    # another's, so the dsh that is already here has to be run with the Node it
+    # was installed with, not with one this script chose.
+    if dsh=$(find_dsh); then
+        say "检测到系统里已有 dsh（$dsh），跳过安装。"
+        [ -n "$M_DSH" ] || M_DSH=system
+
+        # Written down because the app cannot find this on its own: a dsh under
+        # nvm is on the user's PATH and not on the app's, and without a prefix
+        # in the marker `dsh.rs` looks for a dsh it cannot see, concludes there
+        # is none, and runs this script again on every launch.
+        [ -n "$M_PREFIX" ] || M_PREFIX=$(find_dsh_prefix "$dsh")
+
+        # The Node beside it — that is the one its native modules were built
+        # for. `find_any_node` asks no version question, and rightly: the floor
+        # decides whether a Node has to be installed, and here none does.
+        if [ ! -x "${M_NODE_EXE:-/nonexistent}" ] || [ ! -f "${M_NPM_CLI:-/nonexistent}" ]; then
+            node=''
+            if [ -n "$M_PREFIX" ] && [ -x "$M_PREFIX/bin/node" ]; then
+                node="$M_PREFIX/bin/node"
+            else
+                node=$(find_any_node) || node=''
+            fi
+            if [ -n "$node" ] && cli=$(find_npm "$node"); then
+                M_NODE_EXE=$node
+                M_NPM_CLI=$cli
+                [ -n "$M_NODE" ] || M_NODE=system
+            fi
+        fi
+
+        write_marker
+        return 0
+    fi
 
     if node=$(find_node); then
         say "检测到可用的 Node：$node"
@@ -922,16 +970,6 @@ install_all() {
     M_NPM_CLI=$cli
     write_marker
 
-    # A dsh that is already there stays exactly as it is, whoever put it there.
-    # Installing a second copy of a 327 MB tree next to a working one is 327 MB
-    # nobody asked for.
-    if dsh=$(find_dsh); then
-        say "检测到系统里已有 dsh（$dsh），跳过安装。"
-        [ -n "$M_DSH" ] || M_DSH=system
-        write_marker
-        return 0
-    fi
-
     prefix=$(find_prefix "$node" "$cli")
 
     step '正在下载 dsh，约 185 MB，请耐心等待…' 36
@@ -943,7 +981,11 @@ install_all() {
     M_PREFIX=$prefix
     write_marker
 
-    add_path "$prefix/bin"
+    # Said rather than done: the app runs this dsh through the marker and needs
+    # nothing on PATH, and a user who wants it in their own terminal can decide
+    # for themselves where — and whether — to put it.
+    say "dsh 已安装到 $prefix/bin/dsh"
+    say "想在终端里直接用 dsh，把 $prefix/bin 加进你的 PATH 即可。"
     step 'dsh 安装完成。' 100
 }
 

@@ -676,6 +676,19 @@ function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [string] 
 
 # --------------------------------------------------------------------- path --
 
+# Nothing here puts anything on the user's PATH any more, and that is
+# deliberate.
+#
+# The app does not need it: `dsh.rs` finds Node and dsh through `bootstrap.json`
+# and puts them in front of the PATH it hands the child itself — see
+# `search_path` and `apply_path` there. The only thing a PATH entry ever bought
+# was a bare `dsh` working in the user's own terminal, and the price was the
+# Node directory going on the front of it, shadowing whatever `node`, `npm` and
+# `npx` a version manager had put there and letting a shim be paired with a Node
+# of a different major version than its native modules were built for.
+#
+# `Remove-Path` stays, for the entry versions up to 0.1.2 added.
+
 # Rebuild `$env:Path` from the registry. Whatever the installer just did — a Node
 # unpacked, a prefix prepended — is on the user's PATH and not on this process's,
 # which inherited its environment before any of it happened. The same goes for
@@ -706,23 +719,6 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
     }
 }
 
-# Put `Dir` on the user's own PATH — HKCU\Environment, never the machine's.
-# Prepended, so that the dsh this installed is the one a bare `dsh` finds.
-function Add-Path([string] $Dir) {
-    $key = 'HKCU:\Environment'
-    $current = (Get-ItemProperty -Path $key -Name Path -ErrorAction SilentlyContinue).Path
-    if ($null -eq $current) { $current = '' }
-
-    $entries = @($current.Split(';') | Where-Object { $_ -ne '' })
-    if ($entries -contains $Dir) { return }
-
-    # REG_EXPAND_SZ is what Windows' own environment editor writes, and what
-    # keeps a `%USERPROFILE%` in somebody else's entry meaning what it says.
-    Set-ItemProperty -Path $key -Name Path -Value ((@($Dir) + $entries) -join ';') -Type ExpandString
-    Publish-Environment
-    Say "已把 $Dir 加入 PATH。"
-}
-
 function Remove-Path([string] $Dir) {
     $key = 'HKCU:\Environment'
     $current = (Get-ItemProperty -Path $key -Name Path -ErrorAction SilentlyContinue).Path
@@ -738,10 +734,20 @@ function Remove-Path([string] $Dir) {
 
 # Whether the machine can already run dsh, and where from.
 #
-# `$env:Path` is rebuilt from the registry first: a Node installed a moment ago
-# is on the user's PATH but not on this process's, which inherited its
-# environment before any of that happened.
-function Find-Dsh {
+# The prefix a previous run recorded comes first, because nothing puts it on the
+# user's PATH any more — without this a dsh this script installed would be
+# invisible to the next run, which would then install it again.
+#
+# Then the user's own PATH, rebuilt from the registry: a dsh they installed
+# themselves sits in npm's default prefix, which npm's own installer put there,
+# and a Node unpacked a moment ago is on that PATH but not on this process's.
+function Find-Dsh([hashtable] $State) {
+    $recorded = [string] $State['prefix']
+    if ($recorded) {
+        $shim = Join-Path $recorded 'dsh.cmd'
+        if (Test-Path -LiteralPath $shim) { return $shim }
+    }
+
     Sync-Path
 
     $found = Get-Command dsh -CommandType Application -ErrorAction SilentlyContinue |
@@ -752,6 +758,63 @@ function Find-Dsh {
 
 function Install-All {
     $state = Read-Marker
+
+    # The entry a version up to 0.1.2 prepended, taken back off. Only ours: a
+    # prefix like %APPDATA%\npm is on that PATH because npm's own installer put
+    # it there, and `Add-Path` left it alone for exactly that reason.
+    $recorded = [string] $state['prefix']
+    if ($recorded -and $recorded.StartsWith($NodeDir, 'OrdinalIgnoreCase')) {
+        Remove-Path $recorded
+    }
+
+    # dsh first, and a Node only if there turns out to be something to install
+    # it with. A Node is not a thing this app wants on the machine for its own
+    # sake — it is what `npm install -g` needs — so a machine that already has a
+    # dsh, whoever put it there, needs no Node of ours and gets none.
+    #
+    # The pairing matters as much as the download. dsh's native modules — koffi
+    # and node-pty — are built against one Node's ABI and refuse to load on
+    # another's, so the dsh that is already here has to be run with the Node it
+    # was installed with, not with one this script chose.
+    $dsh = Find-Dsh $state
+    if ($dsh) {
+        Say "检测到系统里已有 dsh（$dsh），跳过安装。"
+        if (-not $state.ContainsKey('dsh')) { $state['dsh'] = 'system' }
+
+        # Written down because the app cannot find this on its own: without a
+        # prefix in the marker `dsh.rs` looks for a dsh it cannot see, concludes
+        # there is none, and runs this script again on every launch.
+        if (-not $state['prefix']) {
+            $found = Find-DshPrefix $state $dsh
+            if ($found) { $state['prefix'] = $found }
+        }
+
+        # The Node beside it — that is the one its native modules were built
+        # for. `Find-AnyNode` asks no version question, and rightly: the floor
+        # decides whether a Node has to be installed, and here none does.
+        $node = [string] $state['nodeExe']
+        $cli = [string] $state['npmCli']
+        if (-not ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli))) {
+            $node = ''
+            $beside = if ($state['prefix']) { Join-Path ([string] $state['prefix']) 'node.exe' } else { '' }
+            if ($beside -and (Test-Path -LiteralPath $beside)) {
+                $node = $beside
+            } else {
+                $node = Find-AnyNode
+            }
+            if ($node) {
+                $cli = Find-Npm $node
+                if ($cli) {
+                    $state['nodeExe'] = $node
+                    $state['npmCli'] = $cli
+                    if (-not $state.ContainsKey('node')) { $state['node'] = 'system' }
+                }
+            }
+        }
+
+        Write-Marker $state
+        return
+    }
 
     $node = Find-Node
     if ($node) {
@@ -770,17 +833,6 @@ function Install-All {
     $state['npmCli'] = $cli
     Write-Marker $state
 
-    # A dsh that is already there stays exactly as it is, whoever put it there.
-    # Installing a second copy of a 327 MB tree next to a working one is 327 MB
-    # nobody asked for.
-    $dsh = Find-Dsh
-    if ($dsh) {
-        Say "检测到系统里已有 dsh（$dsh），跳过安装。"
-        if (-not $state.ContainsKey('dsh')) { $state['dsh'] = 'system' }
-        Write-Marker $state
-        return
-    }
-
     Step '正在下载 dsh，约 185 MB，请耐心等待…' 36
     # No prefix: npm's own default is what `Get-Prefix` then writes down.
     if (-not (Install-Package $node $cli "$Package@latest" '' 36 $ProgressCeiling)) {
@@ -791,9 +843,11 @@ function Install-All {
     $state['prefix'] = Get-Prefix $node $cli
     Write-Marker $state
 
-    # The terminal gets the same dsh the app runs, and the same updates. For a
-    # Node this script installed it is also what puts `node` and `npm` in reach.
-    Add-Path $state['prefix']
+    # Said rather than done: the app runs this dsh through the marker and needs
+    # nothing on PATH, and a user who wants it in their own terminal can decide
+    # for themselves whether to put it there.
+    Say "dsh 已安装到 $($state['prefix'])\dsh.cmd"
+    Say "想在终端里直接用 dsh，把 $($state['prefix']) 加进你的 PATH 即可。"
     Step 'dsh 安装完成。' 100
 }
 
@@ -832,7 +886,7 @@ function Update-All {
 # dsh on PATH, whose prefix is read off the layout `npm install -g` leaves on
 # Windows: the shim in the prefix, the package under the `node_modules` beside
 # it. Anything else is not an npm global install, and npm cannot remove it.
-function Find-DshPrefix([hashtable] $State) {
+function Find-DshPrefix([hashtable] $State, [string] $Dsh) {
     $manifest = "node_modules\$Package\package.json"
 
     $recorded = [string] $State['prefix']
@@ -840,7 +894,9 @@ function Find-DshPrefix([hashtable] $State) {
         return $recorded
     }
 
-    $dsh = Find-Dsh
+    # `$Dsh` when the caller already has one, rather than looking twice.
+    $dsh = $Dsh
+    if (-not $dsh) { $dsh = Find-Dsh $State }
     if ($dsh) {
         $dir = Split-Path -Parent $dsh
         if (Test-Path -LiteralPath (Join-Path $dir $manifest)) { return $dir }
