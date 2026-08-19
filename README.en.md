@@ -10,7 +10,7 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 
 [![Release](https://img.shields.io/github/v/release/MochiNek0/dsh-desktop?color=blue)](https://github.com/MochiNek0/dsh-desktop/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)]()
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 <br/>
@@ -40,13 +40,15 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 
 ## Installation
 
+> **Important**: It is recommended to install **v0.1.3 and later versions**, as previous versions may have some known issues. Currently, the application has been verified on **Windows** and **Linux (Debian-based systems)**.
+
 Download the latest release package for your operating system from the [Releases page](https://github.com/MochiNek0/dsh-desktop/releases):
 
 | Operating System | Package Format | Details |
 | :--- | :--- | :--- |
-| **Windows** | `.exe` installer | Requires WebView2 (automatically prompted/downloaded if missing) |
-| **macOS** | `.dmg` image | Universal binary supporting both Apple Silicon and Intel |
-| **Linux** | `.AppImage` / `.deb` | `.AppImage` is recommended for built-in self-updater support |
+| **Windows** | `.exe` installer | Requires WebView2 (automatically prompted/downloaded if missing) **[Verified]** |
+| **macOS** | `.dmg` image | Universal binary supporting both Apple Silicon and Intel **[Unverified, feedback welcome]** |
+| **Linux** | `.AppImage` / `.deb` | `.AppImage` is recommended for built-in self-updater support **[Verified on Debian]** |
 
 > **macOS First-Launch Note**
 >
@@ -91,10 +93,10 @@ dsh-desktop/
 ├── dist/index.html               # Frontend loading and error feedback page
 ├── scripts/                      # Dependency setup and runtime packaging scripts
 ├── src-tauri/
+│   ├── Cargo.toml                # Rust dependencies and build configuration
 │   ├── tauri.*.conf.json         # Platform-specific Tauri configurations
 │   └── src/                      # Rust core (window management, process supervisor, tray, updater)
-├── package.json
-└── Cargo.toml
+└── package.json
 ```
 
 ## Notes

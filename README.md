@@ -10,7 +10,7 @@ DeepSeek Harness (`dsh web`) 的跨平台 Tauri 桌面客户端
 
 [![Release](https://img.shields.io/github/v/release/MochiNek0/dsh-desktop?color=blue)](https://github.com/MochiNek0/dsh-desktop/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)]()
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 <br/>
@@ -40,13 +40,15 @@ DeepSeek Harness (`dsh web`) 的跨平台 Tauri 桌面客户端
 
 ## 安装与下载
 
+> **重要提示**：建议用户安装 **v0.1.3 及以后的版本**，之前的版本可能存在一些已知问题。目前应用已在 **Windows** 和 **Linux（Debian系统）** 上完成验证。
+
 前往 [Releases 页面](https://github.com/MochiNek0/dsh-desktop/releases) 下载适用于您操作系统的最新安装包：
 
 | 操作系统 | 安装包格式 | 说明 |
 | :--- | :--- | :--- |
-| **Windows** | `.exe` 安装包 | 需系统已安装 WebView2（如缺失将自动引导下载） |
-| **macOS** | `.dmg` 镜像 | 通用二进制架构，原生支持 Apple Silicon 及 Intel 设备 |
-| **Linux** | `.AppImage` / `.deb` | 推荐使用 `.AppImage` 以获得完整的自更新支持 |
+| **Windows** | `.exe` 安装包 | 需系统已安装 WebView2（如缺失将自动引导下载） **[已验证]** |
+| **macOS** | `.dmg` 镜像 | 通用二进制架构，原生支持 Apple Silicon 及 Intel 设备 **[暂未验证，欢迎反馈]** |
+| **Linux** | `.AppImage` / `.deb` | 推荐使用 `.AppImage` 以获得完整的自更新支持 **[Debian系统已验证]** |
 
 > **macOS 首次运行提示**
 >
@@ -91,10 +93,10 @@ dsh-desktop/
 ├── dist/index.html               # 前端加载等待与错误提示页面
 ├── scripts/                      # 依赖初始化与运行时打包脚本
 ├── src-tauri/
+│   ├── Cargo.toml                # Rust 依赖项与构建配置
 │   ├── tauri.*.conf.json         # 多平台 Tauri 配置
 │   └── src/                      # Rust 后端源码（窗口管理、进程托管、托盘、更新）
-├── package.json
-└── Cargo.toml
+└── package.json
 ```
 
 ## 注意事项
