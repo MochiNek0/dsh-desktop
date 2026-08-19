@@ -35,6 +35,40 @@ permissions:
   contents: write
 
 jobs:
+  # Does it still compile, and do the unit tests still pass, on all three platforms?
+  # This job only runs on manual dispatch to check code health without doing a full release bundle.
+  test:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest, ubuntu-22.04]
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: install the Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential
+
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
   # The bootstrap script has no test suite and cannot have much of one, so what
   # is checked is that a stock `/bin/sh` can parse it and that shellcheck has
   # nothing to say.
@@ -114,7 +148,7 @@ jobs:
       - run: npm ci
 
       - name: run cargo test
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml
 
       - uses: tauri-apps/tauri-action@v0
         env:
