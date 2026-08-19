@@ -6,18 +6,6 @@
 # updater endpoint points at `releases/latest`, which a published release starts
 # serving to every installed copy the moment it appears.
 #
-# The checks come first and the bundling waits on them, so that something that
-# does not compile costs four minutes rather than three platforms' worth of
-# release builds. They are also the only place two things ever run: the unit
-# tests, which `tauri build` compiles past without executing, and shellcheck
-# over a bootstrap script that cannot be tested any other way — it downloads
-# Node and installs dsh.
-#
-# Running this by hand (the Run workflow button, or `gh workflow run
-# release.yml`) runs the checks and stops there: `bundle` is guarded on the ref
-# being a tag. That is how to find out whether the two platforms this cannot be
-# compiled on are still happy, before committing to a tag.
-#
 # What has to be configured for this to work, once, in the repository's
 # Settings → Secrets and variables → Actions:
 #
@@ -47,40 +35,6 @@ permissions:
   contents: write
 
 jobs:
-  # Does it still compile, and do the unit tests still pass, on all three?
-  # `dist/` and `resources/` are both in the repository, so this needs neither
-  # `npm ci` nor `bundle:runtime`.
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [windows-latest, macos-latest, ubuntu-22.04]
-
-    runs-on: ${{ matrix.platform }}
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
-      - name: install the Linux build dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libxdo-dev \
-            libssl-dev \
-            build-essential
-
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
-
   # The bootstrap script has no test suite and cannot have much of one, so what
   # is checked is that a stock `/bin/sh` can parse it and that shellcheck has
   # nothing to say.
@@ -96,7 +50,7 @@ jobs:
           shellcheck --shell=sh scripts/install-deps.sh
 
   bundle:
-    needs: [test, lint]
+    needs: [lint]
     # A tag is the only thing worth bundling for. A run started by hand stops
     # after the checks above.
     if: startsWith(github.ref, 'refs/tags/v')
@@ -158,6 +112,9 @@ jobs:
             wget
 
       - run: npm ci
+
+      - name: run cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - uses: tauri-apps/tauri-action@v0
         env:
