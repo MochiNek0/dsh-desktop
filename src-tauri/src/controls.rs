@@ -54,6 +54,7 @@
 
 use tauri::{AppHandle, Manager, Url, WebviewWindow};
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_opener::OpenerExt;
 
 /// The scheme the injected buttons signal on. Not registered with anything — it
 /// only has to be a scheme no real navigation would use, since the navigation
@@ -102,6 +103,8 @@ pub enum Action {
     RestartDsh,
     /// A notification the page raised; see [`crate::notify`].
     Notify(crate::notify::Notice),
+    /// Open an external URL in the system browser.
+    OpenUrl(String),
 }
 
 /// Recognise a navigation as a button press. `None` for every ordinary URL,
@@ -131,6 +134,12 @@ pub fn action(url: &Url) -> Option<Action> {
         "plugins-directory" => Some(Action::PluginsDirectory),
         "terminal" => Some(Action::Terminal),
         "restart-dsh" => Some(Action::RestartDsh),
+        "open" => {
+            url.query_pairs()
+                .find_map(|(key, value)| if key == "url" { Some(value.into_owned()) } else { None })
+                .filter(|target| !target.is_empty())
+                .map(Action::OpenUrl)
+        }
         // The only one carrying a payload the app reads rather than acts on,
         // and the only one that can decline: an empty notification is dropped
         // here rather than raised as a blank toast.
@@ -161,6 +170,10 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::PluginsDirectory => return crate::plugins::open_directory(app),
         Action::RestartDsh => return crate::restart_dsh(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),
+        Action::OpenUrl(target) => {
+            let _ = app.opener().open_url(target, None::<&str>);
+            return;
+        }
         Action::Terminal => {
             if let Err(error) = crate::dsh::terminal(app) {
                 crate::dsh::note(
@@ -329,6 +342,59 @@ pub fn script() -> String {
   function signal(verb) {{
     window.location.href = '{SCHEME}://' + verb;
   }}
+
+  // ------------------------------------------------------------- links --
+  function isExternal(url) {{
+    if (!url || typeof url !== 'string') return false;
+    try {{
+      var parsed = new URL(url, window.location.href);
+      if (parsed.protocol === '{SCHEME}:' || parsed.protocol === 'javascript:' || parsed.protocol === 'about:' || parsed.protocol === 'blob:' || parsed.protocol === 'data:') {{
+        return false;
+      }}
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {{
+        if (parsed.origin === window.location.origin || parsed.hostname === 'tauri.localhost') {{
+          return false;
+        }}
+        return true;
+      }}
+      return true;
+    }} catch (e) {{
+      return false;
+    }}
+  }}
+
+  function openExternal(url) {{
+    try {{
+      var parsed = new URL(url, window.location.href);
+      signal('open?url=' + encodeURIComponent(parsed.href));
+    }} catch (e) {{
+      signal('open?url=' + encodeURIComponent(url));
+    }}
+  }}
+
+  document.addEventListener('click', function (event) {{
+    if (event.defaultPrevented) return;
+    if (event.button !== 0) return;
+    var el = event.target;
+    while (el && el !== document && el.tagName !== 'A') {{
+      el = el.parentElement;
+    }}
+    if (!el || !el.href) return;
+    if (isExternal(el.href)) {{
+      event.preventDefault();
+      event.stopPropagation();
+      openExternal(el.href);
+    }}
+  }}, true);
+
+  var origOpen = window.open;
+  window.open = function (url, target, features) {{
+    if (url && isExternal(url)) {{
+      openExternal(url);
+      return null;
+    }}
+    return origOpen ? origOpen.apply(this, arguments) : null;
+  }};
 
   function start() {{
     var style = document.createElement('style');
@@ -703,3 +769,44 @@ pub fn script() -> String {
 }})();"#
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauri::Url;
+
+    #[test]
+    fn parses_open_action() {
+        let url = Url::parse("dsh-window://open?url=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1").unwrap();
+        match action(&url) {
+            Some(Action::OpenUrl(target)) => assert_eq!(target, "https://example.com/path?a=1"),
+            _ => panic!("expected Action::OpenUrl"),
+        }
+    }
+
+    #[test]
+    fn ignores_empty_open_action() {
+        let url = Url::parse("dsh-window://open?url=").unwrap();
+        assert!(action(&url).is_none());
+
+        let url_no_param = Url::parse("dsh-window://open").unwrap();
+        assert!(action(&url_no_param).is_none());
+    }
+
+    #[test]
+    fn parses_window_control_actions() {
+        assert!(matches!(
+            action(&Url::parse("dsh-window://minimize").unwrap()),
+            Some(Action::Minimize)
+        ));
+        assert!(matches!(
+            action(&Url::parse("dsh-window://maximize").unwrap()),
+            Some(Action::Maximize)
+        ));
+        assert!(matches!(
+            action(&Url::parse("dsh-window://close").unwrap()),
+            Some(Action::Close)
+        ));
+    }
+}
+

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::webview::PageLoadEvent;
+use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 use tauri_plugin_opener::OpenerExt;
@@ -162,6 +162,8 @@ fn build_window(
 ) -> tauri::Result<WebviewWindow> {
     let opener = app.clone();
     let closer = app.clone();
+    let new_window_opener = app.clone();
+    let new_window_origin = origin.clone();
 
     let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("dsh desktop")
@@ -226,6 +228,12 @@ fn build_window(
             // of the session they are working in.
             let _ = opener.opener().open_url(url.to_string(), None::<&str>);
             false
+        })
+        .on_new_window(move |url, _features| {
+            if !is_ours(&url, &new_window_origin) {
+                let _ = new_window_opener.opener().open_url(url.to_string(), None::<&str>);
+            }
+            NewWindowResponse::Deny
         })
         .build()?;
 
