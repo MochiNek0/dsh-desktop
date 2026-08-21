@@ -1,8 +1,9 @@
 //! The managed `dsh web` child process.
 //!
-//! `dsh web --port 0` binds a free loopback port and prints one line —
-//! `dsh web: http://127.0.0.1:<port>` — which is both the readiness signal and
-//! the URL the window navigates to.
+//! `dsh web --no-open --port 0` binds a free loopback port and prints one
+//! line — `dsh web: http://127.0.0.1:<port>` — which is both the readiness
+//! signal and the URL the window navigates to. `--no-open` suppresses the
+//! default-browser handoff newer dsh does, since this window is the browser.
 
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
@@ -238,7 +239,11 @@ fn command(app: &tauri::AppHandle) -> Command {
         None => Command::new(if cfg!(windows) { "dsh.cmd" } else { "dsh" }),
     };
 
-    command.args(["web", "--port", "0"]);
+    command.args(["web", "--no-open", "--port", "0"]);
+    // `--no-open` keeps dsh from handing the URL to the system's default
+    // browser: this app's own window navigates to it, so a second tab in the
+    // user's browser is a leftover from running `dsh web` in a terminal, not
+    // something the desktop client wants. Newer dsh defaults to opening it.
     // dsh shells out to `node` for workers and plugin tooling, and the shim
     // itself needs one. See `dsh::apply_path`.
     crate::dsh::apply_path(app, &mut command);
