@@ -658,10 +658,26 @@ fn watch(window: &WebviewWindow, session: &Session, events: Receiver<server::Eve
     });
 }
 
-/// Start `dsh web` again after it exited on its own, from the button the
-/// watcher's error page draws.
+/// Start `dsh web` again. Two callers reach this: the menu's "Restart dsh"
+/// item, where the server is still up and serving the page the user is looking
+/// at; and the loading page's retry button, where it has already exited.
+///
+/// The second is why this used to be a bare `start_serving`. The first needs
+/// more: the running server has to come down before a fresh one can take its
+/// place, and the page it was serving has to go back to the loading page — the
+/// only one of ours with a status line a start reports onto. Both are harmless
+/// from the retry button: `stop_server` on nothing is a no-op, and the loading
+/// page is already where it is.
 fn restart_dsh(app: &tauri::AppHandle) {
     if BUSY.swap(true, Ordering::SeqCst) {
+        dsh::note(
+            app,
+            t!("请稍等", "One moment"),
+            t!(
+                "dsh 正在启动或更新中，等它忙完再试。",
+                "dsh is starting or updating; try again once it has finished."
+            ),
+        );
         return;
     }
 
@@ -673,6 +689,31 @@ fn restart_dsh(app: &tauri::AppHandle) {
         let Some(window) = app.get_webview_window("main") else {
             return;
         };
+
+        // Down first: a server still serving has to stop before a fresh one
+        // starts, and from the retry button there is nothing to stop.
+        stop_server(&session);
+
+        // The dsh page died with the server above; only the loading page can
+        // show a start's progress, so back there the way an update goes back.
+        // Skipped from the retry button, which is already on it.
+        let home = session.home.read().unwrap().clone();
+        let arrived = home
+            .as_ref()
+            .is_some_and(|home| window.url().is_ok_and(|showing| &showing == home));
+        if !arrived {
+            session.splash.rearm();
+
+            let back = window.clone();
+            let target = home.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(home) = target {
+                    if let Err(error) = back.navigate(home) {
+                        eprintln!("dsh-desktop: could not return to the loading page: {error}");
+                    }
+                }
+            });
+        }
 
         start_serving(&app, &window, &session);
     });

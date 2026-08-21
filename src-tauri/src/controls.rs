@@ -285,6 +285,7 @@ pub fn script() -> String {
     let label = |text: &str| serde_json::to_string(text).expect("a string is always serializable");
     let plugins = label(t!("插件…", "Plugins…"));
     let terminal = label(t!("打开终端", "Open a terminal"));
+    let restart_dsh = label(t!("重启 dsh", "Restart dsh"));
     let update_dsh = label(t!("更新 dsh…", "Update dsh…"));
     let check_app = label(t!("检查应用更新…", "Check for app updates…"));
     let autostart = label(t!("开机自启动", "Start at login"));
@@ -316,6 +317,7 @@ pub fn script() -> String {
     {{ verb: 'plugins', label: {plugins} }},
     {{ verb: 'terminal', label: {terminal} }},
     {{ separator: true }},
+    {{ verb: 'restart-dsh', label: {restart_dsh} }},
     {{ verb: 'update-dsh', label: {update_dsh} }},
     {{ verb: 'check-app', label: {check_app} }},
     {{ separator: true }},
