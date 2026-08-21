@@ -183,6 +183,15 @@ fn build_window(
         // resolves `prefers-color-scheme` against, so the loading page opens in
         // the theme dsh is about to show.
         .theme(preference.window())
+        // Tauri replaces WebView2's drag-drop handler by default and routes the
+        // events to its own `DragDropEvent` — which has the side effect of
+        // swallowing the page's HTML5 drag events (the `dragstart`/`dragover`/
+        // `drop` a `draggable` row fires) before they reach the DOM. dsh's
+        // plugin cards sort by dragging, so the desktop shell would lose that
+        // while it still works in a plain browser. This app has no use for
+        // OS-level file drops — nothing listens for them — so turn the
+        // interception off and let the HTML5 events through.
+        .disable_drag_drop_handler()
         .initialization_script(theme::script(preference))
         .initialization_script(controls::script())
         // Turns the page's own `Notification` calls into real ones.
