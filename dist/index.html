@@ -28,6 +28,8 @@
         --accent: #4d6bfe;
         --danger: #b42318;
         --panel: #f7f8fa;
+        /* The accent, diluted — the wash behind the wordmark. */
+        --glow: rgba(77, 107, 254, 0.1);
       }
       :root[data-theme='dark'] {
         color-scheme: dark;
@@ -37,6 +39,7 @@
         --line: #26262e;
         --danger: #f97066;
         --panel: #17171d;
+        --glow: rgba(77, 107, 254, 0.16);
       }
       :root[data-theme='light'] {
         color-scheme: light;
@@ -49,7 +52,9 @@
         height: 100vh;
         display: grid;
         place-items: center;
-        background: var(--bg);
+        background:
+          radial-gradient(72% 52% at 50% 34%, var(--glow), transparent 68%),
+          var(--bg);
         color: var(--fg);
         font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
         user-select: none;
@@ -58,15 +63,70 @@
       main {
         width: min(560px, 86vw);
         text-align: center;
+        animation: rise 420ms cubic-bezier(0.2, 0.7, 0.3, 1) both;
       }
+      @keyframes rise {
+        from {
+          opacity: 0;
+          transform: translateY(6px);
+        }
+      }
+      /* The lockup: "dsh" is the logotype, "desktop" the product tag. */
       .mark {
-        font-size: 34px;
-        font-weight: 600;
-        letter-spacing: 0.04em;
-        margin-bottom: 22px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        margin-bottom: 24px;
       }
-      .mark span {
+      .mark .glyph {
+        width: 38px;
+        height: 38px;
+        flex: none;
+        border-radius: 8.3px;
+        box-shadow: 0 2px 10px rgba(77, 107, 254, 0.22);
+      }
+      .mark .logo {
+        font-size: 36px;
+        font-weight: 600;
+        letter-spacing: 0;
+      }
+      .mark .logo span {
         color: var(--accent);
+      }
+      /* Tag and version share one column past the rule, so the build number
+         costs the page no line of its own. */
+      .mark .meta {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 1px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+        /* The tag's tracking hangs off its last letter; pull it back so the
+           lockup stays optically centred. */
+        margin-right: -0.22em;
+      }
+      .mark .tag {
+        font-size: 12px;
+        font-weight: 500;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      /* Selectable on purpose: the whole reason to show a version is so it can
+         go into a bug report. */
+      #version {
+        font-size: 11px;
+        line-height: 1.3;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+        opacity: 0.7;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      #version:empty {
+        display: none;
       }
       .spinner {
         width: 22px;
@@ -80,6 +140,14 @@
       @keyframes spin {
         to {
           transform: rotate(360deg);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        main {
+          animation: none;
+        }
+        .spinner {
+          animation-duration: 2.4s;
         }
       }
       #status {
@@ -135,9 +203,13 @@
       body.failed #error {
         display: block;
       }
+      .actions {
+        display: flex;
+        gap: 10px;
+        margin-top: 14px;
+      }
       #error-retry {
         display: none;
-        margin-top: 14px;
       }
       body.failed.retryable #error-retry {
         display: inline-flex;
@@ -179,14 +251,43 @@
   </head>
   <body>
     <main>
-      <div class="mark">d<span>s</span>h</div>
+      <div class="mark">
+        <!-- The app icon as pixel vectors (hand-drawn, 26x24). The 116 source
+             paths are merged into 8 by consecutive fill, document order kept so
+             the overdraw is unchanged. The artwork sits unscaled inside a 34x34
+             tile; that light tile is what keeps the #333 body legible on dark. -->
+        <svg class="glyph" viewBox="-4 -5 34 34" aria-hidden="true">
+          <clipPath id="whale-tile">
+            <rect x="-4" y="-5" width="34" height="34" rx="7.4" />
+          </clipPath>
+          <g clip-path="url(#whale-tile)">
+            <rect x="-4" y="-5" width="34" height="34" fill="#fff" />
+            <path fill="black" d="M5 7H11V8H5V7ZM3 8H5V9H3V8ZM2 9H3V10H2V9ZM1 16H2V18H1V16ZM2 18H3V19H2V18ZM4 20H6V21H4V20ZM6 21H12V22H6V21ZM13 9H14V10H13V9ZM14 10H15V11H14V10ZM13 9H14V10H13V9ZM15 11H16V12H15V11ZM16 12H17V13H16V12ZM17 13H18V14H17V13ZM18 14H19V15H18V14ZM19 13H20V14H19V13ZM20 12H21V13H20V12ZM19 11H20V12H19V11ZM18 10H19V11H18V10ZM18 6H19V7H18V6ZM19 7H20V8H19V7ZM20 8H21V9H20V8ZM21 9H22V10H21V9ZM25 8H26V10H25V8ZM24 7H25V8H24V7ZM24 10H25V11H24V10ZM23 11H24V12H23V11ZM21 15H22V17H21V15ZM20 17H21V18H20V17ZM19 18H20V19H19V18ZM18 19H19V20H18V19ZM17 20H18V21H17V20ZM12 20H13V21H12V20ZM15 20H16V21H15V20ZM17 18H18V19H17V18ZM14 18H15V19H14V18ZM18 17H20V18H18V17ZM14 19H17V20H14V19ZM11 18H12V20H11V18ZM1 15H2V16H1V15ZM2 14H4V15H2V14ZM4 15H6V16H4V15ZM6 16H8V17H6V16ZM8 17H11V18H8V17ZM13 21H17V22H13V21ZM22 12H23V15H22V12ZM22 8H24V9H22V8ZM17 7H18V10H17V7ZM11 8H13V9H11V8ZM3 19H4V20H3V19ZM0 12H1V16H0V12ZM1 10H2V12H1V10ZM8 14H9V15H8V14ZM8 13H9V14H8V13ZM9 12H10V13H9V12ZM10 13H11V14H10V13ZM10 15H11V16H10V15ZM11 14H12V15H11V14ZM9 14H10V15H9V14Z"/>
+            <path fill="#6C8CFF" d="M10 14H11V15H10V14Z"/>
+            <path fill="#FFB6D5" d="M11 15H12V16H11V15Z"/>
+            <path fill="#333333" d="M5 8H11V9H5V8ZM3 9H13V10H3V9ZM2 10H14V11H2V10ZM2 11H15V12H2V11ZM1 12H9V13H1V12ZM1 13H8V14H1V13ZM1 14H2V15H1V14ZM19 14H22V15H19V14ZM20 13H22V14H20V13ZM21 12H22V13H21V12ZM20 11H23V12H20V11ZM19 10H24V11H19V10ZM18 9H21V10H18V9ZM22 9H25V10H22V9ZM11 17H18V18H11V17ZM12 18H14V19H12V18ZM12 19H14V20H12V19ZM13 20H15V21H13V20ZM15 18H17V19H15V18ZM18 8H20V9H18V8ZM18 7H19V8H18V7ZM24 8H25V9H24V8ZM4 14H8V15H4V14ZM6 15H10V16H6V15ZM10 12H16V13H10V12ZM11 13H17V14H11V13ZM12 14H18V15H12V14ZM12 15H21V16H12V15ZM8 16H21V17H8V16Z"/>
+            <path fill="#D9D9D9" d="M3 10H4V11H3V10ZM16 20H17V21H16V20ZM17 19H18V20H17V19ZM2 15H3V18H2V15ZM3 18H4V19H3V18ZM4 19H6V20H4V19ZM6 20H9V21H6V20Z"/>
+            <path fill="#6C8CFF" d="M9 2H10V6H9V2ZM11 4H12V6H11V4ZM12 4H15V5H12V4ZM12 3H14V4H12V3ZM10 0H11V3H10V0ZM7 3H8V5H7V3ZM5 2H7V4H5V2Z"/>
+            <path fill="#E6E3FF" d="M3 21H6V22H3V21ZM1 22H21V23H1V22ZM3 23H19V24H3V23ZM12 21H13V22H12V21ZM17 21H19V22H17V21Z"/>
+            <path fill="white" d="M3 15H4V16H3V15ZM3 16H6V17H3V16ZM3 17H8V18H3V17ZM4 18H11V19H4V18ZM6 19H11V20H6V19ZM9 20H12V21H9V20ZM18 18H19V19H18V18ZM9 13H10V14H9V13Z"/>
+          </g>
+        </svg>
+        <span class="logo">d<span>s</span>h</span>
+        <span class="meta">
+          <span class="tag">desktop</span>
+          <span id="version"></span>
+        </span>
+      </div>
       <div class="spinner"></div>
       <p id="status"></p>
       <div id="progress" hidden><div id="progress-fill"></div></div>
       <div id="error">
         <h2 id="error-title"></h2>
         <pre id="error-detail"></pre>
-        <button id="error-retry" class="primary"></button>
+        <div class="actions">
+          <button id="error-retry" class="primary"></button>
+          <button id="error-copy"></button>
+        </div>
       </div>
     </main>
 
@@ -213,13 +314,74 @@
 
         // ----------------------------------------------------- the boot --
 
-        id('status').textContent = t('正在启动 dsh…', 'Starting dsh…');
+        // Only what shows before Rust's first `dshStatus` lands. Deliberately
+        // not "starting dsh": on a cold boot the first real stage is the update
+        // check, so saying "starting" here would flash the wrong thing. The
+        // retry button below does reset to "starting", because `restart_dsh`
+        // goes straight to `start_serving`.
+        id('status').textContent = t('正在准备…', 'Getting ready…');
+
+        // Absent only when this page is opened outside the app; see main.rs.
+        if (window.__DSH_VERSION__) {
+          id('version').textContent = 'v' + window.__DSH_VERSION__;
+        }
         id('error-retry').textContent = t('重启 dsh', 'Restart dsh');
         id('error-retry').addEventListener('click', function () {
           document.body.classList.remove('failed', 'retryable');
           id('status').textContent = t('正在启动 dsh…', 'Starting dsh…');
           signal('restart-dsh');
         });
+
+        var copy = id('error-copy');
+        copy.textContent = t('复制详情', 'Copy details');
+        copy.addEventListener('click', function () {
+          // What a bug report needs: which build, what failed, and the detail
+          // the Rust side sent.
+          write(
+            [
+              ('dsh desktop ' + id('version').textContent).trim(),
+              id('error-title').textContent,
+              '',
+              id('error-detail').textContent
+            ].join('\n'),
+            copy
+          );
+        });
+
+        // This page runs on tauri.localhost, which counts as a secure context,
+        // so the clipboard API is there — but fall back rather than leave the
+        // button dead on a build where it is not.
+        function write(text, button) {
+          function copied() {
+            button.textContent = t('已复制', 'Copied');
+            setTimeout(function () {
+              button.textContent = t('复制详情', 'Copy details');
+            }, 1600);
+          }
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(copied, function () {
+              legacy(text, copied);
+            });
+            return;
+          }
+          legacy(text, copied);
+        }
+
+        function legacy(text, copied) {
+          var box = document.createElement('textarea');
+          box.value = text;
+          box.style.position = 'fixed';
+          box.style.top = '-1000px';
+          document.body.appendChild(box);
+          box.select();
+          try {
+            if (document.execCommand('copy')) {
+              copied();
+            }
+          } finally {
+            box.remove();
+          }
+        }
 
         // Called from the Rust side via webview eval; see src-tauri/src/main.rs.
         window.dshStatus = function (text) {

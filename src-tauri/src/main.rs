@@ -204,6 +204,13 @@ fn build_window(
             "window.__DSH_LANG__ = {:?};",
             crate::i18n::tag()
         ))
+        // The build's own version, for the line under the wordmark on the
+        // loading page. Read from the crate at compile time, which is the same
+        // number `sync-version` keeps `tauri.conf.json` and `package.json` on.
+        .initialization_script(format!(
+            "window.__DSH_VERSION__ = {:?};",
+            env!("CARGO_PKG_VERSION")
+        ))
         .on_page_load(move |webview, payload| {
             // The first page this window ever loads is the bundled loading page,
             // and this is the one place its address is stated by something that
