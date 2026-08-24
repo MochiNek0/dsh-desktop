@@ -496,7 +496,15 @@ pub fn script() -> String {
       'transition:opacity .2s ease,transform .2s ease}}' +
       '.dsh-wc-toast.dsh-wc-shown{{opacity:1;transform:none}}' +
       '.dsh-wc-spin{{width:11px;height:11px;border-radius:50%;flex:none;' +
-      'border:1.5px solid var(--dsh-wc-line);border-top-color:var(--dsh-wc-fg);' +
+      'border:1.5px solid var(--dsh-wc-line);border-top-color:var(--dsh-wc-fg)}}' +
+      // Only while the toast is up. The toast is hidden with `opacity`, which
+      // leaves the spinner in the render tree, and an animation there never
+      // stops ticking: a frame source that outlives what it is drawing keeps
+      // the compositor awake for as long as the app runs. Measured at 1.6% of
+      // a core with nothing on screen to show for it -- the same rule costs
+      // 0.5% in a plain browser window, so the embedded compositing path makes
+      // it three times worse than the mistake looks.
+      '.dsh-wc-toast.dsh-wc-shown .dsh-wc-spin{{' +
       'animation:dsh-wc-spin .7s linear infinite}}' +
       '@keyframes dsh-wc-spin{{to{{transform:rotate(360deg)}}}}' +
       '.dsh-wc-drag{{position:fixed;top:0;left:0;right:0;' +
