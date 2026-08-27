@@ -86,6 +86,12 @@ struct Preset {
     package: String,
     name: String,
     description: String,
+    /// Which group of the panel it is drawn under. Free-form, because the panel
+    /// decides what a group is called and in what order the groups come; an
+    /// entry naming one the panel does not know falls in with the rest rather
+    /// than disappearing. Defaults to `recommended`, so an entry written before
+    /// there were groups still lands somewhere.
+    section: String,
     /// Offered only on Windows — the one entry so far is a fix for a Windows
     /// failure, and listing it elsewhere is an invitation to install a no-op.
     windows_only: bool,
@@ -154,6 +160,10 @@ fn parse(raw: &str) -> Vec<Preset> {
                         .or_else(|| text("description"))
                         .unwrap_or_default()
                 },
+                section: text("section")
+                    .map(|section| section.trim().to_string())
+                    .filter(|section| !section.is_empty())
+                    .unwrap_or_else(|| "recommended".to_string()),
                 windows_only: flag("windowsOnly"),
                 checked: flag("checked"),
                 fix: flag("fix"),
@@ -194,6 +204,7 @@ pub fn listing(app: &AppHandle) -> String {
                 "id": preset.id,
                 "name": preset.name,
                 "description": preset.description,
+                "section": preset.section,
                 "url": preset.url,
                 "fix": preset.fix,
                 "checked": preset.checked,
@@ -704,7 +715,45 @@ mod tests {
                 preset.id
             );
             assert!(!preset.spec.is_empty(), "{} has no spec", preset.id);
+            // A section is never empty, so the panel always has a group to put
+            // an entry in — including one written before sections existed.
+            assert!(
+                !preset.section.is_empty(),
+                "{} has an empty section",
+                preset.id
+            );
         }
+    }
+
+    /// The two groups the panel draws, both actually present in the shipped
+    /// list. A typo in one of these names is a heading the panel renders empty
+    /// and a plugin that quietly falls to the end of the list.
+    #[test]
+    fn the_shipped_list_is_grouped() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(PRESETS);
+        let raw = std::fs::read_to_string(&path).expect("the shipped preset list");
+        let presets = parse(&raw);
+
+        for group in ["recommended", "authored"] {
+            assert!(
+                presets.iter().any(|preset| preset.section == group),
+                "nothing is in the {group} group"
+            );
+        }
+    }
+
+    /// An entry from before sections existed still lands in a group.
+    #[test]
+    fn an_entry_without_a_section_is_recommended() {
+        let presets = parse(
+            r#"[{"id":"a","spec":"a","name":"A","description":"d"},
+                {"id":"b","spec":"b","name":"B","description":"d","section":"  "}]"#,
+        );
+
+        assert_eq!(presets.len(), 2);
+        assert!(presets.iter().all(|preset| preset.section == "recommended"));
     }
 
     #[test]
