@@ -13,6 +13,7 @@ mod panel;
 mod plugins;
 mod server;
 mod theme;
+mod turn;
 mod update;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -196,6 +197,10 @@ fn build_window(
         .initialization_script(controls::script())
         // Turns the page's own `Notification` calls into real ones.
         .initialization_script(notify::script())
+        // Raises one of those calls itself when a turn ends, so a finished run
+        // is announced without a plugin having to be installed for it. After
+        // `notify`, because it calls the shim that one installs.
+        .initialization_script(turn::script())
         // The plugin panel, drawn over whatever page is showing when it is
         // asked for — dsh's included, which is the point of it being here.
         .initialization_script(panel::script())
