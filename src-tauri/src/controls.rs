@@ -84,6 +84,8 @@ pub enum Action {
     UpdateDsh,
     CheckApp,
     Autostart,
+    /// Turn the finished-turn notification on or off; see [`crate::settings`].
+    NotifyTurns,
     Quit,
     /// Open the plugin panel on the loading page.
     Plugins,
@@ -123,6 +125,7 @@ pub fn action(url: &Url) -> Option<Action> {
         "update-dsh" => Some(Action::UpdateDsh),
         "check-app" => Some(Action::CheckApp),
         "autostart" => Some(Action::Autostart),
+        "notify-turns" => Some(Action::NotifyTurns),
         "quit" => Some(Action::Quit),
         "plugins" => Some(Action::Plugins),
         "plugins-install" => {
@@ -162,6 +165,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::UpdateDsh => return crate::update_dsh(app),
         Action::CheckApp => return crate::update::check_now(app),
         Action::Autostart => return crate::toggle_autostart(app),
+        Action::NotifyTurns => return crate::toggle_notify_turns(app),
         Action::Quit => return crate::quit(app),
         Action::Plugins => return crate::open_plugins(app),
         Action::PluginsInstall(ids, spec) => return crate::install_plugins(app, ids, spec),
@@ -240,6 +244,16 @@ pub fn sync_autostart(app: &AppHandle) {
     );
 }
 
+/// Put the checkmark on the notification item, or take it off. Pushed on every
+/// page load and after every toggle, like the login item above.
+pub fn sync_notify(app: &AppHandle) {
+    let enabled = crate::settings::notify_on_turn_end(app);
+    eval(
+        app,
+        &format!("window.__dshNotifyTurns && window.__dshNotifyTurns({enabled})"),
+    );
+}
+
 /// Say what is running, or `""` when nothing is. Everything the menu starts
 /// reaches the network before it has anything to show — `npm view` can sit there
 /// for fifteen seconds — and a menu item that leads to nothing visible is a menu
@@ -289,6 +303,7 @@ pub fn script() -> String {
     let update_dsh = label(t!("更新 dsh…", "Update dsh…"));
     let check_app = label(t!("检查应用更新…", "Check for app updates…"));
     let autostart = label(t!("开机自启动", "Start at login"));
+    let notify = label(t!("对话完成后通知", "Notify when a turn finishes"));
     let quit = label(t!("退出 dsh", "Quit dsh"));
 
     format!(
@@ -322,6 +337,7 @@ pub fn script() -> String {
     {{ verb: 'check-app', label: {check_app} }},
     {{ separator: true }},
     {{ verb: 'autostart', label: {autostart}, check: true }},
+    {{ verb: 'notify-turns', label: {notify}, check: true }},
     {{ separator: true }},
     {{ verb: 'quit', label: {quit} }}
   ];
@@ -630,10 +646,17 @@ pub fn script() -> String {
       if (open) shut();
     }});
 
-    // Called from Rust; see `sync_autostart` and `busy`.
-    window.__dshAutostart = function (on) {{
-      var entry = checks['autostart'];
+    // Called from Rust; see `sync_autostart`, `sync_notify` and `busy`.
+    function mark(verb, on) {{
+      var entry = checks[verb];
       if (entry) entry.classList.toggle('dsh-wc-checked', !!on);
+    }}
+
+    window.__dshAutostart = function (on) {{
+      mark('autostart', on);
+    }};
+    window.__dshNotifyTurns = function (on) {{
+      mark('notify-turns', on);
     }};
     window.__dshBusy = function (text) {{
       said.textContent = text || '';

@@ -12,6 +12,7 @@ mod notify;
 mod panel;
 mod plugins;
 mod server;
+mod settings;
 mod theme;
 mod turn;
 mod update;
@@ -229,11 +230,13 @@ fn build_window(
             if payload.event() == PageLoadEvent::Finished {
                 splash.flush(&webview);
                 // The chrome was just drawn by a fresh document that has no way
-                // of knowing whether the window is maximised or the login item
-                // is on — nothing resized to tell it, and nothing was toggled.
-                // Every navigation lands here, so every navigation gets both.
+                // of knowing whether the window is maximised, the login item is
+                // on, or notifications are — nothing resized to tell it, and
+                // nothing was toggled. Every navigation lands here, so every
+                // navigation gets all three.
                 controls::sync(&webview);
                 controls::sync_autostart(webview.app_handle());
+                controls::sync_notify(webview.app_handle());
             }
         })
         .on_navigation(move |url| {
@@ -340,6 +343,18 @@ fn toggle_autostart(app: &tauri::AppHandle) {
     }
 
     controls::sync_autostart(app);
+}
+
+/// Turn the finished-turn notification on or off, and repaint the checkmark.
+///
+/// Unlike the login item there is nobody to ask afterwards what actually
+/// happened — the answer is whatever was just written — so the checkmark is
+/// pushed from the value [`settings`] returns rather than by reading the file
+/// back. A write that failed leaves the setting on for this session, which the
+/// checkmark then honestly shows.
+fn toggle_notify_turns(app: &tauri::AppHandle) {
+    settings::toggle_notify_on_turn_end(app);
+    controls::sync_notify(app);
 }
 
 /// Quit, from the window's own menu rather than the tray.
