@@ -1,6 +1,10 @@
 node_modules/
 src-tauri/target/
 src-tauri/gen/
+# Scratch space for anything a script renders for a human to look at — the
+# installer-art previews, and the injected scripts the dialog test dumps for
+# `node --check`. Never an input to a build.
+target/
 # Staged by scripts/bundle-runtime.mjs: the Node runtime and dsh the installer
 # ships. The directory itself is tracked so the bundler's glob always matches —
 # a build without a staged runtime falls back to `dsh` on PATH.
@@ -9,4 +13,10 @@ src-tauri/resources/*
 # Not staged: source, which happens to live where the resources go so that one
 # path serves both a bundled build and `tauri dev`. See src-tauri/src/plugins.rs.
 !src-tauri/resources/preset-plugins.json
+# The installer's sidebar and header bitmaps, drawn from the app icon by
+# scripts/make-installer-art.mjs. Generated rather than committed: a .bmp is a
+# blob nobody can review, and the icon they are made from is already tracked.
+# Not under resources/, because that glob is copied into the installation
+# directory and these are only read while the installer is built.
+src-tauri/installer/
 bash.exe.stackdump
