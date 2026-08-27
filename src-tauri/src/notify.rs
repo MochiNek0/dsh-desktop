@@ -44,6 +44,25 @@
 //!
 //! Because a click leads nowhere, the body is written to stand on its own: it
 //! says what finished, not "click to return".
+//!
+//! ## Whose name and icon a toast carries
+//!
+//! The installed app's. This has been reported as a bug more than once, so:
+//! a Windows toast is drawn with the name and icon of the AppUserModelID it was
+//! raised under, and `tauri-plugin-notification` passes the bundle identifier as
+//! that AUMID — but only when the running exe is not under `target\debug` or
+//! `target\release`. For an uninstalled build it passes nothing, notify-rust
+//! substitutes its `POWERSHELL_APP_ID`, and the toast says *Windows PowerShell*
+//! and wears PowerShell's icon.
+//!
+//! That is a property of running the build output directly, not a defect to fix
+//! here: the AUMID only resolves to a name and an icon because a Start Menu
+//! shortcut declares it, and an uninstalled build has no shortcut. The NSIS
+//! template already stamps `${BUNDLEID}` onto both shortcuts it creates (its
+//! `SetLnkAppUserModelId`), which is the same string the plugin sends, so an
+//! installed app is correct with nothing added. Do not "fix" this by stamping
+//! the AUMID again from `installer-hooks.nsh` — it is already done, and a second
+//! copy is one more thing to keep in step.
 
 use tauri::{AppHandle, Manager, Url};
 use tauri_plugin_notification::NotificationExt;
@@ -86,15 +105,22 @@ pub fn received(url: &Url) -> Option<Notice> {
     Some(Notice { title, body })
 }
 
-/// Raise it, unless the user is already looking at the thing it is about.
+/// Raise it, unless the user turned notifications off or is already looking at
+/// the thing it is about.
 ///
 /// A toast over the window it is announcing something in is noise — the user can
 /// see the turn finish. Suppressed here rather than in the shim because the page
 /// cannot tell: a webview's `document.hidden` follows the tab, and this window
 /// has no tabs, so it reads visible while the window is buried behind three
 /// others or sitting in the tray.
+///
+/// The preference is checked here too, for the same reason it is the last gate
+/// rather than the first: this is the one place every notification passes
+/// through, whoever raised it. Turning the setting off silences a plugin's
+/// notifications as well as this app's own, which is what a user who switched
+/// off notifications asked for.
 pub fn show(app: &AppHandle, notice: Notice) {
-    if watching(app) {
+    if !crate::settings::notify_on_turn_end(app) || watching(app) {
         return;
     }
 
