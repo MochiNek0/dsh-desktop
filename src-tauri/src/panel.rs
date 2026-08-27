@@ -48,6 +48,13 @@ pub fn script() -> String {
         ),
         "fix": t!("修复", "Fix"),
         "have": t!("已安装", "Installed"),
+        // The group headings. `recommended` and `authored` are the two the
+        // shipped list uses; `other` catches a section name the list invents
+        // that this panel has no heading for. See `section` in plugins.rs.
+        "groupRecommended": t!("推荐", "Recommended"),
+        "groupAuthored": t!("作者创建", "By the author"),
+        "groupOther": t!("其他", "More"),
+        "repo": t!("查看仓库", "View repository"),
         "allIn": t!(
             "推荐的插件都装上了。要装别的，用下面的输入框。",
             "Everything on the suggested list is installed. The box below takes anything else."
@@ -77,7 +84,7 @@ pub fn script() -> String {
 
   var TEXT = {labels};
 
-  var root = null, lede, list, held, heldList, hint, spec, log, note;
+  var root = null, lede, list, held, heldList, heldCount, hint, spec, log, note;
   var dir, drop, leave, install;
 
   // The whole channel back to Rust; see controls.rs. The navigation is
@@ -120,13 +127,24 @@ pub fn script() -> String {
     return tag;
   }}
 
+  /** Keep a card's selected styling in step with the box inside it. */
+  function mark(line, box) {{
+    line.classList.toggle('dsh-pp-on', box.checked);
+  }}
+
   function row(preset) {{
-    var line = make('label', 'dsh-pp-row');
+    var line = make('label', 'dsh-pp-row dsh-pp-card-row');
 
     var box = make('input', '', line);
     box.type = 'checkbox';
     box.value = preset.id;
     box.checked = !!preset.checked;
+
+    // The tick the user actually sees. The real checkbox stays in the DOM --
+    // it is what `ticked()` reads and what keyboard focus lands on -- but it is
+    // taken out of the layout by the stylesheet and drawn as this instead.
+    var mock = make('span', 'dsh-pp-tick', line);
+    mock.setAttribute('aria-hidden', 'true');
 
     var body = make('div', 'dsh-pp-body', line);
     var name = make('div', 'dsh-pp-name', body);
@@ -137,24 +155,49 @@ pub fn script() -> String {
     if (preset.url) {{
       // Opened in the user's browser: every navigation out of this app's own
       // origins goes there. See `is_ours` in main.rs.
-      var link = make('a', '', body);
+      var link = make('a', 'dsh-pp-repo', body);
       link.href = preset.url;
-      link.textContent = preset.url;
+      link.textContent = TEXT.repo + ' \u2197';
+      // The card is a <label>, so a click anywhere in it toggles the box --
+      // including on this link, which would tick the card on the way out to
+      // the browser. The link is the one part that is not a tick target.
+      link.addEventListener('click', function (event) {{
+        event.stopPropagation();
+      }});
     }}
+
+    box.addEventListener('change', function () {{
+      mark(line, box);
+    }});
+    mark(line, box);
 
     return line;
   }}
 
+  /** The heading over one group, with how many are in it. */
+  function heading(parent, text, count) {{
+    var head = make('div', 'dsh-pp-group', parent);
+    make('span', '', head).textContent = text;
+    make('span', 'dsh-pp-count', head).textContent = count;
+    return head;
+  }}
+
   /** One plugin that is already in the profile, and so can be taken out. */
   function holding(item) {{
-    var line = make('label', 'dsh-pp-row');
+    var line = make('label', 'dsh-pp-row dsh-pp-card-row');
 
     var box = make('input', '', line);
     box.type = 'checkbox';
     box.value = item.name;
     // The remove button only appears while something is ticked: a button that
     // takes things away should not sit on the panel with nothing to act on.
-    box.addEventListener('change', offerRemoval);
+    box.addEventListener('change', function () {{
+      mark(line, box);
+      offerRemoval();
+    }});
+
+    var mock = make('span', 'dsh-pp-tick', line);
+    mock.setAttribute('aria-hidden', 'true');
 
     var body = make('div', 'dsh-pp-body', line);
     make('div', 'dsh-pp-name', body).textContent = item.label || item.name;
@@ -196,9 +239,35 @@ pub fn script() -> String {
     var installed = data.installed || [];
 
     list.textContent = '';
+
+    // The order groups are drawn in, and what each is called. Anything whose
+    // section is not one of these falls into `other`, which keeps a preset
+    // visible even when the shipped list names a group this panel predates.
+    var groups = [
+      {{ key: 'recommended', label: TEXT.groupRecommended }},
+      {{ key: 'authored', label: TEXT.groupAuthored }},
+      {{ key: 'other', label: TEXT.groupOther }}
+    ];
+    var known = {{ recommended: 1, authored: 1, other: 1 }};
+
+    var bucketed = {{}};
     presets.forEach(function (preset) {{
-      list.appendChild(row(preset));
+      var key = known[preset.section] ? preset.section : 'other';
+      (bucketed[key] = bucketed[key] || []).push(preset);
     }});
+
+    groups.forEach(function (group) {{
+      var members = bucketed[group.key];
+      if (!members || !members.length) return;
+
+      // Only worth a heading when there is more than one group on screen --
+      // a single heading over the whole list is a label for nothing.
+      heading(list, group.label, members.length);
+      members.forEach(function (preset) {{
+        list.appendChild(row(preset));
+      }});
+    }});
+
     if (!presets.length) {{
       make('p', 'dsh-pp-lede', list).textContent = installed.length ? TEXT.allIn : TEXT.empty;
     }}
@@ -207,6 +276,7 @@ pub fn script() -> String {
     installed.forEach(function (item) {{
       heldList.appendChild(holding(item));
     }});
+    heldCount.textContent = installed.length;
     held.hidden = !installed.length;
     offerRemoval();
   }}
@@ -278,32 +348,81 @@ pub fn script() -> String {
       'user-select:none;-webkit-user-select:none;' +
       '--pp-bg:#fff;--pp-fg:#1a1a1a;--pp-muted:#6b7280;--pp-line:#e5e7eb;' +
       '--pp-accent:#4d6bfe;--pp-danger:#b42318;--pp-ok:#12805c;' +
-      '--pp-soft:#f7f8fa;--pp-fix:#b54708}}' +
+      // `hover` is the border a card takes before it is ticked, and `tint` the
+      // wash it takes after: both sit between the line colour and the accent,
+      // and both have to be given per theme rather than mixed from the accent.
+      '--pp-soft:#f7f8fa;--pp-fix:#b54708;' +
+      '--pp-hover:#c3cbe6;--pp-tint:rgba(77,107,254,.07)}}' +
       '.dsh-pp.dsh-pp-dark{{background:rgba(0,0,0,.5);' +
       '--pp-bg:#17171d;--pp-fg:#ececf1;--pp-muted:#9aa0ac;--pp-line:#2b2b34;' +
       '--pp-danger:#f97066;--pp-ok:#3ccb9a;' +
-      '--pp-soft:rgba(255,255,255,.04);--pp-fix:#f0a35e}}' +
+      '--pp-soft:rgba(255,255,255,.04);--pp-fix:#f0a35e;' +
+      '--pp-hover:#454554;--pp-tint:rgba(77,107,254,.16)}}' +
       '.dsh-pp.dsh-pp-shown{{display:flex}}' +
       // The page underneath has styles of its own for every tag this is built
       // out of. The family is the one thing worth taking back wholesale; the
       // sizes are written onto each piece below.
       '.dsh-pp,.dsh-pp *{{box-sizing:border-box;font-family:{font}}}' +
       '.dsh-pp-card{{display:flex;flex-direction:column;min-height:0;' +
-      'max-height:100%;width:min(720px,100%);padding:20px 22px;' +
+      'max-height:100%;width:min(760px,100%);padding:22px 24px;' +
       'border-radius:14px;background:var(--pp-bg);color:var(--pp-fg);' +
       'box-shadow:0 24px 64px rgba(0,0,0,.32),0 0 0 .5px var(--pp-line)}}' +
       '.dsh-pp-card h1{{font-size:17px;font-weight:600;line-height:1.4;margin:0 0 6px}}' +
       '.dsh-pp-lede{{margin:0 0 16px;color:var(--pp-muted);font-size:13px}}' +
       '.dsh-pp-list{{flex:1 1 auto;min-height:0;overflow:auto;margin:0 -4px;padding:0 4px}}' +
-      '.dsh-pp-row{{display:flex;gap:11px;align-items:flex-start;padding:11px 13px;' +
-      'border:1px solid var(--pp-line);border-radius:10px;margin-bottom:8px;' +
-      'background:var(--pp-soft)}}' +
-      '.dsh-pp-row input{{margin:3px 0 0;accent-color:var(--pp-accent);flex:none}}' +
-      '.dsh-pp-body{{min-width:0}}' +
+      // The heading over a group, and the count beside it.
+      '.dsh-pp-group{{display:flex;align-items:center;gap:8px;margin:14px 2px 9px;' +
+      'font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--pp-muted)}}' +
+      '.dsh-pp-group:first-child{{margin-top:2px}}' +
+      '.dsh-pp-count{{flex:none;min-width:18px;height:18px;padding:0 6px;' +
+      'display:inline-flex;align-items:center;justify-content:center;' +
+      'border-radius:999px;background:var(--pp-soft);border:1px solid var(--pp-line);' +
+      'font-size:11px;font-weight:600;color:var(--pp-muted)}}' +
+      // A card rather than a row: it lifts on hover and takes an accent border
+      // when it is ticked, so a selection is visible without reading the box.
+      '.dsh-pp-row{{position:relative;display:flex;gap:11px;align-items:flex-start;' +
+      'padding:13px 15px;border:1px solid var(--pp-line);border-radius:12px;' +
+      'margin-bottom:9px;background:var(--pp-bg);cursor:pointer;' +
+      'transition:border-color .15s,background .15s,box-shadow .15s,transform .15s}}' +
+      '.dsh-pp-row:hover{{border-color:var(--pp-hover);background:var(--pp-soft);' +
+      'transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.07)}}' +
+      '.dsh-pp-row.dsh-pp-on{{border-color:var(--pp-accent);background:var(--pp-tint)}}' +
+      '.dsh-pp-row.dsh-pp-on:hover{{border-color:var(--pp-accent)}}' +
+      // The real checkbox: still focusable and still what `ticked()` reads,
+      // but out of the layout so the drawn tick can take its place.
+      '.dsh-pp-row input{{position:absolute;opacity:0;width:1px;height:1px;' +
+      'margin:0;pointer-events:none}}' +
+      '.dsh-pp-tick{{flex:none;width:17px;height:17px;margin-top:2px;border-radius:6px;' +
+      'border:1.5px solid var(--pp-line);background:var(--pp-bg);position:relative;' +
+      'transition:border-color .15s,background .15s}}' +
+      '.dsh-pp-row:hover .dsh-pp-tick{{border-color:var(--pp-hover)}}' +
+      '.dsh-pp-row.dsh-pp-on .dsh-pp-tick{{border-color:var(--pp-accent);' +
+      'background:var(--pp-accent)}}' +
+      // The check itself, drawn as a rotated corner rather than a glyph: a
+      // character would inherit whatever the page underneath does to fonts.
+      '.dsh-pp-tick:after{{content:"";position:absolute;left:5px;top:1.5px;' +
+      'width:4px;height:8px;border:solid #fff;border-width:0 2px 2px 0;' +
+      'transform:rotate(45deg) scale(0);transition:transform .15s}}' +
+      '.dsh-pp-row.dsh-pp-on .dsh-pp-tick:after{{transform:rotate(45deg) scale(1)}}' +
+      // Keyboard focus has to land somewhere visible, and the box it lands on
+      // is invisible by now.
+      '.dsh-pp-row input:focus-visible ~ .dsh-pp-tick{{outline:2px solid var(--pp-accent);' +
+      'outline-offset:2px}}' +
+      '.dsh-pp-body{{min-width:0;flex:1}}' +
       '.dsh-pp-name{{font-weight:600;display:flex;align-items:center;gap:7px;flex-wrap:wrap}}' +
-      '.dsh-pp-desc{{color:var(--pp-muted);font-size:13px;margin-top:2px}}' +
-      '.dsh-pp-row a{{color:var(--pp-accent);text-decoration:none;font-size:12px}}' +
-      '.dsh-pp-row a:hover{{text-decoration:underline}}' +
+      '.dsh-pp-desc{{color:var(--pp-muted);font-size:13px;margin-top:3px}}' +
+      // A badge, not a bare URL. The repository addresses in the list run long
+      // enough to wrap twice and say nothing the name has not already said.
+      '.dsh-pp-repo{{display:inline-flex;align-items:center;margin-top:9px;' +
+      'padding:3px 9px;border-radius:999px;border:1px solid var(--pp-line);' +
+      'background:var(--pp-soft);color:var(--pp-muted);text-decoration:none;' +
+      'font-size:11.5px;transition:color .15s,border-color .15s}}' +
+      '.dsh-pp-repo:hover{{color:var(--pp-accent);border-color:var(--pp-accent)}}' +
+      // Nothing here is load-bearing; a user who asked for less movement can
+      // have the same panel without any of it.
+      '@media (prefers-reduced-motion:reduce){{.dsh-pp-row,.dsh-pp-tick,' +
+      '.dsh-pp-tick:after,.dsh-pp-repo{{transition:none}}' +
+      '.dsh-pp-row:hover{{transform:none}}}}' +
       '.dsh-pp-chip{{font-size:11px;font-weight:500;line-height:1.5;padding:0 7px;' +
       'border-radius:999px;border:1px solid currentColor}}' +
       '.dsh-pp-chip.dsh-pp-fix{{color:var(--pp-fix)}}' +
@@ -313,7 +432,10 @@ pub fn script() -> String {
       // the one being chosen from.
       '.dsh-pp-held{{flex:none;max-height:26vh;overflow:auto;margin:14px -4px 0;padding:0 4px}}' +
       '.dsh-pp-held[hidden]{{display:none}}' +
-      '.dsh-pp-sub{{font-size:12px;font-weight:600;color:var(--pp-muted);margin:0 0 8px}}' +
+      // The same heading as a group's, so "Installed" reads as one more group
+      // rather than as a different kind of thing.
+      '.dsh-pp-sub{{display:flex;align-items:center;gap:8px;margin:0 2px 9px;' +
+      'font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--pp-muted)}}' +
       '.dsh-pp-hint{{display:block;margin-top:12px;font-size:12px;color:var(--pp-muted)}}' +
       '.dsh-pp-spec{{width:100%;margin-top:4px;padding:8px 11px;' +
       'border:1px solid var(--pp-line);border-radius:8px;background:var(--pp-bg);' +
@@ -361,7 +483,9 @@ pub fn script() -> String {
     list = make('div', 'dsh-pp-list', card);
 
     held = make('div', 'dsh-pp-held', card);
-    make('div', 'dsh-pp-sub', held).textContent = TEXT.have;
+    var haveHead = make('div', 'dsh-pp-sub', held);
+    make('span', '', haveHead).textContent = TEXT.have;
+    heldCount = make('span', 'dsh-pp-count', haveHead);
     heldList = make('div', '', held);
 
     hint = make('label', 'dsh-pp-hint', card);
