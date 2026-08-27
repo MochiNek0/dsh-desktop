@@ -30,6 +30,20 @@
 //! keeps the `Notification` object and its `onclick` intact and simply never
 //! fires it, which is exactly what happens today, and the notification itself is
 //! the part that was missing.
+//!
+//! This has been asked about, so the state of the ground underneath it: the
+//! Windows half is in fact reachable — `notify-rust` calls `Toast::on_activated`
+//! and hands back a `NotificationHandle` carrying the activation — but
+//! `tauri-plugin-notification`'s desktop `show()` drops that handle on the
+//! floor, so nothing above it can see a click. Wiring one up means going around
+//! the plugin to `notify-rust` directly, on Windows only, and owning a second
+//! notification path for the one platform. That is a real cost for a
+//! convenience, and the decision here is deliberately to leave the toast
+//! inert and put what the user needs into its text instead. Revisit if the
+//! plugin ever surfaces the handle.
+//!
+//! Because a click leads nowhere, the body is written to stand on its own: it
+//! says what finished, not "click to return".
 
 use tauri::{AppHandle, Manager, Url};
 use tauri_plugin_notification::NotificationExt;
@@ -133,10 +147,22 @@ pub fn script() -> String {
   if (window.__dshNotify) return;
   window.__dshNotify = true;
 
+  // Bumped for every notification and pasted into the URL below, which is what
+  // makes each one different from the last.
+  //
+  // Assigning `location.href` only navigates when the value actually changes,
+  // and this navigation is cancelled in Rust (see main.rs, which answers
+  // `false` to it) so the address bar never moves. Two identical notifications
+  // would therefore build the same string twice, and the second assignment
+  // would be a no-op: the toast simply would not appear. That is not
+  // hypothetical -- it is what made a repeated notification fire exactly once.
+  var nonce = 0;
+
   // The channel back to Rust; see controls.rs. The navigation is cancelled
   // there, so raising a notification never moves the page.
   function signal(title, body) {{
-    var query = 'title=' + encodeURIComponent(title) + '&body=' + encodeURIComponent(body);
+    var query = 'title=' + encodeURIComponent(title) + '&body=' + encodeURIComponent(body) +
+      '&n=' + (++nonce) + '.' + Date.now();
     window.location.href = '{scheme}://notify?' + query;
   }}
 
@@ -247,5 +273,34 @@ mod tests {
     #[test]
     fn leaves_a_short_string_alone() {
         assert_eq!(clamp("  done  "), "done");
+    }
+
+    /// The cache-buster the shim adds is not part of the notification.
+    ///
+    /// It exists because `location.href` only navigates when the string
+    /// changes, and this navigation is cancelled — so two identical
+    /// notifications would produce one toast. Reading it as a field would put
+    /// it on screen.
+    #[test]
+    fn ignores_the_cache_buster() {
+        let notice = parse("title=Turn%20finished&body=all%20done&n=7.1700000000000")
+            .expect("a notice");
+
+        assert_eq!(notice.title, "Turn finished");
+        assert_eq!(notice.body, "all done");
+    }
+
+    /// The shim has to put something different in the URL every time, or the
+    /// second of two identical notifications never navigates and so is never
+    /// raised. Asserted against the generated script because that is where the
+    /// mistake would be reintroduced.
+    #[test]
+    fn the_shim_varies_every_url() {
+        let script = super::script();
+
+        assert!(
+            script.contains("++nonce"),
+            "the shim must make each notification URL unique"
+        );
     }
 }
