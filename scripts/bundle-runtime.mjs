@@ -48,3 +48,12 @@ for (const script of ['install-deps.ps1', 'install-deps.sh']) {
   copyFileSync(join(root, 'scripts', script), join(resources, script));
 }
 console.log('[bundle] staged install-deps.ps1 and install-deps.sh');
+
+// The installer's two bitmaps, drawn from the app icon. They go into
+// `src-tauri/installer/` rather than here, because everything in `resources/`
+// is copied into the installation directory and these are only read while the
+// installer is being built. An earlier version wrote them here; sweep those.
+for (const stale of ['installer-sidebar.bmp', 'installer-header.bmp']) {
+  rmSync(join(resources, stale), { force: true });
+}
+await import('./make-installer-art.mjs');

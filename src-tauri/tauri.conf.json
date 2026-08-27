@@ -42,7 +42,9 @@
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
-        "installerHooks": "installer-hooks.nsh"
+        "installerHooks": "installer-hooks.nsh",
+        "sidebarImage": "installer/installer-sidebar.bmp",
+        "headerImage": "installer/installer-header.bmp"
       }
     }
   }
