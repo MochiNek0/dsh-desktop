@@ -14,7 +14,6 @@
 use std::time::{Duration, Instant};
 
 use tauri::AppHandle;
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 /// How often the download may repaint the status line. Every chunk would be a
@@ -71,36 +70,49 @@ fn check(app: AppHandle, verbose: bool) {
 
 /// Ask before spending the user's bandwidth.
 fn offer(app: &AppHandle, update: Update) {
-    let app = app.clone();
     let version = update.version.clone();
     let notes = update.body.clone().unwrap_or_default();
 
-    app.clone()
-        .dialog()
-        .message(&if notes.is_empty() {
-            t!(
-                "发现新版本 {}，是否现在下载并安装？",
-                "Version {} is available. Download and install it now?",
-                version
-            )
-        } else {
-            t!(
-                "发现新版本 {}，是否现在下载并安装？\n\n{}",
-                "Version {} is available. Download and install it now?\n\n{}",
-                version,
-                notes
-            )
-        })
-        .title(t!("有可用更新", "Update available"))
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            t!("现在更新", "Update now").into(),
-            t!("稍后", "Later").into(),
-        ))
-        .show(move |accepted| {
-            if accepted {
+    let body = if notes.is_empty() {
+        t!(
+            "发现新版本 {}，是否现在下载并安装？",
+            "Version {} is available. Download and install it now?",
+            version
+        )
+    } else {
+        t!(
+            "发现新版本 {}，是否现在下载并安装？\n\n{}",
+            "Version {} is available. Download and install it now?\n\n{}",
+            version,
+            notes
+        )
+    };
+
+    // The update is not `Clone` and the callback is a `Box<dyn FnOnce>` that
+    // has to be `Send`; a mutex is how it is carried into one and taken out
+    // again exactly once.
+    let carried = std::sync::Mutex::new(Some(update));
+
+    crate::dialog::ask(
+        app,
+        crate::dialog::Ask {
+            title: t!("有可用更新", "Update available").to_string(),
+            body,
+            choices: vec![
+                crate::dialog::Choice::new("later", t!("稍后", "Later")),
+                crate::dialog::Choice::primary("now", t!("现在更新", "Update now")),
+            ],
+            answered: Box::new(move |app, id| {
+                if id != "now" {
+                    return;
+                }
+                let Some(update) = carried.lock().ok().and_then(|mut held| held.take()) else {
+                    return;
+                };
                 install(app.clone(), update);
-            }
-        });
+            }),
+        },
+    );
 }
 
 fn install(app: AppHandle, update: Update) {
@@ -157,25 +169,30 @@ fn install(app: AppHandle, update: Update) {
         {
             crate::controls::busy(&app, "");
 
-            let restarting = app.clone();
-            app.dialog()
-                .message(t!(
-                    "新版本已安装，重启后生效。正在进行的会话会被中断。",
-                    "The update is installed and takes effect on restart. \
-                     A session in progress will be interrupted."
-                ))
-                .title(t!("更新就绪", "Update ready"))
-                .buttons(MessageDialogButtons::OkCancelCustom(
-                    t!("立即重启", "Restart now").into(),
-                    t!("稍后", "Later").into(),
-                ))
-                .show(move |now| {
-                    if now {
-                        // Skips the ordinary shutdown path, so the dsh process
-                        // tree is left to the job object backstop in `server`.
-                        restarting.restart();
-                    }
-                });
+            crate::dialog::ask(
+                &app,
+                crate::dialog::Ask {
+                    title: t!("更新就绪", "Update ready").to_string(),
+                    body: t!(
+                        "新版本已安装，重启后生效。正在进行的会话会被中断。",
+                        "The update is installed and takes effect on restart. \
+                         A session in progress will be interrupted."
+                    )
+                    .to_string(),
+                    choices: vec![
+                        crate::dialog::Choice::new("later", t!("稍后", "Later")),
+                        crate::dialog::Choice::primary("now", t!("立即重启", "Restart now")),
+                    ],
+                    answered: Box::new(|app, id| {
+                        if id == "now" {
+                            // Skips the ordinary shutdown path, so the dsh
+                            // process tree is left to the job object backstop
+                            // in `server`.
+                            app.restart();
+                        }
+                    }),
+                },
+            );
         }
     });
 }
@@ -202,6 +219,16 @@ fn downloaded(done: u64, total: Option<u64>) -> String {
     }
 }
 
+/// Say something that needs no answer. One button, because the only thing to do
+/// about "up to date" or "the check failed" is to stop reading it.
 fn note(app: &AppHandle, title: &str, detail: &str) {
-    app.dialog().message(detail).title(title).show(|_| {});
+    crate::dialog::ask(
+        app,
+        crate::dialog::Ask {
+            title: title.to_string(),
+            body: detail.to_string(),
+            choices: vec![crate::dialog::Choice::primary("ok", t!("知道了", "OK"))],
+            answered: Box::new(|_, _| {}),
+        },
+    );
 }

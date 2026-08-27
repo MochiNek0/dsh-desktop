@@ -105,6 +105,9 @@ pub enum Action {
     RestartDsh,
     /// A notification the page raised; see [`crate::notify`].
     Notify(crate::notify::Notice),
+    /// A button in one of this app's own dialogs; see [`crate::dialog`]. Carries
+    /// the whole URL because the token and the button id are read there.
+    Answered(Url),
     /// Open an external URL in the system browser.
     OpenUrl(String),
 }
@@ -147,6 +150,9 @@ pub fn action(url: &Url) -> Option<Action> {
         // and the only one that can decline: an empty notification is dropped
         // here rather than raised as a blank toast.
         "notify" => crate::notify::received(url).map(Action::Notify),
+        // An answer to a question this app asked; see `crate::dialog`, which
+        // owns the parsing because it owns the callback the answer runs.
+        "ask" => Some(Action::Answered(url.clone())),
         other => {
             eprintln!("dsh-desktop: ignoring unknown window action {other}");
             None
@@ -174,6 +180,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::PluginsDirectory => return crate::plugins::open_directory(app),
         Action::RestartDsh => return crate::restart_dsh(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),
+        Action::Answered(url) => return crate::dialog::answered(app, &url),
         Action::OpenUrl(target) => {
             let _ = app.opener().open_url(target, None::<&str>);
             return;

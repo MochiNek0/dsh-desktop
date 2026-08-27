@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 
 use semver::Version;
 use tauri::{AppHandle, Manager};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -730,22 +729,28 @@ fn printed(mut command: Command, timeout: Duration) -> Option<String> {
 /// Blocking, unlike every other dialog here: the answer decides what this
 /// launch does next, and there is nothing sensible to do until it arrives.
 fn ask(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
-    app.dialog()
-        .message(&t!(
-            "dsh 有新版本 {}（当前 {}）。\n\n\
-             下载约需 {}。更新期间应用会等待，完成后直接启动。",
-            "dsh {} is available (this machine has {}).\n\n\
-             The download is {}. The app waits for it and then starts.",
-            latest,
-            installed,
-            download_size()
-        ))
-        .title(t!("dsh 有可用更新", "A dsh update is available"))
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            t!("更新", "Update").into(),
-            t!("跳过此版本", "Skip this version").into(),
-        ))
-        .blocking_show()
+    crate::dialog::confirm(
+        app,
+        crate::dialog::Ask {
+            title: t!("dsh 有可用更新", "A dsh update is available").to_string(),
+            body: t!(
+                "dsh 有新版本 {}（当前 {}）。\n\n\
+                 下载约需 {}。更新期间应用会等待，完成后直接启动。",
+                "dsh {} is available (this machine has {}).\n\n\
+                 The download is {}. The app waits for it and then starts.",
+                latest,
+                installed,
+                download_size()
+            ),
+            choices: vec![
+                crate::dialog::Choice::new("skip", t!("跳过此版本", "Skip this version")),
+                crate::dialog::Choice::primary("update", t!("更新", "Update")),
+            ],
+            // Replaced by `confirm`; it is the channel send that answers.
+            answered: Box::new(|_, _| {}),
+        },
+        "update",
+    )
 }
 
 /// The same question from the tray, where dsh is already serving the window.
@@ -753,24 +758,29 @@ fn ask(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
 /// Also blocking: the answer decides whether the server comes down, and the
 /// caller has nothing to do until it arrives.
 fn confirm(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
-    app.dialog()
-        .message(&t!(
-            "dsh 有新版本 {}（当前 {}）。\n\n\
-             下载约需 {}。更新前会先关闭正在运行的 dsh —— \
-             正在进行的会话会被中断 —— 完成后自动重新启动。",
-            "dsh {} is available (this machine has {}).\n\n\
-             The download is {}. The running dsh is stopped first — a session in \
-             progress will be interrupted — and started again when it is done.",
-            latest,
-            installed,
-            download_size()
-        ))
-        .title(t!("更新 dsh", "Update dsh"))
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            t!("更新", "Update").into(),
-            t!("取消", "Cancel").into(),
-        ))
-        .blocking_show()
+    crate::dialog::confirm(
+        app,
+        crate::dialog::Ask {
+            title: t!("更新 dsh", "Update dsh").to_string(),
+            body: t!(
+                "dsh 有新版本 {}（当前 {}）。\n\n\
+                 下载约需 {}。更新前会先关闭正在运行的 dsh —— \
+                 正在进行的会话会被中断 —— 完成后自动重新启动。",
+                "dsh {} is available (this machine has {}).\n\n\
+                 The download is {}. The running dsh is stopped first — a session in \
+                 progress will be interrupted — and started again when it is done.",
+                latest,
+                installed,
+                download_size()
+            ),
+            choices: vec![
+                crate::dialog::Choice::new("cancel", t!("取消", "Cancel")),
+                crate::dialog::Choice::primary("update", t!("更新", "Update")),
+            ],
+            answered: Box::new(|_, _| {}),
+        },
+        "update",
+    )
 }
 
 /// Tell the user about an update to a dsh that is not laid out as one
@@ -908,7 +918,15 @@ fn interpreter(script: &Path) -> Command {
 /// A dialog with nothing to answer. Public because the tray has one thing to say
 /// that this module knows nothing about — see `update_dsh` in `main.rs`.
 pub fn note(app: &AppHandle, title: &str, detail: &str) {
-    app.dialog().message(detail).title(title).show(|_| {});
+    crate::dialog::ask(
+        app,
+        crate::dialog::Ask {
+            title: title.to_string(),
+            body: detail.to_string(),
+            choices: vec![crate::dialog::Choice::primary("ok", t!("知道了", "OK"))],
+            answered: Box::new(|_, _| {}),
+        },
+    );
 }
 
 /// Put the directories dsh needs at the front of a child's PATH.

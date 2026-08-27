@@ -7,6 +7,7 @@
 mod i18n;
 
 mod controls;
+mod dialog;
 mod dsh;
 mod notify;
 mod panel;
@@ -205,6 +206,8 @@ fn build_window(
         // The plugin panel, drawn over whatever page is showing when it is
         // asked for — dsh's included, which is the point of it being here.
         .initialization_script(panel::script())
+        // The app's own dialogs, in place of the window manager's; see `dialog`.
+        .initialization_script(dialog::script())
         // Which language the pages pick their own strings out of; see `i18n`.
         .initialization_script(format!(
             "window.__DSH_LANG__ = {:?};",
