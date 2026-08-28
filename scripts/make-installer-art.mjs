@@ -31,10 +31,9 @@ const out = join(root, "src-tauri", "installer");
 // Gitignored, so it is absent on a fresh clone and on CI.
 mkdirSync(out, { recursive: true });
 
-// The loading page's palette; see `dist/index.html`. The whale's own colours
+// The loading page's accent; see `dist/index.html`. The whale's own colours
 // are not here — they come from the icon, decoded below.
 const ACCENT = [0x4d, 0x6b, 0xfe];
-const MUTED = [0x6b, 0x72, 0x80];
 
 /** A canvas of solid white, addressed in RGB. */
 function canvas(width, height) {
@@ -269,24 +268,26 @@ glow(side, 82, 110, 150, ACCENT, 0.16);
 // than floating.
 glow(side, 82, 120, 76, ACCENT, 0.1);
 icon(side, mark, 30, 76, 104);
-// The accent rule along the bottom, echoing the loading page's progress bar.
-for (let x = 22; x < 142; x++) {
-  for (let y = 268; y < 270; y++) side.set(x, y, ACCENT, 0.85);
-}
-for (let x = 22; x < 142; x++) {
-  for (let y = 276; y < 277; y++) side.set(x, y, MUTED, 0.25);
-}
+// Nothing under the mark. Two rules were drawn here once, echoing the loading
+// page's progress bar -- but that bar means something, and a copy of it in a
+// panel with no progress to report is just a line. On screen it read as one:
+// the same complaint as the hairline the header used to carry.
 const sidebar = save("installer-sidebar.bmp", side);
 
 // -------------------------------------------------------------- the header --
-// 150x57, top right of every page between welcome and finish. NSIS draws it on
+// 150x57, top left of every page between welcome and finish. NSIS draws it on
 // the header's own white, so this stays white and carries just the mark.
+//
+// MUI2 puts the header bitmap on the *left*, with the page's title text to
+// its right. `MUI_HEADERIMAGE_RIGHT` would swap the two, and the installer
+// Tauri generates does not define it. So the mark sits at the right-hand end
+// of these 150 pixels, which is where it ends up beside the title rather than
+// marooned against the edge of the window -- and nothing is drawn to its left.
+// A rule was, once, on the assumption the title came first; with the title on
+// the other side it shipped as a stray line floating in the header.
 const head = canvas(150, 57);
 glow(head, 112, 28, 58, ACCENT, 0.1);
 icon(head, mark, 96, 8, 42);
-// A hairline between the mark and the page's own title text, which NSIS draws
-// to the left of this bitmap.
-for (let y = 14; y < 43; y++) head.set(86, y, ACCENT, 0.45);
 const header = save("installer-header.bmp", head);
 
 console.log(`installer art: ${sidebar}, ${header}`);
