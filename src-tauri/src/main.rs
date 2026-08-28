@@ -81,6 +81,11 @@ struct Session {
 }
 
 fn main() {
+    // Before anything else, and from the thread that is about to become the
+    // event loop: `dialog::confirm` blocks on a message only this thread can
+    // deliver, and this is what lets it assert it is not being called here.
+    dialog::remember_main_thread();
+
     let server: Arc<Mutex<Option<server::Server>>> = Arc::new(Mutex::new(None));
     let setup_server = server.clone();
 
@@ -348,7 +353,10 @@ fn toggle_autostart(app: &tauri::AppHandle) {
     controls::sync_autostart(app);
 }
 
-/// Turn the finished-turn notification on or off, and repaint the checkmark.
+/// Turn this app's notifications on or off, and repaint the checkmark.
+///
+/// Every notification, not only the finished-turn one: the gate is in
+/// `notify::show`, which they all pass through. See [`settings`].
 ///
 /// Unlike the login item there is nobody to ask afterwards what actually
 /// happened — the answer is whatever was just written — so the checkmark is
@@ -356,7 +364,7 @@ fn toggle_autostart(app: &tauri::AppHandle) {
 /// back. A write that failed leaves the setting on for this session, which the
 /// checkmark then honestly shows.
 fn toggle_notify_turns(app: &tauri::AppHandle) {
-    settings::toggle_notify_on_turn_end(app);
+    settings::toggle_notifications(app);
     controls::sync_notify(app);
 }
 
