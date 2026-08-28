@@ -45,33 +45,59 @@
 //! next question in a queue, which becomes visible the moment the first is
 //! answered — audible.
 //!
-//! ## The first look is a baseline
+//! ## The first seconds are a baseline
 //!
 //! A document that loads with a question already pending records it and says
 //! nothing. The alternative announces one on every navigation and every reload
 //! that lands while dsh happens to be waiting, which is noise about something
-//! the user already knows. Only a change away from what was there at load is
-//! news. This mirrors the turn watcher, which samples at load to have something
-//! to measure against rather than to announce.
+//! the user already knows. Only a change away from what this document arrived
+//! with is news.
+//!
+//! What it arrived with takes a moment to appear, which is why the baseline is a
+//! window and not a first look: dsh's page is a shell when this script runs, and
+//! a card replaying a pending request is mounted by a render and a resync that
+//! both come later. A single look would record "nothing pending" every time and
+//! then announce the replay. See [`GRACE`].
 //!
 //! ## It cannot double up with the turn watcher
 //!
 //! The two edges are disjoint, and the DOM is what makes them so rather than a
 //! flag shared between the modules. While a card is up the input bar is gone,
-//! so `turn`'s `primary()` finds no button carrying both the hashed `primary`
-//! class and an svg — the only other `_primary` in the build this was checked
-//! against belongs to the models settings dialog — and its `running()` answers
-//! `null`, which it treats as "say nothing, keep the last known state". The
-//! turn watcher therefore stays quiet for the whole wait and fires once, later,
-//! when the answer has been given and the run actually ends.
+//! so `turn`'s `primary()` finds no button of dsh's carrying both the hashed
+//! `primary` class and an svg — the only other one in the build this was checked
+//! against belongs to the models settings dialog, and this app's own cards are
+//! skipped by name; see `ours` there — and its `running()` answers `null`, which
+//! it treats as "say nothing, keep the last known state". The turn watcher
+//! therefore stays quiet for the whole wait and fires once, later, when the
+//! answer has been given and the run actually ends.
 
-/// How long a card has to stay up before it is believed, in milliseconds.
+/// How often the composer is read, in milliseconds.
 ///
-/// The takeover is one React commit, so this is not smoothing a swap the way
-/// [`crate::turn`]'s debounce is; it is coalescing the burst of mutations that
-/// one commit produces into a single read. Short, because unlike a finished
-/// turn there is no argument for letting a question sit unannounced.
-const DEBOUNCE: u32 = 400;
+/// A clock of its own, for the reason [`crate::turn::PERIOD`] gives: this was a
+/// `MutationObserver` feeding a debounce that every batch reset, and anything
+/// still redrawing the page — a stream that has not stopped, an elapsed-time
+/// counter — could keep resetting it past the moment a question went up. What is
+/// being read is a state, and a state is read on a clock. Short, because unlike
+/// a finished turn there is no argument for letting a question sit unannounced.
+const PERIOD: u32 = 500;
+
+/// How long after a document starts a card still counts as one that was already
+/// there, in milliseconds.
+///
+/// The baseline cannot be a single first look. dsh's page arrives as a shell:
+/// the composer is mounted by the first render and a card replaying a pending
+/// request by the resync after that, both of them well after this script runs.
+/// A single look would therefore always record "nothing pending" and then
+/// announce the replay as a fresh question — on every navigation, and every
+/// reload that lands while dsh happens to be waiting, which is exactly the noise
+/// the baseline exists to prevent.
+///
+/// So the baseline is a window rather than a moment: for this long, whatever is
+/// on screen is recorded and nothing is announced. The cost is that a genuinely
+/// new question raised within it is silent, and that is the right way round —
+/// a question that arrives seconds after a load is one the user is sitting in
+/// front of, having just navigated or reloaded to get there.
+const GRACE: u32 = 4_000;
 
 /// The waits dsh can raise: the attribute that marks each, and what to say.
 ///
@@ -109,10 +135,9 @@ fn waits() -> [(&'static str, &'static str, &'static str); 3] {
 
 /// The watcher, injected into every document the window loads.
 pub fn script() -> String {
-    let debounce = DEBOUNCE;
+    let period = PERIOD;
+    let grace = GRACE;
 
-    // Both lists are built from `waits`, so an attribute cannot reach the
-    // lookup without also reaching the observer that triggers it.
     let table = waits()
         .iter()
         // Every string goes in through `{:?}`, so a quote or a backslash in a
@@ -122,12 +147,6 @@ pub fn script() -> String {
         })
         .collect::<Vec<_>>()
         .join(",\n    ");
-
-    let filter = waits()
-        .iter()
-        .map(|(attribute, _, _)| format!("{attribute:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
 
     format!(
         r#"(function () {{
@@ -141,11 +160,13 @@ pub fn script() -> String {
     {table}
   ];
 
-  // Undefined until the first sample, which records what was already there
-  // without announcing it. A string after that: the attribute and the pending
-  // request's key, or '' for nothing pending.
-  var seen;
-  var pending = null;
+  // The attribute and the pending request's key, or '' for nothing pending.
+  // Recorded rather than compared until the baseline window is over; see GRACE
+  // in waiting.rs.
+  var seen = '';
+  // When this document started, which is when this script ran: the baseline
+  // window is measured from here rather than from the first sample.
+  var opened = Date.now();
 
   /** The wait on screen, and the mark identifying the request behind it. */
   function current() {{
@@ -171,8 +192,8 @@ pub fn script() -> String {
       // is already looking at the window.
       new Notification(wait.title, {{ body: wait.body, tag: 'dsh-waiting' }});
     }} catch (error) {{
-      // A toast is a courtesy; it is not worth throwing inside an observer
-      // callback that dsh's own rendering is driving.
+      // A toast is a courtesy; it is not worth throwing out of a timer dsh's
+      // own rendering shares.
     }}
   }}
 
@@ -181,8 +202,11 @@ pub fn script() -> String {
     var now = current();
     var mark = now ? now.mark : '';
 
-    // The state as it stands at load. Recorded, not announced; see waiting.rs.
-    if (seen === undefined) {{
+    // The state as this document arrived. Recorded, not announced, and for a
+    // window rather than for one look -- dsh mounts its UI, and then replays
+    // whatever it was waiting on, after this script has run. See GRACE in
+    // waiting.rs.
+    if (Date.now() - opened < {grace}) {{
       seen = mark;
       return;
     }}
@@ -193,37 +217,18 @@ pub fn script() -> String {
     if (now) announce(now.wait);
   }}
 
-  function schedule() {{
-    if (pending !== null) clearTimeout(pending);
-    pending = setTimeout(function () {{
-      pending = null;
-      sample();
-    }}, {debounce});
-  }}
-
-  function watch() {{
-    // The whole document, for the reason the turn watcher gives: the composer
-    // is replaced wholesale, so observing it would mean re-attaching every time
-    // it goes. Attributes are watched as well as the child list because a card
-    // can in principle keep its element and be handed a new request's key.
-    new MutationObserver(schedule).observe(document.body, {{
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: [{filter}]
-    }});
-    sample();
-  }}
-
-  if (document.body) watch();
-  else document.addEventListener('DOMContentLoaded', watch, {{ once: true }});
+  // On a clock rather than on dsh's mutations, and with no wait for a document:
+  // `current()` only ever queries, and a query against a document that has not
+  // built its body yet finds nothing -- which is the same answer as a composer
+  // with nothing pending in it.
+  setInterval(sample, {period});
 }})();"#
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{script, waits, DEBOUNCE};
+    use super::{script, waits, GRACE, PERIOD};
 
     /// The script is pasted into a webview whole, so what is worth asserting is
     /// that the parts that vary actually reached it.
@@ -231,7 +236,8 @@ mod tests {
     fn carries_its_constants_and_strings() {
         let script = script();
 
-        assert!(script.contains(&DEBOUNCE.to_string()));
+        assert!(script.contains(&PERIOD.to_string()));
+        assert!(script.contains(&GRACE.to_string()));
         for (attribute, title, body) in waits() {
             assert!(
                 script.contains(attribute),
@@ -242,24 +248,40 @@ mod tests {
         }
     }
 
-    /// Every wait it looks for is also one it is woken for.
+    /// Each attribute reaches the script exactly once, from the table.
     ///
-    /// The two lists are built from the same table but pasted into different
-    /// places — the `WAITS` array and the observer's `attributeFilter` — and an
-    /// attribute that reached only one of them would be a wait that is either
-    /// never noticed or noticed only when something else happened to redraw.
+    /// There used to be a second copy in the observer's `attributeFilter`, and
+    /// an attribute that reached only one of the two was a wait either never
+    /// noticed or noticed only when something else happened to redraw. Reading
+    /// on a clock removed that whole class of mistake along with the observer —
+    /// this pins that it stays removed rather than growing a second list again.
     #[test]
-    fn watches_every_attribute_it_looks_for() {
+    fn looks_every_wait_up_from_one_table() {
         let script = script();
 
         for (attribute, _, _) in waits() {
             let quoted = format!("{attribute:?}");
             assert_eq!(
                 script.matches(&quoted).count(),
-                2,
-                "{attribute} must appear in both the table and the attribute filter"
+                1,
+                "{attribute} must reach the script once, from the table"
             );
         }
+    }
+
+    /// It reads on a clock of its own, not on dsh's mutations.
+    ///
+    /// The mutation-driven debounce could be held off past the moment a card
+    /// went up by anything else still redrawing the page; see PERIOD.
+    #[test]
+    fn samples_on_a_clock_of_its_own() {
+        let script = script();
+
+        assert!(script.contains(&format!("setInterval(sample, {PERIOD})")));
+        assert!(
+            !script.contains("MutationObserver"),
+            "a mutation-driven wait can be held off by an unrelated redraw"
+        );
     }
 
     /// Both strings go in through `{:?}`, so a quote in a translation arrives
@@ -294,8 +316,13 @@ mod tests {
         );
     }
 
-    /// The first sample records rather than announces, so a reload that lands
+    /// The opening seconds record rather than announce, so a reload that lands
     /// while dsh is waiting is not news.
+    ///
+    /// A window rather than a single look, because dsh's page is a shell when
+    /// this script runs: the card replaying a pending request is mounted by a
+    /// render and a resync that both come later, so one look would record
+    /// "nothing pending" and then announce the replay as a new question.
     ///
     /// The second assertion is written against whitespace-stripped lines rather
     /// than against a literal `"seen = mark;\n      return;"`. That form pins
@@ -308,7 +335,7 @@ mod tests {
     fn the_first_look_is_a_baseline() {
         let script = script();
 
-        assert!(script.contains("if (seen === undefined) {"));
+        assert!(script.contains(&format!("if (Date.now() - opened < {GRACE}) {{")));
 
         let lines: Vec<&str> = script.lines().map(str::trim).collect();
         let baseline = lines

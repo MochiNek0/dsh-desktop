@@ -1200,11 +1200,25 @@ impl Splash {
             .iter()
             .map(|arg| serde_json::to_string(arg).expect("a string is always serializable"))
             .collect();
-        let js = format!(
-            "window.{function} && window.{function}({})",
-            args.join(", ")
+        self.send(
+            window,
+            format!(
+                "window.{function} && window.{function}({})",
+                args.join(", ")
+            ),
         );
+    }
 
+    /// Evaluate a whole script, or hold it until a document can receive it.
+    ///
+    /// The queueing half of [`Self::call`], reachable on its own for
+    /// [`crate::dialog`]: that module builds its own call rather than a
+    /// `window.fn(args)` — one JSON payload, and deliberately unguarded — but it
+    /// needs exactly this. A dialog evaluated into a document on its way out is
+    /// a dialog nobody sees, and for `dialog::confirm` that is a worker thread
+    /// waiting on a click that cannot arrive: the boot asks its question before
+    /// the first `PageLoadEvent::Finished` has landed.
+    fn send(&self, window: &WebviewWindow, js: String) {
         let mut state = self.state.lock().unwrap();
         if state.loaded {
             let _ = window.eval(&js);
