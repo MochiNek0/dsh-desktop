@@ -42,6 +42,21 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The package the whole thing is about.
 const PACKAGE: &str = "@deepseek-ai/dsh";
 
+/// The names npm's shims go by, most specific first: the `.cmd` wrapper npm
+/// writes on Windows, then the bare name it uses everywhere else.
+///
+/// Named once and shared, because a typo in one copy is a tool the app decides
+/// is missing — and the copies are far apart: [`current`] resolves the dsh this
+/// launch runs, while `plugins.rs` asks [`tool`] about the same two names to
+/// tell a broken shim from an absent one. Listing both on every platform is
+/// deliberate: [`look_up`] joins each onto directories that only hold one of
+/// them, so the wrong name simply never matches.
+pub const DSH: &[&str] = &["dsh.cmd", "dsh"];
+/// pnpm's, which dsh forwards every plugin install to; see `plugins.rs`.
+pub const PNPM: &[&str] = &["pnpm.cmd", "pnpm"];
+/// Node's, which is what [`npm`] runs npm's own entry point with.
+const NODE: &[&str] = &["node.exe", "node"];
+
 /// What a dsh install costs over the wire. Quoted to the user before they agree
 /// to it, because it is a lot. Measured, not estimated: 587 packages, 185 MB of
 /// tarballs, four minutes on a 2 MB/s link.
@@ -138,6 +153,21 @@ fn bootstrap(app: &AppHandle) -> Bootstrap {
     }
 }
 
+/// Where npm puts a global package's shims for a given prefix: the prefix itself
+/// on Windows, and `<prefix>/bin` everywhere else.
+///
+/// One definition, because two places depend on agreeing with it — the directory
+/// [`search_path`] searches, and the directory a `--prefix` install has to land
+/// its shims in for that search to find them. They were the same expression
+/// written twice, which is how they come apart.
+pub fn shim_dir(prefix: &Path) -> PathBuf {
+    if cfg!(windows) {
+        prefix.to_path_buf()
+    } else {
+        prefix.join("bin")
+    }
+}
+
 /// Every directory a command of ours might be in, most specific first: what the
 /// script installed, then whatever this process inherited.
 ///
@@ -146,21 +176,24 @@ fn bootstrap(app: &AppHandle) -> Bootstrap {
 /// and the directory to search for is derived from it.
 fn search_path(app: &AppHandle) -> Vec<PathBuf> {
     let state = bootstrap(app);
-    let shims = state.prefix.map(|prefix| {
-        if cfg!(windows) {
-            prefix
-        } else {
-            prefix.join("bin")
-        }
-    });
+    let shims = state.prefix.as_deref().map(shim_dir);
     let node_dir = state
         .node
         .as_deref()
         .and_then(Path::parent)
         .map(Path::to_path_buf);
 
+    // The app's own prefix, which is where [`tool_prefix`] puts a tool when
+    // neither the recorded nor the installed prefix can be written to. Listed
+    // unconditionally and without creating it: a tool installed there has to be
+    // findable afterwards, and on the machines that never need it this is one
+    // directory that does not exist and matches nothing.
+    //
+    // Last of the three, so a pnpm beside dsh still wins over a stale copy here.
+    let own = app_dir(app).map(|dir| shim_dir(&dir.join("npm")));
+
     let inherited = std::env::var_os("PATH").unwrap_or_default();
-    [shims, node_dir]
+    [shims, node_dir, own]
         .into_iter()
         .flatten()
         .chain(std::env::split_paths(&inherited))
@@ -176,8 +209,131 @@ pub fn look_up(app: &AppHandle, names: &[&str]) -> Option<PathBuf> {
         names
             .iter()
             .map(|name| dir.join(name))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| present(candidate))
     })
+}
+
+/// Whether npm left an entry at `path` — the question [`look_up`] is actually
+/// asking, which is not the same as `is_file`.
+///
+/// On Windows a global shim is a plain `.cmd` file and the two agree. Everywhere
+/// else it is a symlink into `<prefix>/lib/node_modules`, and `is_file` follows
+/// it: a shim whose target is gone — a Node switched by nvm/fnm/asdf/volta, a
+/// half-removed global package, a distro Node upgraded underneath — reads as
+/// *absent*, so this said "no pnpm" and "no dsh" on a machine that has both
+/// names sitting right there in the prefix.
+///
+/// Answering that with the file gone is worse than answering it wrongly: the
+/// caller reinstalls over a broken link, or reports that there is no dsh at all
+/// while `dsh` works in the user's terminal. `symlink_metadata` does not follow
+/// the link, so a dangling shim is found, handed back, and allowed to fail as
+/// what it is — see [`executable`], which is where a broken one gets caught with
+/// something specific to say.
+fn present(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        // A directory named `pnpm` is not the pnpm we are looking for.
+        Ok(metadata) => !metadata.is_dir(),
+        Err(_) => false,
+    }
+}
+
+/// Whether `path` resolves to something that can actually be run.
+///
+/// [`present`] deliberately accepts a dangling symlink, so somebody has to be
+/// the one that notices. This is it: `metadata` follows the link, so this is
+/// false exactly when the shim points at nothing — and on Unix it also checks
+/// the executable bit, because a global bin that lost it fails to spawn with an
+/// error no more helpful than the dangling case.
+fn executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.is_dir() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return metadata.permissions().mode() & 0o111 != 0;
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+/// What [`look_up`] found, as the three states a caller actually has to tell
+/// apart.
+///
+/// A pair of `Option`-returning calls — one for "is it there", one for "is it
+/// broken" — makes the interesting state the *absence* of one answer and the
+/// presence of another, which every caller has to reassemble correctly and no
+/// single call can answer. It also walks the search path twice, so the two
+/// answers can describe different files if the directory changes in between.
+/// One enum from one walk removes both problems.
+pub enum Tool {
+    /// There and runnable.
+    ///
+    /// No path: every caller so far only needs to know that it is usable,
+    /// because what actually runs it is dsh through [`apply_path`] rather than
+    /// this app spawning it directly. Carrying one nobody reads is a promise
+    /// that the value has been checked for the caller's purpose, which it has
+    /// not.
+    Ready,
+    /// There but not runnable, with the reason spelled out for the user. The
+    /// state that used to be invisible: the name is in the prefix, so nothing
+    /// reinstalls it, and every attempt to run it fails far from the cause.
+    Broken(String),
+    /// Not on the search path at all.
+    Missing,
+}
+
+/// Resolve one tool by its platform names, in one walk of the search path.
+pub fn tool(app: &AppHandle, names: &[&str]) -> Tool {
+    let Some(path) = look_up(app, names) else {
+        return Tool::Missing;
+    };
+    if executable(&path) {
+        return Tool::Ready;
+    }
+
+    let shown = path.display();
+    Tool::Broken(match std::fs::read_link(&path) {
+        // The common one: npm's symlink outliving what it pointed at.
+        //
+        // `read_link` hands back the target exactly as stored, and npm writes a
+        // relative one (`../lib/node_modules/pnpm/bin/pnpm.cjs`). Testing that
+        // as-is would resolve it against this process's working directory —
+        // wherever the app happens to have been started — and call a perfectly
+        // good shim dangling. So it is resolved against the link's own directory,
+        // which is what the kernel does.
+        Ok(target) if !resolve(&path, &target).exists() => t!(
+            "{} 指向的目标已经不存在（{}）。这通常是切换过 Node 版本（nvm / fnm / asdf / volta）或全局包被删掉一半留下的断链。",
+            "{} points at something that no longer exists ({}). That is usually a dangling link left by switching Node versions (nvm/fnm/asdf/volta) or a half-removed global package.",
+            shown,
+            target.display()
+        ),
+        Ok(target) => t!(
+            "{} 指向 {}，但它不可执行。",
+            "{} points at {}, which is not executable.",
+            shown,
+            target.display()
+        ),
+        Err(_) => t!(
+            "{} 存在，但不可执行。",
+            "{} exists but is not executable.",
+            shown
+        ),
+    })
+}
+
+/// A symlink's target as an absolute path: relative to the directory the link
+/// sits in, which is how the kernel reads it. An already-absolute target is
+/// returned unchanged.
+fn resolve(link: &Path, target: &Path) -> PathBuf {
+    if target.is_absolute() {
+        return target.to_path_buf();
+    }
+    link.parent().unwrap_or(Path::new(".")).join(target)
 }
 
 /// The dsh command this launch will run.
@@ -199,11 +355,26 @@ pub struct Install {
 /// 2. `dsh` in the npm prefix the bootstrap script recorded, or on PATH.
 ///
 /// `None` means the machine has no dsh at all, which [`gate`] answers by
-/// installing one.
+/// installing one — including the case where the name is in the prefix but the
+/// shim behind it is broken, which is reinstalled over rather than left as a dsh
+/// that cannot run. [`tool`] is what turns that into something to say.
 pub fn current(app: &AppHandle) -> Option<Install> {
     let bin = match std::env::var_os("DSH_BIN") {
         Some(bin) => PathBuf::from(bin),
-        None => look_up(app, &["dsh.cmd", "dsh"])?,
+        None => {
+            let found = look_up(app, DSH)?;
+            // A dangling shim is not a dsh. Saying so here means `gate`
+            // reinstalls instead of handing back an install whose every command
+            // fails, and `version_of` below is not asked to run a broken link.
+            if !executable(&found) {
+                eprintln!(
+                    "dsh-desktop: {} is not runnable; treating this machine as having no dsh",
+                    found.display()
+                );
+                return None;
+            }
+            found
+        }
     };
 
     let version = manifest_version(&root_of(&bin)).or_else(|| version_of(bin.as_os_str()))?;
@@ -254,15 +425,142 @@ fn prefix_of(bin: &Path) -> Option<PathBuf> {
 /// writing to answer it would be a side effect on every launch.
 fn updatable(installed: &Install) -> Option<&Path> {
     let prefix = installed.prefix.as_deref()?;
+    writable(&package_root(prefix)).then_some(prefix)
+}
 
+/// Whether a file can be created in `dir` — the only reliable form of the
+/// question, for the reasons in [`updatable`]. Shared with
+/// [`unwritable_prefix`] so the update path and the plugin path cannot come to
+/// different conclusions about the same directory.
+fn writable(dir: &Path) -> bool {
     // The pid keeps two copies of the app out of each other's way. There is only
     // ever meant to be one — see the single-instance plugin — but a file left
     // behind by a crash would otherwise be a permanent "no".
-    let probe = package_root(prefix).join(format!(".dsh-write-probe-{}", std::process::id()));
+    let probe = dir.join(format!(".dsh-write-probe-{}", std::process::id()));
     let allowed = std::fs::write(&probe, b"").is_ok();
     let _ = std::fs::remove_file(&probe);
+    allowed
+}
 
-    allowed.then_some(prefix)
+/// The npm global prefix a `-g` install would land in, when this process cannot
+/// write to it — `None` when it can, or when there is no prefix to check.
+///
+/// This is the Linux failure the plugin panel used to report as a bare npm exit
+/// code: a distribution's Node keeps its global prefix under `/usr`, so
+/// `npm install -g pnpm` fails with `EACCES` for reasons that have nothing to do
+/// with the network or the registry. Windows never sees it, because npm's prefix
+/// there is a per-user directory under `%APPDATA%`.
+///
+/// The probe is aimed at the deepest directory that already exists, since npm
+/// creates the rest: probing a missing `lib/node_modules` would report every
+/// fresh prefix as unwritable.
+pub fn unwritable_prefix(app: &AppHandle) -> Option<PathBuf> {
+    let prefix = bootstrap(app)
+        .prefix
+        .or_else(|| current(app).and_then(|install| install.prefix))?;
+
+    // A prefix that is not there at all is not reported as unwritable:
+    // "missing" is a different problem, and the advice below — move npm's
+    // prefix — would not address it.
+    if !prefix.is_dir() {
+        return None;
+    }
+
+    // The deepest level that exists, which is the one npm would write into and
+    // so the one worth naming. `usable_prefix` asks the same question of the
+    // same directory; this reports *which* directory rather than yes or no, so
+    // they stay in agreement by construction.
+    let existing = deepest_existing(&prefix)?;
+    (!writable(&existing)).then_some(existing)
+}
+
+/// The deepest directory under `prefix` that already exists, walking up from the
+/// `node_modules` a `-g` install lands in. `None` when `prefix` itself is gone.
+///
+/// npm creates the levels below, so probing a missing `lib/node_modules` would
+/// reject a perfectly good fresh prefix. The walk stops at `prefix` because
+/// stepping above it reaches directories npm would never touch — accepting one
+/// of those is how a nonexistent prefix passes for a usable one.
+fn deepest_existing(prefix: &Path) -> Option<PathBuf> {
+    package_root(prefix)
+        .ancestors()
+        .take_while(|dir| dir.starts_with(prefix))
+        .find(|dir| dir.is_dir())
+        .map(Path::to_path_buf)
+}
+
+/// Where a `-g` install of a tool this app needs should go, and whether that had
+/// to be chosen rather than left to npm.
+///
+/// `install-deps.sh` already solves this for dsh itself — see `find_prefix`
+/// there: it takes npm's configured global prefix when the user can write to it,
+/// and otherwise falls back to a prefix of the app's own under the application
+/// data directory, because installing as the user who will run it is the point
+/// and asking for a password is not on the table.
+///
+/// Nothing was applying that reasoning to pnpm. `npm install -g pnpm` let npm
+/// pick, so on a Mac with the nodejs.org pkg or a Linux box with a distribution
+/// Node the install went at `/usr/local` or `/usr` and failed with `EACCES` —
+/// while the dsh beside it had been carefully placed somewhere writable. Worse,
+/// npm could succeed into a prefix that is not the one [`search_path`] looks in,
+/// leaving a pnpm that exists and cannot be found.
+///
+/// So the prefix is chosen here, explicitly, and handed to npm as `--prefix`:
+///
+/// 1. The prefix the bootstrap script recorded, when it is writable. That is
+///    where dsh is, so pnpm lands beside it and [`search_path`] finds it.
+/// 2. The prefix the running dsh sits in, when that is writable — covers a dsh
+///    the user installed themselves, with no marker to read.
+/// 3. The app's own prefix under the data directory. Always writable, because
+///    the app owns it.
+///
+/// `None` only when there is no application data directory to fall back to,
+/// which is a machine this app cannot run on anyway.
+pub fn tool_prefix(app: &AppHandle) -> Option<PathBuf> {
+    let recorded = bootstrap(app).prefix;
+    let installed = current(app).and_then(|install| install.prefix);
+
+    if let Some(usable) = first_writable_prefix([recorded, installed]) {
+        return Some(usable);
+    }
+
+    // Ours, and made if it is not there. This is the same directory the shell
+    // script falls back to, so a machine that took that path keeps one prefix
+    // rather than growing a second.
+    let own = app_dir(app)?.join("npm");
+    if let Err(error) = std::fs::create_dir_all(&own) {
+        eprintln!(
+            "dsh-desktop: could not create a prefix at {}: {error}",
+            own.display()
+        );
+        return None;
+    }
+    Some(own)
+}
+
+/// The first candidate a `-g` install could actually write into. Split out from
+/// [`tool_prefix`] so the choice can be tested without an `AppHandle`.
+fn first_writable_prefix<C>(candidates: C) -> Option<PathBuf>
+where
+    C: IntoIterator<Item = Option<PathBuf>>,
+{
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| usable_prefix(candidate))
+}
+
+/// Whether a `-g` install aimed at `prefix` would land somewhere this process
+/// can write.
+///
+/// The prefix itself has to exist. Walking up to *any* writable ancestor — which
+/// is what an unguarded `ancestors()` does — accepts a prefix that is not there
+/// at all because its parent happens to be writable, and npm would then create a
+/// tree nothing else in this app looks at. Only the levels npm itself creates
+/// (`lib/node_modules`, or `node_modules` on Windows) may be missing, so the
+/// probe walks up from the package root and stops at the prefix.
+fn usable_prefix(prefix: &Path) -> bool {
+    deepest_existing(prefix).is_some_and(|dir| writable(&dir))
 }
 
 /// The `node_modules` an update lands in: under `lib` on the layout npm uses
@@ -660,7 +958,13 @@ pub fn npm(app: &AppHandle) -> Option<Command> {
         _ => {
             // Beside the binary on Windows, and one level up under `lib`
             // everywhere else — the same two layouts `root_of` covers.
-            let node = look_up(app, &["node.exe", "node"])?;
+            //
+            // `executable` rather than bare presence: `look_up` deliberately
+            // reports a dangling shim so it can be named, and a Node that cannot
+            // run is no use to the caller, which is about to spawn it. Bailing
+            // here turns it into "no npm to install pnpm with" rather than a
+            // spawn failure from inside the install.
+            let node = look_up(app, NODE).filter(|node| executable(node))?;
             let dir = node.parent()?;
             let cli = [
                 dir.join("node_modules/npm/bin/npm-cli.js"),
@@ -1064,7 +1368,10 @@ fn shell_quote(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{package_root, prefix_of, PACKAGE};
+    use super::{
+        executable, first_writable_prefix, package_root, prefix_of, present, resolve, shim_dir,
+        writable, PACKAGE,
+    };
     use std::path::{Path, PathBuf};
 
     /// A directory of this test's own, gone again when the test ends. Both
@@ -1137,6 +1444,223 @@ mod tests {
     #[test]
     fn refuses_a_shim_at_the_root_of_the_filesystem() {
         assert_eq!(prefix_of(Path::new("/")), None);
+    }
+
+    /// The bug this pair is here for: npm's global shims are symlinks on every
+    /// platform but Windows, and `is_file` follows them. A shim whose target is
+    /// gone — a Node switched by a version manager, a half-removed global
+    /// package — read as *absent*, so the app announced there was no pnpm and no
+    /// dsh on a machine where both names were sitting in the prefix, then
+    /// reinstalled over the top and reported the wrong cause when that failed.
+    ///
+    /// Unix-only because it is about symlink semantics; the Windows shim is a
+    /// plain file and was never affected.
+    #[cfg(unix)]
+    #[test]
+    fn finds_a_shim_whose_symlink_target_is_gone() {
+        let scratch = Scratch::new("dangling");
+        let target = scratch.at("lib/node_modules/pnpm/bin/pnpm.cjs");
+        let link = scratch.at("bin/pnpm");
+        std::fs::create_dir_all(link.parent().expect("the bin directory"))
+            .expect("the bin directory");
+        std::os::unix::fs::symlink(&target, &link).expect("the shim symlink");
+
+        assert!(!target.exists(), "the target is deliberately absent");
+        assert!(
+            present(&link),
+            "a dangling shim is still an entry npm left behind"
+        );
+        assert!(
+            !executable(&link),
+            "and it is exactly what cannot be run, which is what gets reported"
+        );
+    }
+
+    /// The healthy Unix layout: a symlink to a real executable is both found and
+    /// runnable, so nothing reinstalls over a working pnpm.
+    #[cfg(unix)]
+    #[test]
+    fn accepts_a_shim_that_is_a_symlink_to_something_runnable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::new("linked");
+        let target = scratch.shim("lib/node_modules/pnpm/bin/pnpm.cjs");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("the executable bit");
+
+        let link = scratch.at("bin/pnpm");
+        std::fs::create_dir_all(link.parent().expect("the bin directory"))
+            .expect("the bin directory");
+        std::os::unix::fs::symlink(&target, &link).expect("the shim symlink");
+
+        assert!(present(&link));
+        assert!(executable(&link));
+    }
+
+    /// A global bin that lost its executable bit fails to spawn with an error no
+    /// clearer than the dangling case, so it is caught the same way.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_shim_without_its_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::new("unreadable");
+        let shim = scratch.shim("bin/pnpm");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o644))
+            .expect("the permissions");
+
+        assert!(present(&shim), "it is there");
+        assert!(!executable(&shim), "but it cannot be run");
+    }
+
+    /// A directory named `pnpm` on the search path is not the pnpm anybody wants
+    /// to execute.
+    #[test]
+    fn ignores_a_directory_with_the_name_of_a_shim() {
+        let scratch = Scratch::new("dir");
+        let dir = scratch.at("bin/pnpm");
+        std::fs::create_dir_all(&dir).expect("the directory");
+
+        assert!(!present(&dir));
+        assert!(!executable(&dir));
+    }
+
+    #[test]
+    fn a_missing_path_is_neither_present_nor_executable() {
+        let scratch = Scratch::new("absent");
+        let nothing = scratch.at("bin/pnpm");
+
+        assert!(!present(&nothing));
+        assert!(!executable(&nothing));
+    }
+
+    /// npm writes its shim targets as relative paths, so the liveness test has
+    /// to resolve them against the link's directory rather than this process's
+    /// working directory — which would call a healthy shim dangling depending on
+    /// where the app was started from.
+    #[test]
+    fn resolves_a_relative_symlink_target_against_the_link() {
+        let link = Path::new("/usr/local/bin/pnpm");
+
+        assert_eq!(
+            resolve(link, Path::new("../lib/node_modules/pnpm/bin/pnpm.cjs")),
+            Path::new("/usr/local/bin/../lib/node_modules/pnpm/bin/pnpm.cjs")
+        );
+        // An absolute target is already the answer.
+        assert_eq!(
+            resolve(link, Path::new("/opt/pnpm/bin/pnpm.cjs")),
+            Path::new("/opt/pnpm/bin/pnpm.cjs")
+        );
+    }
+
+    /// The same thing on disk: a relative link to a real file is not reported as
+    /// broken, whatever the working directory is.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_shim_to_a_real_target_is_not_broken() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::new("relative");
+        let target = scratch.shim("lib/node_modules/pnpm/bin/pnpm.cjs");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("the executable bit");
+
+        let link = scratch.at("bin/pnpm");
+        std::fs::create_dir_all(link.parent().expect("the bin directory"))
+            .expect("the bin directory");
+        std::os::unix::fs::symlink("../lib/node_modules/pnpm/bin/pnpm.cjs", &link)
+            .expect("the relative shim symlink");
+
+        let stored = std::fs::read_link(&link).expect("the target");
+        assert!(stored.is_relative(), "npm stores a relative target");
+        assert!(
+            resolve(&link, &stored).exists(),
+            "and it resolves to the real file"
+        );
+        assert!(present(&link) && executable(&link));
+    }
+
+    /// The prefix choice behind `--prefix`: the first candidate that can be
+    /// written to wins, a nonexistent one is skipped rather than created, and
+    /// nothing usable answers `None` so the caller falls back to its own prefix.
+    ///
+    /// This is what stops the macOS/Linux `EACCES`: pnpm goes where dsh already
+    /// is when that is writable, and never into a `/usr` prefix chosen by npm.
+    #[test]
+    fn takes_the_first_prefix_it_can_write_to() {
+        let scratch = Scratch::new("toolprefix");
+        let good = scratch.at("writable");
+        std::fs::create_dir_all(&good).expect("the writable prefix");
+
+        // A prefix that is not there is not a candidate — even though its
+        // ancestors are writable, which an unguarded `ancestors()` walk would
+        // have accepted, sending npm off to build a tree nothing looks at. This
+        // assertion is here because the first version of the code did exactly
+        // that and this test caught it.
+        let missing = scratch.at("no/such/prefix");
+
+        assert_eq!(
+            first_writable_prefix([Some(missing.clone()), Some(good.clone())]),
+            Some(good.clone()),
+            "an unusable candidate is skipped for the next one"
+        );
+        assert_eq!(
+            first_writable_prefix([Some(good.clone()), Some(missing.clone())]),
+            Some(good),
+            "and the first usable one wins"
+        );
+        assert_eq!(
+            first_writable_prefix([None, Some(missing)]),
+            None,
+            "nothing usable means the caller uses its own prefix"
+        );
+        assert_eq!(first_writable_prefix([]), None);
+    }
+
+    /// A prefix that exists but has no `lib/node_modules` yet is still usable —
+    /// npm creates those itself. Rejecting it would push every fresh install
+    /// into the fallback prefix and defeat the point of installing beside dsh.
+    #[test]
+    fn accepts_a_prefix_npm_has_not_filled_in_yet() {
+        let scratch = Scratch::new("freshprefix");
+        let fresh = scratch.at("fresh");
+        std::fs::create_dir_all(&fresh).expect("an empty prefix");
+
+        assert!(
+            !package_root(&fresh).is_dir(),
+            "the package root is deliberately absent"
+        );
+        assert_eq!(
+            first_writable_prefix([Some(fresh.clone())]),
+            Some(fresh),
+            "an empty but writable prefix is where npm should go"
+        );
+    }
+
+    /// The one definition both the search path and the `--prefix` install rely
+    /// on. If these two ever disagree, a tool is installed into a directory
+    /// nothing looks in — which is the failure `tool_prefix` exists to prevent,
+    /// so it is pinned per platform rather than left to a `cfg!` written twice.
+    #[test]
+    fn puts_shims_where_npm_puts_them() {
+        let prefix = Path::new("/some/prefix");
+
+        if cfg!(windows) {
+            assert_eq!(shim_dir(prefix), prefix);
+        } else {
+            assert_eq!(shim_dir(prefix), prefix.join("bin"));
+        }
+    }
+
+    /// The probe behind the `EACCES` message: it answers for a directory that
+    /// exists and refuses one that does not, so a fresh prefix is not reported as
+    /// unwritable.
+    #[test]
+    fn probes_a_directory_it_can_write_to() {
+        let scratch = Scratch::new("probe");
+
+        assert!(writable(&scratch.0));
+        assert!(!writable(&scratch.at("does/not/exist")));
     }
 
     /// What the write probe is aimed at, which is the directory npm replaces.
