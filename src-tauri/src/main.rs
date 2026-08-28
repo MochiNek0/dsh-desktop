@@ -99,7 +99,6 @@ fn main() {
             reveal(app);
         }))
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
         // Raised from Rust only; nothing in the webview is granted it. See
         // `notify`.
         .plugin(tauri_plugin_notification::init())
