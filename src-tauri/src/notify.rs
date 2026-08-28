@@ -198,6 +198,11 @@ pub fn script() -> String {
 
     format!(
         r#"(function () {{
+  // The top document only. This shim answers by navigating, and a navigation
+  // started inside an iframe never reaches the handler that cancels it: wry
+  // hooks WebView2's main-frame `NavigationStarting` and nothing else. See
+  // `controls`.
+  if (window.top !== window.self) return;
   if (window.__dshNotify) return;
   window.__dshNotify = true;
 
