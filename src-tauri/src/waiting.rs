@@ -296,13 +296,26 @@ mod tests {
 
     /// The first sample records rather than announces, so a reload that lands
     /// while dsh is waiting is not news.
+    ///
+    /// The second assertion is written against whitespace-stripped lines rather
+    /// than against a literal `"seen = mark;\n      return;"`. That form pins
+    /// the indentation and the newline of a source file whose line endings are
+    /// not fixed — `.gitattributes` pins `*.sh`, not `*.rs` — so it passes on
+    /// the Linux and macOS runners and fails on a Windows checkout with
+    /// `core.autocrlf=true`. The three platforms have to agree about whether
+    /// the suite passes.
     #[test]
     fn the_first_look_is_a_baseline() {
         let script = script();
 
         assert!(script.contains("if (seen === undefined) {"));
+
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        let baseline = lines
+            .windows(2)
+            .any(|pair| pair[0] == "seen = mark;" && pair[1] == "return;");
         assert!(
-            script.contains("seen = mark;\n      return;"),
+            baseline,
             "the baseline must return before it can announce"
         );
     }
