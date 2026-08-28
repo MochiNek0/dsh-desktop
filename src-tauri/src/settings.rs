@@ -4,8 +4,8 @@
 //! Almost nothing belongs here. The theme is dsh's, read out of its
 //! `settings.yaml` (see [`crate::theme`]); the login item is the operating
 //! system's, and is asked about rather than recorded. What is left is the
-//! preferences that are this window's alone, and today that is one: whether a
-//! finished turn raises a notification.
+//! preferences that are this window's alone, and today that is one: whether
+//! this app raises notifications at all.
 //!
 //! ## Where it lives
 //!
@@ -33,16 +33,31 @@ use std::path::PathBuf;
 use serde_json::{Map, Value};
 use tauri::AppHandle;
 
-/// Whether a finished turn raises a notification. On unless it was turned off:
+/// Whether this app raises notifications at all. On unless it was turned off:
 /// the feature exists because the window spends turns in the tray, and a
 /// notification setting that defaults to silent is one nobody discovers.
-const NOTIFY_KEY: &str = "notifyOnTurnEnd";
+///
+/// Deliberately not `notifyOnTurnEnd`, which is what this was called first. The
+/// gate it drives sits in [`crate::notify::show`], the one place *every*
+/// notification passes through — a plugin's as much as this app's own — so a
+/// name that promised only the finished-turn toast was describing a narrower
+/// switch than the one actually wired up. The menu item says the same thing:
+/// "Notifications", not "Notify when a turn finishes".
+const NOTIFY_KEY: &str = "notifications";
+
+/// What the key was called while this was a turn-only switch, still read so a
+/// preference set by an earlier build of this branch is not silently reset. Only
+/// ever read; a write always uses [`NOTIFY_KEY`].
+const NOTIFY_KEY_WAS: &str = "notifyOnTurnEnd";
+
 const NOTIFY_DEFAULT: bool = true;
 
 /// Read the preference. Any problem reading it is the default.
-pub fn notify_on_turn_end(app: &AppHandle) -> bool {
-    read(app)
+pub fn notifications(app: &AppHandle) -> bool {
+    let document = read(app);
+    document
         .get(NOTIFY_KEY)
+        .or_else(|| document.get(NOTIFY_KEY_WAS))
         .and_then(Value::as_bool)
         .unwrap_or(NOTIFY_DEFAULT)
 }
@@ -52,8 +67,8 @@ pub fn notify_on_turn_end(app: &AppHandle) -> bool {
 /// Returns the value that was written rather than re-reading, so a caller can
 /// repaint the checkmark even on the disk error path — where the toggle did not
 /// survive, but the menu should still not show a lie about this session.
-pub fn toggle_notify_on_turn_end(app: &AppHandle) -> bool {
-    let wanted = !notify_on_turn_end(app);
+pub fn toggle_notifications(app: &AppHandle) -> bool {
+    let wanted = !notifications(app);
     write(app, NOTIFY_KEY, Value::Bool(wanted));
     wanted
 }
@@ -122,16 +137,39 @@ mod tests {
     }
 
     fn notify(text: &str) -> bool {
-        parse(text)
+        let document = parse(text);
+        document
             .get(super::NOTIFY_KEY)
+            .or_else(|| document.get(super::NOTIFY_KEY_WAS))
             .and_then(Value::as_bool)
             .unwrap_or(super::NOTIFY_DEFAULT)
     }
 
     #[test]
     fn reads_the_preference() {
+        assert!(!notify(r#"{"notifications": false}"#));
+        assert!(notify(r#"{"notifications": true}"#));
+    }
+
+    /// The key this was called while it was a turn-only switch still reads, so
+    /// someone who turned notifications off on an earlier build of this branch
+    /// does not find them back on.
+    #[test]
+    fn still_reads_the_old_key() {
         assert!(!notify(r#"{"notifyOnTurnEnd": false}"#));
         assert!(notify(r#"{"notifyOnTurnEnd": true}"#));
+    }
+
+    /// With both present the current name wins: it is the only one ever
+    /// written, so it is the one that was set most recently.
+    #[test]
+    fn the_current_key_beats_the_old_one() {
+        assert!(notify(
+            r#"{"notifications": true, "notifyOnTurnEnd": false}"#
+        ));
+        assert!(!notify(
+            r#"{"notifications": false, "notifyOnTurnEnd": true}"#
+        ));
     }
 
     /// Every way the file can be unusable ends at the default, because a
@@ -144,7 +182,7 @@ mod tests {
         assert!(notify("[1, 2, 3]"));
         assert!(notify("{}"));
         // Present, but not a boolean.
-        assert!(notify(r#"{"notifyOnTurnEnd": "no"}"#));
+        assert!(notify(r#"{"notifications": "no"}"#));
     }
 
     /// On by default: the window spends a turn in the tray, and a notification
