@@ -1,11 +1,17 @@
 //! The app's own dialogs, drawn over the page instead of by the window manager.
 //!
 //! [`crate::update`] used to ask its questions through `tauri-plugin-dialog`,
-//! which raises a native message box. That works, and on Windows it looks like
-//! a message box from 2012: a grey strip, the system font at the system size,
-//! and buttons whose order and labels are the platform's rather than ours. Next
-//! to the plugin panel — which is this app's own card, in dsh's own colours,
-//! following dsh's own light/dark — it reads as a different program.
+//! which raises a native message box. That works, and it produced three
+//! different-looking apps: on Windows a message box from 2012 — a grey strip,
+//! the system font at the system size, the affirmative button first — on macOS
+//! an NSAlert with the affirmative last, on Linux whatever GTK theme is
+//! installed. Next to the plugin panel — which is this app's own card, in dsh's
+//! own colours, following dsh's own light/dark — every one of them read as a
+//! different program.
+//!
+//! That plugin is gone now; this module is the only thing that asks. Nothing
+//! depends on `tauri-plugin-dialog` any more, which on Linux also takes `rfd`
+//! and its GTK dialog machinery out of the build.
 //!
 //! So the questions are drawn here, in the same idiom as [`crate::panel`]: an
 //! injected script, a card over the page, the theme read off the document, and
@@ -37,6 +43,30 @@
 //! the answer arrives later as a navigation — which is what lets an update be
 //! offered from inside the webview's own navigation handler without deadlocking
 //! it.
+//!
+//! ## The same dialog on all three platforms
+//!
+//! That is the point of drawing it here, and it is also the obligation. A native
+//! message box came with things a `<div>` does not, and each of them had to be
+//! put back by hand or the three platforms would drift apart in a different way
+//! than before:
+//!
+//! - **Escape closes it**, which macOS in particular expects of anything shaped
+//!   like a dialog. It answers with [`DISMISSED`] rather than merely hiding the
+//!   card — see the note there.
+//! - **Focus is trapped** in the card and handed back to whatever had it when
+//!   the dialog closes. Without the trap, Tab walks out of a modal into dsh's
+//!   page behind it.
+//! - **It announces itself** as `role="dialog"`, `aria-modal`, and a title and
+//!   body the card points at. A screen reader got this for free from the
+//!   platform and gets nothing from a bare card.
+//! - **The buttons are drawn, not native.** `-webkit-appearance` goes in beside
+//!   the unprefixed property, or an older WKWebView and an older WebKitGTK keep
+//!   the system button shell under our own.
+//!
+//! Button order is ours now rather than the platform's, which is the one place
+//! this deliberately overrides a convention: the affirmative is last everywhere,
+//! including on Windows, where a native box would have put it first.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -122,8 +152,13 @@ pub struct Ask {
     /// Left to right, so the affirmative goes last — the end of the row is
     /// where this app's other cards put the button that does the thing.
     pub choices: Vec<Choice>,
-    /// Run on the main thread when a button is clicked, with the id of that
-    /// button. Dismissing without choosing never calls it.
+    /// Run on the main thread when the dialog is answered, with the id of the
+    /// button that was clicked — or [`DISMISSED`] when the user pressed Escape.
+    ///
+    /// Dismissal answers rather than going quiet, because a dialog that goes
+    /// quiet leaves [`confirm`] blocked on a worker thread. Every callback here
+    /// is written as "act on this one id, otherwise do nothing", which is what
+    /// makes an id none of them names the safe answer.
     pub answered: Answer,
 }
 
@@ -149,27 +184,60 @@ struct Pending {
 
 /// The JavaScript that hands one dialog to the page.
 ///
-/// Deliberately not `window.__dshAsk && window.__dshAsk(…)`. That guard reads
-/// like defensive good manners, but it turns the one case worth detecting —
-/// the document has not run the injected script yet, which `boot` can easily
-/// beat — into a silent success: `eval` returns `Ok`, [`ask`] reports the
-/// dialog delivered, and [`confirm`] then blocks forever on an answer nobody
-/// can give. Called unguarded, that case throws, `eval` reports it, and the
-/// caller gets to fall back.
+/// Called unguarded — not `window.__dshAsk && window.__dshAsk(…)` — but not for
+/// the reason an earlier version of this comment gave. That version claimed the
+/// bare call throws when the script has not run yet, that `eval` reports the
+/// throw, and that [`ask`] can therefore tell a delivered dialog from an
+/// undelivered one. None of that is true on any of the three platforms:
+/// `Webview::eval` hands the script to `eval_script`, which from a worker thread
+/// only queues a message on the event loop and returns `Ok` before any
+/// JavaScript has run, and which on the main thread reaches
+/// `WebviewMessage::EvaluateScript` — where the runtime logs the error and
+/// discards it. Underneath, all three backends evaluate asynchronously with no
+/// way back: WKWebView with a nil completion handler, WebView2's `ExecuteScript`
+/// with no callback, and WebKitGTK's `webkit_web_view_evaluate_javascript`.
 ///
-/// Its own function so a test can assert the guard has not crept back in.
+/// So the guard is left off only because it would add noise, and delivery is
+/// made certain at the other end instead: the script waits for `document.body`
+/// (see `ready` in [`script`]) rather than throwing without one, and [`confirm`]
+/// carries [`ANSWER_TIMEOUT`] rather than trusting a bool that cannot be wrong.
+///
+/// Its own function so a test can pin the shape of the call.
 fn delivery(json: &str) -> String {
     format!("window.__dshAsk({json})")
 }
 
+/// The id an answer carries when the dialog was dismissed rather than answered.
+///
+/// Escape sends this. It is deliberately a string no caller will ever name a
+/// button, so the ordinary `if id == "now"` / `id == affirmative` test in every
+/// callback reads it as "not the affirmative" without any of them having to know
+/// dismissal exists. See the module docs on why dismissal must answer at all
+/// rather than merely hiding the card.
+pub const DISMISSED: &str = "";
+
+/// How long [`confirm`] waits for a click before giving up and answering "no".
+///
+/// A backstop, not a policy: every path that should end the wait already does —
+/// a click, a dismissal, [`ask`] replacing the dialog and dropping its sender.
+/// What this covers is the paths that cannot signal, all of which end with the
+/// card gone and the sender still parked in [`PENDING`]: the document navigating
+/// out from under a dialog, a webview that never ran the script, a renderer
+/// crash. Without it those hang `boot` forever, and a boot thread that never
+/// returns is an app that never starts dsh and cannot be recovered except by
+/// killing it.
+///
+/// Long enough that it is never reached by a user who simply walked away
+/// mid-question and came back — these dialogs ask about downloads that take
+/// minutes, and answering "no" under someone's hand would be worse than waiting.
+const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// Put a question on screen. Returns immediately; see the module docs.
 ///
-/// Answers whether the question actually reached the window. It can fail to:
-/// there may be no window yet, or the document showing may not have run the
-/// injected script — `ask` is reachable from `boot`, which starts before the
-/// first `PageLoadEvent::Finished`. A caller that only wanted to say something
-/// can ignore that, but [`confirm`] cannot, because a question nobody can see
-/// is a question nobody will ever answer.
+/// Answers whether the question was handed to a window at all — which is to say,
+/// whether there was one. It is *not* a promise that the dialog is on screen:
+/// see [`delivery`] for why no such promise is available from `eval`. Callers
+/// that need the answer use [`confirm`], which does not rely on this.
 pub fn ask(app: &AppHandle, ask: Ask) -> bool {
     let token = TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -244,12 +312,15 @@ pub fn ask(app: &AppHandle, ask: Ask) -> bool {
 /// waiting for a message only it could deliver. The debug assertion below says
 /// so out loud rather than hanging the window.
 ///
-/// A dialog that is replaced before it is answered — [`ask`] overwrites the
-/// pending one — drops its sender, and the receive then fails rather than
-/// waiting forever. A dialog that never reached the window is the same story
-/// told earlier: [`ask`] says so, and this answers without waiting at all.
-/// Both are reported as the negative answer, which for every caller means "do
-/// not touch anything", the safe half.
+/// Four things end the wait, and all four answer the negative — which for every
+/// caller means "do not touch anything", the safe half:
+///
+///   - the user clicks something that is not `affirmative`;
+///   - the user dismisses with Escape, which sends [`DISMISSED`];
+///   - [`ask`] replaces the dialog before it is answered, dropping its sender
+///     and failing the receive;
+///   - nothing happens for [`ANSWER_TIMEOUT`], which is the backstop for a card
+///     that went away without being able to say so — see the note there.
 pub fn confirm(app: &AppHandle, mut ask_for: Ask, affirmative: &'static str) -> bool {
     // The deadlock this prevents is total: the dialog is up, and the thread
     // that would carry the click back is the one about to block. Debug-only
@@ -267,13 +338,25 @@ pub fn confirm(app: &AppHandle, mut ask_for: Ask, affirmative: &'static str) -> 
         let _ = send.send(id == affirmative);
     });
 
-    // Nothing to wait for when nothing was shown: the sender is already dropped
-    // and the `recv` below would only confirm it the slow way.
+    // Nothing to wait for when there was no window: the sender is already
+    // dropped and the receive below would only confirm it the slow way.
     if !ask(app, ask_for) {
         return false;
     }
 
-    receive.recv().unwrap_or(false)
+    match receive.recv_timeout(ANSWER_TIMEOUT) {
+        Ok(answer) => answer,
+        // Disconnected: the dialog was replaced, and its sender went with it.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => false,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "dsh-desktop: nothing answered the dialog in {} minutes; \
+                 taking it as a no",
+                ANSWER_TIMEOUT.as_secs() / 60
+            );
+            false
+        }
+    }
 }
 
 /// A `dsh-window://ask` navigation: the user clicked something.
@@ -319,6 +402,7 @@ pub fn answered(app: &AppHandle, url: &tauri::Url) {
 pub fn script() -> String {
     let scheme = crate::controls::SCHEME;
     let font = crate::controls::FONT;
+    let dismissed = DISMISSED;
 
     format!(
         r#"(function () {{
@@ -327,12 +411,31 @@ pub fn script() -> String {
 
   var root = null, card, heading, message, row;
   var token = 0;
+  // Whatever had the keyboard before the dialog took it, so it can have it back.
+  var restore = null;
 
   // The channel back to Rust; see controls.rs. The navigation is cancelled
   // there, so answering never moves the page.
   function signal(id) {{
     window.location.href = '{scheme}://ask?token=' + token +
       '&id=' + encodeURIComponent(id);
+  }}
+
+  /** Take the card down and answer `id`. Every way out of a dialog comes here. */
+  function close(id) {{
+    // Down before the signal: the navigation is cancelled, so nothing else
+    // takes this card off the screen.
+    root.classList.remove('dsh-ask-shown');
+    if (restore && document.contains(restore)) {{
+      try {{ restore.focus(); }} catch (error) {{}}
+    }}
+    restore = null;
+    signal(id);
+  }}
+
+  /** The dialog's own buttons, in tab order. */
+  function stops() {{
+    return row.querySelectorAll('button');
   }}
 
   function make(tag, className, parent) {{
@@ -403,7 +506,12 @@ pub fn script() -> String {
       'user-select:text;-webkit-user-select:text}}' +
       '.dsh-ask-row{{display:flex;gap:8px;justify-content:flex-end;' +
       'flex-wrap:wrap;margin-top:20px}}' +
-      '.dsh-ask button{{appearance:none;border-radius:8px;padding:7px 14px;' +
+      // `-webkit-appearance` as well as the unprefixed property: the plain one
+      // is Safari 15.4 and WebKitGTK 2.36, so on an older WKWebView or an older
+      // Ubuntu the native push-button shell survives underneath everything set
+      // below and the three platforms stop looking alike.
+      '.dsh-ask button{{-webkit-appearance:none;appearance:none;' +
+      'border-radius:8px;padding:7px 14px;' +
       'background:var(--ask-bg);border:1px solid var(--ask-line);cursor:pointer;' +
       'font-size:13px;line-height:1;color:var(--ask-fg);white-space:nowrap}}' +
       '.dsh-ask button:hover{{background:var(--ask-soft)}}' +
@@ -416,15 +524,79 @@ pub fn script() -> String {
 
     root = make('div', 'dsh-ask');
     card = make('div', 'dsh-ask-card', root);
+    // A card over a page is not a dialog to anything that is not looking at
+    // pixels. The window manager's message box carried all of this for free;
+    // drawing our own means saying it by hand.
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-modal', 'true');
+
     heading = make('h1', '', card);
+    heading.id = 'dsh-ask-title';
+    card.setAttribute('aria-labelledby', heading.id);
+
     message = make('p', 'dsh-ask-body', card);
+    message.id = 'dsh-ask-desc';
+    card.setAttribute('aria-describedby', message.id);
+
     row = make('div', 'dsh-ask-row', card);
+
+    // Escape, and the tab loop. Both are things the platform's own dialog did
+    // and a <div> does not, and both have to hold on all three platforms --
+    // macOS especially, where a card that will not take Escape reads as stuck.
+    //
+    // On the document rather than on the card, and capturing, because the page
+    // underneath is dsh's and has keybindings of its own: while a question is up
+    // these keys are the dialog's and nobody else's.
+    document.addEventListener('keydown', function (event) {{
+      if (!root || !root.classList.contains('dsh-ask-shown')) return;
+
+      if (event.key === 'Escape') {{
+        event.preventDefault();
+        event.stopPropagation();
+        // Answered, not merely hidden. A dialog that goes quiet without
+        // answering leaves `confirm` blocked on a worker thread; see dialog.rs.
+        close({dismissed:?});
+        return;
+      }}
+
+      if (event.key !== 'Tab') return;
+
+      // Keep the focus inside the card. Without this, Tab walks straight out of
+      // a supposedly modal dialog into the page behind it.
+      var focusable = stops();
+      if (!focusable.length) return;
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      var here = document.activeElement;
+
+      if (event.shiftKey && (here === first || !card.contains(here))) {{
+        event.preventDefault();
+        last.focus();
+      }} else if (!event.shiftKey && (here === last || !card.contains(here))) {{
+        event.preventDefault();
+        first.focus();
+      }}
+    }}, true);
 
     paint(root);
     document.body.appendChild(root);
   }}
 
-  /** Put a question up. Called from Rust; see dialog.rs. */
+  function ready(then) {{
+    if (document.body) then();
+    else document.addEventListener('DOMContentLoaded', then, {{ once: true }});
+  }}
+
+  /**
+   * Put a question up. Called from Rust; see dialog.rs.
+   *
+   * Wrapped in `ready` the way the plugin panel's entry point is: this is
+   * reachable from `boot`, which runs before the first PageLoadEvent, so
+   * `document.body` is not a given. Building without one throws, and a throw
+   * here is a dialog that never appears -- which Rust cannot detect, because
+   * `eval` does not carry JavaScript exceptions back on any platform. Waiting
+   * is what makes the question arrive rather than the throw.
+   */
   window.__dshAsk = function (payload) {{
     var data;
     try {{
@@ -432,39 +604,40 @@ pub fn script() -> String {
     }} catch (error) {{
       return;
     }}
-    if (!root) build();
 
-    token = data.token;
-    heading.textContent = data.title || '';
-    message.textContent = data.body || '';
-    message.hidden = !data.body;
-    row.textContent = '';
+    ready(function () {{
+      if (!root) build();
 
-    var buttons = data.buttons || [];
-    for (var i = 0; i < buttons.length; i++) {{
-      (function (choice) {{
-        var node = make('button', choice.primary ? 'dsh-ask-primary' : '', row);
-        node.type = 'button';
-        node.textContent = choice.label;
-        node.addEventListener('click', function () {{
-          // Down before the signal: the navigation is cancelled, so nothing
-          // else takes this card off the screen.
-          root.classList.remove('dsh-ask-shown');
-          signal(choice.id);
-        }});
-      }})(buttons[i]);
-    }}
+      // Only when a dialog is not already up, or a second question would hand
+      // back focus to the first one's button.
+      if (!root.classList.contains('dsh-ask-shown')) {{
+        restore = document.activeElement;
+      }}
 
-    root.classList.add('dsh-ask-shown');
-    // The primary if there is one, so Enter answers the question the dialog is
-    // actually asking.
-    var focus = row.querySelector('.dsh-ask-primary') || row.querySelector('button');
-    if (focus) focus.focus();
-  }};
+      token = data.token;
+      heading.textContent = data.title || '';
+      message.textContent = data.body || '';
+      message.hidden = !data.body;
+      row.textContent = '';
 
-  /** Take it down without answering. */
-  window.__dshAskHide = function () {{
-    if (root) root.classList.remove('dsh-ask-shown');
+      var buttons = data.buttons || [];
+      for (var i = 0; i < buttons.length; i++) {{
+        (function (choice) {{
+          var node = make('button', choice.primary ? 'dsh-ask-primary' : '', row);
+          node.type = 'button';
+          node.textContent = choice.label;
+          node.addEventListener('click', function () {{
+            close(choice.id);
+          }});
+        }})(buttons[i]);
+      }}
+
+      root.classList.add('dsh-ask-shown');
+      // The primary if there is one, so Enter answers the question the dialog is
+      // actually asking.
+      var focus = row.querySelector('.dsh-ask-primary') || row.querySelector('button');
+      if (focus) focus.focus();
+    }});
   }};
 }})();"#
     )
@@ -521,22 +694,79 @@ mod tests {
         );
     }
 
-    /// The shim is called unguarded.
+    /// The shim is called plainly, with the payload as its one argument.
     ///
-    /// `window.__dshAsk && window.__dshAsk(…)` would swallow the case where the
-    /// document has not run the injected script yet — `eval` would succeed,
-    /// `ask` would report the dialog delivered, and `confirm` would block on an
-    /// answer that can never arrive. The throw is the signal, so the guard must
-    /// not come back.
+    /// The call used to be unguarded for a stated reason that was wrong — that
+    /// a bare call throws when the script has not run and that `eval` reports
+    /// the throw. It does not, on any of the three platforms; see [`delivery`].
+    /// What keeps an undelivered dialog from hanging a caller is the `ready`
+    /// wrapper in the script and the timeout in [`confirm`], both asserted
+    /// below. This test now only pins the shape of the call.
     #[test]
-    fn delivers_without_a_guard() {
+    fn delivers_a_single_payload() {
         let call = super::delivery(r#""{}""#);
 
+        assert_eq!(call, r#"window.__dshAsk("{}")"#);
+    }
+
+    /// The entry point waits for a body rather than throwing without one.
+    ///
+    /// `ask` is reachable from `boot`, which runs before the first
+    /// `PageLoadEvent::Finished`, and `build` ends in `document.body
+    /// .appendChild`. Throwing there is invisible to Rust, so the wait is the
+    /// only thing standing between that race and a dialog that never appears.
+    #[test]
+    fn waits_for_a_document_before_drawing() {
+        let script = script();
+
+        assert!(script.contains("function ready(then)"));
         assert!(
-            !call.contains("&&"),
-            "a guard here hides an undelivered dialog: {call}"
+            script.contains("ready(function () {"),
+            "__dshAsk must go through `ready`, not build straight away"
         );
-        assert!(call.starts_with("window.__dshAsk("));
+    }
+
+    /// Escape answers instead of merely hiding the card.
+    ///
+    /// A dismissal that only took the card off the screen would leave `confirm`
+    /// parked on a worker thread with nothing left that could ever wake it —
+    /// which for `boot` is an app that never starts dsh.
+    #[test]
+    fn escape_answers_rather_than_going_quiet() {
+        let script = script();
+
+        assert!(script.contains("event.key === 'Escape'"));
+        assert!(
+            script.contains(&format!("close({:?})", super::DISMISSED)),
+            "Escape must send the dismissal id back to Rust"
+        );
+    }
+
+    /// The dismissal id is not something a caller could name a button, so every
+    /// `id == "…"` test in a callback reads it as "not that one" for free.
+    #[test]
+    fn nothing_can_collide_with_the_dismissal_id() {
+        for id in ["ok", "now", "later", "skip", "cancel", "update", "go"] {
+            assert_ne!(id, super::DISMISSED);
+        }
+    }
+
+    /// The things a native message box did and a `<div>` has to be told to do.
+    /// Each is a way the three platforms would otherwise differ; see the module
+    /// docs.
+    #[test]
+    fn carries_what_the_platform_dialog_carried() {
+        let script = script();
+
+        assert!(script.contains(r#"'role', 'dialog'"#));
+        assert!(script.contains(r#"'aria-modal', 'true'"#));
+        assert!(script.contains("aria-labelledby"));
+        // The tab loop, without which "modal" is only a claim about z-index.
+        assert!(script.contains("event.key !== 'Tab'"));
+        assert!(script.contains("last.focus()") && script.contains("first.focus()"));
+        // Both spellings, or an older WKWebView and an older WebKitGTK keep the
+        // native button shell.
+        assert!(script.contains("-webkit-appearance:none;appearance:none"));
     }
 
     #[test]
@@ -555,7 +785,6 @@ mod tests {
         let script = script();
 
         assert!(script.contains("window.__dshAsk"));
-        assert!(script.contains("window.__dshAskHide"));
         // It has to answer over the same scheme everything else in this window
         // uses, or the navigation is a real one and the page leaves.
         assert!(script.contains(&format!("{}://ask?", crate::controls::SCHEME)));
