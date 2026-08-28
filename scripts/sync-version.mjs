@@ -57,9 +57,14 @@ rewrite('src-tauri/tauri.conf.json', /"version": "[^"]+"/, `"version": "${versio
 rewrite('src-tauri/Cargo.toml', /^version = "[^"]+"$/m, `version = "${version}"`);
 
 // The lock would otherwise be rewritten by the next build, after the tag.
+//
+// `\r?` because this is the only pattern here that reaches across a line
+// break, and a checkout on Windows hands the file over with CRLF endings:
+// without it the version is looked for straight after an `\n` that has a `\r`
+// sitting in front of it, and the bump stops with the lock left behind.
 rewrite(
   'src-tauri/Cargo.lock',
-  /(name = "dsh-desktop"\nversion = )"[^"]+"/,
+  /(name = "dsh-desktop"\r?\nversion = )"[^"]+"/,
   `$1"${version}"`,
 );
 
