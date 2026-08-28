@@ -17,6 +17,7 @@ mod settings;
 mod theme;
 mod turn;
 mod update;
+mod waiting;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -208,6 +209,10 @@ fn build_window(
         // is announced without a plugin having to be installed for it. After
         // `notify`, because it calls the shim that one installs.
         .initialization_script(turn::script())
+        // And one when dsh stops to ask the user something, which the turn
+        // watcher cannot see: the run has not ended, it is blocked. Same
+        // shim, so both land in the same suppression check.
+        .initialization_script(waiting::script())
         // The plugin panel, drawn over whatever page is showing when it is
         // asked for — dsh's included, which is the point of it being here.
         .initialization_script(panel::script())
