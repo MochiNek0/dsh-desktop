@@ -459,10 +459,23 @@ pub fn script() -> String {
       '.dsh-pp-running .dsh-pp-held{{display:none}}' +
       '.dsh-pp-running .dsh-pp-log,.dsh-pp-logged .dsh-pp-log{{display:block}}' +
       '.dsh-pp-logged .dsh-pp-log{{flex:none;max-height:30vh}}' +
-      '.dsh-pp-foot{{display:flex;align-items:center;gap:10px;margin-top:14px}}' +
-      '.dsh-pp-note{{flex:1;min-width:0;font-size:12px;color:var(--pp-muted)}}' +
+      // Wraps, and the buttons keep to their own line once it does. A note is
+      // usually a few words — "Plugins installed." — and sits beside the
+      // buttons. But a failure explains itself in a paragraph, and a paragraph
+      // sharing one row with four buttons squeezes both into an unreadable
+      // column, which is what a release-age refusal did. So a note that is
+      // marked bad takes the full width and pushes the buttons below it;
+      // `justify-content` then keeps them at the end of their own row.
+      '.dsh-pp-foot{{display:flex;flex-wrap:wrap;align-items:center;' +
+      'justify-content:flex-end;gap:10px;margin-top:14px}}' +
+      '.dsh-pp-note{{flex:1 1 auto;min-width:0;font-size:12px;line-height:1.55;' +
+      'color:var(--pp-muted)}}' +
       '.dsh-pp-note.dsh-pp-ok{{color:var(--pp-ok)}}' +
-      '.dsh-pp-note.dsh-pp-bad{{color:var(--pp-danger)}}' +
+      // A whole row of its own, and a little breathing room from the buttons
+      // that follow it. Keyed off the class the failure already sets, so no
+      // `:has()` — WebKitGTK on the older Linux this ships for predates it.
+      '.dsh-pp-note.dsh-pp-bad{{flex:1 1 100%;margin-bottom:2px;' +
+      'color:var(--pp-danger)}}' +
       '.dsh-pp button{{all:unset;display:inline-flex;align-items:center;' +
       'justify-content:center;height:32px;padding:0 15px;border-radius:8px;' +
       'border:1px solid var(--pp-line);cursor:pointer;font-size:13px;' +

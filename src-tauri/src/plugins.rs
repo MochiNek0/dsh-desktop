@@ -38,13 +38,21 @@
 //! installation.
 //!
 //! The same reasoning does *not* extend to `minimumReleaseAge`, pnpm's cooldown
-//! on newly published versions. On an install it is left alone for exactly the
-//! reason above — it is the check that stops a freshly compromised version from
-//! being pulled in, and the user is told what it is rather than having it
-//! switched off for them. On a *removal* it is lifted automatically: taking a
-//! dependency out cannot install anything, and pnpm re-resolves the whole
-//! lockfile to do it, so the cooldown fails removals over unrelated entries
-//! that merely happen to be too new. See [`remove`].
+//! on newly published versions — but what follows from it depends on who the
+//! cooldown is actually stopping, because pnpm re-verifies every entry in the
+//! lockfile before it does anything at all.
+//!
+//! - A *removal* lifts it outright: taking a dependency out cannot install
+//!   anything, so the check has nothing to protect there. See [`remove`].
+//! - An *install* that the cooldown blocks over a package on the command line
+//!   keeps the refusal. That is the check doing its job — stopping a freshly
+//!   compromised version — and the user is told what it is rather than having
+//!   it switched off for them.
+//! - An install blocked *only* over lockfile entries nobody asked about lifts
+//!   it too. A version pinned earlier (a plugin that updated itself) fails
+//!   every later install until it ages out, over a package the user is not
+//!   touching; refusing there protects nothing and strands the panel. See
+//!   [`install`].
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
@@ -407,7 +415,43 @@ pub fn install(
     command.args(&specs);
     crate::dsh::apply_path(app, &mut command);
 
-    let outcome = run(command, log)?;
+    let mut outcome = run(command, log)?;
+
+    // A release-age refusal that names only packages this install did not ask
+    // for is a stale lockfile, not a verdict on what is being installed. pnpm
+    // re-verifies every lockfile entry before adding anything, so a version
+    // that was pinned earlier — by a plugin updating itself, say — keeps
+    // failing every later install until it ages out, over a package the user
+    // is not touching. Retried once with the cooldown lifted, as a removal is.
+    //
+    // The distinction is the whole point: if the cooldown names something on
+    // the command line, the check is doing its job and the refusal stands.
+    if outcome.code != 0 && outcome.flagged(RELEASE_AGE) {
+        let wanted: HashSet<String> = specs.iter().filter_map(|spec| spec_name(spec)).collect();
+        let blamed = outcome.blamed();
+        let stale: Vec<&String> = blamed.iter().filter(|name| !wanted.contains(*name)).collect();
+
+        if !blamed.is_empty() && stale.len() == blamed.len() {
+            let mut names: Vec<&str> = stale.iter().map(|name| name.as_str()).collect();
+            names.sort_unstable();
+            log(&t!(
+                "被拦下的是 lockfile 里已有的 {}，不是这次要装的东西。跳过这项检查重试…",
+                "What was blocked is {}, already in the lockfile — not anything being installed now. Retrying with that check skipped…",
+                names.join("、")
+            ));
+
+            let mut retry = Command::new(&dsh.bin);
+            retry.args(["plugin", "--profile", PROFILE, "add"]);
+            if profile_dir(app).join("pnpm-workspace.yaml").is_file() {
+                retry.arg("-w");
+            }
+            retry.args(&specs);
+            crate::dsh::apply_path(app, &mut retry);
+            retry.env("PNPM_CONFIG_MINIMUM_RELEASE_AGE", "0");
+            outcome = run(retry, log)?;
+        }
+    }
+
     match outcome.code {
         0 => {
             log(t!("插件安装完成。", "Plugins installed."));
@@ -437,6 +481,27 @@ pub fn install(
 /// cooldown the machine is configured with.
 const RELEASE_AGE: &str = "ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION";
 
+/// The package name a pnpm spec installs under, as far as it can be known
+/// without fetching anything.
+///
+/// A registry spec is its own name once the version range is cut off. Anything
+/// exotic — `github:owner/repo`, a tarball URL, a path — resolves to whatever
+/// the fetched manifest declares, which nothing here can work out, so those
+/// answer `None` and are treated as "not known to be ours".
+fn spec_name(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.contains(['/', '\\', ':']) && !spec.starts_with('@') {
+        return None;
+    }
+    // A scoped name keeps its leading `@`; the range separator is a later one.
+    let name = match spec.rfind('@') {
+        Some(at) if at > 0 => &spec[..at],
+        _ => spec,
+    };
+    let name = name.trim();
+    (!name.is_empty() && !name.contains(' ')).then(|| name.to_string())
+}
+
 /// Turn a failed run into something the user can act on.
 ///
 /// Every other failure in this module names a cause and a next step — a broken
@@ -454,18 +519,24 @@ fn diagnose(app: &AppHandle, outcome: &Outcome, removing: bool) -> String {
         // *also* failed, so the advice cannot be "turn the policy off" — that
         // was just tried. Naming the attempt is what stops the user from being
         // sent to do it again by hand.
+        //
+        // Both are kept to a couple of lines. This lands in the panel's footer
+        // note, beside the buttons and directly under pnpm's own output — the
+        // detail is already on screen, so a paragraph restating it only
+        // crowds the row. What the note owes the user is the one thing the log
+        // does not say: what to do next.
         return if removing {
             t!(
-                "卸载被 pnpm 的 minimumReleaseAge 拦下了，跳过该检查重试之后仍然失败。这台机器上的这项设置可能来自 {}，或者 ~/.npmrc、~/.config/pnpm/rc 之类的全局配置。上面是 pnpm 的完整输出。",
-                "The removal was blocked by pnpm's minimumReleaseAge, and retrying with that check skipped failed as well. The setting may come from {}, or from a global config such as ~/.npmrc or ~/.config/pnpm/rc. pnpm's full output is above.",
+                "卸载仍被 pnpm 的 minimumReleaseAge 拦着——跳过这项检查重试过一次，还是失败。这项设置来自这台机器，可能在 {}，也可能在全局配置里。",
+                "The removal is still blocked by pnpm's minimumReleaseAge — it was retried once with the check skipped and failed again. The setting comes from this machine: look in {}, or in a global pnpm config.",
                 path
             )
         } else {
-            // Not so on install: here the policy is doing its job, and this
-            // says what it is before saying how to switch it off.
+            // Not so on install: here the policy is doing its job, so this says
+            // what it is before saying how to relax it.
             t!(
-                "这台机器上的 pnpm 设了 minimumReleaseAge：包发布后要满一段冷却期才允许安装，用来防止刚被投毒的版本被装进来。要安装的插件（或它的某个依赖）比这个期限新，所以被拦下了。可以等冷却期过去，或者在确认这些包可信的前提下，在 {} 里加一行 minimumReleaseAge: 0。上面是 pnpm 的完整输出。",
-                "pnpm on this machine has minimumReleaseAge set: a package must age past a cooldown before it may be installed, which is what stops a freshly compromised version from being pulled in. Something being installed — a plugin or one of its dependencies — is newer than that, so pnpm refused. Either wait out the cooldown, or, if you trust these packages, add minimumReleaseAge: 0 to {}. pnpm's full output is above.",
+                "要装的包比 pnpm 的 minimumReleaseAge 冷却期新——这项检查用来挡住刚被投毒的版本。可以过一会儿再装，或在确认可信后往 {} 加一行 minimumReleaseAge: 0。",
+                "Something being installed is newer than pnpm's minimumReleaseAge cooldown — the check that keeps a freshly compromised version out. Try again later, or, if you trust it, add minimumReleaseAge: 0 to {}.",
                 path
             )
         };
@@ -609,16 +680,19 @@ fn ensure_pnpm(app: &AppHandle, log: &Log) -> Result<(), String> {
     }
 }
 
-/// What a finished child left behind: its exit code, and the pnpm error codes
-/// its output named.
+/// What a finished child left behind: its exit code, the pnpm error codes its
+/// output named, and the packages those errors named.
 ///
 /// The output itself is not kept. A failing pnpm run can be thousands of lines
 /// and all of them have already gone to the panel; what the callers need is the
 /// much smaller question of *which* known failure this was, so only the
-/// `ERR_PNPM_*` tokens are retained — see [`Outcome::flagged`].
+/// `ERR_PNPM_*` tokens are retained — see [`Outcome::flagged`] — along with the
+/// package names a supply-chain refusal listed, which decide whether the
+/// refusal is about this install at all. See [`Outcome::blamed`].
 struct Outcome {
     code: i32,
     codes: HashSet<String>,
+    blamed: HashSet<String>,
 }
 
 impl Outcome {
@@ -626,6 +700,11 @@ impl Outcome {
     /// `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`.
     fn flagged(&self, code: &str) -> bool {
         self.codes.contains(code)
+    }
+
+    /// The packages a supply-chain refusal named, without their versions.
+    fn blamed(&self) -> &HashSet<String> {
+        &self.blamed
     }
 }
 
@@ -637,6 +716,33 @@ fn pnpm_codes(line: &str) -> impl Iterator<Item = String> + '_ {
     line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|word| word.starts_with("ERR_PNPM_"))
         .map(str::to_string)
+}
+
+/// The package a supply-chain refusal blames, if this line is one.
+///
+/// pnpm lists each rejected entry on its own indented line, in the shape
+/// `name@version was published at <date>, within the minimumReleaseAge cutoff
+/// (<date>)`. Only the name is taken: the question these answer is *which
+/// package* is holding the install up, not which version of it.
+///
+/// Anchored on the ` was published at ` phrase rather than on indentation,
+/// because indentation is shared with every other list pnpm prints. A line
+/// that does not carry the phrase is not one of these.
+fn pnpm_blamed(line: &str) -> Option<String> {
+    let spec = line.trim().split(" was published at ").next()?.trim();
+    if spec == line.trim() {
+        return None;
+    }
+
+    // A scoped name keeps its leading `@`, so the version separator is the
+    // *last* `@`, and only when something follows the first character.
+    let name = match spec.rfind('@') {
+        Some(at) if at > 0 => &spec[..at],
+        _ => spec,
+    };
+
+    let name = name.trim();
+    (!name.is_empty() && !name.contains(' ')).then(|| name.to_string())
 }
 
 /// Run a child to completion, putting every line either stream produces through
@@ -696,9 +802,11 @@ fn run(mut command: Command, log: &Log) -> Result<Outcome, String> {
     pump(stderr, tx);
 
     let mut codes = HashSet::new();
+    let mut blamed = HashSet::new();
     for line in rx {
         eprintln!("[plugin] {line}");
         codes.extend(pnpm_codes(&line));
+        blamed.extend(pnpm_blamed(&line));
         log(&line);
     }
 
@@ -715,6 +823,7 @@ fn run(mut command: Command, log: &Log) -> Result<Outcome, String> {
     Ok(Outcome {
         code: status?.code().unwrap_or(-1),
         codes,
+        blamed,
     })
 }
 
@@ -932,12 +1041,68 @@ pub fn open_directory(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dependencies_of, parse, pnpm_codes, requested, wanted_gone, Outcome, PRESETS, RELEASE_AGE,
+        dependencies_of, parse, pnpm_blamed, pnpm_codes, requested, spec_name, wanted_gone,
+        Outcome, PRESETS, RELEASE_AGE,
     };
     use tauri::Url;
 
     fn codes(line: &str) -> Vec<String> {
         pnpm_codes(line).collect()
+    }
+
+    /// The exact shape pnpm prints under a release-age refusal, taken from a
+    /// real failure. Only the name is wanted, and a scoped name must survive
+    /// having its version cut off.
+    #[test]
+    fn reads_the_package_a_refusal_blames() {
+        assert_eq!(
+            pnpm_blamed(
+                "  dshmarket@1.36.0 was published at 2026-08-28T15:38:44.000Z, within the minimumReleaseAge cutoff (2026-08-27T17:12:08.726Z)"
+            )
+            .as_deref(),
+            Some("dshmarket")
+        );
+        assert_eq!(
+            pnpm_blamed("  @scope/pkg@2.0.0 was published at 2026-01-01T00:00:00.000Z").as_deref(),
+            Some("@scope/pkg")
+        );
+        // Every other line pnpm prints, including the headline that carries the
+        // error code, is not one of these.
+        assert_eq!(pnpm_blamed("Progress: resolved 42, reused 0"), None);
+        assert_eq!(
+            pnpm_blamed("[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 2 lockfile entries failed"),
+            None
+        );
+    }
+
+    /// What a spec installs under, so a refusal can be matched against what was
+    /// asked for. An exotic spec resolves to a name only the fetched manifest
+    /// knows, so it must not guess.
+    #[test]
+    fn reads_the_name_a_spec_installs_under() {
+        assert_eq!(spec_name("dshmarket").as_deref(), Some("dshmarket"));
+        assert_eq!(spec_name("dshmarket@1.36.0").as_deref(), Some("dshmarket"));
+        assert_eq!(spec_name("@scope/pkg@^2").as_deref(), Some("@scope/pkg"));
+        assert_eq!(spec_name("@scope/pkg").as_deref(), Some("@scope/pkg"));
+        assert_eq!(spec_name("github:owner/repo"), None);
+        assert_eq!(spec_name(""), None);
+    }
+
+    /// The distinction the install retry turns on: a refusal naming only
+    /// packages nobody asked for is stale lockfile baggage, while one naming a
+    /// package on the command line is the check doing its job.
+    #[test]
+    fn tells_stale_lockfile_entries_from_the_install() {
+        let blamed: std::collections::HashSet<String> =
+            ["dshmarket".to_string()].into_iter().collect();
+
+        let installing_something_else: std::collections::HashSet<String> =
+            [spec_name("dsh-web-search-free").unwrap()].into_iter().collect();
+        assert!(blamed.iter().all(|n| !installing_something_else.contains(n)));
+
+        let installing_the_blamed: std::collections::HashSet<String> =
+            [spec_name("dshmarket@1.36.0").unwrap()].into_iter().collect();
+        assert!(blamed.iter().all(|n| installing_the_blamed.contains(n)));
     }
 
     /// The line from the failure this was written for, verbatim: pnpm puts the
@@ -950,6 +1115,7 @@ mod tests {
             codes: codes("[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 2 lockfile entries failed verification:")
                 .into_iter()
                 .collect(),
+            blamed: Default::default(),
         };
 
         assert!(outcome.flagged(RELEASE_AGE));
@@ -996,6 +1162,7 @@ mod tests {
             codes: codes("[ERR_PNPM_NO_MATCHING_VERSION] no matching version")
                 .into_iter()
                 .collect(),
+            blamed: Default::default(),
         };
 
         assert!(!outcome.flagged(RELEASE_AGE));
