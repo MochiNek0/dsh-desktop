@@ -150,6 +150,10 @@ pub fn script() -> String {
 
     format!(
         r#"(function () {{
+  // The top document only. There is one dsh UI to watch, and a copy of this
+  // running in every iframe the page opens is a timer apiece announcing
+  // through a navigation no iframe can make. See `controls`.
+  if (window.top !== window.self) return;
   if (window.__dshWaitWatch) return;
   window.__dshWaitWatch = true;
 

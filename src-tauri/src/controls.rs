@@ -317,6 +317,16 @@ pub fn script() -> String {
 
     format!(
         r#"(function () {{
+  // The page in the window, never a frame inside it. On Windows an
+  // initialization script is registered through WebView2's
+  // `AddScriptToExecuteOnDocumentCreated`, which runs it in every frame the
+  // webview creates -- wry's `for_main_only` is a no-op there, it hands the
+  // script straight over. dsh embeds pages it does not own in iframes, the
+  // plugin market's comment dialog (giscus) among them, and each of them was
+  // getting a titlebar of its own: the dots over its top-left corner, its body
+  // pushed down by the padding rule below and then clipped to the frame by the
+  // height and overflow ones, which cut the comment box off entirely.
+  if (window.top !== window.self) return;
   if (window.__dshWindowControls) return;
   window.__dshWindowControls = true;
 

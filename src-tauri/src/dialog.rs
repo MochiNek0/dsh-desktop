@@ -494,6 +494,10 @@ pub fn script() -> String {
 
     format!(
         r#"(function () {{
+  // The top document only. Drawn anywhere else this is a panel the size of an
+  // iframe, with buttons that answer through a navigation no iframe can make.
+  // See `controls`.
+  if (window.top !== window.self) return;
   if (window.__dshAskPanel) return;
   window.__dshAskPanel = true;
 
