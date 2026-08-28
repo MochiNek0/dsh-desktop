@@ -254,7 +254,7 @@ pub fn sync_autostart(app: &AppHandle) {
 /// Put the checkmark on the notification item, or take it off. Pushed on every
 /// page load and after every toggle, like the login item above.
 pub fn sync_notify(app: &AppHandle) {
-    let enabled = crate::settings::notify_on_turn_end(app);
+    let enabled = crate::settings::notifications(app);
     eval(
         app,
         &format!("window.__dshNotifyTurns && window.__dshNotifyTurns({enabled})"),
@@ -310,7 +310,9 @@ pub fn script() -> String {
     let update_dsh = label(t!("更新 dsh…", "Update dsh…"));
     let check_app = label(t!("检查应用更新…", "Check for app updates…"));
     let autostart = label(t!("开机自启动", "Start at login"));
-    let notify = label(t!("对话完成后通知", "Notify when a turn finishes"));
+    // Not "Notify when a turn finishes": the switch behind it gates every
+    // notification this app raises, a plugin's included. See `crate::settings`.
+    let notify = label(t!("通知", "Notifications"));
     let quit = label(t!("退出 dsh", "Quit dsh"));
 
     format!(

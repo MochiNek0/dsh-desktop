@@ -117,10 +117,12 @@ pub fn received(url: &Url) -> Option<Notice> {
 /// The preference is checked here too, for the same reason it is the last gate
 /// rather than the first: this is the one place every notification passes
 /// through, whoever raised it. Turning the setting off silences a plugin's
-/// notifications as well as this app's own, which is what a user who switched
-/// off notifications asked for.
+/// notifications as well as this app's own — which is why the setting is called
+/// "Notifications" rather than naming the finished-turn toast. It was named for
+/// the toast once, and a switch whose label promises less than it does is a
+/// switch that surprises the person who used it. See [`crate::settings`].
 pub fn show(app: &AppHandle, notice: Notice) {
-    if !crate::settings::notify_on_turn_end(app) || watching(app) {
+    if !crate::settings::notifications(app) || watching(app) {
         return;
     }
 
