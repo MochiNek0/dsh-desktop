@@ -155,44 +155,46 @@ fn install(app: AppHandle, update: Update) {
             )
             .await;
 
+        // An `else` rather than an early return: on Windows the block below is
+        // compiled out, which would leave the `return` as the last statement in
+        // the function — redundant, and clippy is right to say so.
         if let Err(error) = finished {
             crate::controls::busy(&app, "");
             note(&app, t!("更新失败", "Update failed"), &error.to_string());
-            return;
-        }
+        } else {
+            // Windows never reaches this: `Update::install` there ends in
+            // `std::process::exit(0)` after starting the NSIS installer, which
+            // is passed `/P /R` and so restarts the app itself. Everywhere else
+            // the install returns and the restart is ours to ask about.
+            #[cfg(not(windows))]
+            {
+                crate::controls::busy(&app, "");
 
-        // Windows never reaches this: `Update::install` there ends in
-        // `std::process::exit(0)` after starting the NSIS installer, which is
-        // passed `/P /R` and so restarts the app itself. Everywhere else the
-        // install returns and the restart is ours to ask about.
-        #[cfg(not(windows))]
-        {
-            crate::controls::busy(&app, "");
-
-            crate::dialog::ask(
-                &app,
-                crate::dialog::Ask {
-                    title: t!("更新就绪", "Update ready").to_string(),
-                    body: t!(
-                        "新版本已安装，重启后生效。正在进行的会话会被中断。",
-                        "The update is installed and takes effect on restart. \
-                         A session in progress will be interrupted."
-                    )
-                    .to_string(),
-                    choices: vec![
-                        crate::dialog::Choice::new("later", t!("稍后", "Later")),
-                        crate::dialog::Choice::primary("now", t!("立即重启", "Restart now")),
-                    ],
-                    answered: Box::new(|app, id| {
-                        if id == "now" {
-                            // Skips the ordinary shutdown path, so the dsh
-                            // process tree is left to the job object backstop
-                            // in `server`.
-                            app.restart();
-                        }
-                    }),
-                },
-            );
+                crate::dialog::ask(
+                    &app,
+                    crate::dialog::Ask {
+                        title: t!("更新就绪", "Update ready").to_string(),
+                        body: t!(
+                            "新版本已安装，重启后生效。正在进行的会话会被中断。",
+                            "The update is installed and takes effect on restart. \
+                             A session in progress will be interrupted."
+                        )
+                        .to_string(),
+                        choices: vec![
+                            crate::dialog::Choice::new("later", t!("稍后", "Later")),
+                            crate::dialog::Choice::primary("now", t!("立即重启", "Restart now")),
+                        ],
+                        answered: Box::new(|app, id| {
+                            if id == "now" {
+                                // Skips the ordinary shutdown path, so the dsh
+                                // process tree is left to the job object
+                                // backstop in `server`.
+                                app.restart();
+                            }
+                        }),
+                    },
+                );
+            }
         }
     });
 }

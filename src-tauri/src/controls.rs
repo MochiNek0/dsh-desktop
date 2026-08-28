@@ -235,7 +235,7 @@ pub fn perform(app: &AppHandle, action: Action) {
 /// the page never sees — Win+Up, a snap, a double-click the OS handled itself.
 pub fn sync(window: &WebviewWindow) {
     let maximized = window.is_maximized().unwrap_or(false);
-    let _ = window.eval(&format!(
+    let _ = window.eval(format!(
         "window.__dshMaximized && window.__dshMaximized({maximized})"
     ));
 }

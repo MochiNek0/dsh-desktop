@@ -36,6 +36,15 @@
 //! automatically would mean this app deciding, on the user's behalf and without
 //! showing them, that a package downloaded from a repository may run code during
 //! installation.
+//!
+//! The same reasoning does *not* extend to `minimumReleaseAge`, pnpm's cooldown
+//! on newly published versions. On an install it is left alone for exactly the
+//! reason above — it is the check that stops a freshly compromised version from
+//! being pulled in, and the user is told what it is rather than having it
+//! switched off for them. On a *removal* it is lifted automatically: taking a
+//! dependency out cannot install anything, and pnpm re-resolves the whole
+//! lockfile to do it, so the cooldown fails removals over unrelated entries
+//! that merely happen to be too new. See [`remove`].
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
@@ -398,7 +407,8 @@ pub fn install(
     command.args(&specs);
     crate::dsh::apply_path(app, &mut command);
 
-    match run(command, log)? {
+    let outcome = run(command, log)?;
+    match outcome.code {
         0 => {
             log(t!("插件安装完成。", "Plugins installed."));
             Ok(())
@@ -419,12 +429,53 @@ pub fn install(
             )
             .to_string(),
         }),
-        code => Err(t!(
-            "dsh plugin 退出码 {}。上面是它的完整输出。",
-            "dsh plugin exited with code {}. Its full output is above.",
-            code
-        )),
+        _ => Err(diagnose(app, &outcome, false)),
     }
+}
+
+/// The pnpm error code for a package younger than the `minimumReleaseAge`
+/// cooldown the machine is configured with.
+const RELEASE_AGE: &str = "ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION";
+
+/// Turn a failed run into something the user can act on.
+///
+/// Every other failure in this module names a cause and a next step — a broken
+/// pnpm shim, an unwritable npm prefix, the `allowBuilds` key to add. The
+/// fallback did not: an exit code and "the output is above" leaves a user who
+/// clicked a button in a panel to work out a pnpm policy from its log. The
+/// codes pnpm names are the reliable part of that log, so they are what this
+/// switches on.
+fn diagnose(app: &AppHandle, outcome: &Outcome, removing: bool) -> String {
+    if outcome.flagged(RELEASE_AGE) {
+        let workspace = profile_dir(app).join("pnpm-workspace.yaml");
+        let path = workspace.display();
+
+        // Removal reaches here only after the retry with the policy lifted has
+        // *also* failed, so the advice cannot be "turn the policy off" — that
+        // was just tried. Naming the attempt is what stops the user from being
+        // sent to do it again by hand.
+        return if removing {
+            t!(
+                "卸载被 pnpm 的 minimumReleaseAge 拦下了，跳过该检查重试之后仍然失败。这台机器上的这项设置可能来自 {}，或者 ~/.npmrc、~/.config/pnpm/rc 之类的全局配置。上面是 pnpm 的完整输出。",
+                "The removal was blocked by pnpm's minimumReleaseAge, and retrying with that check skipped failed as well. The setting may come from {}, or from a global config such as ~/.npmrc or ~/.config/pnpm/rc. pnpm's full output is above.",
+                path
+            )
+        } else {
+            // Not so on install: here the policy is doing its job, and this
+            // says what it is before saying how to switch it off.
+            t!(
+                "这台机器上的 pnpm 设了 minimumReleaseAge：包发布后要满一段冷却期才允许安装，用来防止刚被投毒的版本被装进来。要安装的插件（或它的某个依赖）比这个期限新，所以被拦下了。可以等冷却期过去，或者在确认这些包可信的前提下，在 {} 里加一行 minimumReleaseAge: 0。上面是 pnpm 的完整输出。",
+                "pnpm on this machine has minimumReleaseAge set: a package must age past a cooldown before it may be installed, which is what stops a freshly compromised version from being pulled in. Something being installed — a plugin or one of its dependencies — is newer than that, so pnpm refused. Either wait out the cooldown, or, if you trust these packages, add minimumReleaseAge: 0 to {}. pnpm's full output is above.",
+                path
+            )
+        };
+    }
+
+    t!(
+        "dsh plugin 退出码 {}。上面是它的完整输出。",
+        "dsh plugin exited with code {}. Its full output is above.",
+        outcome.code
+    )
 }
 
 /// Put pnpm where the dsh we are about to run will find it.
@@ -486,7 +537,9 @@ fn ensure_pnpm(app: &AppHandle, log: &Log) -> Result<(), String> {
         ));
     }
 
-    match run(npm, log)? {
+    // Only the exit code matters here: this runs npm, not pnpm, so there are no
+    // `ERR_PNPM_*` codes to switch on.
+    match run(npm, log)?.code {
         // npm exiting 0 is not the same as pnpm being runnable: it will report
         // success having written a shim whose target the next step cannot
         // execute, or into a prefix nothing on the search path looks at. The
@@ -556,14 +609,44 @@ fn ensure_pnpm(app: &AppHandle, log: &Log) -> Result<(), String> {
     }
 }
 
+/// What a finished child left behind: its exit code, and the pnpm error codes
+/// its output named.
+///
+/// The output itself is not kept. A failing pnpm run can be thousands of lines
+/// and all of them have already gone to the panel; what the callers need is the
+/// much smaller question of *which* known failure this was, so only the
+/// `ERR_PNPM_*` tokens are retained — see [`Outcome::flagged`].
+struct Outcome {
+    code: i32,
+    codes: HashSet<String>,
+}
+
+impl Outcome {
+    /// Whether pnpm named this error code, e.g.
+    /// `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`.
+    fn flagged(&self, code: &str) -> bool {
+        self.codes.contains(code)
+    }
+}
+
+/// pnpm prints its error codes as bare `ERR_PNPM_…` tokens, one per failure, in
+/// a line that also carries prose. Matching the token rather than the whole
+/// line keeps this working across pnpm's phrasing changes, and bounds what is
+/// held from a run whose output is otherwise unbounded.
+fn pnpm_codes(line: &str) -> impl Iterator<Item = String> + '_ {
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| word.starts_with("ERR_PNPM_"))
+        .map(str::to_string)
+}
+
 /// Run a child to completion, putting every line either stream produces through
-/// `log`, and answer with its exit code.
+/// `log`, and answer with its exit code and the pnpm error codes it named.
 ///
 /// Both streams, interleaved as they arrive: pnpm writes its progress to one and
 /// its warnings — including the `allowBuilds` instruction this module
 /// deliberately does not act on — to the other, and a user reading a failure
 /// needs them in the order they happened.
-fn run(mut command: Command, log: &Log) -> Result<i32, String> {
+fn run(mut command: Command, log: &Log) -> Result<Outcome, String> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -612,8 +695,10 @@ fn run(mut command: Command, log: &Log) -> Result<i32, String> {
     pump(stdout, tx.clone());
     pump(stderr, tx);
 
+    let mut codes = HashSet::new();
     for line in rx {
         eprintln!("[plugin] {line}");
+        codes.extend(pnpm_codes(&line));
         log(&line);
     }
 
@@ -627,7 +712,10 @@ fn run(mut command: Command, log: &Log) -> Result<i32, String> {
     let status = active.child.wait().map_err(|error| error.to_string());
     *running = None;
 
-    Ok(status?.code().unwrap_or(-1))
+    Ok(Outcome {
+        code: status?.code().unwrap_or(-1),
+        codes,
+    })
 }
 
 /// How much of one line reaches the panel. Lines are split on newlines only, so
@@ -770,12 +858,40 @@ pub fn remove(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String
 
     log(&t!("正在卸载：{}", "Removing: {}", names.join(" ")));
 
-    let mut command = Command::new(&dsh.bin);
-    command.args(["plugin", "--profile", PROFILE, "remove"]);
-    command.args(&names);
-    crate::dsh::apply_path(app, &mut command);
+    // Built twice, because the retry below needs a `Command` of its own — they
+    // are not reusable once run.
+    let removal = || {
+        let mut command = Command::new(&dsh.bin);
+        command.args(["plugin", "--profile", PROFILE, "remove"]);
+        command.args(&names);
+        crate::dsh::apply_path(app, &mut command);
+        command
+    };
 
-    match run(command, log)? {
+    let mut outcome = run(removal(), log)?;
+
+    // A removal stopped by the release-age cooldown is retried once with the
+    // policy lifted for this one child, because the policy cannot be protecting
+    // anything here: removing a dependency only ever takes installed code away.
+    // What it *does* do is fail the removal over unrelated lockfile entries that
+    // happen to be too new (pnpm/pnpm#10071), which is a wall the user has no
+    // way through from a panel with one button on it.
+    //
+    // The env var, specifically. `--config.minimumReleaseAge=0` is silently
+    // dropped by pnpm 12's Rust CLI while the env overlay is honored
+    // (pnpm/pnpm#13929), so the flag would look like a fix and change nothing.
+    if outcome.code != 0 && outcome.flagged(RELEASE_AGE) {
+        log(t!(
+            "卸载被 pnpm 的 minimumReleaseAge 拦下了。卸载不会引入新代码，正在跳过这项检查重试…",
+            "The removal was blocked by pnpm's minimumReleaseAge. Removing adds no code, so retrying with that check skipped…"
+        ));
+
+        let mut retry = removal();
+        retry.env("PNPM_CONFIG_MINIMUM_RELEASE_AGE", "0");
+        outcome = run(retry, log)?;
+    }
+
+    match outcome.code {
         0 => {
             log(t!("插件已卸载。", "Plugins removed."));
             Ok(())
@@ -792,11 +908,7 @@ pub fn remove(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String
             )
             .to_string(),
         }),
-        code => Err(t!(
-            "dsh plugin 退出码 {}。上面是它的完整输出。",
-            "dsh plugin exited with code {}. Its full output is above.",
-            code
-        )),
+        _ => Err(diagnose(app, &outcome, true)),
     }
 }
 
@@ -819,8 +931,75 @@ pub fn open_directory(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{dependencies_of, parse, requested, wanted_gone, PRESETS};
+    use super::{
+        dependencies_of, parse, pnpm_codes, requested, wanted_gone, Outcome, PRESETS, RELEASE_AGE,
+    };
     use tauri::Url;
+
+    fn codes(line: &str) -> Vec<String> {
+        pnpm_codes(line).collect()
+    }
+
+    /// The line from the failure this was written for, verbatim: pnpm puts the
+    /// code in brackets alongside prose, so the token has to come out of a line
+    /// that is not just the token.
+    #[test]
+    fn a_release_age_failure_is_recognised() {
+        let outcome = Outcome {
+            code: 1,
+            codes: codes("[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 2 lockfile entries failed verification:")
+                .into_iter()
+                .collect(),
+        };
+
+        assert!(outcome.flagged(RELEASE_AGE));
+    }
+
+    /// Only `ERR_PNPM_*` tokens are kept, and punctuation around them is not
+    /// part of the token — otherwise the bracketed form above would never match
+    /// the bare constant.
+    #[test]
+    fn only_pnpm_error_codes_are_kept() {
+        assert_eq!(codes("Progress: resolved 42, reused 0"), Vec::<String>::new());
+        assert_eq!(
+            codes(" ERR_PNPM_FETCH_404  ERR_OTHER_THING error"),
+            vec!["ERR_PNPM_FETCH_404"]
+        );
+    }
+
+    /// The retry in [`super::remove`] lifts the cooldown through the
+    /// environment, not through `--config.minimumReleaseAge=0`, because pnpm
+    /// 12's Rust CLI silently ignores that flag while honoring the env overlay
+    /// (pnpm/pnpm#13929). A flag would look like a fix and change nothing, so
+    /// the spelling of the variable is worth pinning.
+    #[test]
+    fn the_cooldown_is_lifted_through_the_environment() {
+        let source = include_str!("plugins.rs");
+
+        assert!(source.contains(r#".env("PNPM_CONFIG_MINIMUM_RELEASE_AGE", "0")"#));
+
+        // Built rather than written out, because a literal spelling the flag
+        // out would appear in this file and match itself. The flag does appear
+        // in prose above, explaining why it is not used; what must not appear
+        // is the flag being passed as an argument.
+        let flag = format!("{}{}", "--config.minimum", "-release-age");
+        assert!(!source.contains(&format!("arg(\"{flag}")));
+        assert!(!source.contains(&format!("\"{flag}=0\"")));
+    }
+
+    /// A run that named a different pnpm failure must not be reported as the
+    /// release-age one — the whole point of switching on the code.
+    #[test]
+    fn an_unrelated_failure_is_not_release_age() {
+        let outcome = Outcome {
+            code: 1,
+            codes: codes("[ERR_PNPM_NO_MATCHING_VERSION] no matching version")
+                .into_iter()
+                .collect(),
+        };
+
+        assert!(!outcome.flagged(RELEASE_AGE));
+    }
 
     /// The list that actually ships, read the way the app reads it. Every entry
     /// has to survive [`parse`] — one that does not is silently missing from the
