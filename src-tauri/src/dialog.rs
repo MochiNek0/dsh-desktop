@@ -39,9 +39,42 @@
 //! it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::thread::ThreadId;
 
 use tauri::{AppHandle, Manager};
+
+/// The thread `main` runs on, recorded there before anything can ask.
+///
+/// Tauri exposes no public "am I on the main thread", and the answer is what
+/// the debug assertion in [`confirm`] needs. The deadlock it guards is
+/// otherwise unrecoverable: a dialog is on screen, and the thread that would
+/// deliver the click is the one sitting in `recv`.
+static MAIN: OnceLock<ThreadId> = OnceLock::new();
+
+/// Record the calling thread as the main one. Called first thing in `main`.
+pub fn remember_main_thread() {
+    let _ = MAIN.set(std::thread::current().id());
+}
+
+/// Whether this is the thread that pumps the event loop.
+///
+/// `false` when nobody ever recorded one, which is every unit test: there is no
+/// event loop there to deadlock, and an assertion that fired would be noise.
+fn on_main_thread() -> bool {
+    is_main(MAIN.get().copied(), std::thread::current().id())
+}
+
+/// The decision [`on_main_thread`] makes, with the global read out of it.
+///
+/// Split out because [`MAIN`] is deliberately write-once for the life of the
+/// process, so a test cannot set it to each of the cases in turn — and two
+/// tests that each tried would race for who got to claim it. This takes the
+/// recorded thread as an argument instead, which is the part with the logic in
+/// it; the accessor above is the part with the global in it.
+fn is_main(recorded: Option<ThreadId>, current: ThreadId) -> bool {
+    recorded == Some(current)
+}
 
 /// One way out of a dialog.
 pub struct Choice {
@@ -114,8 +147,30 @@ struct Pending {
     answered: Answer,
 }
 
+/// The JavaScript that hands one dialog to the page.
+///
+/// Deliberately not `window.__dshAsk && window.__dshAsk(…)`. That guard reads
+/// like defensive good manners, but it turns the one case worth detecting —
+/// the document has not run the injected script yet, which `boot` can easily
+/// beat — into a silent success: `eval` returns `Ok`, [`ask`] reports the
+/// dialog delivered, and [`confirm`] then blocks forever on an answer nobody
+/// can give. Called unguarded, that case throws, `eval` reports it, and the
+/// caller gets to fall back.
+///
+/// Its own function so a test can assert the guard has not crept back in.
+fn delivery(json: &str) -> String {
+    format!("window.__dshAsk({json})")
+}
+
 /// Put a question on screen. Returns immediately; see the module docs.
-pub fn ask(app: &AppHandle, ask: Ask) {
+///
+/// Answers whether the question actually reached the window. It can fail to:
+/// there may be no window yet, or the document showing may not have run the
+/// injected script — `ask` is reachable from `boot`, which starts before the
+/// first `PageLoadEvent::Finished`. A caller that only wanted to say something
+/// can ignore that, but [`confirm`] cannot, because a question nobody can see
+/// is a question nobody will ever answer.
+pub fn ask(app: &AppHandle, ask: Ask) -> bool {
     let token = TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
 
     let buttons: Vec<serde_json::Value> = ask
@@ -138,6 +193,10 @@ pub fn ask(app: &AppHandle, ask: Ask) {
     })
     .to_string();
 
+    // Kept for the failure message below: `answered` is moved out of `ask` on
+    // the next line, and a partially moved struct cannot be read from again.
+    let title = ask.title;
+
     // Replaces whatever was there. The previous dialog's `answered` is dropped
     // without running, which is the same outcome as dismissing it.
     if let Ok(mut pending) = PENDING.lock() {
@@ -152,9 +211,25 @@ pub fn ask(app: &AppHandle, ask: Ask) {
     // Without that, a quote in an update's release notes ends the argument and
     // takes the rest of the call with it.
     let json = serde_json::to_string(&payload).expect("a string is always serializable");
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.eval(format!("window.__dshAsk && window.__dshAsk({json})"));
+
+    let delivered = app
+        .get_webview_window("main")
+        .is_some_and(|window| window.eval(delivery(&json)).is_ok());
+
+    if !delivered {
+        eprintln!("dsh-desktop: no window could show the dialog {title:?}");
+        // Put back whatever was pending, rather than leaving this dialog's
+        // entry to be answered by a click that can never come. Dropping it here
+        // also drops the sender `confirm` is waiting on, which is what turns its
+        // `recv` into an error instead of a hang.
+        if let Ok(mut pending) = PENDING.lock() {
+            if pending.as_ref().is_some_and(|one| one.token == token) {
+                *pending = None;
+            }
+        }
     }
+
+    delivered
 }
 
 /// Ask, and wait for the answer. `true` for the affirmative.
@@ -171,15 +246,33 @@ pub fn ask(app: &AppHandle, ask: Ask) {
 ///
 /// A dialog that is replaced before it is answered — [`ask`] overwrites the
 /// pending one — drops its sender, and the receive then fails rather than
-/// waiting forever. That is reported as the negative answer, which for both
-/// callers means "do not touch anything", the safe half.
+/// waiting forever. A dialog that never reached the window is the same story
+/// told earlier: [`ask`] says so, and this answers without waiting at all.
+/// Both are reported as the negative answer, which for every caller means "do
+/// not touch anything", the safe half.
 pub fn confirm(app: &AppHandle, mut ask_for: Ask, affirmative: &'static str) -> bool {
+    // The deadlock this prevents is total: the dialog is up, and the thread
+    // that would carry the click back is the one about to block. Debug-only
+    // because the cost in a release build is a hang nobody can report usefully,
+    // whereas in a debug build this is a panic with a stack trace pointing at
+    // the caller that has to move to a worker thread.
+    debug_assert!(
+        !on_main_thread(),
+        "dialog::confirm blocks until a click arrives on the main thread; \
+         call it from a worker thread. See the module docs."
+    );
+
     let (send, receive) = std::sync::mpsc::channel();
     ask_for.answered = Box::new(move |_, id| {
         let _ = send.send(id == affirmative);
     });
 
-    ask(app, ask_for);
+    // Nothing to wait for when nothing was shown: the sender is already dropped
+    // and the `recv` below would only confirm it the slow way.
+    if !ask(app, ask_for) {
+        return false;
+    }
+
     receive.recv().unwrap_or(false)
 }
 
@@ -379,7 +472,72 @@ pub fn script() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{script, Ask, Choice};
+    use super::{is_main, remember_main_thread, script, Ask, Choice};
+
+    /// The rule `confirm`'s debug assertion is built on: only the recorded
+    /// thread is the main one.
+    ///
+    /// Written against [`super::is_main`] rather than the global, which is
+    /// write-once for the life of the process — two tests that each tried to
+    /// set it would race for who claimed it first, and the loser would see an
+    /// answer that had nothing to do with what it was asserting.
+    #[test]
+    fn only_the_recorded_thread_is_the_main_one() {
+        let here = std::thread::current().id();
+        let elsewhere = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("the probe thread");
+
+        assert!(is_main(Some(here), here));
+        // A worker thread is the correct caller of `confirm`, so this is the
+        // case that must not fire the assertion.
+        assert!(!is_main(Some(elsewhere), here));
+    }
+
+    /// Before `main` has recorded anything there is no event loop to deadlock,
+    /// so nothing counts as the main thread and the assertion stays quiet. This
+    /// is what every unit test in this binary runs under.
+    #[test]
+    fn nothing_is_the_main_thread_until_one_is_recorded() {
+        assert!(!is_main(None, std::thread::current().id()));
+    }
+
+    /// Recording is once-only, so a stray later call cannot move the main
+    /// thread onto whichever worker happened to make it.
+    #[test]
+    fn the_main_thread_is_recorded_once() {
+        remember_main_thread();
+        let first = super::MAIN.get().copied();
+        assert!(first.is_some(), "the first call records something");
+
+        std::thread::spawn(remember_main_thread)
+            .join()
+            .expect("the probe thread");
+
+        assert_eq!(
+            super::MAIN.get().copied(),
+            first,
+            "a later call must not reassign the main thread"
+        );
+    }
+
+    /// The shim is called unguarded.
+    ///
+    /// `window.__dshAsk && window.__dshAsk(…)` would swallow the case where the
+    /// document has not run the injected script yet — `eval` would succeed,
+    /// `ask` would report the dialog delivered, and `confirm` would block on an
+    /// answer that can never arrive. The throw is the signal, so the guard must
+    /// not come back.
+    #[test]
+    fn delivers_without_a_guard() {
+        let call = super::delivery(r#""{}""#);
+
+        assert!(
+            !call.contains("&&"),
+            "a guard here hides an undelivered dialog: {call}"
+        );
+        assert!(call.starts_with("window.__dshAsk("));
+    }
 
     #[test]
     fn a_choice_is_ordinary_unless_it_is_primary() {
