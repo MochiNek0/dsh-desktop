@@ -53,7 +53,23 @@ console.log('[bundle] staged install-deps.ps1 and install-deps.sh');
 // `src-tauri/installer/` rather than here, because everything in `resources/`
 // is copied into the installation directory and these are only read while the
 // installer is being built. An earlier version wrote them here; sweep those.
+//
+// The sweep runs everywhere — a stale file in a working copy that once built on
+// Windows is a stale file whatever you build next — but the drawing does not.
 for (const stale of ['installer-sidebar.bmp', 'installer-header.bmp']) {
   rmSync(join(resources, stale), { force: true });
 }
-await import('./make-installer-art.mjs');
+
+// Windows only, and not merely to save the work. This whole file runs from
+// `beforeBuildCommand` *and* `beforeDevCommand`, so an unconditional import puts
+// a Windows-installer asset on the critical path of `npm run dev` on all three
+// platforms: `make-installer-art.mjs` decodes `icons/icon.png` with a hand-
+// rolled reader that throws on anything but 8-bit truecolour, non-interlaced.
+// Regenerate the icons with a tool that emits a paletted PNG and the macOS and
+// Linux builds break over a bitmap only NSIS ever reads. `check-installer-
+// hooks.mjs` draws the same line for the same reason.
+if (process.platform === 'win32') {
+  await import('./make-installer-art.mjs');
+} else {
+  console.log('[bundle] installer art: skipped, not Windows');
+}
