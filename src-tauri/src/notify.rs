@@ -63,6 +63,26 @@
 //! installed app is correct with nothing added. Do not "fix" this by stamping
 //! the AUMID again from `installer-hooks.nsh` — it is already done, and a second
 //! copy is one more thing to keep in step.
+//!
+//! ## The other two platforms
+//!
+//! Everything above is Windows. The same call behaves like this elsewhere, and
+//! it is worth writing down because the failures look identical from here — the
+//! toast simply does not appear:
+//!
+//! - **macOS** goes through `mac-notification-sys`, which needs a bundle
+//!   identifier registered with LaunchServices. The plugin handles the awkward
+//!   case itself: `set_application(if tauri::is_dev() { "com.apple.Terminal" }
+//!   else { identifier })`, so a `tauri dev` run borrows Terminal's identity and
+//!   an installed `.app` uses its own. Nothing to do here, and in particular do
+//!   not add a `cfg(target_os = "macos")` branch that sets it again.
+//! - **Linux** goes over D-Bus to `org.freedesktop.Notifications`. That is
+//!   present under GNOME, KDE and anything else with a notification daemon, and
+//!   absent under a bare window manager or in a container — where the toast is
+//!   dropped by the session, not by this app.
+//!
+//! In all three cases the failure is silent by design: see the note in [`show`]
+//! on why the `Result` cannot tell you which happened.
 
 use tauri::{AppHandle, Manager, Url};
 use tauri_plugin_notification::NotificationExt;
@@ -131,6 +151,12 @@ pub fn show(app: &AppHandle, notice: Notice) {
         builder = builder.body(notice.body);
     }
 
+    // The `Result` is about building the request, not about raising the toast.
+    // `tauri-plugin-notification`'s desktop `show()` hands the notification to
+    // `tauri::async_runtime::spawn` and discards what comes back, so it answers
+    // `Ok` on every platform whether or not anything was ever displayed. This
+    // arm therefore catches almost nothing — kept because it costs a line, but
+    // do not read silence here as a toast that appeared.
     if let Err(error) = builder.show() {
         // The whole feature is a courtesy; a platform that will not raise one is
         // not a reason to interrupt anybody.

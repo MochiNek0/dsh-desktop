@@ -9,8 +9,14 @@
 //!
 //! ## Where it lives
 //!
-//! `%LOCALAPPDATA%\<identifier>\desktop.json`, beside the `bootstrap.json` the
-//! install script writes — [`crate::dsh::app_dir`], the same directory the
+//! `desktop.json` in [`crate::dsh::app_dir`] — Tauri's `app_local_data_dir`,
+//! which is `%LOCALAPPDATA%\<identifier>` on Windows, `~/Library/Application
+//! Support/<identifier>` on macOS and `$XDG_DATA_HOME/<identifier>` (in
+//! practice `~/.local/share/<identifier>`) on Linux.
+//!
+//! The same directory on all three, and the same one `install-deps.sh` picks
+//! with its own `Darwin` / `*` branch, so this file lands beside the
+//! `bootstrap.json` that script writes — and, on Windows, inside what the
 //! installer hooks clean up. Deliberately *not* in `$DSH_HOME`: that directory
 //! is dsh's own, it survives an uninstall on purpose, and a desktop-only
 //! preference has no business in a file dsh parses.

@@ -317,6 +317,17 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .tooltip("dsh desktop")
         .menu(&menu)
         // Left click reveals the window; the menu belongs on the right button.
+        //
+        // Windows and macOS only, and not by choice: `tray-icon` documents
+        // `TrayIconEvent` as unsupported on Linux — the StatusNotifierItem the
+        // AppIndicator backend registers has no click to deliver, so
+        // `on_tray_icon_event` below is simply never called there. This is why
+        // "Show window" is a menu item rather than a comment saying "just click
+        // the icon": on Linux the menu is the only way back to a hidden window,
+        // and the two platforms that do get the click get it as a shortcut.
+        //
+        // Nothing to fix here. If a later tray-icon gains Linux click events
+        // this comment is what to delete.
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "show" => reveal(app),
