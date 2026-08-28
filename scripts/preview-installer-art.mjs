@@ -97,5 +97,7 @@ mkdirSync(to, { recursive: true });
 for (const name of ["installer-sidebar", "installer-header"]) {
   const image = readBmp(join(from, `${name}.bmp`));
   writePng(join(to, `${name}.png`), image, scale);
-  console.log(`${name}: ${image.width}x${image.height} -> ${to}\\${name}.png (x${scale})`);
+  console.log(
+    `${name}: ${image.width}x${image.height} -> ${join(to, `${name}.png`)} (x${scale})`
+  );
 }
