@@ -68,7 +68,6 @@
 //! this deliberately overrides a convention: the affirmative is last everywhere,
 //! including on Windows, where a native box would have put it first.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
@@ -162,24 +161,63 @@ pub struct Ask {
     pub answered: Answer,
 }
 
-/// The dialog currently on screen, if any.
+/// The dialog currently on screen, and the token the next one will carry.
 ///
 /// One at a time: the script draws into a single card, and a second dialog
 /// would replace the first while its `answered` was still pending — which for
 /// the updater would mean a download whose question nobody ever answers.
-static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
-
-/// Which dialog an arriving answer belongs to.
 ///
-/// A monotonic token rather than a flag, because an answer can outlive the
-/// question: the user clicks, and in the same instant a new dialog goes up. The
-/// stale click carries the old token and is dropped instead of answering the
-/// new question.
-static TOKEN: AtomicU64 = AtomicU64::new(0);
+/// Both halves under one lock, because they have to move together. The token
+/// came from an `AtomicU64` of its own, and two threads could then claim in one
+/// order and install in the other — leaving the newer dialog on screen and the
+/// older one's entry in the slot, so the click on what the user was actually
+/// looking at arrived with a token nothing recognised and was dropped as stale.
+/// For [`confirm`] that is a wait that ends at [`ANSWER_TIMEOUT`]; the window
+/// with dsh's update question in it can be answered and go nowhere. Two dialogs
+/// at once is rare — the tray's dsh update while the app updater's check comes
+/// back is the reachable pair — but rare and silent is the worst of the two
+/// halves of that.
+///
+/// [`ask`] therefore holds this across the whole business of putting a dialog
+/// up: claiming the token, handing the script to the window, and installing the
+/// entry. `claim` taking `&mut self` is what makes it impossible to number a
+/// dialog without holding the lock that will file it.
+static DIALOGS: Mutex<Dialogs> = Mutex::new(Dialogs {
+    next: 1,
+    on_screen: None,
+});
+
+struct Dialogs {
+    /// The token the next dialog gets. Monotonic and never reused: an answer can
+    /// outlive its question — the user clicks, and in the same instant a new
+    /// dialog goes up — and the stale click has to be recognisable as stale.
+    next: u64,
+    on_screen: Option<Pending>,
+}
+
+impl Dialogs {
+    /// Number the dialog that is about to go up.
+    fn claim(&mut self) -> u64 {
+        let token = self.next;
+        self.next += 1;
+        token
+    }
+}
 
 struct Pending {
     token: u64,
     answered: Answer,
+}
+
+/// Whether an arriving answer belongs to the dialog now on screen.
+///
+/// Split out from [`answered`] the way [`is_main`] is split out of
+/// [`on_main_thread`]: this is the part with the rule in it, and it is the rule
+/// that a test can hold on to. `None` is a dialog that has already been answered
+/// — the entry is taken out under the lock, so the second of two clicks in
+/// flight finds nothing rather than running a callback twice.
+fn is_current(on_screen: Option<u64>, arriving: u64) -> bool {
+    on_screen == Some(arriving)
 }
 
 /// The JavaScript that hands one dialog to the page.
@@ -207,6 +245,36 @@ fn delivery(json: &str) -> String {
     format!("window.__dshAsk({json})")
 }
 
+/// Hand the call to the window, or hold it until a document can receive it.
+///
+/// Through the same queue every other injected call goes through — `Splash` in
+/// main.rs — rather than straight to `Webview::eval`, and for the reason that
+/// queue exists: a call evaluated into a document that is on its way out is
+/// lost, exactly as one made before the first load is. The `ready` wrapper in
+/// [`script`] covers a document whose body has not been built yet; it cannot
+/// cover a document whose initialization script has not run at all, which is
+/// every moment before the first `PageLoadEvent::Finished` and every moment
+/// between a navigation and the next one.
+///
+/// That gap is not hypothetical for the one caller that cannot survive it.
+/// `boot` asks whether to update dsh from a worker thread it started before the
+/// loading page had finished loading, and [`confirm`] then blocks on the answer:
+/// a question that missed its document is a loading page that sits there until
+/// [`ANSWER_TIMEOUT`].
+///
+/// `true` once the call is out or queued. Falls back to evaluating directly when
+/// there is no session to queue against, which is every unit test and the moment
+/// before `setup` has managed one.
+fn deliver(app: &AppHandle, window: &tauri::WebviewWindow, js: String) -> bool {
+    match app.try_state::<crate::Session>() {
+        Some(session) => {
+            session.splash.send(window, js);
+            true
+        }
+        None => window.eval(js).is_ok(),
+    }
+}
+
 /// The id an answer carries when the dialog was dismissed rather than answered.
 ///
 /// Escape sends this. It is deliberately a string no caller will ever name a
@@ -221,7 +289,7 @@ pub const DISMISSED: &str = "";
 /// A backstop, not a policy: every path that should end the wait already does —
 /// a click, a dismissal, [`ask`] replacing the dialog and dropping its sender.
 /// What this covers is the paths that cannot signal, all of which end with the
-/// card gone and the sender still parked in [`PENDING`]: the document navigating
+/// card gone and the sender still parked in [`DIALOGS`]: the document navigating
 /// out from under a dialog, a webview that never ran the script, a renderer
 /// crash. Without it those hang `boot` forever, and a boot thread that never
 /// returns is an app that never starts dsh and cannot be recovered except by
@@ -234,12 +302,29 @@ const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 
 
 /// Put a question on screen. Returns immediately; see the module docs.
 ///
-/// Answers whether the question was handed to a window at all — which is to say,
-/// whether there was one. It is *not* a promise that the dialog is on screen:
-/// see [`delivery`] for why no such promise is available from `eval`. Callers
-/// that need the answer use [`confirm`], which does not rely on this.
+/// Answers whether the question was handed over at all: there was a window, and
+/// the call to it is out or queued. It is *not* a promise that the dialog is on
+/// screen — see [`delivery`] for why no such promise is available from `eval`.
+/// Callers that need the answer use [`confirm`], which does not rely on this.
+///
+/// A question this answers `false` to changes nothing: the dialog already on
+/// screen, if there was one, is still there and still answerable, and this one's
+/// `answered` is dropped here rather than left in the slot for a click that can
+/// never come — which is what fails [`confirm`]'s receive instead of parking it
+/// for [`ANSWER_TIMEOUT`].
 pub fn ask(app: &AppHandle, ask: Ask) -> bool {
-    let token = TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
+    // Nothing to hand a dialog to, and nothing to disturb: the dialog already on
+    // screen, if there is one, is left where it is and stays answerable. An
+    // earlier version installed this dialog's entry first and only then looked
+    // for a window, so a question raised with no window took the live one's
+    // callback down with it.
+    let Some(window) = app.get_webview_window("main") else {
+        eprintln!(
+            "dsh-desktop: no window could show the dialog {:?}",
+            ask.title
+        );
+        return false;
+    };
 
     let buttons: Vec<serde_json::Value> = ask
         .choices
@@ -253,6 +338,16 @@ pub fn ask(app: &AppHandle, ask: Ask) -> bool {
         })
         .collect();
 
+    // Held across all three steps — numbering the dialog, handing it over, and
+    // filing the entry that answers it — so the dialog on screen and the entry
+    // in the slot cannot end up being different dialogs. See [`DIALOGS`].
+    let Ok(mut dialogs) = DIALOGS.lock() else {
+        eprintln!("dsh-desktop: the dialog slot is poisoned; dropping a question");
+        return false;
+    };
+
+    let token = dialogs.claim();
+
     let payload = serde_json::json!({
         "token": token,
         "title": ask.title,
@@ -261,43 +356,33 @@ pub fn ask(app: &AppHandle, ask: Ask) -> bool {
     })
     .to_string();
 
-    // Kept for the failure message below: `answered` is moved out of `ask` on
-    // the next line, and a partially moved struct cannot be read from again.
-    let title = ask.title;
-
-    // Replaces whatever was there. The previous dialog's `answered` is dropped
-    // without running, which is the same outcome as dismissing it.
-    if let Ok(mut pending) = PENDING.lock() {
-        *pending = Some(Pending {
-            token,
-            answered: ask.answered,
-        });
-    }
-
     // The payload is JSON, and it is pasted into a JavaScript call — so it is
     // serialised a second time, into a string literal the script then parses.
     // Without that, a quote in an update's release notes ends the argument and
     // takes the rest of the call with it.
     let json = serde_json::to_string(&payload).expect("a string is always serializable");
 
-    let delivered = app
-        .get_webview_window("main")
-        .is_some_and(|window| window.eval(delivery(&json)).is_ok());
-
-    if !delivered {
-        eprintln!("dsh-desktop: no window could show the dialog {title:?}");
-        // Put back whatever was pending, rather than leaving this dialog's
-        // entry to be answered by a click that can never come. Dropping it here
-        // also drops the sender `confirm` is waiting on, which is what turns its
-        // `recv` into an error instead of a hang.
-        if let Ok(mut pending) = PENDING.lock() {
-            if pending.as_ref().is_some_and(|one| one.token == token) {
-                *pending = None;
-            }
-        }
+    if !deliver(app, &window, delivery(&json)) {
+        eprintln!(
+            "dsh-desktop: the window would not take the dialog {:?}",
+            ask.title
+        );
+        // Before the slot is touched, so a dialog that could not be handed over
+        // leaves the one already on screen answerable. The token it claimed is
+        // spent either way, which is the point of never reusing one.
+        return false;
     }
 
-    delivered
+    // Replaces whatever was there. The previous dialog's `answered` is dropped
+    // without running, which is the same outcome as dismissing it — and dropping
+    // it is what fails the receive in [`confirm`] rather than leaving it to wait
+    // out [`ANSWER_TIMEOUT`].
+    dialogs.on_screen = Some(Pending {
+        token,
+        answered: ask.answered,
+    });
+
+    true
 }
 
 /// Ask, and wait for the answer. `true` for the affirmative.
@@ -379,11 +464,14 @@ pub fn answered(app: &AppHandle, url: &tauri::Url) {
         return;
     };
 
-    // Taken out under the lock, so two clicks in flight cannot both run it.
-    let found = PENDING.lock().ok().and_then(|mut pending| {
-        let matches = pending.as_ref().is_some_and(|one| one.token == token);
-        if matches {
-            pending.take()
+    // Taken out under the lock, so two clicks in flight cannot both run it. The
+    // callback runs after the lock is released — it is somebody else's code, and
+    // one that asks another question would otherwise be asking for the lock it
+    // is already inside.
+    let found = DIALOGS.lock().ok().and_then(|mut dialogs| {
+        let on_screen = dialogs.on_screen.as_ref().map(|one| one.token);
+        if is_current(on_screen, token) {
+            dialogs.on_screen.take()
         } else {
             None
         }
@@ -645,7 +733,40 @@ pub fn script() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_main, remember_main_thread, script, Ask, Choice};
+    use super::{is_current, is_main, remember_main_thread, script, Ask, Choice, Dialogs};
+
+    /// Every dialog is numbered once, in order, and no number comes back.
+    ///
+    /// Written against [`Dialogs`] rather than the static, the way the
+    /// main-thread tests are written against [`super::is_main`]: the static is
+    /// process-wide and two tests taking numbers out of it would each see the
+    /// other's.
+    #[test]
+    fn every_dialog_gets_its_own_token() {
+        let mut dialogs = Dialogs {
+            next: 1,
+            on_screen: None,
+        };
+
+        assert_eq!(dialogs.claim(), 1);
+        assert_eq!(dialogs.claim(), 2);
+        assert_eq!(dialogs.claim(), 3, "a token is never handed out twice");
+    }
+
+    /// Only the dialog on screen can be answered.
+    ///
+    /// The token is what makes a click that lands as a new question goes up
+    /// answer nothing rather than answer the new one — see [`super::DIALOGS`] on
+    /// why claiming it and filing it are one step under one lock.
+    #[test]
+    fn only_the_dialog_on_screen_can_be_answered() {
+        assert!(is_current(Some(7), 7));
+        // The click the user made a moment before this dialog replaced the last.
+        assert!(!is_current(Some(8), 7));
+        // Already answered: the entry is taken out under the lock, so the second
+        // of two clicks in flight finds nothing.
+        assert!(!is_current(None, 7));
+    }
 
     /// The rule `confirm`'s debug assertion is built on: only the recorded
     /// thread is the main one.

@@ -17,10 +17,15 @@
 //   - `.onGUIInit` cannot be defined by the hooks file, because MUI2 defines it.
 //     The supported seam is `MUI_CUSTOMFUNCTION_GUIINIT`.
 //
-// Windows only: makensis is the NSIS compiler, and the copy this uses is the one
-// the Tauri CLI downloads for bundling. On any other platform, and on a Windows
-// machine that has never bundled, this exits 0 with a note rather than failing —
-// it is a check that could not run, not a check that failed.
+// It also checks the one thing about that file a compiler cannot: that it is
+// still UTF-8 with a BOM rather than UTF-16, which makensis accepts and git
+// reads as binary. See the note above that check.
+//
+// Windows only for the compile: makensis is the NSIS compiler, and the copy this
+// uses is the one the Tauri CLI downloads for bundling. On any other platform,
+// and on a Windows machine that has never bundled, this exits 0 with a note
+// rather than failing — it is a check that could not run, not a check that
+// failed. The encoding check runs everywhere.
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -30,6 +35,42 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const script = join(root, "src-tauri", "hooks-syntax-check.nsi");
+const hooks = join(root, "src-tauri", "installer-hooks.nsh");
+
+// The hooks file has to be UTF-8 with a BOM, and this is the half of that rule
+// nothing else enforces.
+//
+// makensis reads UTF-16 just as happily, so a compile says nothing about it. Git
+// does not: a file with NUL bytes in it is a binary blob, so 30 KB of installer
+// logic stops appearing in diffs altogether and nothing about it can be
+// reviewed. That is not hypothetical — the file spent a while as UTF-16LE after
+// an editor rewrote it, and the change that fixed a registry key nobody could
+// see was reviewed as "Bin 13836 -> 44996 bytes".
+//
+// Checked before the makensis lookup below, so it runs on every platform and on
+// a machine that has never bundled — the skip further down is about the
+// compiler, not about this.
+const opening = readFileSync(hooks).subarray(0, 3);
+
+if (opening[0] === 0xff && opening[1] === 0xfe) {
+  console.error(
+    "check:installer - installer-hooks.nsh is UTF-16LE; it must be UTF-8 with a BOM.\n" +
+      "  Git treats it as binary at that point, so the file stops being reviewable.\n" +
+      "  Convert it back with:\n" +
+      "    iconv -f UTF-16LE -t UTF-8 src-tauri/installer-hooks.nsh > hooks.utf8\n" +
+      "    mv hooks.utf8 src-tauri/installer-hooks.nsh"
+  );
+  process.exit(1);
+}
+
+if (!(opening[0] === 0xef && opening[1] === 0xbb && opening[2] === 0xbf)) {
+  console.error(
+    "check:installer - installer-hooks.nsh has no UTF-8 BOM.\n" +
+      "  The generated installer is built with `Unicode true`, and without the BOM\n" +
+      "  NSIS reads the Chinese DetailPrint messages in that file as ANSI."
+  );
+  process.exit(1);
+}
 
 function makensis() {
   if (process.platform !== "win32") return null;
