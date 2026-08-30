@@ -78,9 +78,14 @@ $Marker = Join-Path $AppDir 'bootstrap.json'
 $NodeVersion = '24.19.0'
 
 # What an existing Node has to be for us to use it instead of installing our
-# own. dsh declares no `engines` field, so this is a judgement call rather than
-# something read off the package.
-$NodeMinimum = [version] '22.22.3'
+# own. dsh declares no `engines` field itself, but its direct dependency
+# commander@15 does — `>=22.12.0` — so anything under that will not run dsh at
+# all. Kept a little above that floor rather than pinned to it exactly.
+#
+# Has to match `NODE_MINIMUM` in `install-deps.sh`: this decides whether a
+# machine downloads 30 MB of Node it did not need, and the two answering
+# differently means the same Node is fine on one platform and not on another.
+$NodeMinimum = [version] '22.19.0'
 
 # The mirrors that carry Node's own layout — same paths, same SHASUMS256.txt.
 # Which one is used is decided by measuring them (see `Sort-Mirrors`); this order

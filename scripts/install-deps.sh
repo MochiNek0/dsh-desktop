@@ -93,6 +93,10 @@ NODE_VERSION='24.19.0'
 # own. dsh declares no `engines` field itself, but its direct dependency
 # commander@15 does — `>=22.12.0` — so anything under that will not run dsh at
 # all. Kept a little above that floor rather than pinned to it exactly.
+#
+# Has to match `$NodeMinimum` in `install-deps.ps1`: this decides whether a
+# machine downloads 30 MB of Node it did not need, and the two answering
+# differently means the same Node is fine on one platform and not on another.
 NODE_MINIMUM='22.19.0'
 
 # The mirrors that carry Node's own layout — same paths, same SHASUMS256.txt.
