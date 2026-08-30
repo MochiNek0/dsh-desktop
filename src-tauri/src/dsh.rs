@@ -1265,11 +1265,12 @@ pub fn note(app: &AppHandle, title: &str, detail: &str) {
 
 /// Put the directories dsh needs at the front of a child's PATH.
 ///
-/// Two things depend on this. The Node the bootstrap script may have installed
-/// is on the user's PATH but not on this process's, so without it `dsh.cmd`
-/// would run and fail to find the `node` it shells out to. And dsh shells out
-/// to `node` again for workers and plugin tooling, which should reach the same
-/// one the app is running it with.
+/// Two things depend on this. A Node the bootstrap script installed is on
+/// nobody's PATH — not the user's, and so not this process's either — so
+/// without it `dsh.cmd` would run and fail to find the `node` it shells out to.
+/// And dsh shells out to `node` again for workers and plugin tooling, which
+/// should reach the same one the app is running it with, not whichever one a
+/// version manager happens to have active.
 pub fn apply_path(app: &AppHandle, command: &mut Command) {
     if let Ok(path) = std::env::join_paths(search_path(app)) {
         command.env("PATH", path);
