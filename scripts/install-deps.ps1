@@ -850,7 +850,6 @@ function Install-All {
     }
 
     $node = Find-Node
-    $managed = $false
     if ($node) {
         Say "检测到可用的 Node：$node"
         if (-not $state.ContainsKey('node')) { $state['node'] = 'system' }
@@ -858,8 +857,19 @@ function Install-All {
         Say "没有检测到 Node $NodeMinimum 或更高版本，正在为你安装。"
         $node = Install-Node
         $state['node'] = 'managed'
-        $managed = $true
     }
+
+    # Ours or the machine's — asked of the Node in hand, not of whether this run
+    # installed one. `Find-Node` returns the Node a *previous* run unpacked
+    # before it ever looks at PATH, so a repair, or a retry after the 185 MB dsh
+    # download failed, arrives here holding a Node of ours with `Install-Node`
+    # never called. Asking the run instead sent exactly those installs to npm's
+    # default prefix — the nvm tree `Get-ManagedPrefix` exists to stay out of.
+    #
+    # The path rather than `$state['node']`: both `Find-Node` and `Install-Node`
+    # answer with `$NodeDir\node.exe` for ours, and this stays right on a
+    # machine whose marker was lost.
+    $managed = (Split-Path -Parent $node) -ieq $NodeDir
 
     $cli = Find-Npm $node
     if (-not $cli) { Fail "这个 Node 旁边没有 npm（$node），无法安装 dsh。" }
