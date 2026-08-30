@@ -18,11 +18,15 @@
 //! registry mirrors before walking it, and a second copy of all that would
 //! drift.
 //!
-//! Finding dsh cannot go through the process's own PATH. The installer adds
-//! Node's directory to the user's PATH and then launches this app, which
-//! inherited its environment before any of that happened — so the search below
-//! starts from what the script wrote down in `bootstrap.json` and falls back to
-//! PATH, rather than the other way round.
+//! Finding dsh cannot go through the process's own PATH. Nothing puts a Node of
+//! ours on it: a desktop app editing the environment of every terminal on the
+//! machine is a change the user did not ask for and cannot see, so the script
+//! writes down what it installed instead of publishing it. On a machine where
+//! it installed its own Node, `bootstrap.json` is therefore the *only* record of
+//! where that Node and its dsh are — the search below starts from it and falls
+//! back to PATH, rather than the other way round, and a marker it cannot read is
+//! an app that reports no dsh at all. See [`marker`], and [`terminal`] for what
+//! the user gets instead of a PATH entry.
 
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read};
@@ -135,7 +139,33 @@ fn bootstrap(app: &AppHandle) -> Bootstrap {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Bootstrap::default();
     };
-    let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) else {
+    marker(&text)
+}
+
+/// What [`bootstrap`] makes of the marker's contents. Split from the read so
+/// that the parse — which is what this app got wrong, silently, for every
+/// machine the script installed a Node on — can be tested without an app.
+fn marker(text: &str) -> Bootstrap {
+    // The BOM is not decoration. `install-deps.ps1` wrote this file with
+    // `Out-File -Encoding utf8`, and under Windows PowerShell 5.1 — which is
+    // what `powershell.exe` is, and what both the NSIS hook and [`interpreter`]
+    // run the script with — that emits a UTF-8 BOM. `serde_json` does not skip
+    // one: it answers `expected value at line 1 column 1`, and every field below
+    // came back empty.
+    //
+    // That was invisible for as long as npm's default prefix was on the user's
+    // PATH, because [`search_path`] falls back to it. On a machine where the
+    // script installed its own Node it is not: the marker is the only record of
+    // where that Node and its dsh are, so the app reported no dsh at all while
+    // `dsh.cmd` sat in the prefix answering `--version` perfectly well.
+    //
+    // The script no longer writes a BOM, and its `install` mode rewrites the
+    // marker on every app upgrade, so this is not what carries the fix. It is
+    // for the machine that is already broken and has not upgraded yet — and for
+    // the next thing that writes this file without being asked what encoding it
+    // meant.
+    let Ok(state) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
+    else {
         return Bootstrap::default();
     };
 
@@ -1369,8 +1399,8 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        executable, first_writable_prefix, package_root, prefix_of, present, resolve, shim_dir,
-        writable, PACKAGE,
+        executable, first_writable_prefix, marker, package_root, prefix_of, present, resolve,
+        shim_dir, writable, PACKAGE,
     };
     use std::path::{Path, PathBuf};
 
@@ -1413,6 +1443,57 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Verbatim from a machine where the app reported no dsh: the marker was
+    /// right about everything, and unreadable because of the three bytes in
+    /// front of it.
+    const MARKER: &str = concat!(
+        "\u{feff}",
+        r#"{
+    "prefix":  "C:\\Users\\me\\AppData\\Local\\ai.deepseek.dsh.desktop\\node",
+    "dsh":  "managed",
+    "node":  "managed",
+    "npmCli":  "C:\\Users\\me\\AppData\\Local\\ai.deepseek.dsh.desktop\\node\\node_modules\\npm\\bin\\npm-cli.js",
+    "nodeExe":  "C:\\Users\\me\\AppData\\Local\\ai.deepseek.dsh.desktop\\node\\node.exe"
+}"#
+    );
+
+    #[test]
+    fn reads_a_marker_that_powershell_wrote_a_bom_onto() {
+        let state = marker(MARKER);
+
+        assert_eq!(
+            state.prefix,
+            Some(PathBuf::from(
+                r"C:\Users\me\AppData\Local\ai.deepseek.dsh.desktop\node"
+            ))
+        );
+        assert_eq!(
+            state.node,
+            Some(PathBuf::from(
+                r"C:\Users\me\AppData\Local\ai.deepseek.dsh.desktop\node\node.exe"
+            ))
+        );
+        assert!(state.npm.is_some(), "npm's entry point is recorded too");
+    }
+
+    #[test]
+    fn reads_a_marker_without_one_the_same_way() {
+        assert_eq!(
+            marker(MARKER.trim_start_matches('\u{feff}')).prefix,
+            marker(MARKER).prefix,
+            "the BOM is the only difference between these two files"
+        );
+    }
+
+    #[test]
+    fn a_marker_that_is_not_json_leaves_the_search_to_the_path() {
+        let state = marker("not json at all");
+
+        assert!(state.prefix.is_none());
+        assert!(state.node.is_none());
+        assert!(state.npm.is_none());
     }
 
     #[test]

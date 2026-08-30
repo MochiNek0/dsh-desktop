@@ -215,7 +215,16 @@ function Read-Marker {
 
 function Write-Marker([hashtable] $State) {
     New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-    ($State | ConvertTo-Json) | Out-File -LiteralPath $Marker -Encoding utf8
+    # Not `Out-File -Encoding utf8`. This runs under Windows PowerShell 5.1 —
+    # `powershell.exe`, which is what both the NSIS hook and the app invoke it
+    # with — where that spelling means UTF-8 *with* a BOM, and `serde_json` on
+    # the reading end refuses to parse one. The app fell back to an empty
+    # bootstrap and reported no dsh at all on exactly the machines that have no
+    # other way to find it: the ones this script installed a Node onto, which is
+    # nothing on any PATH. See `marker` in `dsh.rs`, which strips a BOM off the
+    # files this already wrote.
+    $json = $State | ConvertTo-Json
+    [IO.File]::WriteAllText($Marker, $json, (New-Object Text.UTF8Encoding $false))
 }
 
 # ------------------------------------------------------------------ probing --
@@ -596,9 +605,13 @@ function Find-Npm([string] $Exe) {
     return $null
 }
 
-# Where `npm install -g` puts things. For the Node this script installs that is
-# the Node directory itself, which is npm's default on Windows; for the
-# machine's own Node it is whatever they have configured.
+# Where `npm install -g` puts things, for a Node whose prefix is the machine's
+# own business — the user's `.npmrc` decides, and asking npm is the only way to
+# learn it.
+#
+# Not used for a Node this script installed: `npm prefix -g` there answers with
+# whatever the user configured, not with the Node directory beside it. See
+# `Get-ManagedPrefix`.
 function Get-Prefix([string] $Exe, [string] $Cli) {
     try {
         $printed = & $Exe $Cli prefix -g
@@ -606,6 +619,26 @@ function Get-Prefix([string] $Exe, [string] $Cli) {
     } catch {
         # Falls through to the directory npm would have defaulted to anyway.
     }
+    return (Split-Path -Parent $Exe)
+}
+
+# Where a `-g` install goes for the Node *this script* unpacked: the Node
+# directory itself, which is npm's own default on Windows when nothing overrides
+# it — and the point is that something usually does.
+#
+# `npm prefix -g` cannot answer this. It reports the configured prefix, and a
+# machine running nvm almost always has one: nvm-for-windows works by pointing
+# `C:\Program Files\nodejs` at the version in use, and a `prefix=` in the user's
+# `.npmrc` (or one inherited from an earlier Node) sends every global install
+# there. Letting npm default meant dsh being installed *by* the Node we just
+# unpacked and *into* nvm's tree — a directory nvm repoints on the next
+# `nvm use`, so the recorded prefix stopped resolving and the app reported no
+# dsh at all. It also paired dsh's native modules (koffi, node-pty) with one
+# Node major while leaving them to be loaded by another.
+#
+# So this is asserted rather than asked. The Node is ours, it is not on anyone's
+# PATH, and nothing else has an opinion about what belongs beside it.
+function Get-ManagedPrefix([string] $Exe) {
     return (Split-Path -Parent $Exe)
 }
 
@@ -817,6 +850,7 @@ function Install-All {
     }
 
     $node = Find-Node
+    $managed = $false
     if ($node) {
         Say "检测到可用的 Node：$node"
         if (-not $state.ContainsKey('node')) { $state['node'] = 'system' }
@@ -824,6 +858,7 @@ function Install-All {
         Say "没有检测到 Node $NodeMinimum 或更高版本，正在为你安装。"
         $node = Install-Node
         $state['node'] = 'managed'
+        $managed = $true
     }
 
     $cli = Find-Npm $node
@@ -833,14 +868,21 @@ function Install-All {
     $state['npmCli'] = $cli
     Write-Marker $state
 
+    # A Node of ours gets an explicit prefix beside it; the machine's own Node
+    # keeps npm's default, which is the user's configured prefix and the right
+    # answer for a Node they manage. See `Get-ManagedPrefix` for why the first
+    # case cannot be left to npm.
+    $prefix = if ($managed) { Get-ManagedPrefix $node } else { '' }
+
     Step '正在下载 dsh，约 185 MB，请耐心等待…' 36
-    # No prefix: npm's own default is what `Get-Prefix` then writes down.
-    if (-not (Install-Package $node $cli "$Package@latest" '' 36 $ProgressCeiling)) {
+    if (-not (Install-Package $node $cli "$Package@latest" $prefix 36 $ProgressCeiling)) {
         Fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
     }
 
     $state['dsh'] = 'managed'
-    $state['prefix'] = Get-Prefix $node $cli
+    # What was installed into, not what npm would report: with `--prefix` above
+    # the two differ exactly on the machines this matters for.
+    $state['prefix'] = if ($prefix) { $prefix } else { Get-Prefix $node $cli }
     Write-Marker $state
 
     # Said rather than done: the app runs this dsh through the marker and needs
