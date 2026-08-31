@@ -458,7 +458,11 @@ FunctionEnd
 
   StrCpy $R1 ""
 
-  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "是否同时卸载 dsh？$\r$\n$\r$\n选「否」会保留它，终端里的 dsh 命令仍然可用。" IDNO keep_dsh
+  ; Only ever the copy this app installed. A dsh the user installed themselves
+  ; and let the app adopt is their own global npm package, and `-Mode uninstall`
+  ; now refuses it whatever the answer here is — so the question says so rather
+  ; than promising something broader than it delivers.
+  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "是否同时卸载 dsh？$\r$\n$\r$\n只会卸载本应用装的那一份。如果 dsh 是你自己用 npm 装的，不会动它。$\r$\n$\r$\n选「否」会保留它，终端里的 dsh 命令仍然可用。" IDNO keep_dsh
   StrCpy $R1 "$R1 -RemoveDsh"
   keep_dsh:
 

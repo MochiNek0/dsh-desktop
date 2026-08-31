@@ -952,20 +952,24 @@ update_all() {
 uninstall_all() {
     read_marker
 
-    # Only a Node of ours goes: one the machine already had is not this script's
-    # to take, whatever the flags say. dsh has no such reservation — it is one
-    # `npm install -g` either way, and the caller has just been asked about it by
-    # name.
+    # Only what this script installed goes, and that is now true of dsh as well as
+    # of Node. It was not: `-RemoveDsh` uninstalled whatever the marker pointed
+    # at, so a user who had installed dsh themselves and let this app adopt it
+    # lost their own global package to one vague question at uninstall time.
     #
-    # Node is also a Node program's only way to run, so taking it away while
-    # leaving dsh behind would leave a `dsh` command that cannot start.
+    # Node was always guarded this way. Node is also a Node program's only way to
+    # run, so taking ours away has to take the dsh inside it too — that dsh is
+    # ours by definition, it is in our directory.
     drop_node=0
     drop_dsh=0
     [ "$REMOVE_NODE" = 1 ] && [ "$M_NODE" = managed ] && drop_node=1
-    { [ "$REMOVE_DSH" = 1 ] || [ "$drop_node" = 1 ]; } && drop_dsh=1
+    { { [ "$REMOVE_DSH" = 1 ] && [ "$M_DSH" = managed ]; } || [ "$drop_node" = 1 ]; } && drop_dsh=1
 
     if [ "$REMOVE_NODE" = 1 ] && [ "$drop_node" = 0 ]; then
         say 'Node 是你自己装的，不会动它。'
+    fi
+    if [ "$REMOVE_DSH" = 1 ] && [ "$drop_dsh" = 0 ]; then
+        say 'dsh 是你自己装的，不会动它。要卸载请用：npm uninstall -g @deepseek-ai/dsh'
     fi
 
     if [ "$drop_dsh" = 1 ]; then
@@ -984,7 +988,6 @@ uninstall_all() {
         elif [ -x "${M_NODE_EXE:-/nonexistent}" ] && [ -f "${M_NPM_CLI:-/nonexistent}" ]; then
             # npm has to unpick its own tree, pointed at the prefix holding it
             # rather than at whatever this run would default to.
-            [ "$M_DSH" = managed ] || say '这份 dsh 不是本应用装的，按你的选择一并卸载。'
             say "正在卸载 dsh（$prefix）…"
             "$M_NODE_EXE" "$M_NPM_CLI" uninstall -g --prefix "$prefix" \
                 --loglevel=error "$PACKAGE" 2>&1 | while IFS= read -r line; do say "$line"; done
@@ -1170,6 +1173,21 @@ real_prefix() {
     printf '%s' "$_rp"
 }
 
+# Where a `-g` install for this Node already lives — for reading, not writing.
+#
+# `find_prefix`'s writable fallback is wrong here: a Node whose configured prefix
+# needs root would be reported as `$APP_DIR/npm`, and the panel would say it has
+# no dsh when what it has is a dsh the app cannot update. `real_prefix` alone is
+# wrong the other way — for a Node this script unpacked, `npm prefix -g` answers
+# with the user's own `.npmrc` rather than the directory beside it, so the app's
+# own Node reported no dsh on exactly the machines that got one from us.
+node_prefix() {
+    case "$1" in
+        "$NODE_DIR"/*) printf '%s' "$NODE_DIR"; return 0 ;;
+    esac
+    real_prefix "$1" "$2"
+}
+
 # One Node's worth of the chooser's payload, as a single-line JSON object.
 node_json() {
     _p=$(json_escape "$1")
@@ -1198,7 +1216,7 @@ list_nodes() {
         _hasdsh=false
         _dshver=''
         if [ -n "$_cli" ]; then
-            _prefix=$(real_prefix "$_exe" "$_cli")
+            _prefix=$(node_prefix "$_exe" "$_cli")
             _manifest="$_prefix/lib/node_modules/$PACKAGE/package.json"
             if [ -f "$_manifest" ]; then
                 _hasdsh=true
@@ -1232,7 +1250,7 @@ switch_node() {
     # will not start rather than as the version problem it is.
     node_is_new_enough "$NODE_EXE" || fail "这个 Node 的版本低于 dsh 需要的 $NODE_MINIMUM，无法用它运行 dsh。"
     cli=$(find_npm "$NODE_EXE") || fail "这个 Node 旁边没有 npm（$NODE_EXE）。"
-    prefix=$(real_prefix "$NODE_EXE" "$cli")
+    prefix=$(node_prefix "$NODE_EXE" "$cli")
     manifest="$prefix/lib/node_modules/$PACKAGE/package.json"
     [ -f "$manifest" ] || fail "这个 Node 里没有安装 dsh（$prefix），无法直接切换。"
 
@@ -1329,6 +1347,61 @@ install_node_and_dsh() {
     step 'dsh 安装完成。' 100
 }
 
+# Take dsh out of one Node the user named, and nothing else.
+#
+# `uninstall -RemoveDsh` cannot do this. It reads the marker, so the only dsh it
+# can reach is the one the app recorded; a machine can have one in every Node it
+# has, and the panel lists them all.
+uninstall_dsh_from() {
+    [ -n "$NODE_EXE" ] || fail 'uninstall-dsh 需要 -NodeExe。'
+    [ -x "$NODE_EXE" ] || fail "找不到指定的 Node：$NODE_EXE"
+
+    cli=$(find_npm "$NODE_EXE") || fail "这个 Node 旁边没有 npm（$NODE_EXE）。"
+    prefix=$(node_prefix "$NODE_EXE" "$cli")
+    [ -f "$prefix/lib/node_modules/$PACKAGE/package.json" ] ||
+        fail "这个 Node 里没有安装 dsh（$prefix）。"
+
+    step "正在卸载 dsh（$prefix）…" 0
+    "$NODE_EXE" "$cli" uninstall -g --prefix "$prefix" --loglevel=error "$PACKAGE" 2>&1 |
+        while IFS= read -r line; do say "$line"; done
+
+    # A marker pointing at the dsh just removed describes nothing. Cleared rather
+    # than left for `search_path` to fall back onto and find a gap.
+    read_marker
+    if [ "$M_PREFIX" = "$prefix" ]; then
+        M_PREFIX=''
+        M_DSH=''
+        write_marker
+    fi
+    step 'dsh 已卸载。' 100
+}
+
+# Delete the Node this script unpacked, and the dsh inside it.
+#
+# Only ever ours. `$NODE_DIR` is a directory this script created and nothing else
+# writes to; a Node the machine already had is not this app's to remove, from
+# this mode or any other.
+remove_managed_node() {
+    [ -d "$NODE_DIR" ] || fail '本应用没有安装过 Node。'
+
+    step '正在删除应用安装的 Node 和 dsh…' 0
+    rm -rf "$NODE_DIR"
+
+    # The marker is only wiped when it was describing the Node that just went. A
+    # user who has since moved onto a Node of their own keeps their answer.
+    read_marker
+    case "$M_NODE_EXE" in
+        "$NODE_DIR"/*)
+            # The fallback prefix `find_prefix` writes into is ours too, and it
+            # only exists because this Node needed somewhere writable.
+            rm -rf "$APP_DIR/npm"
+            remove_path
+            rm -f "$MARKER"
+            ;;
+    esac
+    step '已删除。' 100
+}
+
 case "$MODE" in
     update) update_all ;;
     uninstall) uninstall_all ;;
@@ -1336,6 +1409,8 @@ case "$MODE" in
     switch) switch_node ;;
     install-dsh) install_dsh_into ;;
     install-node) install_node_and_dsh ;;
+    uninstall-dsh) uninstall_dsh_from ;;
+    remove-node) remove_managed_node ;;
 esac
 
 exit 0

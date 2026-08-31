@@ -571,7 +571,7 @@ pub fn script() -> String {
       // One layer under the plugin panel, so a question raised while the panel
       // is up is still drawn over it -- and, like the panel, clear of the
       // titlebar so the window buttons stay reachable.
-      '.dsh-ask{{position:fixed;inset:0;z-index:2147483644;display:none;' +
+      '.dsh-ask{{position:fixed;inset:0;z-index:2147483645;display:none;' +
       'align-items:center;justify-content:center;box-sizing:border-box;' +
       'padding:calc(var(--dsh-titlebar-height,36px) + 12px) 16px 20px;' +
       'background:rgba(18,18,22,.34);-webkit-backdrop-filter:blur(3px);' +

@@ -78,6 +78,20 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 /// display only, and the script is the authority on what it actually installs.
 const NODE_VERSION: &str = "24.19.0";
 
+/// Why the panel is up, which is the whole of what differs between its two
+/// callers.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// The boot cannot go on without an answer. Nothing is running behind the
+    /// panel, so the way out of it is quitting the app, and an answer is not
+    /// confirmed — there is no state to lose and nothing to interrupt.
+    Required,
+    /// Opened from the menu, over a dsh that is already serving. The way out is
+    /// closing it; every action is confirmed first, because every action ends in
+    /// a restart and two of them delete something.
+    Manage,
+}
+
 /// One Node the `list` mode found, in the shape the chooser needs.
 ///
 /// Built by hand from [`serde_json::Value`] rather than derived, the way
@@ -94,6 +108,10 @@ struct NodeInfo {
     /// Where the Node came from — `nvm`, `fnm`, `path`, `managed`… — for the
     /// panel's label.
     source: String,
+    /// Whether this is the Node the app is running dsh with right now. Filled in
+    /// by [`mark_current`] rather than by the script: which Node is in use is a
+    /// question about [`crate::dsh::search_path`], not about the machine.
+    current: bool,
 }
 
 /// What the user picked in the panel. Carried back across the channel by id, the
@@ -105,10 +123,18 @@ pub enum Choice {
     InstallDsh(usize),
     /// Download a fresh Node and dsh (`install-node`).
     InstallNode,
+    /// Take dsh out of Node `i` (`uninstall-dsh`). Offered in [`Mode::Manage`]
+    /// only: it does not get a blocked boot any closer to starting.
+    UninstallDsh(usize),
+    /// Delete the Node this app installed, and the dsh in it (`remove-node`).
+    /// [`Mode::Manage`] only, and only when there is one.
+    RemoveNode,
     /// Look again. The button only appears when the scan failed, which is the
     /// one state a user can do something about without restarting the app.
     Rescan,
-    /// Walk away.
+    /// Put the panel away, leaving the running dsh alone. [`Mode::Manage`] only.
+    Close,
+    /// Walk away, and take the app with it.
     Quit,
 }
 
@@ -152,11 +178,42 @@ fn enumerate(app: &AppHandle) -> Option<Vec<NodeInfo>> {
         eprintln!("dsh-desktop: listing the machine's Nodes failed or timed out");
         return None;
     };
-    parse_nodes(&output)
+    let mut nodes = parse_nodes(&output)?;
+    mark_current(app, &mut nodes);
+    Some(nodes)
 }
 
 /// What [`enumerate`] makes of one JSON line. Split from the run so the parse —
 /// the part that can go wrong quietly — can be read on its own.
+/// Mark the row the app is actually running out of.
+///
+/// Compared by the Node's path rather than by the marker, because the marker is
+/// no longer the whole answer: a dsh on the user's own PATH outranks it. See
+/// [`crate::dsh::search_path`].
+fn mark_current(app: &AppHandle, nodes: &mut [NodeInfo]) {
+    let Some(active) = crate::dsh::active_node(app) else {
+        return;
+    };
+    for node in nodes.iter_mut() {
+        node.current = same_path(&node.path, &active);
+    }
+}
+
+/// Whether two paths name the same file, for the comparison above.
+///
+/// Case-folded on Windows, where `D:\app\nvm` and `d:\App\nvm` are one
+/// directory and the script and [`crate::dsh::look_up`] build their strings
+/// independently. Compared as written everywhere else, where they are two.
+fn same_path(one: &std::path::Path, other: &std::path::Path) -> bool {
+    if cfg!(windows) {
+        one.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&other.as_os_str().to_string_lossy())
+    } else {
+        one == other
+    }
+}
+
 fn parse_nodes(json: &str) -> Option<Vec<NodeInfo>> {
     let Ok(array) = serde_json::from_str::<serde_json::Value>(json) else {
         return None;
@@ -193,6 +250,7 @@ fn parse_nodes(json: &str) -> Option<Vec<NodeInfo>> {
                 has_dsh,
                 dsh_version,
                 source,
+                current: false,
             })
         })
         .collect())
@@ -205,6 +263,35 @@ fn parse_nodes(json: &str) -> Option<Vec<NodeInfo>> {
 /// [`crate::dsh::gate`], and blocks on the user the way [`crate::dialog::confirm`]
 /// does.
 pub fn present(app: &AppHandle, report: &Report) -> bool {
+    show(app, report, Mode::Required)
+}
+
+/// The same panel, opened from the titlebar menu over a dsh that is already
+/// running: switch which Node runs it, install dsh into another one, take one
+/// out, or delete the Node this app installed.
+///
+/// One panel rather than a menu item each. Everything here is a different answer
+/// to the same question — which Node, and which dsh — and they are only legible
+/// next to each other and next to the list of what is actually on the machine.
+///
+/// Blocks for as long as the panel is up, so it belongs on a worker thread; see
+/// [`crate::open_runtime`]. Progress goes into the panel's own status line
+/// rather than onto the loading page, which is not the page underneath this
+/// time.
+pub fn manage(app: &AppHandle) {
+    // One panel at a time. The boot's is not reachable behind itself, but a
+    // second click on the menu item while the first is still up would replace
+    // the pending answer and leave the first loop waiting on a dead channel.
+    if PENDING.lock().unwrap().is_some() {
+        return;
+    }
+
+    let status = |text: &str, percent: f64| crate::setup_status(app, text, percent);
+    show(app, &status, Mode::Manage);
+}
+
+/// The loop both callers run; [`Mode`] is what differs.
+fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
     // The window has to be visible: a chooser over a hidden window is one the
     // user cannot answer, and the autostart path reaches this with it hidden.
     reveal(app);
@@ -221,7 +308,7 @@ pub fn present(app: &AppHandle, report: &Report) -> bool {
             // replaced dialog.
         }
 
-        crate::deliver_setup(app, &payload(nodes.as_deref(), error.as_deref()));
+        crate::deliver_setup(app, &payload(nodes.as_deref(), error.as_deref(), mode));
 
         let choice = receive.recv_timeout(ANSWER_TIMEOUT);
         // The panel is no longer the one on screen either way; take the slot so a
@@ -229,9 +316,15 @@ pub fn present(app: &AppHandle, report: &Report) -> bool {
         let _ = PENDING.lock().unwrap().take();
 
         match choice {
-            Ok(Choice::Quit) => {
+            // Only the boot's panel can take the app down. The menu's has a dsh
+            // running behind it, and the button there says "close".
+            Ok(Choice::Quit) if mode == Mode::Required => {
                 quit(app);
                 return false;
+            }
+            Ok(Choice::Quit | Choice::Close) => {
+                crate::hide_setup(app);
+                return true;
             }
             Ok(Choice::Rescan) => {
                 crate::hide_setup(app);
@@ -240,8 +333,28 @@ pub fn present(app: &AppHandle, report: &Report) -> bool {
                 continue;
             }
             Ok(choice) => {
+                let listed = nodes.as_deref().unwrap_or_default();
+
+                // Asked before the panel comes down, so the dialog is read
+                // against the row that raised it. Nothing to confirm on the
+                // boot's panel: no dsh is running to be interrupted, and the
+                // destructive verbs are not offered there.
+                if mode == Mode::Manage && !confirm(app, &choice, listed) {
+                    error = None;
+                    continue;
+                }
+
                 crate::hide_setup(app);
-                match act(app, choice, nodes.as_deref().unwrap_or_default(), report) {
+                match act(app, choice, listed, report) {
+                    Outcome::Done if mode == Mode::Manage => {
+                        // Which dsh runs is settled once, at boot, by
+                        // `dsh::current` — and the server, the plugin list and
+                        // the update check all hang off that one answer. Rather
+                        // than unpick them, the app comes up again on the new
+                        // one. Never returns.
+                        report(t!("正在重启应用…", "Restarting…"), -1.0);
+                        app.restart();
+                    }
                     Outcome::Done => return true,
                     Outcome::Aborted => return false,
                     Outcome::Failed(message) => {
@@ -257,16 +370,21 @@ pub fn present(app: &AppHandle, report: &Report) -> bool {
                     }
                 }
             }
-            // Nobody is here. Quitting rather than leaving a loading page that
-            // will never move: there is no dsh to start, nothing else for the
-            // boot thread to do, and reopening the app is what asks again.
+            // Nobody is here. The boot's panel quits rather than leaving a
+            // loading page that will never move: there is no dsh to start and
+            // nothing else for that thread to do, and reopening the app is what
+            // asks again. The menu's just goes away — there is a dsh behind it.
             Err(RecvTimeoutError::Timeout) => {
                 eprintln!(
-                    "dsh-desktop: nothing answered the setup panel in {} minutes; quitting",
+                    "dsh-desktop: nothing answered the setup panel in {} minutes",
                     ANSWER_TIMEOUT.as_secs() / 60
                 );
-                quit(app);
-                return false;
+                if mode == Mode::Required {
+                    quit(app);
+                    return false;
+                }
+                crate::hide_setup(app);
+                return true;
             }
             Err(RecvTimeoutError::Disconnected) => return false,
         }
@@ -290,6 +408,110 @@ fn quit(app: &AppHandle) {
 
 /// Run the script mode the user's choice asks for, reporting its progress onto
 /// the loading page the way the rest of the bootstrap does.
+/// Put the action to the user before it runs, in [`Mode::Manage`] only.
+///
+/// Every one of these ends by restarting the app, and two of them delete
+/// something, so none of them should happen on one click of a row. The dialog is
+/// the one the rest of the app uses, and it draws above this panel — see the
+/// z-index note in [`crate::dialog`].
+fn confirm(app: &AppHandle, choice: &Choice, nodes: &[NodeInfo]) -> bool {
+    use crate::dialog::{Ask, Choice as Button};
+
+    let (title, body, affirmative) = match choice {
+        Choice::Use(index) => {
+            let Some(node) = nodes.get(*index) else {
+                return false;
+            };
+            (
+                t!("切换到 Node {}？", "Switch to Node {}?", node.version),
+                t!(
+                    "应用会重启，改用这里的 dsh：\n{}",
+                    "The app restarts and runs the dsh in:\n{}",
+                    node.path.display()
+                ),
+                t!("切换并重启", "Switch and restart"),
+            )
+        }
+        Choice::InstallDsh(index) => {
+            let Some(node) = nodes.get(*index) else {
+                return false;
+            };
+            (
+                t!(
+                    "在 Node {} 里安装 dsh？",
+                    "Install dsh into Node {}?",
+                    node.version
+                ),
+                t!(
+                    "会下载约 185 MB，装到 {}。装好之后应用会重启并改用它。",
+                    "About 185 MB will be downloaded into {}. The app restarts onto it when that is done.",
+                    node.path.display()
+                ),
+                t!("安装并重启", "Install and restart"),
+            )
+        }
+        Choice::InstallNode => (
+            t!("安装 Node {}？", "Install Node {}?", NODE_VERSION),
+            t!(
+                "会把 Node 和 dsh（约 185 MB）装到应用自己的目录，不动你已有的任何一个 Node。装好之后应用会重启。",
+                "Node and dsh (about 185 MB) go into the app's own directory, leaving every Node you already have alone. The app restarts when that is done."
+            )
+            .to_string(),
+            t!("安装并重启", "Install and restart"),
+        ),
+        Choice::UninstallDsh(index) => {
+            let Some(node) = nodes.get(*index) else {
+                return false;
+            };
+            let mut body = t!(
+                "会把 dsh 从这个 Node 里卸载：\n{}\n\n你的会话、凭证和配置（$DSH_HOME）不受影响。",
+                "dsh will be uninstalled from:\n{}\n\nYour sessions, credentials and settings ($DSH_HOME) are left alone.",
+                node.path.display()
+            );
+            if node.current {
+                body.push_str(t!(
+                    "\n\n这正是应用现在用的那一份。卸载并重启之后，应用会再问你选哪一个。",
+                    "\n\nThis is the one the app is running. After the restart it will ask you to pick another."
+                ));
+            }
+            (
+                t!(
+                    "从 Node {} 里卸载 dsh？",
+                    "Uninstall dsh from Node {}?",
+                    node.version
+                ),
+                body,
+                t!("卸载并重启", "Uninstall and restart"),
+            )
+        }
+        Choice::RemoveNode => (
+            t!("删除应用装的 Node？", "Delete the Node the app installed?").to_string(),
+            t!(
+                "会删掉本应用自己装的那个 Node，以及装在它里面的 dsh。你自己装的 Node 一个都不会动。",
+                "The Node this app unpacked goes, and the dsh inside it. None of the Nodes you installed yourself are touched."
+            )
+            .to_string(),
+            t!("删除并重启", "Delete and restart"),
+        ),
+        // Never reach here; [`show`] answers them before the action runs.
+        Choice::Rescan | Choice::Close | Choice::Quit => return true,
+    };
+
+    crate::dialog::confirm(
+        app,
+        Ask {
+            title,
+            body,
+            choices: vec![
+                Button::new("cancel", t!("取消", "Cancel")),
+                Button::primary("go", affirmative),
+            ],
+            answered: Box::new(|_, _| {}),
+        },
+        "go",
+    )
+}
+
 fn act(app: &AppHandle, choice: Choice, nodes: &[NodeInfo], report: &Report) -> Outcome {
     let result = match choice {
         Choice::Use(index) => {
@@ -326,8 +548,31 @@ fn act(app: &AppHandle, choice: Choice, nodes: &[NodeInfo], report: &Report) -> 
         Choice::InstallNode => {
             crate::dsh::run(app, &[OsStr::new("-Mode"), OsStr::new("install-node")], report)
         }
-        // Both handled in [`present`] before the action runs.
-        Choice::Quit | Choice::Rescan => return Outcome::Aborted,
+        Choice::UninstallDsh(index) => {
+            let Some(node) = nodes.get(index) else {
+                return Outcome::Failed(t!("找不到所选的 Node。", "The chosen Node is gone.").into());
+            };
+            report(t!("正在卸载 dsh…", "Uninstalling dsh…"), -1.0);
+            crate::dsh::run(
+                app,
+                &[
+                    OsStr::new("-Mode"),
+                    OsStr::new("uninstall-dsh"),
+                    OsStr::new("-NodeExe"),
+                    node.path.as_os_str(),
+                ],
+                report,
+            )
+        }
+        Choice::RemoveNode => {
+            report(
+                t!("正在删除应用安装的 Node…", "Deleting the app's Node…"),
+                -1.0,
+            );
+            crate::dsh::run(app, &[OsStr::new("-Mode"), OsStr::new("remove-node")], report)
+        }
+        // All handled in [`show`] before the action runs.
+        Choice::Quit | Choice::Close | Choice::Rescan => return Outcome::Aborted,
     };
 
     match result {
@@ -351,7 +596,7 @@ enum Outcome {
 /// The JSON the panel takes: the nodes, whether the machine could be looked at
 /// at all, the version a fresh install would bring, and the error from a
 /// previous attempt when there was one.
-fn payload(nodes: Option<&[NodeInfo]>, error: Option<&str>) -> String {
+fn payload(nodes: Option<&[NodeInfo]>, error: Option<&str>, mode: Mode) -> String {
     let list: Vec<serde_json::Value> = nodes
         .unwrap_or_default()
         .iter()
@@ -363,6 +608,7 @@ fn payload(nodes: Option<&[NodeInfo]>, error: Option<&str>) -> String {
                 "hasDsh": node.has_dsh,
                 "dshVersion": node.dsh_version.clone().unwrap_or_default(),
                 "source": node.source,
+                "current": node.current,
             })
         })
         .collect();
@@ -372,6 +618,9 @@ fn payload(nodes: Option<&[NodeInfo]>, error: Option<&str>) -> String {
         "scanned": nodes.is_some(),
         "nodeVersion": NODE_VERSION,
         "error": error,
+        // What the panel keys its two shapes off: which way out it offers, and
+        // whether the verbs that remove things are drawn at all.
+        "manage": mode == Mode::Manage,
     })
     .to_string()
 }
@@ -410,6 +659,10 @@ pub fn script() -> String {
             "这台机器上没有检测到 Node。可以在这里装一个，dsh 会跟着一起装好。",
             "No Node was found on this machine. Install one here and dsh comes with it."
         ),
+        "ledeManage": t!(
+            "这台机器上的 Node，以及每个里面的 dsh。可以换用哪一个，也可以在这里装上或卸掉。改动之后应用会重启。",
+            "The Nodes on this machine, and the dsh in each. Switch which one runs, or install and uninstall from here. The app restarts after a change."
+        ),
         "ledeFailed": t!(
             "没能列出这台机器上的 Node —— 检测脚本没有跑起来，或者跑得太久。如果你确定机器上装过 Node，先点“重新检测”；也可以直接装一个新的 Node。",
             "The machine's Nodes could not be listed — the scan would not run, or took too long. If you know this machine has a Node, scan again; installing a fresh one is the other way out."
@@ -420,7 +673,11 @@ pub fn script() -> String {
         "hasDsh": t!("已装 dsh", "Has dsh"),
         "canInstall": t!("可安装 dsh", "Can install dsh"),
         "installNode": t!("安装新的 Node", "Install a fresh Node"),
+        "uninstallDsh": t!("卸载 dsh", "Uninstall dsh"),
+        "removeNode": t!("删除应用装的 Node", "Delete the app's Node"),
+        "inUse": t!("使用中", "In use"),
         "rescan": t!("重新检测", "Scan again"),
+        "close": t!("关闭", "Close"),
         "quit": t!("退出", "Quit"),
         "sources": {
             "managed": t!("应用管理", "App-managed"),
@@ -450,8 +707,11 @@ pub fn script() -> String {
   var TEXT = {labels};
 
   var root = null, card, lede, list, errBox, errText;
-  var installNode, rescan, quit;
+  var statusBox, statusText, statusFill;
+  var installNode, removeNode, rescan, quit;
   var sent = false;
+  // Set from every payload; see the `manage` field in `payload`.
+  var managing = false;
 
   // One answer per showing. The panel stays up until the app takes it down, and
   // a second click in that gap would be read against a list the next payload is
@@ -497,11 +757,12 @@ pub fn script() -> String {
   // on one row — "has dsh 0.1.8" and "too old" — which is the honest description
   // of it, and the button is the disabled one.
   function row(node, index) {{
-    var line = make('div', 'dsh-su-row');
+    var line = make('div', 'dsh-su-row' + (node.current ? ' dsh-su-now' : ''));
 
     var head = make('div', 'dsh-su-head', line);
     var title = make('span', 'dsh-su-ver', head);
     title.textContent = 'Node ' + node.version;
+    if (node.current) head.appendChild(chip('now', TEXT.inUse));
     if (node.hasDsh) {{
       head.appendChild(chip('have',
         node.dshVersion ? TEXT.hasDsh + ' ' + node.dshVersion : TEXT.hasDsh));
@@ -519,6 +780,10 @@ pub fn script() -> String {
     if (!node.meetsMinimum) {{
       var off = button(actions, TEXT.tooOld, function () {{}});
       off.disabled = true;
+    }} else if (node.current) {{
+      // Nothing to switch to; this is where the app already is.
+      var here = button(actions, TEXT.inUse, function () {{}});
+      here.disabled = true;
     }} else if (node.hasDsh) {{
       button(actions, TEXT.use, function () {{
         signal('setup-use?i=' + index);
@@ -527,6 +792,17 @@ pub fn script() -> String {
       button(actions, TEXT.installDsh, function () {{
         signal('setup-install-dsh?i=' + index);
       }});
+    }}
+
+    // Taking dsh out is offered wherever there is one, floor or no floor: a dsh
+    // in a Node too old to run it is exactly the thing worth clearing away. Not
+    // on the boot's panel though — it gets a blocked launch no closer to
+    // starting, and that panel has one job.
+    if (managing && node.hasDsh) {{
+      var drop = button(actions, TEXT.uninstallDsh, function () {{
+        signal('setup-uninstall-dsh?i=' + index);
+      }});
+      drop.className = 'dsh-su-danger';
     }}
 
     return line;
@@ -614,8 +890,27 @@ pub fn script() -> String {
       '.dsh-su button.dsh-su-primary:hover{{filter:brightness(1.08)}}' +
       '.dsh-su button[disabled]{{opacity:.45;cursor:default;pointer-events:none}}' +
       '.dsh-su button[hidden]{{display:none}}' +
-      // Answered, and waiting for the app to take the panel away.
-      '.dsh-su.dsh-su-busy .dsh-su-card{{opacity:.6;pointer-events:none}}';
+      '.dsh-su button.dsh-su-danger{{color:var(--su-bad);' +
+      'border-color:color-mix(in srgb,var(--su-bad) 40%,transparent)}}' +
+      '.dsh-su button.dsh-su-danger:hover{{background:var(--su-bad);color:#fff;' +
+      'border-color:var(--su-bad)}}' +
+      '.dsh-su-row.dsh-su-now{{border-color:var(--su-accent)}}' +
+      // The status line an action reports onto. Only the menu's panel needs it
+      // — the boot's has the loading page underneath — but it is drawn either
+      // way and simply stays empty.
+      '.dsh-su-status{{display:none;margin-top:12px;font-size:13px;' +
+      'color:var(--su-muted)}}' +
+      '.dsh-su-status.dsh-su-status-on{{display:block}}' +
+      '.dsh-su-bar{{height:4px;margin-top:8px;border-radius:999px;' +
+      'background:var(--su-soft);overflow:hidden;display:none}}' +
+      '.dsh-su-bar.dsh-su-bar-on{{display:block}}' +
+      '.dsh-su-bar i{{display:block;height:100%;width:0;border-radius:999px;' +
+      'background:var(--su-accent);transition:width .25s ease}}' +
+      // Answered, and waiting for the app to take the panel away. The list goes
+      // quiet; the status line does not, because reading it is the whole of what
+      // there is to do while an install runs.
+      '.dsh-su.dsh-su-busy .dsh-su-card{{pointer-events:none}}' +
+      '.dsh-su.dsh-su-busy .dsh-su-list{{opacity:.45}}';
     document.head.appendChild(style);
 
     root = make('div', 'dsh-su');
@@ -626,17 +921,38 @@ pub fn script() -> String {
     errText = make('div', '', errBox);
     list = make('div', 'dsh-su-list', card);
 
+    statusBox = make('div', 'dsh-su-status', card);
+    statusText = make('span', '', statusBox);
+    var bar = make('div', 'dsh-su-bar', statusBox);
+    statusFill = make('i', '', bar);
+
     var foot = make('div', 'dsh-su-foot', card);
-    quit = button(foot, TEXT.quit, function () {{ signal('setup-quit'); }});
+    quit = button(foot, TEXT.quit, function () {{
+      // Written out rather than as a ternary on the verb: the test below reads
+      // the verb literals out of this script, and a computed one is a verb
+      // nothing checks.
+      if (managing) signal('setup-close');
+      else signal('setup-quit');
+    }});
     make('span', 'dsh-su-spacer', foot);
     rescan = button(foot, TEXT.rescan, function () {{ signal('setup-rescan'); }});
+    removeNode = button(foot, TEXT.removeNode, function () {{
+      signal('setup-remove-node');
+    }});
+    removeNode.className = 'dsh-su-danger';
     installNode = button(foot, TEXT.installNode, function () {{
       signal('setup-install-node');
     }}, true);
 
-    // No Escape-to-quit. There is nothing here to cancel back to — the app is
-    // waiting on this answer to decide whether it starts at all — and the key
-    // people press to dismiss things should not be the one that closes the app.
+    // Escape closes the panel opened from the menu, and does nothing on the
+    // one the boot is waiting on: there the app has not decided whether it
+    // starts at all, and the key people press to dismiss things should not be
+    // the one that quits.
+    document.addEventListener('keydown', function (event) {{
+      if (event.key === 'Escape' && managing && root.classList.contains('dsh-su-shown')) {{
+        signal('setup-close');
+      }}
+    }});
 
     paint(root);
     document.body.appendChild(root);
@@ -661,14 +977,27 @@ pub fn script() -> String {
       sent = false;
       root.classList.remove('dsh-su-busy');
 
+      // Read before the rows are built: `row` keys the destructive verbs off it.
+      managing = data.manage === true;
+      quit.textContent = managing ? TEXT.close : TEXT.quit;
+
       var nodes = data.nodes || [];
       // `scanned: false` is a machine that could not be looked at, which is not
       // the same as a machine with no Node — see `enumerate`.
       var scanned = data.scanned !== false;
       lede.textContent = !scanned
         ? TEXT.ledeFailed
-        : (nodes.length ? TEXT.ledeNodes : TEXT.ledeNone);
+        : (managing ? TEXT.ledeManage
+          : (nodes.length ? TEXT.ledeNodes : TEXT.ledeNone));
       rescan.hidden = scanned;
+
+      // Only where there is one to delete. The row's own `managed` source is
+      // the only thing that says this app unpacked a Node.
+      var ours = nodes.some(function (node) {{ return node.source === 'managed'; }});
+      removeNode.hidden = !(managing && ours);
+
+      statusBox.classList.remove('dsh-su-status-on');
+      statusText.textContent = '';
 
       var shown = data.error && typeof data.error === 'string';
       errBox.classList.toggle('dsh-su-err-shown', shown);
@@ -686,6 +1015,18 @@ pub fn script() -> String {
 
       root.classList.add('dsh-su-shown');
     }});
+  }};
+
+  /** Progress for an action started from the menu; see `setup_status`. */
+  window.__dshSetupStatus = function (text, percent) {{
+    if (!root || !statusBox) return;
+    statusText.textContent = text || '';
+    statusBox.classList.toggle('dsh-su-status-on', !!text);
+
+    var value = parseFloat(percent);
+    var known = !isNaN(value) && value >= 0;
+    statusFill.parentNode.classList.toggle('dsh-su-bar-on', known);
+    if (known) statusFill.style.width = Math.min(100, value) + '%';
   }};
 
   window.__dshSetupHide = function () {{
@@ -751,8 +1092,20 @@ mod tests {
     /// Both states reach the panel, and it has to be able to tell them apart.
     #[test]
     fn the_payload_says_whether_the_machine_was_looked_at() {
-        assert!(super::payload(Some(&[]), None).contains("\"scanned\":true"));
-        assert!(super::payload(None, None).contains("\"scanned\":false"));
+        let scanned = super::payload(Some(&[]), None, super::Mode::Required);
+        let failed = super::payload(None, None, super::Mode::Required);
+
+        assert!(scanned.contains("\"scanned\":true"));
+        assert!(failed.contains("\"scanned\":false"));
+    }
+
+    /// The other flag the panel keys off. Wrong, and either the boot's chooser
+    /// grows a button that quits to nowhere, or the menu's loses the only way
+    /// out it has.
+    #[test]
+    fn the_payload_says_which_panel_this_is() {
+        assert!(super::payload(Some(&[]), None, super::Mode::Manage).contains("\"manage\":true"));
+        assert!(super::payload(Some(&[]), None, super::Mode::Required).contains("\"manage\":false"));
     }
 
     /// The version on the install-a-Node button is this module's copy of a
@@ -783,7 +1136,7 @@ mod tests {
     fn every_verb_the_panel_signals_is_one_the_app_answers() {
         let script = super::script();
 
-        let mut checked = 0;
+        let mut checked = std::collections::BTreeSet::new();
         for piece in script.split("signal('").skip(1) {
             let verb = piece.split('\'').next().expect("a closed string literal");
             // `setup-use?i=` and friends have the index appended at click time.
@@ -799,9 +1152,62 @@ mod tests {
                 crate::controls::action(&url).is_some(),
                 "the panel signals {verb}, which `controls::action` does not answer"
             );
-            checked += 1;
+            checked.insert(verb);
         }
 
-        assert_eq!(checked, 5, "expected five verbs, found {checked}");
+        // A set, not a count: two of the verbs are signalled from more than one
+        // place, and what matters is that every distinct one resolves.
+        assert_eq!(
+            checked,
+            std::collections::BTreeSet::from([
+                "setup-use?i=",
+                "setup-install-dsh?i=",
+                "setup-uninstall-dsh?i=",
+                "setup-install-node",
+                "setup-remove-node",
+                "setup-rescan",
+                "setup-close",
+                "setup-quit",
+            ]),
+            "the panel's verbs are not the ones expected"
+        );
+    }
+
+    /// Every `-Mode` this module runs has to be one both scripts accept. They
+    /// are three files edited separately, and a mode only one of them knows is a
+    /// button that fails with a parameter error the moment it is pressed —
+    /// after the confirm, and on the panel that has no other way forward.
+    #[test]
+    fn every_mode_this_module_runs_is_one_the_scripts_take() {
+        let here = include_str!("setup.rs");
+        let read = |path: &str| {
+            let bytes = std::fs::read(path).expect("a readable bootstrap script");
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let ps1 = read(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.ps1"));
+        let sh = read(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.sh"));
+
+        for mode in [
+            "switch",
+            "install-dsh",
+            "install-node",
+            "uninstall-dsh",
+            "remove-node",
+        ] {
+            // The list above is only worth checking if it is still the list this
+            // module actually runs.
+            assert!(
+                here.contains(&format!("OsStr::new(\"{mode}\")")),
+                "{mode} is not run from this module any more"
+            );
+            assert!(
+                ps1.contains(&format!("'{mode}'")),
+                "install-deps.ps1 does not accept -Mode {mode}"
+            );
+            assert!(
+                sh.contains(&format!("\n    {mode}) ")),
+                "install-deps.sh does not accept -Mode {mode}"
+            );
+        }
     }
 }

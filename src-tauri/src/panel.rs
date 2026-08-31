@@ -344,7 +344,7 @@ pub fn script() -> String {
       // Under the titlebar's two layers, so minimise, maximise and close stay
       // reachable while the panel is up -- and padded clear of the strip they
       // sit in.
-      '.dsh-pp{{position:fixed;inset:0;z-index:2147483645;display:none;' +
+      '.dsh-pp{{position:fixed;inset:0;z-index:2147483644;display:none;' +
       'align-items:center;justify-content:center;box-sizing:border-box;' +
       'padding:calc(var(--dsh-titlebar-height,36px) + 12px) 16px 20px;' +
       'background:rgba(18,18,22,.34);-webkit-backdrop-filter:blur(3px);' +

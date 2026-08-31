@@ -353,6 +353,16 @@ pub fn look_up(app: &AppHandle, names: &[&str]) -> Option<PathBuf> {
     first_on(&search_path(app), names)
 }
 
+/// The Node this launch would run dsh with, for the runtime panel to mark.
+///
+/// The same lookup [`node_is_new_enough`] makes, exposed because the panel lists
+/// every Node on the machine and one of them is the one in use — and which one
+/// that is cannot be read off the marker any more, now that the PATH can outrank
+/// it. See [`search_path`].
+pub fn active_node(app: &AppHandle) -> Option<PathBuf> {
+    look_up(app, NODE)
+}
+
 /// Whether npm left an entry at `path` — the question [`look_up`] is actually
 /// asking, which is not the same as `is_file`.
 ///

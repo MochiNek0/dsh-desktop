@@ -104,9 +104,18 @@ pub enum Action {
     SetupUse(usize),
     SetupInstallDsh(usize),
     SetupInstallNode,
+    /// Take dsh out of Node `i`.
+    SetupUninstallDsh(usize),
+    /// Delete the Node this app installed, and the dsh in it.
+    SetupRemoveNode,
     /// Look at the machine again, after a scan that could not.
     SetupRescan,
+    /// Put the panel away. The menu's way out, where [`Action::SetupQuit`] is
+    /// the boot's: there is a dsh running behind this one.
+    SetupClose,
     SetupQuit,
+    /// Open the panel from the menu.
+    Runtime,
     /// A shell with dsh on its PATH.
     Terminal,
     /// Start `dsh web` again after it exited on its own.
@@ -151,8 +160,12 @@ pub fn action(url: &Url) -> Option<Action> {
         "setup-use" => setup_index(url).map(Action::SetupUse),
         "setup-install-dsh" => setup_index(url).map(Action::SetupInstallDsh),
         "setup-install-node" => Some(Action::SetupInstallNode),
+        "setup-uninstall-dsh" => setup_index(url).map(Action::SetupUninstallDsh),
+        "setup-remove-node" => Some(Action::SetupRemoveNode),
         "setup-rescan" => Some(Action::SetupRescan),
+        "setup-close" => Some(Action::SetupClose),
         "setup-quit" => Some(Action::SetupQuit),
+        "runtime" => Some(Action::Runtime),
         "terminal" => Some(Action::Terminal),
         "restart-dsh" => Some(Action::RestartDsh),
         "open" => {
@@ -207,8 +220,14 @@ pub fn perform(app: &AppHandle, action: Action) {
             return crate::setup::answered(crate::setup::Choice::InstallDsh(i))
         }
         Action::SetupInstallNode => return crate::setup::answered(crate::setup::Choice::InstallNode),
+        Action::SetupUninstallDsh(i) => {
+            return crate::setup::answered(crate::setup::Choice::UninstallDsh(i))
+        }
+        Action::SetupRemoveNode => return crate::setup::answered(crate::setup::Choice::RemoveNode),
         Action::SetupRescan => return crate::setup::answered(crate::setup::Choice::Rescan),
+        Action::SetupClose => return crate::setup::answered(crate::setup::Choice::Close),
         Action::SetupQuit => return crate::setup::answered(crate::setup::Choice::Quit),
+        Action::Runtime => return crate::open_runtime(app),
         Action::RestartDsh => return crate::restart_dsh(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),
         Action::Answered(url) => return crate::dialog::answered(app, &url),
@@ -337,6 +356,7 @@ pub fn script() -> String {
     let label = |text: &str| serde_json::to_string(text).expect("a string is always serializable");
     let plugins = label(t!("插件…", "Plugins…"));
     let terminal = label(t!("打开终端", "Open a terminal"));
+    let runtime = label(t!("运行环境…", "Runtime…"));
     let restart_dsh = label(t!("重启 dsh", "Restart dsh"));
     let update_dsh = label(t!("更新 dsh…", "Update dsh…"));
     let check_app = label(t!("检查应用更新…", "Check for app updates…"));
@@ -384,6 +404,10 @@ pub fn script() -> String {
     {{ separator: true }},
     {{ verb: 'restart-dsh', label: {restart_dsh} }},
     {{ verb: 'update-dsh', label: {update_dsh} }},
+    // One item for the whole of which Node and which dsh, rather than one per
+    // verb: the panel behind it can switch, install and uninstall, and this
+    // menu is already long. See `setup`.
+    {{ verb: 'runtime', label: {runtime} }},
     {{ verb: 'check-app', label: {check_app} }},
     {{ separator: true }},
     {{ verb: 'autostart', label: {autostart}, check: true }},

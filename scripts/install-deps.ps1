@@ -43,13 +43,23 @@ param(
     # `npm install -g` against a Node the user picked. `install-node` is the
     # no-Node-at-all case: download one of ours, then install dsh into it.
     #
+    # `uninstall-dsh` and `remove-node` are the same panel's undo, reachable from
+    # the runtime menu item rather than only from a launch that cannot start.
+    # Both are explicit where `uninstall`'s switches are not: `uninstall-dsh`
+    # takes dsh out of the Node named by `-NodeExe`, whichever of the machine's
+    # Nodes that is, and `remove-node` deletes the Node this script unpacked and
+    # nothing else. `uninstall` works off the marker, so it can only ever act on
+    # the one dsh the app happens to have recorded — fine for an uninstaller,
+    # useless for a machine with a dsh in three Nodes.
+    #
     # None of them writes the user's PATH. See the note above `Remove-Path`.
     #
     # There is no default. There used to be — `install`, a mode that picked a
     # Node itself and installed dsh into it — and a bare run of this script is
     # not a thing that should still be able to change the machine.
     [Parameter(Mandatory)]
-    [ValidateSet('update', 'uninstall', 'list', 'switch', 'install-dsh', 'install-node')]
+    [ValidateSet('update', 'uninstall', 'list', 'switch', 'install-dsh', 'install-node',
+        'uninstall-dsh', 'remove-node')]
     [string] $Mode,
 
     # `update` only: the npm global prefix holding the dsh to replace. The app
@@ -59,8 +69,8 @@ param(
     # falls back to the marker's prefix, and then to npm's own default.
     [string] $Prefix = '',
 
-    # `switch` and `install-dsh` only: the `node.exe` the user chose in the
-    # setup panel. Everything this script needs — npm, the prefix, the dsh that
+    # `switch`, `install-dsh` and `uninstall-dsh` only: the `node.exe` the user
+    # chose in the runtime panel. Everything this script needs — npm, the prefix, the dsh that
     # is or will be there — hangs off it.
     [string] $NodeExe = '',
 
@@ -665,6 +675,21 @@ function Get-ManagedPrefix([string] $Exe) {
     return (Split-Path -Parent $Exe)
 }
 
+# Where a `-g` install for `$Exe` already lives — the reading counterpart of the
+# two above, and the one every caller that is not about to install should ask.
+#
+# A Node this script unpacked answers from `Get-ManagedPrefix`, and every other
+# Node from npm. Asking npm for both was a quiet bug in `list` mode: on a machine
+# whose `.npmrc` sets a prefix, the app's own Node reported that prefix, found no
+# dsh under it, and the panel offered to install a dsh into the one Node that
+# already had one.
+function Get-NodePrefix([string] $Exe, [string] $Cli) {
+    if ($Exe.StartsWith($NodeDir, [StringComparison]::OrdinalIgnoreCase)) {
+        return (Get-ManagedPrefix $Exe)
+    }
+    return (Get-Prefix $Exe $Cli)
+}
+
 # What npm resolves `registry` to, which is the user's own `.npmrc` if they have
 # one. Empty when npm cannot be asked, which `Sort-Registries` reads as nothing
 # configured.
@@ -874,18 +899,25 @@ function Find-DshPrefix([hashtable] $State, [string] $Dsh) {
 function Uninstall-All {
     $state = Read-Marker
 
-    # Only a Node of ours goes: one the machine already had is not this
-    # uninstaller's to take, whatever the answer was. dsh has no such
-    # reservation — it is one `npm install -g` either way, and the user has just
-    # been asked about it by name.
+    # Only what this script installed goes, and that is now true of dsh as well
+    # as of Node. It was not: `-RemoveDsh` uninstalled whatever the marker
+    # pointed at, so a user who had installed dsh themselves and let this app
+    # adopt it was asked one vague question at uninstall time and lost their own
+    # global package to it. The prompt could not have told them which case they
+    # were in either, because the answer is in the marker and NSIS does not read
+    # it.
     #
-    # Node is also a Node program's only way to run, so taking it away while
-    # leaving dsh behind would leave a `dsh` command that cannot start.
+    # Node was always guarded this way. Node is also a Node program's only way to
+    # run, so taking ours away has to take the dsh inside it too — that dsh is
+    # ours by definition, it is in our directory.
     $dropNode = $RemoveNode -and ($state['node'] -eq 'managed')
-    $dropDsh = $RemoveDsh -or $dropNode
+    $dropDsh = ($RemoveDsh -and ($state['dsh'] -eq 'managed')) -or $dropNode
 
     if ($RemoveNode -and -not $dropNode) {
         Say 'Node 是你自己装的，不会动它。'
+    }
+    if ($RemoveDsh -and -not $dropDsh) {
+        Say 'dsh 是你自己装的，不会动它。要卸载请用：npm uninstall -g @deepseek-ai/dsh'
     }
 
     if ($dropDsh) {
@@ -903,9 +935,6 @@ function Uninstall-All {
             $node = $state['nodeExe']
             $cli = $state['npmCli']
             if ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli)) {
-                if ($state['dsh'] -ne 'managed') {
-                    Say '这份 dsh 不是本应用装的，按你的选择一并卸载。'
-                }
                 Say "正在卸载 dsh（$prefix）…"
                 Invoke-Native $node @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null | Out-Null
             } else {
@@ -1056,7 +1085,7 @@ function List-Nodes {
         $hasDsh = $false
         $dshVersion = $null
         if ($cli) {
-            try { $prefix = Get-Prefix $n.Exe $cli } catch { $prefix = $null }
+            try { $prefix = Get-NodePrefix $n.Exe $cli } catch { $prefix = $null }
             if ($prefix) {
                 $manifest = Join-Path $prefix "node_modules\$Package\package.json"
                 if (Test-Path -LiteralPath $manifest) {
@@ -1112,7 +1141,7 @@ function Switch-Node {
 
     $cli = Find-Npm $NodeExe
     if (-not $cli) { Fail "这个 Node 旁边没有 npm（$NodeExe）。" }
-    $prefix = Get-Prefix $NodeExe $cli
+    $prefix = Get-NodePrefix $NodeExe $cli
     $manifest = Join-Path $prefix "node_modules\$Package\package.json"
     if (-not (Test-Path -LiteralPath $manifest)) {
         Fail "这个 Node 里没有安装 dsh（$prefix），无法直接切换。"
@@ -1164,7 +1193,7 @@ function Install-DshInto {
 
     $cli = Find-Npm $NodeExe
     if (-not $cli) { Fail "这个 Node 旁边没有 npm（$NodeExe），无法安装 dsh。" }
-    $prefix = Get-Prefix $NodeExe $cli
+    $prefix = Get-NodePrefix $NodeExe $cli
 
     $state = Read-Marker
     $state['nodeExe'] = $NodeExe
@@ -1225,6 +1254,64 @@ function Install-NodeAndDsh {
     Step 'dsh 安装完成。' 100
 }
 
+# Take dsh out of one Node the user named, and nothing else.
+#
+# `uninstall -RemoveDsh` cannot do this. It reads the marker, so the only dsh it
+# can reach is the one the app recorded; a machine can have one in every Node it
+# has, and the panel lists them all.
+function Uninstall-DshFrom {
+    if (-not $NodeExe) { Fail 'uninstall-dsh 需要 -NodeExe。' }
+    if (-not (Test-Path -LiteralPath $NodeExe)) { Fail "找不到指定的 Node：$NodeExe" }
+
+    $cli = Find-Npm $NodeExe
+    if (-not $cli) { Fail "这个 Node 旁边没有 npm（$NodeExe）。" }
+    $prefix = Get-NodePrefix $NodeExe $cli
+
+    $manifest = Join-Path $prefix "node_modules\$Package\package.json"
+    if (-not (Test-Path -LiteralPath $manifest)) {
+        Fail "这个 Node 里没有安装 dsh（$prefix）。"
+    }
+
+    Step "正在卸载 dsh（$prefix）…" 0
+    Invoke-Native $NodeExe @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null | Out-Null
+
+    # A marker pointing at the dsh just removed describes nothing. Cleared rather
+    # than left for `search_path` to fall back onto and find a gap.
+    $state = Read-Marker
+    if ([string]$state['prefix'] -eq $prefix) {
+        $state.Remove('prefix')
+        $state.Remove('dsh')
+        Write-Marker $state
+    }
+    Step 'dsh 已卸载。' 100
+}
+
+# Delete the Node this script unpacked, and the dsh inside it.
+#
+# Only ever ours. `$NodeDir` is a directory this script created and nothing else
+# writes to; a Node the machine already had is not this app's to remove, from
+# this mode or any other.
+function Remove-ManagedNode {
+    if (-not (Test-Path -LiteralPath $NodeDir)) {
+        Fail '本应用没有安装过 Node。'
+    }
+
+    Step '正在删除应用安装的 Node 和 dsh…' 0
+    Remove-Item -LiteralPath $NodeDir -Recurse -Force -ErrorAction SilentlyContinue
+
+    # The marker is only wiped when it was describing the Node that just went.
+    # A user who has since moved onto a Node of their own keeps their answer.
+    $state = Read-Marker
+    if (([string]$state['nodeExe']).StartsWith($NodeDir, [StringComparison]::OrdinalIgnoreCase)) {
+        # The fallback prefix `tool_prefix` writes into is ours too, and it only
+        # exists because this Node needed somewhere writable.
+        Remove-Item -LiteralPath (Join-Path $AppDir 'npm') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Path ([string]$state['pathEntry'])
+        Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
+    }
+    Step '已删除。' 100
+}
+
 switch ($Mode) {
     'update' { Update-All }
     'uninstall' { Uninstall-All }
@@ -1232,6 +1319,8 @@ switch ($Mode) {
     'switch' { Switch-Node }
     'install-dsh' { Install-DshInto }
     'install-node' { Install-NodeAndDsh }
+    'uninstall-dsh' { Uninstall-DshFrom }
+    'remove-node' { Remove-ManagedNode }
 }
 
 exit 0

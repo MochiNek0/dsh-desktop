@@ -428,6 +428,33 @@ pub(crate) fn deliver_setup(app: &tauri::AppHandle, payload: &str) {
     }
 }
 
+/// A line of progress into the runtime panel itself.
+///
+/// The boot's chooser reports onto the loading page underneath it, which is the
+/// only page of ours with a status line. The panel opened from the menu is drawn
+/// over a running dsh, which has no such line and is not ours to write on — so
+/// that one carries its own, and this is what feeds it. Without it an install
+/// started from the menu is a frozen card for several minutes.
+pub(crate) fn setup_status(app: &tauri::AppHandle, text: &str, percent: f64) {
+    if let Some(session) = app.try_state::<Session>() {
+        if let Some(window) = app.get_webview_window("main") {
+            session
+                .splash
+                .call(&window, "__dshSetupStatus", &[text, &format!("{percent:.1}")]);
+        }
+    }
+}
+
+/// Open the runtime panel from the menu; see `setup::manage`.
+///
+/// Off the navigation callback that delivered the click, the way `open_plugins`
+/// is: the loop this starts blocks for as long as the panel is up, and the
+/// dialogs it raises block on answers the main thread has to deliver.
+fn open_runtime(app: &tauri::AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || setup::manage(&app));
+}
+
 /// Take the setup panel down; see `setup`.
 ///
 /// Queued through the splash like the delivery above, and for the same reason
@@ -955,26 +982,30 @@ fn remove_plugins(app: &tauri::AppHandle, names: Vec<String>) {
 /// just installed something, has no server to go back to, and that is the one
 /// case that costs a page load.
 fn leave_plugins(app: &tauri::AppHandle) {
-    if BUSY.swap(true, Ordering::SeqCst) {
-        dsh::note(
-            app,
-            t!("请稍等", "One moment"),
-            t!(
-                "插件还在安装中，装完会自动回到 dsh。",
-                "The install is still running; it returns to dsh when it finishes."
-            ),
-        );
-        return;
-    }
-
     let session = app.state::<Session>().inner().clone();
     let app = app.clone();
 
     std::thread::spawn(move || {
-        let _busy = Busy;
         let Some(window) = app.get_webview_window("main") else {
             return;
         };
+
+        // Down first, and without asking anyone. Taking [`BUSY`] before this
+        // meant a panel opened while the boot was still running could not be
+        // closed at all: the boot holds the flag from its first line until dsh
+        // is serving, so the click raised a "one moment" note instead — and that
+        // note is a dialog, drawn *under* this panel, so what the user saw was a
+        // button that did nothing. Closing the panel conflicts with nothing; it
+        // is only the dsh underneath that one thread at a time may drive.
+        session.splash.plugin_hide(&window);
+
+        // Which leaves the question this was really guarding: is there a dsh to
+        // bring back, and is it ours to bring back? A flag already held is the
+        // boot or an update, and both start dsh themselves when they are done.
+        if BUSY.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _busy = Busy;
 
         let serving = session
             .origin
@@ -982,8 +1013,6 @@ fn leave_plugins(app: &tauri::AppHandle) {
             .unwrap()
             .clone()
             .filter(|_| session.server.lock().unwrap().is_some());
-
-        session.splash.plugin_hide(&window);
 
         if serving.is_some() {
             return;
