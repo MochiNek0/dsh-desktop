@@ -1,4 +1,4 @@
-//! The plugin panel, drawn over whatever page the window is showing.
+//! The two panels this app draws over whatever page the window is showing.
 //!
 //! It is injected, the way the window controls in [`crate::controls`] are and
 //! for the same reason: the page underneath belongs to dsh, not to us. Drawing
@@ -14,10 +14,24 @@
 //! three verbs the loading page used to send — install, done, directory — down
 //! the same cancelled-navigation channel everything else in this window uses.
 //! Rust pushes into it with `window.eval`; see `Splash` in main.rs.
+//!
+//! ## And the settings panel
+//!
+//! A second card, on the same backdrop and out of the same stylesheet, holding
+//! what the titlebar menu had grown too long to keep: the login item and
+//! notifications, which were checkmarks; the app's own update check; the three
+//! version numbers; and removing the runtime, which had no caller at all
+//! outside the Windows uninstaller.
+//!
+//! It differs from the plugin panel in one way that matters. Closing that one
+//! is a verb, because leaving it navigates the window and restarts dsh; closing
+//! this one is a class removed in JavaScript, because the page it is drawn over
+//! never went anywhere. So Rust hears from it only when something is asked of
+//! it — a switch, a check, a removal.
 
-/// The script that draws it, injected into every document the window loads.
+/// The script that draws them, injected into every document the window loads.
 ///
-/// Nothing is built until the panel is first shown: on most launches it never
+/// Nothing is built until a panel is first shown: on most launches neither ever
 /// is, and a document this app does not own is not somewhere to leave a card
 /// and a stylesheet lying around unasked.
 pub fn script() -> String {
@@ -74,6 +88,38 @@ pub fn script() -> String {
         "leaveIt": t!("先不装了", "Leave it"),
         "more": t!("继续装别的", "Install more"),
         "retry": t!("重试", "Try again"),
+
+        // The settings panel: the same card and the same stylesheet, different
+        // contents. See `buildPrefs`.
+        "prefsTitle": t!("设置", "Settings"),
+        "prefsAutostart": t!("开机自启", "Start at login"),
+        "prefsAutostartWhy": t!(
+            "登录后自动打开，并停在托盘里。",
+            "Opens after you sign in and waits in the tray."
+        ),
+        "prefsNotify": t!("回合提醒", "Turn notifications"),
+        "prefsNotifyWhy": t!(
+            "dsh 需要你回话时发一条系统通知。",
+            "Raises a system notification when dsh needs an answer."
+        ),
+        "prefsApp": t!("应用版本", "App"),
+        "prefsDsh": t!("dsh 版本", "dsh"),
+        "prefsNode": t!("Node", "Node"),
+        "prefsCheck": t!("检查更新", "Check"),
+        "prefsTerminal": t!("终端里的 dsh", "dsh in a terminal"),
+        "prefsTerminalOurs": t!("就是上面这一份", "the one above"),
+        "prefsTerminalWhy": t!(
+            "终端里跑的是另一份 dsh。它和应用共用 ~/.dsh，所以插件可能装得上、加载不了；卸载它，或者把它从 PATH 上挪到后面。",
+            "A terminal runs a different dsh. It shares ~/.dsh with the app, so a plugin can install and then fail to load; uninstall it, or move it later on your PATH."
+        ),
+        "prefsUnknown": t!("未知", "unknown"),
+        "prefsRemove": t!("移除 dsh 运行时", "Remove the dsh runtime"),
+        "prefsRemoveDo": t!("移除…", "Remove…"),
+        "prefsRemoveWhy": t!(
+            "删除应用自己装的 Node 和 dsh。配置和会话记录会保留，下次启动会重新安装。",
+            "Deletes the Node and dsh this app installed. Settings and sessions are kept, and the next launch installs them again."
+        ),
+        "prefsDone": t!("完成", "Done"),
     })
     .to_string();
 
@@ -338,7 +384,15 @@ pub fn script() -> String {
     media.addEventListener('change', repaint);
   }}
 
-  function build() {{
+  // Injected once and shared by both panels below. They are the same card on
+  // the same backdrop with the same buttons; only the contents differ, and a
+  // second stylesheet saying so again is a second stylesheet to keep in step.
+  var styled = false;
+
+  function styles() {{
+    if (styled) return;
+    styled = true;
+
     var style = document.createElement('style');
     style.textContent =
       // Under the titlebar's two layers, so minimise, maximise and close stay
@@ -490,8 +544,52 @@ pub fn script() -> String {
       'border-color:var(--pp-danger)}}' +
       '.dsh-pp button.dsh-pp-danger:hover{{background:var(--pp-danger);color:#fff}}' +
       '.dsh-pp button[disabled]{{opacity:.45;cursor:default;pointer-events:none}}' +
-      '.dsh-pp button[hidden]{{display:none}}';
+      '.dsh-pp button[hidden]{{display:none}}' +
+      // ----------------------------------------------- the settings panel --
+      // A labelled row with a control at the end of it. The divider is on the
+      // row rather than between rows, so a group can be reordered without the
+      // rule ending up in the wrong place.
+      '.dsh-pp-pref{{display:flex;align-items:center;justify-content:space-between;' +
+      'gap:14px;padding:12px 2px}}' +
+      '.dsh-pp-pref+.dsh-pp-pref{{border-top:1px solid var(--pp-line)}}' +
+      '.dsh-pp-pname{{font-size:13px}}' +
+      '.dsh-pp-pwhy{{margin-top:3px;font-size:12px;line-height:1.5;' +
+      'color:var(--pp-muted)}}' +
+      // Drawn rather than a checkbox: the native control is a different shape,
+      // colour and size on each of the three platforms this ships to, and the
+      // card around it is the same on all of them.
+      '.dsh-pp-switch{{position:relative;flex:none;width:38px;height:22px;' +
+      'border-radius:11px;background:var(--pp-line);cursor:pointer;' +
+      'transition:background .15s}}' +
+      '.dsh-pp-switch::after{{content:"";position:absolute;top:3px;left:3px;' +
+      'width:16px;height:16px;border-radius:50%;background:#fff;' +
+      'box-shadow:0 1px 2px rgba(0,0,0,.3);transition:transform .15s}}' +
+      '.dsh-pp-switch.dsh-pp-on{{background:var(--pp-accent)}}' +
+      '.dsh-pp-switch.dsh-pp-on::after{{transform:translateX(16px)}}' +
+      // The version rows. Monospace for the values so that three of them line
+      // up under each other rather than drifting with the digits.
+      '.dsh-pp-fact{{display:flex;align-items:center;gap:12px;padding:7px 2px;' +
+      'font-size:13px}}' +
+      '.dsh-pp-fname{{flex:none;min-width:82px;font-size:12px;' +
+      'color:var(--pp-muted)}}' +
+      '.dsh-pp-fval{{flex:1 1 auto;min-width:0;font:12px ui-monospace,' +
+      'Consolas,monospace;word-break:break-all;' +
+      'user-select:text;-webkit-user-select:text}}' +
+      '.dsh-pp-fval.dsh-pp-odd{{color:var(--pp-danger)}}' +
+      // Indented to the value column: name is 82 wide with a 12 gap.
+      '.dsh-pp-note{{margin:-3px 0 5px;padding-left:94px;font-size:12px;' +
+      'line-height:1.5;color:var(--pp-muted)}}' +
+      '.dsh-pp button.dsh-pp-small{{height:26px;padding:0 11px;font-size:12px}}' +
+      '.dsh-pp-rule{{height:1px;margin:16px 0 2px;background:var(--pp-line)}}' +
+      // The plugin panel always has a lede under its heading and gets its
+      // spacing from that. This one goes straight to the first row, so it says
+      // so itself rather than growing a paragraph it has nothing to put in.
+      '.dsh-pp-card h1+.dsh-pp-list{{margin-top:10px}}';
     document.head.appendChild(style);
+  }}
+
+  function build() {{
+    styles();
 
     root = make('div', 'dsh-pp');
     var card = make('div', 'dsh-pp-card', root);
@@ -543,6 +641,120 @@ pub fn script() -> String {
   function ready(then) {{
     if (document.body) then();
     else document.addEventListener('DOMContentLoaded', then, {{ once: true }});
+  }}
+
+  // ---------------------------------------------------- the settings panel --
+
+  // A second card on the same stylesheet, holding what the menu used to: the
+  // two switches that were checkmarks, and the app's own update check. The
+  // menu had grown to eight rows and every one of them was drawn on every
+  // open; this is where the ones nobody clicks twice a day went.
+  //
+  // It also holds the one thing there was nowhere to put. `-Mode uninstall`
+  // has always existed and, outside the Windows uninstaller, has never had a
+  // caller: dragging the app to the Trash left the whole runtime behind.
+  //
+  // Closing it is not a verb. The plugin panel navigates the window on its way
+  // out, so Rust has to be told; this one is only ever drawn over a page that
+  // is still sitting there underneath it.
+  var prefs = null, prefsAuto, prefsNotify, prefsApp, prefsDsh, prefsNode,
+      prefsTerm, prefsTermWhy;
+
+  // What Rust last pushed. It arrives on every page load — long before this
+  // panel is first built, on most launches — so it is kept here and applied
+  // when there is something to apply it to. See `sync_autostart`, `sync_notify`.
+  var switches = {{ 'autostart': false, 'notify-turns': false }};
+
+  function flip(knob, on) {{
+    knob.classList.toggle('dsh-pp-on', !!on);
+  }}
+
+  function toggle(parent, verb, name, why) {{
+    var line = make('div', 'dsh-pp-pref', parent);
+    var text = make('div', '', line);
+    make('div', 'dsh-pp-pname', text).textContent = name;
+    make('div', 'dsh-pp-pwhy', text).textContent = why;
+
+    var knob = make('div', 'dsh-pp-switch', line);
+    flip(knob, switches[verb]);
+    // Moved first and corrected afterwards: Rust pushes back what the system
+    // actually ended up with, which is not always what was asked for — a login
+    // item can be refused outright. Waiting for that answer instead would
+    // leave the switch still under the pointer, apparently ignoring it.
+    knob.addEventListener('click', function () {{
+      flip(knob, !knob.classList.contains('dsh-pp-on'));
+      signal(verb);
+    }});
+    return knob;
+  }}
+
+  function fact(parent, name) {{
+    var line = make('div', 'dsh-pp-fact', parent);
+    make('span', 'dsh-pp-fname', line).textContent = name;
+    return make('span', 'dsh-pp-fval', line);
+  }}
+
+  function hidePrefs() {{
+    if (prefs) prefs.classList.remove('dsh-pp-shown');
+  }}
+
+  function buildPrefs() {{
+    styles();
+
+    prefs = make('div', 'dsh-pp');
+    var card = make('div', 'dsh-pp-card', prefs);
+    make('h1', '', card).textContent = TEXT.prefsTitle;
+
+    var body = make('div', 'dsh-pp-list', card);
+    prefsAuto = toggle(body, 'autostart', TEXT.prefsAutostart, TEXT.prefsAutostartWhy);
+    prefsNotify = toggle(body, 'notify-turns', TEXT.prefsNotify, TEXT.prefsNotifyWhy);
+
+    make('div', 'dsh-pp-rule', body);
+
+    // The app's version carries the button, because checking for one is the
+    // only thing anybody does with a version number.
+    var appLine = make('div', 'dsh-pp-fact', body);
+    make('span', 'dsh-pp-fname', appLine).textContent = TEXT.prefsApp;
+    prefsApp = make('span', 'dsh-pp-fval', appLine);
+    button(appLine, TEXT.prefsCheck, function () {{
+      signal('check-app');
+    }}).className = 'dsh-pp-small';
+
+    prefsDsh = fact(body, TEXT.prefsDsh);
+    prefsNode = fact(body, TEXT.prefsNode);
+
+    // Which dsh a shell of theirs answers with. It is the one number here the
+    // app cannot fix for them -- our PATH entry goes first, but the machine's
+    // PATH is composed ahead of the user's and only they can write to it -- so
+    // the whole of what this row does is refuse to let it be silent.
+    prefsTerm = fact(body, TEXT.prefsTerminal);
+    prefsTermWhy = make('div', 'dsh-pp-note', body);
+    prefsTermWhy.hidden = true;
+
+    make('div', 'dsh-pp-rule', body);
+
+    var gone = make('div', 'dsh-pp-pref', body);
+    var told = make('div', '', gone);
+    make('div', 'dsh-pp-pname', told).textContent = TEXT.prefsRemove;
+    make('div', 'dsh-pp-pwhy', told).textContent = TEXT.prefsRemoveWhy;
+    // The panel goes away first: what follows is a dialog, and the answer to it
+    // takes dsh down and the app with it.
+    button(gone, TEXT.prefsRemoveDo, function () {{
+      hidePrefs();
+      signal('runtime-remove');
+    }}).className = 'dsh-pp-danger dsh-pp-small';
+
+    var foot = make('div', 'dsh-pp-foot', card);
+    button(foot, TEXT.prefsDone, hidePrefs).className = 'dsh-pp-primary';
+
+    document.addEventListener('keydown', function (event) {{
+      if (event.key === 'Escape' && prefs.classList.contains('dsh-pp-shown')) {{
+        hidePrefs();
+      }}
+    }});
+
+    paint(prefs);
+    document.body.appendChild(prefs);
   }}
 
   // ------------------------------------------------- what Rust calls in --
@@ -619,6 +831,47 @@ pub fn script() -> String {
    *  that is still running or starting one that is not. */
   window.__dshPluginHide = function () {{
     if (root) root.classList.remove('dsh-pp-shown');
+  }};
+
+  /** Open the settings panel, with the versions Rust has just read off disk. */
+  window.__dshSettings = function (facts) {{
+    ready(function () {{
+      if (!prefs) buildPrefs();
+
+      var data;
+      try {{
+        data = JSON.parse(facts);
+      }} catch (error) {{
+        data = {{}};
+      }}
+
+      // A missing version is a real state, not an error: `dsh` and `node` are
+      // both blank on a launch that has not provisioned a runtime yet.
+      prefsApp.textContent = data.app || TEXT.prefsUnknown;
+      prefsDsh.textContent = data.dsh || TEXT.prefsUnknown;
+      prefsNode.textContent = data.node || TEXT.prefsUnknown;
+
+      var term = data.terminal || {{}};
+      var odd = !!term.path && !term.ours;
+      prefsTerm.textContent = term.ours ? TEXT.prefsTerminalOurs
+        : (term.path ? (term.version ? term.path + '  ' + term.version : term.path)
+                     : TEXT.prefsUnknown);
+      prefsTerm.classList.toggle('dsh-pp-odd', odd);
+      prefsTermWhy.textContent = odd ? TEXT.prefsTerminalWhy : '';
+      prefsTermWhy.hidden = !odd;
+
+      prefs.classList.add('dsh-pp-shown');
+    }});
+  }};
+
+  window.__dshAutostart = function (on) {{
+    switches['autostart'] = !!on;
+    if (prefsAuto) flip(prefsAuto, on);
+  }};
+
+  window.__dshNotifyTurns = function (on) {{
+    switches['notify-turns'] = !!on;
+    if (prefsNotify) flip(prefsNotify, on);
   }};
 }})();"#
     )

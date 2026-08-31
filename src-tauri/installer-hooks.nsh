@@ -1,19 +1,20 @@
-﻿; Getting the machine to a working dsh, and taking it back off on the way out.
+﻿; Taking the dsh runtime back off on the way out, and clearing away what an
+; older scheme left behind.
 ;
-; Neither is implemented here. `resources/install-deps.ps1` does the work —
-; detect Node, install one under %LOCALAPPDATA% if the machine has none, then
-; `npm install -g @deepseek-ai/dsh` — and this file is the installer's half of
-; calling it. The app calls the same script when a launch finds no dsh; see
-; `src-tauri/src/dsh.rs`. Doing it here in NSIS as well would mean a second
-; implementation of SHA256 verification and zip extraction on top of certutil
-; and tar, kept in step with the first one by hand.
+; Putting it *on* is not here any more. `resources/install-deps.ps1` does that
+; work — fetch the pinned Node under %LOCALAPPDATA%, `npm install` dsh and pnpm
+; beside it, write a launcher, put one directory on PATH — and the app is what
+; calls it: `provision` in `src-tauri/src/dsh.rs`, at first launch, on all three
+; platforms. This hook used to call it as well, which made Windows the only
+; platform where the script ever ran a second time; see NSIS_HOOK_POSTINSTALL
+; for what that cost.
 ;
-; The wait is put inside the installer's progress on purpose: an install pulls
-; 185 MB of dsh and possibly 35 MB of Node on top, and that is a wait a user
-; expects from an installer and does not expect from a window they just opened.
-; When it fails the install says so rather than quietly finishing without the
-; thing it runs — but it is no longer the only chance, because the app can now
-; run the same script itself.
+; The script still ships in $INSTDIR, because the uninstaller is the one caller
+; NSIS keeps: NSIS_HOOK_PREUNINSTALL takes a copy along and
+; NSIS_HOOK_POSTUNINSTALL offers to run `-Mode uninstall` with it. Doing that
+; deletion here instead would mean a second implementation of it in NSIS — the
+; `\\?\` long-path handling npm's 30,000-file tree needs included — kept in step
+; with the first one by hand.
 ;
 ; Nothing here needs elevation. The script writes under %LOCALAPPDATA% and to
 ; HKCU\Environment, both of which the current user owns.
@@ -246,15 +247,59 @@ FunctionEnd
 ; Take `dir` back off the user's own PATH. `un` is `Un` in the uninstaller,
 ; where StrFunc's copies of its functions answer to their own names.
 ;
-; $0 the PATH   $1 its length   $2 padded for the search   $3 what gets written
+; $0 the PATH   $1 the open key, then the kind to write back
+; $2 the kind as read, then padded for the search   $3 its size, then the result
 !macro DshPathDrop un dir
-  ReadRegStr $0 HKCU "Environment" "Path"
+  ; What kind the value is and how many bytes it holds, asked of the registry
+  ; directly. NSIS reports neither: `ReadRegStr` hands back a string and
+  ; nothing else.
+  ;
+  ; The kind matters because the value has to go back as whatever it already
+  ; was. `Write-UserPath` in `install-deps.ps1` preserves it too, and the two
+  ; have to agree: both edit this one value, and an uninstall reaches it
+  ; through either of them — the script when the user keeps the runtime, this
+  ; macro when the script never ran. Writing the wrong kind is not fatal, but
+  ; it decides whether a `%VAR%` in somebody else's PATH entry still expands,
+  ; and it would leave the round trip byte-for-byte on only one of the two.
+  ;
+  ; The size matters because it is the only thing that tells the two failures
+  ; below apart. A key that will not open, or no `Path` value at all, leaves
+  ; both at 0.
+  StrCpy $1 0
+  StrCpy $2 0
+  StrCpy $3 0
+  System::Call 'ADVAPI32::RegOpenKeyExW(i 0x80000001, w "Environment", i 0, i 0x20019, *i .r1)'
+  System::Call 'ADVAPI32::RegQueryValueExW(i r1, w "Path", i 0, *i .r2, i 0, *i .r3)'
+  System::Call 'ADVAPI32::RegCloseKey(i r1)'
 
-  ; NSIS strings stop at 1024 characters, and `ReadRegStr` truncates to fit
-  ; without saying so. Writing that back would take everything past the cut with
-  ; it, so a PATH anywhere near the limit is left exactly as it is.
-  StrLen $1 $0
-  ${If} $1 < 1000
+  ; NSIS strings stop at NSIS_MAX_STRLEN — 1024 in the compiler Tauri bundles —
+  ; and a `Path` that long does not come back cut short. It does not come back
+  ; at all: `ReadRegStr` answers with an empty string and sets the error flag.
+  ; Measured on that build, 1023 characters read back whole and 1024 read back
+  ; as "".
+  ;
+  ; So there is no partial read to defend against. This used to skip any PATH
+  ; over 1000 characters, which guarded a truncation that never happens while
+  ; silently leaving the entry behind on a PATH of 1000 to 1023 characters —
+  ; one that rewrites perfectly well.
+  ClearErrors
+  ReadRegStr $0 HKCU "Environment" "Path"
+  ${If} ${Errors}
+    ; Too long to read, so too long to edit. Say so: leaving a stale `dsh` on
+    ; someone's PATH is bad, and leaving it there without a word is worse.
+    ; `$3` keeps this off the screen of a user who simply has no `Path` of
+    ; their own, which is not worth a line.
+    ;
+    ; Whether the entry is actually there cannot be confirmed from here — the
+    ; value is precisely what could not be read — so this asks rather than
+    ; asserts. An uninstall inserts this macro three times, and a machine in
+    ; this state sees one line per directory.
+    ${If} $3 > 0
+      DetailPrint "PATH 超过 1023 个字符，安装程序无法安全地修改它。请手动检查「用户环境变量 Path」，如果有这一项就删掉：${dir}"
+    ${EndIf}
+  ${Else}
+    ; Keep the kind, because `$2` is needed for the search.
+    StrCpy $1 $2
     ; Padded at both ends so the first and last entries match like any other.
     StrCpy $2 ";$0;"
     ${${un}StrRep} $3 $2 ";${dir};" ";"
@@ -264,7 +309,14 @@ FunctionEnd
       StrCpy $3 $3 -1
       ${If} $3 == ""
         DeleteRegValue HKCU "Environment" "Path"
+      ${ElseIf} $1 = 1
+        ; REG_SZ.
+        WriteRegStr HKCU "Environment" "Path" $3
       ${Else}
+        ; REG_EXPAND_SZ, and the fallback for a probe that answered nothing: it
+        ; is what Windows itself creates a user `Path` as, and the safer of the
+        ; two guesses, since it expands a `%VAR%` that a REG_SZ would leave
+        ; broken.
         WriteRegExpandStr HKCU "Environment" "Path" $3
       ${EndIf}
       !insertmacro DshPathBroadcast
@@ -327,24 +379,26 @@ FunctionEnd
 
   !insertmacro DshMigrate
 
-  SetDetailsPrint both
-  DetailPrint "正在检查 Node 和 dsh…"
-  SetDetailsPrint lastused
-
-  ; Everything the script does — what it found, what it decided to install, and
-  ; npm's own http log while it runs — goes into the details pane, which is the
-  ; only thing moving during a download that takes minutes.
-  nsExec::ExecToLog '${DSH_POWERSHELL} "$INSTDIR\${DSH_SCRIPT}" -Mode install'
-  Pop $0
-
-  ${If} $0 != "0"
-    SetDetailsPrint both
-    DetailPrint "Node 或 dsh 安装失败（退出码 $0）。"
-    SetDetailsPrint lastused
-    ${IfNot} ${Silent}
-      MessageBox MB_OK|MB_ICONEXCLAMATION "dsh 没有安装成功。$\r$\n$\r$\n通常是网络或代理的问题 —— 安装过程需要从 nodejs.org 和 npm 下载。$\r$\n$\r$\n应用本身已经装好了，下次启动时它会再试一次；也可以换一个网络或代理后重新运行安装程序。"
-    ${EndIf}
-  ${EndIf}
+  ; And that is all this hook does now.
+  ;
+  ; It used to run `${DSH_SCRIPT} -Mode install` here, which made this the only
+  ; platform where the script re-ran on an upgrade — and so the only platform a
+  ; bumped `NODE_VERSION`, a rewritten launcher, or a new migration ever reached.
+  ; macOS and Linux have no installer to hang that off, so a runtime there was
+  ; built once at first launch and never touched again.
+  ;
+  ; The app does it instead, on all three, from `provision` in
+  ; `src-tauri/src/dsh.rs`: it knows which version built the runtime it is
+  ; looking at, so it can tell "already done" from "done by an older release" —
+  ; which an installer hook, running before the app has ever started, cannot.
+  ;
+  ; The script still ships in `$INSTDIR`; `NSIS_HOOK_PREUNINSTALL` takes it
+  ; along so the uninstaller can run `-Mode uninstall` with it.
+  ;
+  ; The visible cost is that the first launch after installing is the one that
+  ; downloads Node and dsh, rather than the installer's progress pane. It has
+  ; the loading page and the same `::progress` lines to report on, and it is
+  ; what every macOS and Linux install has always done.
 
   Pop $R5
   Pop $R0
@@ -354,29 +408,24 @@ FunctionEnd
   Pop $0
 !macroend
 
-; The uninstaller runs the same script, and by the time it does, neither the
-; script nor what it wrote down is still where it was.
+; The uninstaller runs the same script, and by the time it does `$INSTDIR` is
+; gone — `NSIS_HOOK_POSTUNINSTALL` runs after the app's own files are deleted —
+; so the script is taken along now, into the temporary directory NSIS cleans up
+; on its own.
 ;
-; `$INSTDIR` is gone: `NSIS_HOOK_POSTUNINSTALL` runs after the app's own files
-; are deleted. And `bootstrap.json` may be gone with it — the template's "delete
-; app data" checkbox does `RMDir /r` on `%LOCALAPPDATA%\${BUNDLEID}`, the
-; directory the marker lives in, in the same section and a few lines earlier.
-; The marker is the only place the script reads its state from, so losing it
-; means losing the answers to questions the user has not been asked yet.
-;
-; Both are therefore taken along now, into the temporary directory NSIS cleans
-; up on its own.
+; `bootstrap.json` used to be carried along beside it, and restored afterwards
+; if the "delete app data" checkbox had taken it, because the marker was the
+; only record of which Node was ours and which npm could remove dsh. There is no
+; marker any more and nothing to preserve: everything the uninstaller removes is
+; at a path it can name outright.
 ;
 ; This hook runs ahead of the generated `CheckIfAppIsRunning`, so it may well be
-; running for an uninstall the user is about to abort. Copying two files costs
+; running for an uninstall the user is about to abort. Copying one file costs
 ; nothing in that case.
 !macro NSIS_HOOK_PREUNINSTALL
   InitPluginsDir
   ${If} ${FileExists} "$INSTDIR\${DSH_SCRIPT}"
     CopyFiles /SILENT "$INSTDIR\${DSH_SCRIPT}" "$PLUGINSDIR\install-deps.ps1"
-  ${EndIf}
-  ${If} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
-    CopyFiles /SILENT "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json" "$PLUGINSDIR\bootstrap.json"
   ${EndIf}
 !macroend
 
@@ -394,14 +443,8 @@ FunctionEnd
   Push $3
   Push $R0
   Push $R1
-  Push $R2
   Push $R4
   Push $R5
-
-  ; Whether the marker below is a copy this hook put back, and so a copy this
-  ; hook takes away again. Set here because `uninstall_done` reads it on every
-  ; path through this macro, including the one that leaves right now.
-  StrCpy $R2 ""
 
   ; Not every run of this uninstaller is a removal, and the two that are not
   ; both end with the app still installed:
@@ -436,70 +479,56 @@ FunctionEnd
   RMDir "$R5"
   RMDir "$INSTDIR"
 
-  ; The marker back where the script reads it, if the "delete app data" checkbox
-  ; took it out from under us. `NSIS_HOOK_PREUNINSTALL` kept a copy for exactly
-  ; this. It goes away again at `uninstall_done` — restoring it here is for the
-  ; length of this uninstall and no longer, and a user who asked for the app data
-  ; to be deleted gets that.
-  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
-  ${AndIf} ${FileExists} "$PLUGINSDIR\bootstrap.json"
-    CreateDirectory "$LOCALAPPDATA\${BUNDLEID}"
-    CopyFiles /SILENT "$PLUGINSDIR\bootstrap.json" "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
-    StrCpy $R2 "1"
-  ${EndIf}
-
-  ; `bootstrap.json` is what the script writes down about this machine, and
-  ; without it there is nothing to ask: no record of which Node is ours, and no
-  ; npm recorded to take dsh back off with. The script is still the final
-  ; authority on the Node — it declines to remove one that was already there when
-  ; it arrived — while dsh goes if the user says it goes, whoever installed it:
-  ; either way it is one `npm install -g`, and the question below names it.
-  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
-    Goto uninstall_data
-  ${EndIf}
+  ; One question, where there used to be two.
+  ;
+  ; The old pair had to ask about dsh and about Node separately, because dsh
+  ; might have been the user's own — installed globally with their npm, into
+  ; their prefix — while only a Node under `%LOCALAPPDATA%` was ever ours. That
+  ; distinction was read out of `bootstrap.json`, and getting it wrong meant an
+  ; uninstaller running `npm uninstall -g` against a dsh it had never installed.
+  ;
+  ; Nothing outside `%LOCALAPPDATA%\${BUNDLEID}` is ours any more, and
+  ; everything inside it is. So there is one thing to remove, it is named by a
+  ; path rather than by a marker, and a dsh the user installed themselves cannot
+  ; be reached from here at all.
   ${If} ${Silent}
     Goto uninstall_data
   ${EndIf}
+  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\runtime\node\node.exe"
+    Goto uninstall_data
+  ${EndIf}
   ${IfNot} ${FileExists} "$PLUGINSDIR\install-deps.ps1"
-    DetailPrint "找不到卸载脚本，Node 和 dsh 保持原样。"
+    DetailPrint "找不到卸载脚本，dsh 运行时保持原样。"
     Goto uninstall_data
   ${EndIf}
 
-  StrCpy $R1 ""
+  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "是否同时删除本应用安装的 dsh 运行时？$\r$\n$\r$\n它装在 $LOCALAPPDATA\${BUNDLEID}，包含一个专用的 Node 和 dsh 本体，约 360 MB。$\r$\n$\r$\n你自己安装的 Node 和 dsh 不受影响。" IDNO uninstall_data
 
-  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "是否同时卸载 dsh？$\r$\n$\r$\n选「否」会保留它，终端里的 dsh 命令仍然可用。" IDNO keep_dsh
-  StrCpy $R1 "$R1 -RemoveDsh"
-  keep_dsh:
-
-  ; Only worth asking where there is a Node of ours to remove. The directory
-  ; only exists because the script put it there.
-  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\node\node.exe"
-    Goto keep_node
-  ${EndIf}
-  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "是否同时卸载本应用安装的 Node.js？$\r$\n$\r$\n它装在 $LOCALAPPDATA\${BUNDLEID}\node，不影响你自己装的 Node。$\r$\n$\r$\n注意：dsh 依赖 Node 才能运行，删掉 Node 会连同 dsh 一起删除。" IDNO keep_node
-  StrCpy $R1 "$R1 -RemoveNode"
-  keep_node:
-
-  ${If} $R1 != ""
-    SetDetailsPrint both
-    DetailPrint "正在清理…"
-    SetDetailsPrint lastused
-    nsExec::ExecToLog '${DSH_POWERSHELL} "$PLUGINSDIR\install-deps.ps1" -Mode uninstall$R1'
-    Pop $0
-    ${If} $0 != "0"
-      DetailPrint "清理时出错（退出码 $0）。"
-    ${EndIf}
+  SetDetailsPrint both
+  DetailPrint "正在清理…"
+  SetDetailsPrint lastused
+  nsExec::ExecToLog '${DSH_POWERSHELL} "$PLUGINSDIR\install-deps.ps1" -Mode uninstall'
+  Pop $0
+  ${If} $0 != "0"
+    DetailPrint "清理时出错（退出码 $0）。"
   ${EndIf}
 
   uninstall_data:
-  ; A Node of ours that is no longer there — removed just now, or taken out from
-  ; under us by the template's "delete app data" checkbox, which has already had
-  ; its turn at `%LOCALAPPDATA%\${BUNDLEID}` by the time this hook runs. Either
-  ; way its PATH entry now points at nothing. A Node the user chose to keep
-  ; still exists, and keeps its entry.
-  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\node\node.exe"
-    !insertmacro DshPathDrop "Un" "$LOCALAPPDATA\${BUNDLEID}\node"
+  ; The launcher directory is gone — removed just now, or taken out from under us
+  ; by the template's "delete app data" checkbox, which has already had its turn
+  ; at `%LOCALAPPDATA%\${BUNDLEID}` by the time this hook runs — so its PATH
+  ; entry now points at nothing and comes off. A runtime the user chose to keep
+  ; still has its launcher, and keeps its entry.
+  ;
+  ; The script drops the same entry itself, and dropping it twice is a no-op.
+  ; This is for the paths where the script never ran: a silent uninstall, or the
+  ; checkbox having deleted the runtime before we could ask about it.
+  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\bin\dsh.cmd"
+    !insertmacro DshPathDrop "Un" "$LOCALAPPDATA\${BUNDLEID}\bin"
   ${EndIf}
+  ; And the entry the pre-runtime scheme left, for a machine upgrading straight
+  ; past it into an uninstall.
+  !insertmacro DshPathDrop "Un" "$LOCALAPPDATA\${BUNDLEID}\node"
 
   ; `$DSH_HOME` is the user's own: settings, profiles, conversation history.
   ; None of it is ours to throw away without being told to, and a reinstall
@@ -523,17 +552,12 @@ FunctionEnd
   RMDir /r "$R4"
 
   uninstall_done:
-  ; `RMDir` and not `RMDir /r`: the directory goes only if the marker was the
-  ; last thing in it, which is the case the checkbox left behind. Anything the
-  ; script wrote back into it is the script's to keep.
-  ${If} $R2 == "1"
-    Delete "$LOCALAPPDATA\${BUNDLEID}\bootstrap.json"
-    RMDir "$LOCALAPPDATA\${BUNDLEID}"
-  ${EndIf}
+  ; Nothing to put back. This label used to restore a `bootstrap.json` the hook
+  ; had copied aside so the uninstall script could read it, then delete it again;
+  ; there is no marker now, so every path through this macro simply lands here.
 
   Pop $R5
   Pop $R4
-  Pop $R2
   Pop $R1
   Pop $R0
   Pop $3

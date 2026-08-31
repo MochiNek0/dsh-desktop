@@ -6,21 +6,37 @@
 # certutil and tar, and the Rust copy would then do the whole thing again.
 #
 # Nothing here needs elevation, which is the point of downloading the standalone
-# Node zip rather than running the official MSI. The zip goes under
-# %LOCALAPPDATA%, `npm install -g` writes to a per-user prefix, and the only
-# thing touched outside our own directory is HKCU\Environment's Path.
+# Node zip rather than running the official MSI. Everything goes under
+# %LOCALAPPDATA%, and the only thing touched outside our own directory is
+# HKCU\Environment's Path.
 #
-# A Node the machine already has is used as it is and never replaced; the same
-# goes for a dsh already on PATH — installing a second copy beside it would be
-# 327 MB nobody asked for. Updating one is a different matter: whoever installed
-# it, it is one `npm install -g` in some prefix, so `update` replaces it in place
-# in the prefix it is actually in. What this script installed is written down in
-# `bootstrap.json`, which is what keeps `uninstall` off a Node it did not put
-# there.
+# The app owns its runtime outright, and that one decision is what keeps the
+# rest of this short:
+#
+#     <AppDir>/runtime/node/                  a pinned Node, ours alone
+#     <AppDir>/runtime/node_modules/          dsh and pnpm, a *local* install
+#     <AppDir>/bin/dsh.cmd                    the only thing put on PATH
+#
+# Nothing is detected and nothing is shared. A Node the machine already has is
+# not reused, a dsh the user installed themselves is never touched, and npm's
+# global prefix is not involved at all — so no version manager can move any of
+# it, and every path above is a constant derived from %LOCALAPPDATA% rather than
+# something that has to be discovered and written down. There is no marker file:
+# `bootstrap.json` is read once by `Migrate-Legacy` to clean up after the old
+# scheme and never written again.
+#
+# The launcher is written here rather than left to npm because npm's generated
+# `.cmd` shim falls back to whatever `node` is on PATH, which is the exact
+# coupling this layout exists to remove. `Write-Launcher` hard-codes ours.
+#
+# `install` and `update` are the same npm command into the same directory, so
+# `update` is three lines. `uninstall` deletes two directories and drops one
+# PATH entry; it cannot touch anything of the user's, because it does not know
+# how to name anything outside `<AppDir>`.
 #
 # Output is plain text for the installer's detail log. Pass `-Progress` and it
 # also emits `::status <text>` and `::progress <percent>` lines for the app's
-# loading page to parse, and switches stdout to UTF-8 — see `Bootstrap` in
+# loading page to parse, and switches stdout to UTF-8 — see `run` in
 # `src-tauri/src/dsh.rs`. Without it stdout stays in the ANSI code page, which
 # is what NSIS decodes `nsExec::ExecToLog` output as.
 #
@@ -30,22 +46,14 @@
 [CmdletBinding()]
 param(
     # `install` gets the machine to a working dsh and is what both callers use.
-    # `update` moves an existing one to the newest release. `uninstall` removes
-    # what the switches below name, and only what this script installed.
+    # `update` moves it to the newest release. `uninstall` removes the runtime
+    # this script installed, which is the only thing it can name.
+    #
+    # There is no `-Prefix` any more: install, update and uninstall all act on
+    # `<AppDir>/runtime`, which is a constant. The app used to have to work out
+    # which prefix its dsh was in and pass it down; now there is one answer.
     [ValidateSet('install', 'update', 'uninstall')]
     [string] $Mode = 'install',
-
-    # `update` only: the npm global prefix holding the dsh to replace. The app
-    # resolves it from the copy it is actually running — see `prefix_of` in
-    # `src-tauri/src/dsh.rs` — because a dsh the user installed themselves sits
-    # in their own prefix, not in the one this script would default to. Empty
-    # falls back to the marker's prefix, and then to npm's own default.
-    [string] $Prefix = '',
-
-    # `uninstall` only. Node cannot go without dsh going too: dsh is a Node
-    # program, and leaving it behind would leave a command that cannot run.
-    [switch] $RemoveDsh,
-    [switch] $RemoveNode,
 
     # Emit machine-readable progress alongside the human log, in UTF-8.
     [switch] $Progress
@@ -70,22 +78,38 @@ $Package = '@deepseek-ai/dsh'
 # three have to agree.
 $Identifier = 'ai.deepseek.dsh.desktop'
 $AppDir = Join-Path $env:LOCALAPPDATA $Identifier
-$NodeDir = Join-Path $AppDir 'node'
-$Marker = Join-Path $AppDir 'bootstrap.json'
+
+# Everything below is a constant, and that is the point. `dsh.rs` derives the
+# same paths from `app_local_data_dir()` without reading anything — see
+# `runtime`, `node_dir`, `node` and `entry` there. The two have to agree.
+$RuntimeDir = Join-Path $AppDir 'runtime'
+$NodeDir = Join-Path $RuntimeDir 'node'
+$BinDir = Join-Path $AppDir 'bin'
+
+# npm's own entry point beside our Node, run through Node rather than through
+# the `npm.cmd` shim: no console window, and no dependency on how the machine
+# happens to resolve `npm`. A constant now that the Node is always ours.
+$NpmCli = Join-Path $NodeDir 'node_modules\npm\bin\npm-cli.js'
+
+# What the old scheme left behind, for `Migrate-Legacy` to clear away: a Node
+# under `<AppDir>\node`, an npm prefix under `<AppDir>\npm`, and the marker that
+# recorded where dsh had ended up. Nothing else reads any of these.
+$LegacyNodeDir = Join-Path $AppDir 'node'
+$LegacyNpmDir = Join-Path $AppDir 'npm'
+$LegacyMarker = Join-Path $AppDir 'bootstrap.json'
 
 # Pinned rather than resolved from `latest-v24.x`, so that what a user gets is a
 # visible commit here rather than whatever nodejs.org was serving that day.
 $NodeVersion = '24.19.0'
 
-# What an existing Node has to be for us to use it instead of installing our
-# own. dsh declares no `engines` field itself, but its direct dependency
-# commander@15 does — `>=22.12.0` — so anything under that will not run dsh at
-# all. Kept a little above that floor rather than pinned to it exactly.
+# There is no minimum-version floor any more, and no version check to go with
+# it. The floor existed to decide whether a Node the machine already had was
+# good enough to install dsh with; nothing is asked of the machine's Node now,
+# because nothing uses it. `$NodeVersion` above is what runs dsh, always.
 #
-# Has to match `NODE_MINIMUM` in `install-deps.sh`: this decides whether a
-# machine downloads 30 MB of Node it did not need, and the two answering
-# differently means the same Node is fine on one platform and not on another.
-$NodeMinimum = [version] '22.19.0'
+# That also settles a coupling the floor could never have caught: dsh's native
+# modules (koffi, node-pty) are built against one Node's ABI and will not load
+# on another's. Pinning the Node pins the ABI for the life of the install.
 
 # The mirrors that carry Node's own layout — same paths, same SHASUMS256.txt.
 # Which one is used is decided by measuring them (see `Sort-Mirrors`); this order
@@ -198,15 +222,64 @@ function Invoke-Native([string] $Exe, [string[]] $Arguments, [scriptblock] $OnLi
     }
 }
 
+# --------------------------------------------------------------- filesystem --
+
+# Delete a directory tree, including the parts of it Windows' 260-character path
+# limit puts out of reach. Answers whether the directory is gone; absent counts
+# as gone.
+#
+# `Remove-Item -Recurse` cannot do this, and fails in the worst possible way.
+# npm's tree runs well past MAX_PATH — `runtime\node_modules\…` measured 326
+# characters on the machine this was written on — and PowerShell 5.1's provider
+# throws `DirectoryNotFoundException` naming the leaf it lost, having deleted
+# *nothing*. Every call site here had `-ErrorAction SilentlyContinue` on it, so
+# that failure was invisible: `uninstall` printed "已删除" over a 360 MB tree it
+# had not touched, and the next install layered a new one on top.
+#
+# The `\\?\` prefix turns off path parsing in the Win32 layer, and MAX_PATH with
+# it. It requires a fully qualified path with no `.` or `..` components, which
+# every caller here has — they are all joins onto `$env:LOCALAPPDATA` — and a
+# different spelling for UNC, which `%LOCALAPPDATA%` is not on an ordinary
+# machine but can be when a profile is redirected to a share.
+function Remove-Tree([string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+
+    $extended = if ($Path.StartsWith('\\')) {
+        '\\?\UNC\' + $Path.Substring(2)
+    } else {
+        '\\?\' + $Path
+    }
+
+    try {
+        [IO.Directory]::Delete($extended, $true)
+    } catch {
+        # Reported rather than swallowed. A tree that will not go is usually a
+        # file held open by a dsh that is still running, and the user can act on
+        # that if they are told.
+        Say "删除 $Path 失败：$($_.Exception.Message)"
+    }
+
+    return (-not (Test-Path -LiteralPath $Path))
+}
+
 # ------------------------------------------------------------------- marker --
 
-# What this script installed, so that `uninstall` can leave alone what it did
-# not. Absent until something is actually installed — a machine that already had
-# both Node and dsh gets nothing written and nothing removed.
-function Read-Marker {
-    if (-not (Test-Path -LiteralPath $Marker)) { return @{} }
+# The old `bootstrap.json`, read for the one thing still worth knowing: whether
+# the Node under `<AppDir>\node` was installed by us and so is ours to delete.
+# `Migrate-Legacy` is the only caller, and after it runs the file is gone.
+#
+# Nothing writes a marker any more. It existed because a dsh could be anywhere
+# and its location had to be remembered; every path is a constant now, so there
+# is nothing to remember — and the whole class of bugs that came with reading it
+# back goes with it. The worst of those is worth naming, because it is why this
+# reader passes `-Encoding UTF8` and the Rust side used to strip a BOM: PS 5.1's
+# `Out-File -Encoding utf8` writes a BOM, and `serde_json` refuses to parse one,
+# so the app read an empty marker and reported no dsh at all on exactly the
+# machines that had no other way to find it.
+function Read-LegacyMarker {
+    if (-not (Test-Path -LiteralPath $LegacyMarker)) { return @{} }
     try {
-        $json = Get-Content -LiteralPath $Marker -Raw -Encoding UTF8
+        $json = Get-Content -LiteralPath $LegacyMarker -Raw -Encoding UTF8
         $read = @{}
         # PS 5.1's ConvertFrom-Json has no -AsHashtable.
         foreach ($field in (ConvertFrom-Json $json).PSObject.Properties) {
@@ -216,20 +289,6 @@ function Read-Marker {
     } catch {
         return @{}
     }
-}
-
-function Write-Marker([hashtable] $State) {
-    New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-    # Not `Out-File -Encoding utf8`. This runs under Windows PowerShell 5.1 —
-    # `powershell.exe`, which is what both the NSIS hook and the app invoke it
-    # with — where that spelling means UTF-8 *with* a BOM, and `serde_json` on
-    # the reading end refuses to parse one. The app fell back to an empty
-    # bootstrap and reported no dsh at all on exactly the machines that have no
-    # other way to find it: the ones this script installed a Node onto, which is
-    # nothing on any PATH. See `marker` in `dsh.rs`, which strips a BOM off the
-    # files this already wrote.
-    $json = $State | ConvertTo-Json
-    [IO.File]::WriteAllText($Marker, $json, (New-Object Text.UTF8Encoding $false))
 }
 
 # ------------------------------------------------------------------ probing --
@@ -445,51 +504,32 @@ function Sort-Registries([string] $Exe, [string] $Cli, [double] $At) {
 
 # --------------------------------------------------------------------- node --
 
-# The Node this run will use: ours if a previous run installed one, otherwise
-# whatever is on PATH — and either way only if it is new enough to be worth it.
-function Find-Node {
-    $ours = Join-Path $NodeDir 'node.exe'
-    if ((Test-Path -LiteralPath $ours) -and (Test-NodeVersion $ours)) { return $ours }
-
-    $found = Get-Command node -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($found -and (Test-NodeVersion $found.Source)) { return $found.Source }
-
-    return $null
+# Whether our Node is already unpacked and runnable. The whole of what used to
+# be `Find-Node`, `Find-AnyNode` and `Test-NodeVersion`: there is one Node this
+# script will ever use, at one path, so the only question left is whether it is
+# there.
+#
+# The version is not re-checked. `$NodeDir` is written by `Install-Node` and by
+# nothing else, and a pinned version bump replaces the directory wholesale — see
+# `Test-NodeCurrent`, which is what notices that.
+function Test-NodeReady {
+    return (Test-Path -LiteralPath (Join-Path $NodeDir 'node.exe')) -and
+           (Test-Path -LiteralPath $NpmCli)
 }
 
-# The Node an update runs npm with, when the marker's pair is gone or was never
-# written. Unlike `Find-Node` this asks no version question: the minimum decides
-# whether the machine needs a Node of ours *installed*, and an update installs
-# nothing — it replaces a dsh that is already here, with the npm beside whatever
-# Node put it there. Refusing a Node a few releases short of the minimum would
-# leave exactly that install permanently un-updatable, which is the case this
-# whole path exists for.
-function Find-AnyNode {
-    $ours = Join-Path $NodeDir 'node.exe'
-    if (Test-Path -LiteralPath $ours) { return $ours }
-
-    Sync-Path
-    $found = Get-Command node -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($found) { return $found.Source }
-
-    return $null
-}
-
-function Test-NodeVersion([string] $Exe) {
+# Whether the Node in `$NodeDir` is the pinned one. A `$NodeVersion` bump in a
+# new release of this app has to replace it, and the unpacked tree records what
+# it is in the `version` field of npm's own manifest — no process to start.
+function Test-NodeCurrent {
+    $manifest = Join-Path $NodeDir 'node_modules\npm\package.json'
+    if (-not (Test-Path -LiteralPath $manifest)) { return $false }
+    # Node's `.zip` unpacks as `node-v<version>-win-<arch>`, and `Install-Node`
+    # renames it to `$NodeDir`, so the version is not in the path any more. It
+    # is written beside it instead, by `Install-Node`, for exactly this.
+    $stamp = Join-Path $NodeDir '.dsh-node-version'
+    if (-not (Test-Path -LiteralPath $stamp)) { return $false }
     try {
-        $printed = & $Exe --version
-    } catch {
-        return $false
-    }
-    if ($LASTEXITCODE -ne 0 -or -not $printed) { return $false }
-
-    # `v24.19.0`, and the `-pre` suffix a nightly carries, which [version] would
-    # choke on.
-    $text = ([string] $printed).Trim().TrimStart('v').Split('-')[0]
-    try {
-        return ([version] $text) -ge $NodeMinimum
+        return ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $NodeVersion)
     } catch {
         return $false
     }
@@ -534,6 +574,10 @@ function Fetch([string] $Url, [string] $Path, [double] $From, [double] $To) {
 # Put a Node under `$NodeDir`, from the fastest mirror that answers with an
 # archive whose hash matches what that same mirror published.
 function Install-Node {
+    # Whether there is a tree here to replace, read before anything deletes it.
+    # A replacement invalidates more than the Node; see below.
+    $replacing = Test-Path -LiteralPath $NodeDir
+
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
     $name = "node-v$NodeVersion-win-$arch"
     $scratch = Join-Path ([IO.Path]::GetTempPath()) ('dsh-node-' + [Guid]::NewGuid().ToString('N'))
@@ -575,11 +619,19 @@ function Install-Node {
 
                 # Replaced rather than merged: a half-unpacked tree from an
                 # earlier attempt would otherwise survive underneath the new one.
-                if (Test-Path -LiteralPath $NodeDir) {
-                    Remove-Item -LiteralPath $NodeDir -Recurse -Force
+                if (-not (Remove-Tree $NodeDir)) {
+                    throw "无法删除旧的 Node 目录（$NodeDir）"
                 }
-                New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
+                New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
                 Move-Item -LiteralPath (Join-Path $scratch $name) -Destination $NodeDir
+
+                # What `Test-NodeCurrent` reads. The unpacked tree carries the
+                # version only in the directory name the archive came with, and
+                # that name is gone the moment it is renamed to `$NodeDir`.
+                [IO.File]::WriteAllText(
+                    (Join-Path $NodeDir '.dsh-node-version'),
+                    $NodeVersion,
+                    (New-Object Text.UTF8Encoding $false))
 
                 $installed = $true
                 break
@@ -592,60 +644,50 @@ function Install-Node {
             Fail "无法下载 Node $NodeVersion。已尝试 nodejs.org 和几个国内镜像，都没有成功，通常是网络或代理的问题。"
         }
     } finally {
-        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Tree $scratch | Out-Null
     }
 
     Say "Node 已安装到 $NodeDir"
+
+    # The Node these were built against is gone, so they have to go too.
+    #
+    # Nothing else would notice. `npm install` decides from the lockfile and the
+    # tree that the packages it was asked for are already there, and dsh's
+    # native modules — koffi, node-pty — are then loaded by ABI at require time,
+    # a long way from here and with nothing to connect the failure back to a
+    # Node version that changed. Both ship prebuilds covering several ABIs, so
+    # this would usually survive; a package that fell back to compiling would
+    # not, and "usually" is not a thing to leave in the boot path.
+    #
+    # Only on a replacement. A first install has nothing here to throw away.
+    if ($replacing) {
+        Say '自带的 Node 版本变了，正在清掉按上一版装好的依赖…'
+        Remove-Tree (Join-Path $RuntimeDir 'node_modules') | Out-Null
+        Remove-Item -LiteralPath (Join-Path $RuntimeDir 'package-lock.json') `
+            -Force -ErrorAction SilentlyContinue
+    }
+
     return (Join-Path $NodeDir 'node.exe')
 }
 
 # ---------------------------------------------------------------------- npm --
 
-# npm's own entry point next to `$Exe`, to be run through Node rather than
-# through the `npm.cmd` shim: no console window, and no dependency on how the
-# machine happens to resolve `npm`.
-function Find-Npm([string] $Exe) {
-    $cli = Join-Path (Split-Path -Parent $Exe) 'node_modules\npm\bin\npm-cli.js'
-    if (Test-Path -LiteralPath $cli) { return $cli }
-    return $null
-}
-
-# Where `npm install -g` puts things, for a Node whose prefix is the machine's
-# own business — the user's `.npmrc` decides, and asking npm is the only way to
-# learn it.
+# `Find-Npm`, `Get-Prefix` and `Get-ManagedPrefix` are gone. All three answered
+# the same question — where will this npm put a global install — and all three
+# existed because the answer depended on which Node was in hand and what the
+# user's `.npmrc` said about it.
 #
-# Not used for a Node this script installed: `npm prefix -g` there answers with
-# whatever the user configured, not with the Node directory beside it. See
-# `Get-ManagedPrefix`.
-function Get-Prefix([string] $Exe, [string] $Cli) {
-    try {
-        $printed = & $Exe $Cli prefix -g
-        if ($LASTEXITCODE -eq 0 -and $printed) { return ([string] $printed).Trim() }
-    } catch {
-        # Falls through to the directory npm would have defaulted to anyway.
-    }
-    return (Split-Path -Parent $Exe)
-}
-
-# Where a `-g` install goes for the Node *this script* unpacked: the Node
-# directory itself, which is npm's own default on Windows when nothing overrides
-# it — and the point is that something usually does.
+# There is no global install any more. dsh and pnpm go into `<AppDir>/runtime`
+# as an ordinary *local* install, so the destination is `--prefix` and nothing
+# else: not npm's configured prefix, not the directory beside the Node, not
+# whatever nvm repointed since. `npm prefix -g` is never asked, which is just as
+# well — on a machine running nvm-for-windows it answers with a directory nvm
+# moves out from under it, which is how a recorded prefix stopped resolving and
+# the app reported no dsh at all.
 #
-# `npm prefix -g` cannot answer this. It reports the configured prefix, and a
-# machine running nvm almost always has one: nvm-for-windows works by pointing
-# `C:\Program Files\nodejs` at the version in use, and a `prefix=` in the user's
-# `.npmrc` (or one inherited from an earlier Node) sends every global install
-# there. Letting npm default meant dsh being installed *by* the Node we just
-# unpacked and *into* nvm's tree — a directory nvm repoints on the next
-# `nvm use`, so the recorded prefix stopped resolving and the app reported no
-# dsh at all. It also paired dsh's native modules (koffi, node-pty) with one
-# Node major while leaving them to be loaded by another.
-#
-# So this is asserted rather than asked. The Node is ours, it is not on anyone's
-# PATH, and nothing else has an opinion about what belongs beside it.
-function Get-ManagedPrefix([string] $Exe) {
-    return (Split-Path -Parent $Exe)
-}
+# The local layout is also the same on every platform — `<runtime>/node_modules`
+# — where a `-g` install is not. `shim_dir`, `package_root` and `root_of` in
+# `dsh.rs` were three functions telling those two layouts apart; none survives.
 
 # What npm resolves `registry` to, which is the user's own `.npmrc` if they have
 # one. Empty when npm cannot be asked, which `Sort-Registries` reads as nothing
@@ -660,15 +702,20 @@ function Get-Registry([string] $Exe, [string] $Cli) {
     return ''
 }
 
-# One `npm install -g`, from one registry, into `$Prefix` when one is given and
-# npm's own default when it is not. npm's http log is read as it goes: every
-# tarball that comes back moves the bar, which is the only progress signal npm
-# offers that means anything.
-function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string] $Prefix, $Source, [double] $From, [double] $To) {
-    $arguments = @($Cli, 'install', '-g', '--no-audit', '--no-fund', '--loglevel=http')
-    if ($Prefix) { $arguments += "--prefix=$Prefix" }
+# One `npm install` into `$RuntimeDir`, from one registry. npm's http log is
+# read as it goes: every tarball that comes back moves the bar, which is the
+# only progress signal npm offers that means anything.
+#
+# Local rather than `-g`, which is the whole change. `--prefix` on a local
+# install names the directory holding `package.json` and `node_modules`, so the
+# packages land at `<runtime>/node_modules/<name>` on every platform and npm's
+# global prefix — the user's, configured in their `.npmrc`, moved by their
+# version manager — is not consulted and not written to.
+function Invoke-NpmInstall([string[]] $Specs, $Source, [double] $From, [double] $To) {
+    $arguments = @($NpmCli, 'install', '--no-audit', '--no-fund', '--loglevel=http',
+                   "--prefix=$RuntimeDir")
     if ($Source.Url) { $arguments += "--registry=$($Source.Url)" }
-    $arguments += $Spec
+    $arguments += $Specs
 
     Step "正在安装 dsh（$($Source.Label)）…" $From
 
@@ -682,10 +729,15 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
     # the installer hook runs before anything was unpacked, and the app inherits
     # whatever it was launched with. Without this every package with a build step
     # dies with `node` not found and npm rolls the whole install back.
+    #
+    # Ours goes on the *front*, so a build step that spells it `node` gets the
+    # Node its output will be loaded by. That is what keeps koffi and node-pty
+    # matched to the ABI that will run them.
     $was = $env:Path
-    $env:Path = (Split-Path -Parent $Exe) + [IO.Path]::PathSeparator + $env:Path
+    $node = Join-Path $NodeDir 'node.exe'
+    $env:Path = $NodeDir + [IO.Path]::PathSeparator + $env:Path
     try {
-        return (Invoke-Native $Exe $arguments {
+        return (Invoke-Native $node $arguments {
                 param($line)
                 # `fetch GET 200` is a package coming off the network, `cache` one
                 # npm already had. Counting both keeps the bar moving on a machine
@@ -700,10 +752,16 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
     }
 }
 
-# Install `Spec` through the fastest registry that works.
-function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [string] $Prefix, [double] $From, [double] $To) {
-    foreach ($source in (Sort-Registries $Exe $Cli $From)) {
-        if (Invoke-NpmInstall $Exe $Cli $Spec $Prefix $source $From $To) {
+# Install `$Specs` through the fastest registry that works.
+#
+# dsh and pnpm go in one command rather than two. They used to be installed by
+# different callers into different prefixes — dsh here, pnpm from `plugins.rs`
+# with a prefix it had to work out for itself — which is how they could end up
+# in two places, or how pnpm could end up somewhere the app then could not find.
+# One install into one directory cannot do either.
+function Install-Package([string[]] $Specs, [double] $From, [double] $To) {
+    foreach ($source in (Sort-Registries (Join-Path $NodeDir 'node.exe') $NpmCli $From)) {
+        if (Invoke-NpmInstall $Specs $source $From $To) {
             Say "dsh 安装完成（$($source.Label)）。"
             return $true
         }
@@ -712,29 +770,208 @@ function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [string] 
     return $false
 }
 
+# The `package.json` npm wants at the root of a local install. Without one npm
+# warns on every run and, worse, walks *up* looking for a project to install
+# into — which from `%LOCALAPPDATA%` could find anything at all.
+#
+# `private` keeps it from ever being publishable by accident, and the absence of
+# a `dependencies` block is deliberate: what is installed is decided by the
+# command line, so there is no second copy of the package list to drift.
+function Write-RuntimeManifest {
+    New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
+    $manifest = Join-Path $RuntimeDir 'package.json'
+    if (Test-Path -LiteralPath $manifest) { return }
+    $json = '{"name":"dsh-desktop-runtime","version":"1.0.0","private":true}'
+    [IO.File]::WriteAllText($manifest, $json, (New-Object Text.UTF8Encoding $false))
+}
+
+# ----------------------------------------------------------------- launcher --
+
+# dsh's entry point inside the runtime, read off the `bin` field of the package
+# npm just installed. `$null` if the package is not there or names no `dsh`.
+#
+# npm writes the field either way round — `"bin": "./cli.js"` when the package
+# has one binary named after itself, or `"bin": { "dsh": "./cli.js" }` when it
+# names them — and dsh has used both spellings across releases, so both are
+# read rather than one being assumed.
+function Get-DshEntry {
+    # `$Package` is npm's spelling, with a forward slash. Everything below joins
+    # it onto Windows paths and hands the result to a batch file, so it is
+    # normalised once here rather than at each use.
+    $dir = Join-Path $RuntimeDir ('node_modules\' + ($Package -replace '/', '\'))
+    $manifest = Join-Path $dir 'package.json'
+    if (-not (Test-Path -LiteralPath $manifest)) { return $null }
+
+    try {
+        $bin = (Get-Content -LiteralPath $manifest -Raw -Encoding UTF8 | ConvertFrom-Json).bin
+    } catch {
+        return $null
+    }
+    if (-not $bin) { return $null }
+
+    $relative = if ($bin -is [string]) { $bin } else { $bin.dsh }
+    if (-not $relative) { return $null }
+
+    # `./cli.js` and `cli.js` both, and forward slashes throughout — npm's own
+    # spelling, which `Join-Path` on Windows is happy to take but the batch file
+    # below is not.
+    $relative = ([string] $relative).TrimStart('.', '/', '\') -replace '/', '\'
+    $entry = Join-Path $dir $relative
+    if (-not (Test-Path -LiteralPath $entry)) { return $null }
+    return $entry
+}
+
+# The `dsh` the user's terminal gets: a batch file of our own, naming our Node
+# and our dsh by absolute path.
+#
+# npm generates a shim of its own at `<runtime>/node_modules/.bin/dsh.cmd`, and
+# putting *that* on PATH would undo the entire point of this layout. Its body is
+#
+#     @IF EXIST "%~dp0\node.exe" (...) ELSE ( node ... )
+#
+# and in our tree the `IF` fails, so every invocation would take the `ELSE` and
+# resolve `node` off the user's PATH — the coupling to whatever Node a version
+# manager last selected, reintroduced at the one point that is exposed to the
+# user. So the launcher is written here and the npm shim is never referenced.
+#
+# `%~dp0..` rather than an absolute path: `<AppDir>` contains the user's name,
+# and a batch file that works no matter where the tree is moved costs nothing.
+# The Unix counterpart in `install-deps.sh` *does* hard-code absolute paths,
+# because the file it writes is reached through a symlink and `$0` would resolve
+# against the link's directory rather than the launcher's.
+#
+# It also sets PATH, which does not contradict any of the above: naming Node and
+# dsh absolutely is what keeps *this* invocation off the user's PATH, and the
+# three directories prepended below are what keep everything dsh goes on to
+# spawn off it too. dsh forwards every plugin install to pnpm and finds it by
+# name — `pnpm not found on PATH` is its own error message — so a terminal
+# without this line runs the user's pnpm on the user's Node, builds a plugin's
+# native modules against that ABI, and hands dsh a `.node` its own Node cannot
+# load. That failure lands at plugin-load time, nowhere near the install that
+# caused it.
+#
+# The launcher's own directory goes first, ahead of the Node's. On Windows that
+# Node directory is npm's global prefix, so an `npm i -g` typed into a terminal
+# the app opened lands its shim there — and a `dsh` shim ahead of this launcher
+# would answer in that terminal and nowhere else. The launcher directory holds
+# one file, which is not named `node`, `npm` or `pnpm`, so leading with it costs
+# the rest of this nothing. The order matches `child_path` in
+# `src-tauri/src/dsh.rs`, so the terminal and the window run the same thing.
+function Write-Launcher {
+    $entry = Get-DshEntry
+    if (-not $entry) { return $false }
+
+    New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+
+    # Relative to `$BinDir`, which is `<AppDir>\bin`, so one level up.
+    $nodeDir = 'runtime\node'
+    $modulesBin = 'runtime\node_modules\.bin'
+    $relative = $entry.Substring($AppDir.Length).TrimStart('\')
+
+    # `setlocal` so the PATH below lasts exactly as long as this invocation. A
+    # .cmd run from an interactive cmd.exe edits that session's own environment
+    # otherwise, and the entry would still be there long after dsh had exited.
+    $body = @"
+@echo off
+rem Generated by dsh-desktop's install-deps.ps1. Edits are lost on the next
+rem install or update. Every path here is ours and none depends on PATH.
+setlocal
+set "PATH=%~dp0;%~dp0..\$nodeDir;%~dp0..\$modulesBin;%PATH%"
+"%~dp0..\$nodeDir\node.exe" "%~dp0..\$relative" %*
+"@
+
+    # ASCII: a batch file is read in the console's code page, and every byte
+    # written here is ASCII anyway. A BOM would be echoed as stray characters
+    # before the first command runs.
+    [IO.File]::WriteAllText((Join-Path $BinDir 'dsh.cmd'), $body, [Text.Encoding]::ASCII)
+    Say "已写入 $BinDir\dsh.cmd"
+    return $true
+}
+
 # --------------------------------------------------------------------- path --
 
-# Nothing here puts anything on the user's PATH any more, and that is
-# deliberate.
+# One directory goes on the user's PATH — `<AppDir>\bin`, holding the single
+# launcher above — and it goes on the *front*.
 #
-# The app does not need it: `dsh.rs` finds Node and dsh through `bootstrap.json`
-# and puts them in front of the PATH it hands the child itself — see
-# `search_path` and `apply_path` there. The only thing a PATH entry ever bought
-# was a bare `dsh` working in the user's own terminal, and the price was the
-# Node directory going on the front of it, shadowing whatever `node`, `npm` and
-# `npx` a version manager had put there and letting a shim be paired with a Node
-# of a different major version than its native modules were built for.
+# It used to go on the end, to leave a dsh the user installed themselves in
+# charge of their own terminal. What that actually produced was two dsh
+# installations sharing one `$DSH_HOME`: the other one wins every `dsh` typed
+# into a shell, it is not the copy the app updates, and it runs on whatever Node
+# it was installed with — so a plugin installed from the app, against the pinned
+# Node's ABI, fails to load when that other dsh is the one loading it. Being
+# polite about PATH order bought a failure that looks like a broken plugin.
 #
-# `Remove-Path` stays, for the entry versions up to 0.1.2 added.
+# Prepending is narrow here in a way it would not have been before. The
+# directory holds exactly one file, so the only command it can shadow is a
+# `dsh`; the machine's `node`, `npm`, `npx` and `pnpm` are untouched. That was
+# the failing of the entry versions up to 0.1.2 added, which put the whole Node
+# directory on the front of PATH and broke whatever version manager the user was
+# running.
+#
+# It is also reversible without touching anything that is not ours: `-Mode
+# uninstall` takes this one entry back off and whatever answered `dsh` before
+# answers again. No file outside `<AppDir>` is read, written or deleted.
+#
+# What it cannot do is win against a dsh on the *machine* PATH. Windows composes
+# a process's PATH as the machine's entries followed by the user's, and only
+# HKCU is writable without elevation — so a `dsh` in `C:\Program Files\nodejs`
+# or in nvm4w's symlink directory still answers first, and nothing this script
+# is allowed to do changes that.
+#
+# The path never changes, so this is written once and is still correct after any
+# number of updates — and after any number of `nvm use`.
 
-# Rebuild `$env:Path` from the registry. Whatever the installer just did — a Node
-# unpacked, a prefix prepended — is on the user's PATH and not on this process's,
-# which inherited its environment before any of it happened. The same goes for
-# the app, which the installer launches and which then runs this script.
-function Sync-Path {
-    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $env:Path = (@($machine, $user, $env:Path) | Where-Object { $_ }) -join ';'
+# The user's PATH exactly as stored, unexpanded.
+#
+# Not `Get-ItemProperty`, and not `[Environment]::GetEnvironmentVariable`: both
+# expand `REG_EXPAND_SZ`, so a PATH containing `%USERPROFILE%\bin` reads back
+# with the variable already substituted. Writing that value back would freeze
+# the expansion into the user's environment permanently — the entry would still
+# work today and break the moment anything about the profile moved. The registry
+# API is the only way to ask for the raw string.
+function Read-UserPath {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $false)
+    if (-not $key) { return '' }
+    try {
+        return [string] $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+    } finally {
+        $key.Close()
+    }
+}
+
+# Write it back with the kind it already had.
+#
+# Not a hard-coded `ExpandString`. Windows creates `Path` as `REG_EXPAND_SZ`,
+# but plenty of machines have a `REG_SZ` one — anything that ever wrote it with
+# `setx`, an installer, or `Set-ItemProperty` without `-Type` leaves it that
+# way, and this developer's own machine is one of them. Rewriting the kind is a
+# change to the user's environment that nobody asked for and that appending one
+# directory has no business making: on a `REG_SZ` PATH the promotion would
+# suddenly start expanding any literal `%FOO%` an entry contained.
+#
+# A `Path` that does not exist yet is created as `REG_EXPAND_SZ`, which is what
+# Windows itself would have made it.
+function Write-UserPath([string] $Value) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    if (-not $key) { throw '无法写入 HKCU\Environment' }
+    try {
+        if (-not $Value) {
+            $key.DeleteValue('Path', $false)
+            return
+        }
+
+        $kind = 'ExpandString'
+        try {
+            $existing = $key.GetValueKind('Path')
+            if ($existing -eq 'String') { $kind = 'String' }
+        } catch {
+            # No value there yet; the default above is the one to create.
+        }
+        $key.SetValue('Path', $Value, $kind)
+    } finally {
+        $key.Close()
+        Publish-Environment
+    }
 }
 
 # Tell everything already running that the environment changed. Without it the
@@ -757,266 +994,198 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
     }
 }
 
-function Remove-Path([string] $Dir) {
-    $key = 'HKCU:\Environment'
-    $current = (Get-ItemProperty -Path $key -Name Path -ErrorAction SilentlyContinue).Path
-    if (-not $current) { return }
+# Put `$Dir` at the front of the user's PATH, once.
+#
+# Every other copy of it comes out, so an entry an older version appended is
+# moved rather than duplicated — matched trimmed and case-insensitively, because
+# Windows paths are not case-sensitive and an entry the user has retyped by hand
+# may carry a trailing slash or a stray space. Getting that wrong leaves a
+# second copy behind on every update, and PATH only ever grows.
+#
+# The write is skipped when the result would be the string that is already
+# there, so the common case — the entry already first, from the last install —
+# neither writes the registry nor broadcasts a change to every window on the
+# desktop.
+function Add-Path([string] $Dir) {
+    # The read is inside the try with the write. A `Read-UserPath` that threw
+    # would otherwise take the whole script down before `Fail` could say what
+    # went wrong — and PATH is the one thing here that is not worth dying over,
+    # because the app runs dsh by absolute path and never consults it.
+    try {
+        $current = Read-UserPath
+        $entries = @($current.Split(';') | Where-Object { $_ -ne '' })
 
-    $entries = @($current.Split(';') | Where-Object { $_ -ne '' -and $_ -ne $Dir })
-    Set-ItemProperty -Path $key -Name Path -Value ($entries -join ';') -Type ExpandString
-    Publish-Environment
+        $others = @($entries | Where-Object { $_.Trim().TrimEnd('\') -ine $Dir.TrimEnd('\') })
+        $wanted = (@($Dir) + $others) -join ';'
+
+        if ($wanted -eq $current) {
+            Say "$Dir 已经在 PATH 最前面了。"
+            return $true
+        }
+
+        Write-UserPath $wanted
+    } catch {
+        Say "无法把 $Dir 写入 PATH：$($_.Exception.Message)"
+        Say "dsh 仍然可以在应用里正常使用；想在终端里用，手动把这个目录加进 PATH 即可。"
+        return $false
+    }
+    Say "已把 $Dir 放到 PATH 最前面，新开的终端里 dsh 就是应用自带的这一份了。"
+    return $true
+}
+
+function Remove-Path([string] $Dir) {
+    try {
+        $current = Read-UserPath
+        if (-not $current) { return }
+
+        $kept = @($current.Split(';') |
+            Where-Object { $_ -ne '' -and $_.Trim().TrimEnd('\') -ine $Dir.TrimEnd('\') })
+        # Nothing matched, so nothing is written. This runs on every install to
+        # clear away the old scheme's entries, and on most machines there are
+        # none — rewriting PATH to the value it already has would broadcast a
+        # change that did not happen.
+        $had = @($current.Split(';') | Where-Object { $_ -ne '' })
+        if ($kept.Count -eq $had.Count) { return }
+
+        Write-UserPath ($kept -join ';')
+    } catch {
+        Say "无法把 $Dir 移出 PATH：$($_.Exception.Message)"
+        return
+    }
     Say "已把 $Dir 移出 PATH。"
 }
 
 # -------------------------------------------------------------------- modes --
 
-# Whether the machine can already run dsh, and where from.
+# Clear away what the old scheme left behind in `<AppDir>`: a Node under `node`,
+# an npm prefix under `npm`, and the `bootstrap.json` that recorded where dsh
+# had ended up.
 #
-# The prefix a previous run recorded comes first, because nothing puts it on the
-# user's PATH any more — without this a dsh this script installed would be
-# invisible to the next run, which would then install it again.
+# Everything named here is inside our own application data directory, so all of
+# it is ours by construction and none of it needs the marker's permission to go.
+# The marker is read for one thing the paths cannot tell us — the PATH entry
+# versions up to 0.1.2 prepended, which named the prefix rather than `<AppDir>`.
 #
-# Then the user's own PATH, rebuilt from the registry: a dsh they installed
-# themselves sits in npm's default prefix, which npm's own installer put there,
-# and a Node unpacked a moment ago is on that PATH but not on this process's.
-function Find-Dsh([hashtable] $State) {
-    $recorded = [string] $State['prefix']
-    if ($recorded) {
-        $shim = Join-Path $recorded 'dsh.cmd'
-        if (Test-Path -LiteralPath $shim) { return $shim }
+# The old Node is deleted rather than moved into the new tree. It would have
+# saved a 30 MB download, but a `-g --prefix` install put dsh *inside* that
+# directory too, so moving it wholesale would carry 327 MB of dead weight into
+# the runtime and picking Node's own files back out would mean knowing the
+# contents of Node's zip. One download beats that.
+#
+# Run on every install rather than only the first: on an upgrade this is the one
+# moment it is reachable at all, and it costs nothing when there is nothing to
+# do.
+function Migrate-Legacy {
+    $stale = @($LegacyNodeDir, $LegacyNpmDir) | Where-Object { Test-Path -LiteralPath $_ }
+    if (-not $stale -and -not (Test-Path -LiteralPath $LegacyMarker)) { return }
+
+    Say '正在清理旧版本留下的运行时…'
+
+    # The entry 0.1.2 and earlier added. `Remove-Path` is a no-op when it is not
+    # there, which on most machines it is not.
+    #
+    # Only a prefix inside `<AppDir>` — the marker records where dsh was
+    # installed, and on a machine that already had a Node of its own that is the
+    # *user's* npm prefix, `%APPDATA%\npm`. That directory is on their PATH
+    # because npm's own installer put it there, it holds every other global
+    # command they have, and taking it off would break all of them.
+    $recorded = [string] (Read-LegacyMarker)['prefix']
+    if ($recorded -and $recorded.StartsWith("$AppDir\", 'OrdinalIgnoreCase')) {
+        Remove-Path $recorded
     }
+    Remove-Path $LegacyNodeDir
 
-    Sync-Path
-
-    $found = Get-Command dsh -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($found) { return $found.Source }
-    return $null
+    foreach ($dir in $stale) {
+        # Not fatal. A leftover tree costs disk and nothing else — the new
+        # runtime does not read from it — so a machine that cannot delete it
+        # still gets a working install, and `Remove-Tree` has already said why.
+        Remove-Tree $dir | Out-Null
+    }
+    Remove-Item -LiteralPath $LegacyMarker -Force -ErrorAction SilentlyContinue
 }
 
 function Install-All {
-    $state = Read-Marker
+    Migrate-Legacy
 
-    # The entry a version up to 0.1.2 prepended, taken back off. Only ours: a
-    # prefix like %APPDATA%\npm is on that PATH because npm's own installer put
-    # it there, and `Add-Path` left it alone for exactly that reason.
-    $recorded = [string] $state['prefix']
-    if ($recorded -and $recorded.StartsWith($NodeDir, 'OrdinalIgnoreCase')) {
-        Remove-Path $recorded
-    }
-
-    # dsh first, and a Node only if there turns out to be something to install
-    # it with. A Node is not a thing this app wants on the machine for its own
-    # sake — it is what `npm install -g` needs — so a machine that already has a
-    # dsh, whoever put it there, needs no Node of ours and gets none.
-    #
-    # The pairing matters as much as the download. dsh's native modules — koffi
-    # and node-pty — are built against one Node's ABI and refuse to load on
-    # another's, so the dsh that is already here has to be run with the Node it
-    # was installed with, not with one this script chose.
-    $dsh = Find-Dsh $state
-    if ($dsh) {
-        Say "检测到系统里已有 dsh（$dsh），跳过安装。"
-        if (-not $state.ContainsKey('dsh')) { $state['dsh'] = 'system' }
-
-        # Written down because the app cannot find this on its own: without a
-        # prefix in the marker `dsh.rs` looks for a dsh it cannot see, concludes
-        # there is none, and runs this script again on every launch.
-        if (-not $state['prefix']) {
-            $found = Find-DshPrefix $state $dsh
-            if ($found) { $state['prefix'] = $found }
-        }
-
-        # The Node beside it — that is the one its native modules were built
-        # for. `Find-AnyNode` asks no version question, and rightly: the floor
-        # decides whether a Node has to be installed, and here none does.
-        $node = [string] $state['nodeExe']
-        $cli = [string] $state['npmCli']
-        if (-not ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli))) {
-            $node = ''
-            $beside = if ($state['prefix']) { Join-Path ([string] $state['prefix']) 'node.exe' } else { '' }
-            if ($beside -and (Test-Path -LiteralPath $beside)) {
-                $node = $beside
-            } else {
-                $node = Find-AnyNode
-            }
-            if ($node) {
-                $cli = Find-Npm $node
-                if ($cli) {
-                    $state['nodeExe'] = $node
-                    $state['npmCli'] = $cli
-                    if (-not $state.ContainsKey('node')) { $state['node'] = 'system' }
-                }
-            }
-        }
-
-        Write-Marker $state
-        return
-    }
-
-    $node = Find-Node
-    if ($node) {
-        Say "检测到可用的 Node：$node"
-        if (-not $state.ContainsKey('node')) { $state['node'] = 'system' }
+    if ((Test-NodeReady) -and (Test-NodeCurrent)) {
+        Say "已有可用的 Node $NodeVersion（$NodeDir），跳过下载。"
+        Report 35
     } else {
-        Say "没有检测到 Node $NodeMinimum 或更高版本，正在为你安装。"
-        $node = Install-Node
-        $state['node'] = 'managed'
+        Install-Node | Out-Null
     }
 
-    # Ours or the machine's — asked of the Node in hand, not of whether this run
-    # installed one. `Find-Node` returns the Node a *previous* run unpacked
-    # before it ever looks at PATH, so a repair, or a retry after the 185 MB dsh
-    # download failed, arrives here holding a Node of ours with `Install-Node`
-    # never called. Asking the run instead sent exactly those installs to npm's
-    # default prefix — the nvm tree `Get-ManagedPrefix` exists to stay out of.
-    #
-    # The path rather than `$state['node']`: both `Find-Node` and `Install-Node`
-    # answer with `$NodeDir\node.exe` for ours, and this stays right on a
-    # machine whose marker was lost.
-    $managed = (Split-Path -Parent $node) -ieq $NodeDir
+    Write-RuntimeManifest
 
-    $cli = Find-Npm $node
-    if (-not $cli) { Fail "这个 Node 旁边没有 npm（$node），无法安装 dsh。" }
-
-    $state['nodeExe'] = $node
-    $state['npmCli'] = $cli
-    Write-Marker $state
-
-    # A Node of ours gets an explicit prefix beside it; the machine's own Node
-    # keeps npm's default, which is the user's configured prefix and the right
-    # answer for a Node they manage. See `Get-ManagedPrefix` for why the first
-    # case cannot be left to npm.
-    $prefix = if ($managed) { Get-ManagedPrefix $node } else { '' }
-
+    # Both in one command. pnpm used to be installed separately by `plugins.rs`,
+    # into a prefix it had to work out for itself; installing it here means it
+    # lands beside dsh by construction and the app never has to look for it.
     Step '正在下载 dsh，约 185 MB，请耐心等待…' 36
-    if (-not (Install-Package $node $cli "$Package@latest" $prefix 36 $ProgressCeiling)) {
+    if (-not (Install-Package @("$Package@latest", 'pnpm@latest') 36 $ProgressCeiling)) {
         Fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
     }
 
-    $state['dsh'] = 'managed'
-    # What was installed into, not what npm would report: with `--prefix` above
-    # the two differ exactly on the machines this matters for.
-    $state['prefix'] = if ($prefix) { $prefix } else { Get-Prefix $node $cli }
-    Write-Marker $state
+    if (-not (Write-Launcher)) {
+        Fail 'dsh 装好了，但在它的 package.json 里找不到入口，无法生成 dsh 命令。'
+    }
 
-    # Said rather than done: the app runs this dsh through the marker and needs
-    # nothing on PATH, and a user who wants it in their own terminal can decide
-    # for themselves whether to put it there.
-    Say "dsh 已安装到 $($state['prefix'])\dsh.cmd"
-    Say "想在终端里直接用 dsh，把 $($state['prefix']) 加进你的 PATH 即可。"
+    # The one thing that reaches outside `<AppDir>`, and the only reason the
+    # user's terminal knows about any of this. A failure here is not fatal: the
+    # app runs dsh by absolute path and does not need PATH at all.
+    Add-Path $BinDir | Out-Null
+
     Step 'dsh 安装完成。' 100
 }
 
+# The same npm command into the same directory as `install`. There is no prefix
+# to resolve and no dsh to find first, which is the whole of what this used to
+# be about.
 function Update-All {
-    $state = Read-Marker
-
-    # The pair that installed dsh, if it is still there: any npm can write into
-    # the prefix it is handed, but this one is known to work on this machine.
-    $node = $state['nodeExe']
-    $cli = $state['npmCli']
-    if (-not ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli))) {
-        $node = Find-AnyNode
-        if (-not $node) { Fail '这台机器上找不到 Node，无法更新 dsh。' }
-        $cli = Find-Npm $node
-        if (-not $cli) { Fail "这个 Node 旁边没有 npm（$node）。" }
-        Say "用 $node 更新 dsh。"
+    if (-not (Test-NodeReady)) {
+        Fail '运行时还没有装好，无法更新。重启应用会重新安装。'
     }
 
-    # The prefix the dsh being replaced actually lives in — `-Prefix` from the
-    # app, or the one this script installed into. Without one, npm's default,
-    # which is only the right answer when it is also where dsh already is.
-    $prefix = $Prefix
-    if (-not $prefix) { $prefix = [string] $state['prefix'] }
+    Write-RuntimeManifest
 
     Step '正在更新 dsh…' 0
-    if (-not (Install-Package $node $cli "$Package@latest" $prefix 0 $ProgressCeiling)) {
+    if (-not (Install-Package @("$Package@latest") 0 $ProgressCeiling)) {
         Fail 'dsh 更新失败，默认源和几个备用镜像都没有成功。'
     }
+
+    # Rewritten because a release is free to move its entry point, and the
+    # launcher names it directly rather than going through npm's shim.
+    Write-Launcher | Out-Null
+
     Step 'dsh 更新完成。' 100
 }
 
-# The npm global prefix a dsh lives in, for `npm uninstall -g --prefix` to
-# unpick, or `$null` if there is nothing here to point npm at.
+# Delete our runtime and take our entry back off PATH.
 #
-# The marker's prefix first — that is where this script installed — and then the
-# dsh on PATH, whose prefix is read off the layout `npm install -g` leaves on
-# Windows: the shim in the prefix, the package under the `node_modules` beside
-# it. Anything else is not an npm global install, and npm cannot remove it.
-function Find-DshPrefix([hashtable] $State, [string] $Dsh) {
-    $manifest = "node_modules\$Package\package.json"
-
-    $recorded = [string] $State['prefix']
-    if ($recorded -and (Test-Path -LiteralPath (Join-Path $recorded $manifest))) {
-        return $recorded
-    }
-
-    # `$Dsh` when the caller already has one, rather than looking twice.
-    $dsh = $Dsh
-    if (-not $dsh) { $dsh = Find-Dsh $State }
-    if ($dsh) {
-        $dir = Split-Path -Parent $dsh
-        if (Test-Path -LiteralPath (Join-Path $dir $manifest)) { return $dir }
-    }
-
-    return $null
-}
-
+# No npm involved: unpicking a tree package by package would have npm walk 33k
+# files to arrive at the same place `Remove-Item` reaches in one call. And
+# nothing here can name a file outside `<AppDir>`, so a dsh or a Node the user
+# installed themselves is not reachable from this function even in principle —
+# which is the difference from the version this replaces, where the uninstaller
+# would `npm uninstall -g` a dsh it had never installed.
 function Uninstall-All {
-    $state = Read-Marker
+    Remove-Path $BinDir
 
-    # Only a Node of ours goes: one the machine already had is not this
-    # uninstaller's to take, whatever the answer was. dsh has no such
-    # reservation — it is one `npm install -g` either way, and the user has just
-    # been asked about it by name.
-    #
-    # Node is also a Node program's only way to run, so taking it away while
-    # leaving dsh behind would leave a `dsh` command that cannot start.
-    $dropNode = $RemoveNode -and ($state['node'] -eq 'managed')
-    $dropDsh = $RemoveDsh -or $dropNode
+    Say '正在删除 dsh 运行时…'
 
-    if ($RemoveNode -and -not $dropNode) {
-        Say 'Node 是你自己装的，不会动它。'
+    $stuck = @()
+    foreach ($dir in @($RuntimeDir, $BinDir, $LegacyNodeDir, $LegacyNpmDir)) {
+        if (-not (Remove-Tree $dir)) { $stuck += $dir }
+    }
+    Remove-Item -LiteralPath $LegacyMarker -Force -ErrorAction SilentlyContinue
+
+    # Said only when it is true. The version this replaces printed it
+    # unconditionally, over a tree `Remove-Item` had silently failed to touch.
+    if ($stuck.Count -gt 0) {
+        Say "以下目录没能删掉，通常是 dsh 还在运行；退出后手动删除即可："
+        foreach ($dir in $stuck) { Say "  $dir" }
+        exit 1
     }
 
-    if ($dropDsh) {
-        $prefix = Find-DshPrefix $state
-
-        if (-not $prefix) {
-            Say '找不到 dsh 装在哪里（不是 npm 全局安装？），跳过卸载 dsh。'
-        } elseif ($dropNode -and $prefix.StartsWith($NodeDir, 'OrdinalIgnoreCase')) {
-            # It lives inside the directory about to be deleted, and asking npm
-            # to walk 33k files first would only be slower.
-            Say 'dsh 装在即将删除的 Node 目录里，会随它一起删掉。'
-        } else {
-            # npm has to unpick its own tree, and it has to be pointed at the
-            # prefix holding it rather than at whatever this run would default to.
-            $node = $state['nodeExe']
-            $cli = $state['npmCli']
-            if ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli)) {
-                if ($state['dsh'] -ne 'managed') {
-                    Say '这份 dsh 不是本应用装的，按你的选择一并卸载。'
-                }
-                Say "正在卸载 dsh（$prefix）…"
-                Invoke-Native $node @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null | Out-Null
-            } else {
-                Say '找不到可用的 npm，跳过卸载 dsh。'
-            }
-        }
-    }
-
-    if ($dropNode) {
-        if ($state['prefix']) { Remove-Path $state['prefix'] }
-        Say '正在删除 Node 和 dsh…'
-        Remove-Item -LiteralPath $NodeDir -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
-        return
-    }
-
-    if ($dropDsh) {
-        $state.Remove('dsh')
-        Write-Marker $state
-    }
+    Say '已删除。你自己安装的 Node 和 dsh 没有被改动。'
 }
 
 switch ($Mode) {

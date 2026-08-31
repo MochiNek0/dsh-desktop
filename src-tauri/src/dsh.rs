@@ -1,32 +1,58 @@
 //! The dsh this app runs: finding it, and getting one onto the machine when
 //! there is none.
 //!
-//! Nothing about dsh ships inside the app and nothing here unpacks it. dsh is a
-//! global npm install — `npm install -g @deepseek-ai/dsh` — so the copy the app
-//! starts is the same copy the user's terminal gets, and updating it is one npm
+//! Nothing about dsh ships inside the app and nothing here unpacks it. dsh is an
+//! ordinary npm install into a directory the app owns, so updating it is one npm
 //! command rather than a download into a staging directory and a rename on the
-//! next launch.
+//! next launch — and the copy the app starts is the same copy the launcher on
+//! the user's PATH starts.
 //!
 //! Both the installing and the updating live in a script beside the app —
-//! `resources/install-deps.ps1` on Windows, which the NSIS installer also runs
-//! (see `src-tauri/installer-hooks.nsh`), and `resources/install-deps.sh` on
-//! macOS and Linux, where there is no installer hook to share it with and the
-//! first launch is the only thing that runs it. This module decides *whether* to
-//! run one and reports what it prints onto the loading page. Keeping one
-//! implementation per platform matters more than keeping it in Rust: the script
-//! has to detect Node, fetch and verify a Node archive, and measure a list of
-//! registry mirrors before walking it, and a second copy of all that would
-//! drift.
+//! `resources/install-deps.ps1` on Windows, `resources/install-deps.sh` on macOS
+//! and Linux. This module decides *whether* to run one and reports what it
+//! prints onto the loading page. Keeping one implementation per platform matters
+//! more than keeping it in Rust: the script has to fetch and verify a Node
+//! archive and measure a list of registry mirrors before walking it, and a
+//! second copy of all that would drift.
 //!
-//! Finding dsh cannot go through the process's own PATH. Nothing puts a Node of
-//! ours on it: a desktop app editing the environment of every terminal on the
-//! machine is a change the user did not ask for and cannot see, so the script
-//! writes down what it installed instead of publishing it. On a machine where
-//! it installed its own Node, `bootstrap.json` is therefore the *only* record of
-//! where that Node and its dsh are — the search below starts from it and falls
-//! back to PATH, rather than the other way round, and a marker it cannot read is
-//! an app that reports no dsh at all. See [`marker`], and [`terminal`] for what
-//! the user gets instead of a PATH entry.
+//! It is also the only thing that runs them. The Windows installer used to run
+//! `-Mode install` itself, from `NSIS_HOOK_POSTINSTALL`, which is why Windows
+//! was the one platform where the script ran again on an upgrade — and so the
+//! one platform a bumped Node version reached. That call is gone; [`gate`] does
+//! it at first launch everywhere, and [`provisioned`] is how it tells a runtime
+//! this release built from one an older release left behind.
+//!
+//! Nothing here searches for anything, and that is the whole design.
+//!
+//! The app owns its runtime outright — a pinned Node and a local install of dsh
+//! under `<app data>/runtime` — so every path is a join onto one constant, and
+//! `dsh.rs` and `install-deps.ps1` derive the same paths independently without
+//! either having to tell the other what it did.
+//!
+//! It used to go the other way. dsh was `npm install -g`, which put it in
+//! whichever global prefix the machine's Node had configured, so where it landed
+//! could not be predicted — only recorded, in `bootstrap.json`, and read back on
+//! the next launch. That one fact is what the deleted half of this file was:
+//! a marker parser, a three-level search path, three functions telling npm's
+//! Windows and Unix layouts apart, six deciding whether a prefix could be
+//! written to, and a symlink-liveness check because a `-g` shim outlives the
+//! Node it points at. Every one of them was downstream of not knowing where dsh
+//! was.
+//!
+//! It was also the user's problem, not just ours: switching Node with nvm, fnm,
+//! asdf or volta moved the prefix, and the dsh the app had recorded stopped
+//! existing. A pinned Node cannot be switched out from under us, and it pins the
+//! ABI that dsh's native modules were built against besides.
+//!
+//! One directory does reach outside: `<app data>/bin`, holding a single launcher
+//! that names our Node and our dsh by absolute path, goes on the front of the
+//! user's PATH so that `dsh` works in their terminal — and means the app's copy.
+//! It holds one file rather than a whole Node distribution, so the only command
+//! it can shadow is a `dsh`, and `-Mode uninstall` takes the entry back off. On
+//! Windows that is the whole of what can be done: the machine's PATH comes
+//! before the user's and only HKCU is writable without elevation, so a `dsh`
+//! installed machine-wide still answers first. `install-deps.ps1` writes and
+//! owns that file; see [`terminal`] for the app's own way into a shell.
 
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read};
@@ -46,26 +72,26 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The package the whole thing is about.
 const PACKAGE: &str = "@deepseek-ai/dsh";
 
-/// The names npm's shims go by, most specific first: the `.cmd` wrapper npm
-/// writes on Windows, then the bare name it uses everywhere else.
-///
-/// Named once and shared, because a typo in one copy is a tool the app decides
-/// is missing — and the copies are far apart: [`current`] resolves the dsh this
-/// launch runs, while `plugins.rs` asks [`tool`] about the same two names to
-/// tell a broken shim from an absent one. Listing both on every platform is
-/// deliberate: [`look_up`] joins each onto directories that only hold one of
-/// them, so the wrong name simply never matches.
-pub const DSH: &[&str] = &["dsh.cmd", "dsh"];
-/// pnpm's, which dsh forwards every plugin install to; see `plugins.rs`.
-pub const PNPM: &[&str] = &["pnpm.cmd", "pnpm"];
-/// Node's, which is what [`npm`] runs npm's own entry point with.
-const NODE: &[&str] = &["node.exe", "node"];
+// There are no shim-name lists any more. `DSH`, `PNPM` and `NODE` each held the
+// two names npm's shims go by — `dsh.cmd` and `dsh`, and so on — because finding
+// a tool meant walking a search path and trying each name against every
+// directory on it. Nothing is searched for now: `entry`, `node` and `pnpm_ready`
+// each name one file at one path.
 
 /// What a dsh install costs over the wire. Quoted to the user before they agree
 /// to it, because it is a lot. Measured, not estimated: 587 packages, 185 MB of
 /// tarballs, four minutes on a 2 MB/s link.
 fn download_size() -> &'static str {
     t!("约 185 MB", "about 185 MB")
+}
+
+/// What it takes up once it is on disk, which is not the download above: 185 MB
+/// of tarballs unpack to a tree of some 30,000 files, and the pinned Node sits
+/// beside it. Quoted before deleting it, for the same reason the download is
+/// quoted before fetching it — and the uninstaller in `installer-hooks.nsh`
+/// quotes the same number.
+fn installed_size() -> &'static str {
+    t!("约 360 MB", "about 360 MB")
 }
 
 /// How long the startup check waits for npm before the app stops waiting on it.
@@ -116,531 +142,318 @@ struct Running {
     _job: Option<crate::server::Job>,
 }
 
-/// What `install-deps.ps1` wrote down about what it installed. Absent on a
-/// machine where it has never run, or has never had anything to do.
+/// Where everything the app installed lives: `<app data>/runtime`.
 ///
-/// This is how the app finds a Node that is on the user's PATH but not on this
-/// process's — see the module docs.
-#[derive(Default)]
-struct Bootstrap {
-    /// The Node the script settled on, ours or the machine's.
-    node: Option<PathBuf>,
-    /// npm's entry point beside it.
-    npm: Option<PathBuf>,
-    /// Where `npm install -g` puts things, which is also where `dsh.cmd` and
-    /// the `node_modules` holding dsh live.
-    prefix: Option<PathBuf>,
-}
-
-fn bootstrap(app: &AppHandle) -> Bootstrap {
-    let Some(path) = app_dir(app).map(|dir| dir.join("bootstrap.json")) else {
-        return Bootstrap::default();
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Bootstrap::default();
-    };
-    marker(&text)
-}
-
-/// What [`bootstrap`] makes of the marker's contents. Split from the read so
-/// that the parse — which is what this app got wrong, silently, for every
-/// machine the script installed a Node on — can be tested without an app.
-fn marker(text: &str) -> Bootstrap {
-    // The BOM is not decoration. `install-deps.ps1` wrote this file with
-    // `Out-File -Encoding utf8`, and under Windows PowerShell 5.1 — which is
-    // what `powershell.exe` is, and what both the NSIS hook and [`interpreter`]
-    // run the script with — that emits a UTF-8 BOM. `serde_json` does not skip
-    // one: it answers `expected value at line 1 column 1`, and every field below
-    // came back empty.
-    //
-    // That was invisible for as long as npm's default prefix was on the user's
-    // PATH, because [`search_path`] falls back to it. On a machine where the
-    // script installed its own Node it is not: the marker is the only record of
-    // where that Node and its dsh are, so the app reported no dsh at all while
-    // `dsh.cmd` sat in the prefix answering `--version` perfectly well.
-    //
-    // The script no longer writes a BOM, and its `install` mode rewrites the
-    // marker on every app upgrade, so this is not what carries the fix. It is
-    // for the machine that is already broken and has not upgraded yet — and for
-    // the next thing that writes this file without being asked what encoding it
-    // meant.
-    let Ok(state) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
-    else {
-        return Bootstrap::default();
-    };
-
-    let read = |key: &str| {
-        state
-            .get(key)
-            .and_then(|value| value.as_str())
-            .map(PathBuf::from)
-    };
-
-    Bootstrap {
-        node: read("nodeExe"),
-        npm: read("npmCli"),
-        prefix: read("prefix"),
-    }
-}
-
-/// Where npm puts a global package's shims for a given prefix: the prefix itself
-/// on Windows, and `<prefix>/bin` everywhere else.
+/// This one constant is what replaced `bootstrap.json` and the search it fed.
+/// The old scheme installed dsh into whichever npm global prefix the machine's
+/// Node happened to have — a location nothing can predict, so it had to be
+/// written down, read back, and fallen back from, and the reading is what this
+/// app got wrong silently for every machine the script installed a Node onto.
 ///
-/// One definition, because two places depend on agreeing with it — the directory
-/// [`search_path`] searches, and the directory a `--prefix` install has to land
-/// its shims in for that search to find them. They were the same expression
-/// written twice, which is how they come apart.
-pub fn shim_dir(prefix: &Path) -> PathBuf {
-    if cfg!(windows) {
-        prefix.to_path_buf()
-    } else {
-        prefix.join("bin")
-    }
+/// Nothing is written down now because there is nothing to remember. The
+/// runtime is at one path, derived from the same application data directory
+/// `install-deps.ps1` derives it from, and everything below is a join onto it.
+/// The two have to agree; see the layout comment at the top of that script.
+pub fn runtime(app: &AppHandle) -> Option<PathBuf> {
+    Some(app_dir(app)?.join("runtime"))
 }
 
-/// Every directory a command of ours might be in, most specific first: what the
-/// script installed, then whatever this process inherited.
-///
-/// npm puts a global package's shims in the prefix itself on Windows and in
-/// `<prefix>/bin` everywhere else, so what the marker records is npm's prefix
-/// and the directory to search for is derived from it.
-fn search_path(app: &AppHandle) -> Vec<PathBuf> {
-    let state = bootstrap(app);
-    let shims = state.prefix.as_deref().map(shim_dir);
-    let node_dir = state
-        .node
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-
-    // The app's own prefix, which is where [`tool_prefix`] puts a tool when
-    // neither the recorded nor the installed prefix can be written to. Listed
-    // unconditionally and without creating it: a tool installed there has to be
-    // findable afterwards, and on the machines that never need it this is one
-    // directory that does not exist and matches nothing.
-    //
-    // Last of the three, so a pnpm beside dsh still wins over a stale copy here.
-    let own = app_dir(app).map(|dir| shim_dir(&dir.join("npm")));
-
-    let inherited = std::env::var_os("PATH").unwrap_or_default();
-    [shims, node_dir, own]
-        .into_iter()
-        .flatten()
-        .chain(std::env::split_paths(&inherited))
-        .collect()
+/// The directory holding our Node's executable: `<runtime>/node` on Windows and
+/// `<runtime>/node/bin` everywhere else, which is where Node's own archives put
+/// it. This is what goes on a child's PATH — see [`apply_path`].
+fn node_dir(app: &AppHandle) -> Option<PathBuf> {
+    let dir = runtime(app)?.join("node");
+    Some(if cfg!(windows) { dir } else { dir.join("bin") })
 }
 
-/// The first of `names` that exists in [`search_path`], as an absolute path.
+/// Our Node, and the only Node this app ever runs whatever else the machine has.
 ///
-/// Resolved here rather than left to `Command::new`, which searches the PATH
-/// this process started with — the one that predates anything the installer did.
-pub fn look_up(app: &AppHandle, names: &[&str]) -> Option<PathBuf> {
-    search_path(app).into_iter().find_map(|dir| {
-        names
-            .iter()
-            .map(|name| dir.join(name))
-            .find(|candidate| present(candidate))
+/// Owning it is what makes every path here a constant, and it settles a second
+/// thing the old scheme could not: dsh's native modules — koffi, node-pty — are
+/// built against one Node's ABI and refuse to load on another's. A pinned Node
+/// pins the ABI for the life of the install.
+pub fn node(app: &AppHandle) -> Option<PathBuf> {
+    let node = node_dir(app)?.join(if cfg!(windows) { "node.exe" } else { "node" });
+    node.is_file().then_some(node)
+}
+
+/// `<runtime>/node_modules`, where a local install puts everything.
+///
+/// The same layout on every platform, which a `-g` install is not: that one puts
+/// the package under `lib/node_modules` and the shim in `bin` on Unix, and both
+/// directly under the prefix on Windows. Telling those two apart was the whole
+/// job of `shim_dir`, `package_root` and `root_of`, none of which survives.
+fn modules(app: &AppHandle) -> Option<PathBuf> {
+    Some(runtime(app)?.join("node_modules"))
+}
+
+/// dsh's entry point, read off the `bin` field of the manifest npm installed.
+///
+/// npm's own shim at `<runtime>/node_modules/.bin/dsh` is deliberately not used.
+/// Its body falls back to whatever `node` is on PATH when there is no `node.exe`
+/// beside it — and in this tree there is not — so going through it would put
+/// back exactly the coupling this layout exists to remove, at the one point
+/// that is exposed to the user. `install-deps.ps1` writes the terminal launcher
+/// from the same field for the same reason; see `Get-DshEntry` there.
+fn entry(app: &AppHandle) -> Option<PathBuf> {
+    let dir = modules(app)?.join(PACKAGE);
+    let manifest = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+
+    let entry = dir.join(bin_field(manifest.get("bin")?)?);
+    entry.is_file().then_some(entry)
+}
+
+/// The `dsh` entry out of a manifest's `bin`, whichever way round it is written.
+///
+/// npm accepts `"bin": "./cli.js"` for a package with one binary named after
+/// itself, and `"bin": { "dsh": "./cli.js" }` when it names them. Both are read
+/// rather than one being assumed, because which one dsh ships is dsh's choice
+/// and it has not always been the same. Split out from [`entry`] so the parse
+/// can be tested without an installed package.
+fn bin_field(bin: &serde_json::Value) -> Option<&str> {
+    let named = match bin {
+        serde_json::Value::String(only) => only.as_str(),
+        object => object.get("dsh")?.as_str()?,
+    };
+    // npm's own spelling is `./cli.js`. `Path::join` keeps the `.` as a
+    // component, which resolves but reads badly in every error message.
+    Some(named.trim_start_matches("./"))
+}
+
+// The launcher at `<app data>/bin/dsh.cmd` is the user's way in, not the app's:
+// this module goes straight to [`entry`] with [`node`], and [`child_path`] puts
+// the directory on a child's PATH by name. Nothing here needs to resolve the
+// file itself, so nothing does — `install-deps.ps1` writes it and owns it.
+
+/// Whether pnpm is in the runtime. dsh forwards every plugin install to it; see
+/// `plugins.rs`.
+///
+/// One file test, where this used to be a three-state answer: there, there but
+/// broken, or missing. The middle state existed because a global install leaves
+/// a symlink into the prefix, and a Node switched by nvm/fnm/asdf/volta leaves
+/// it pointing at nothing — so a plain `is_file` reported *absent* for a name
+/// that was sitting right there, and the caller either reinstalled over a broken
+/// link or told the user there was no pnpm at all. There are no symlinks in this
+/// tree and nothing outside it can move, so the question has two answers again.
+pub fn pnpm_ready(app: &AppHandle) -> bool {
+    modules(app).is_some_and(|dir| dir.join("pnpm").join("package.json").is_file())
+}
+
+/// An explicit dsh, for a developer who wants the app to run their checkout. It
+/// wins outright, and nothing offers to update it.
+fn pinned() -> Option<PathBuf> {
+    std::env::var_os("DSH_BIN").map(PathBuf::from)
+}
+
+/// What the settings panel shows: this app's version, the dsh it runs, the Node
+/// underneath, and which dsh the user's own terminal answers with. As JSON,
+/// because that is how the panel is fed.
+///
+/// Any of them can be empty — `dsh` and `node` both are on a launch that has not
+/// provisioned a runtime yet — which the panel draws as "unknown" rather than
+/// treating as a failure to report.
+///
+/// The terminal one is the slow field: it asks a shell or the registry, so this
+/// belongs on the thread `crate::open_settings` already spawns and not in front
+/// of a window.
+pub fn facts(app: &AppHandle) -> String {
+    // The stamp sits beside the Node rather than under its `bin`: the install
+    // script writes it at the root of the tree it unpacked. [`node_dir`] points
+    // one level deeper than that on Unix, so it is not the thing to join onto.
+    let node = runtime(app)
+        .map(|dir| dir.join("node").join(".dsh-node-version"))
+        .and_then(|stamp| std::fs::read_to_string(stamp).ok())
+        .map(|version| version.trim().to_string())
+        .unwrap_or_default();
+
+    let found = terminal_dsh();
+    let ours = found.as_deref().is_some_and(|found| same_file(found, launcher(app)));
+
+    serde_json::json!({
+        "app": app.package_info().version.to_string(),
+        "dsh": current(app).map(|dsh| dsh.version.to_string()).unwrap_or_default(),
+        "node": node,
+        "terminal": {
+            "path": found.as_ref().map(|path| path.display().to_string()).unwrap_or_default(),
+            "ours": ours,
+            // Only for one that is not ours: ours is the `dsh` field above, and
+            // this is a process start apiece.
+            "version": found
+                .filter(|_| !ours)
+                .and_then(|path| version_of(path.as_os_str()))
+                .map(|version| version.to_string())
+                .unwrap_or_default(),
+        },
     })
+    .to_string()
 }
 
-/// Whether npm left an entry at `path` — the question [`look_up`] is actually
-/// asking, which is not the same as `is_file`.
+/// The launcher `install-deps` writes and puts on the user's PATH. One file, at
+/// one path, on every platform; see `Write-Launcher` / `write_launcher`.
+fn launcher(app: &AppHandle) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "dsh.cmd" } else { "dsh" };
+    Some(app_dir(app)?.join("bin").join(name))
+}
+
+/// Whether two paths name the same file on disk.
 ///
-/// On Windows a global shim is a plain `.cmd` file and the two agree. Everywhere
-/// else it is a symlink into `<prefix>/lib/node_modules`, and `is_file` follows
-/// it: a shim whose target is gone — a Node switched by nvm/fnm/asdf/volta, a
-/// half-removed global package, a distro Node upgraded underneath — reads as
-/// *absent*, so this said "no pnpm" and "no dsh" on a machine that has both
-/// names sitting right there in the prefix.
-///
-/// Answering that with the file gone is worse than answering it wrongly: the
-/// caller reinstalls over a broken link, or reports that there is no dsh at all
-/// while `dsh` works in the user's terminal. `symlink_metadata` does not follow
-/// the link, so a dangling shim is found, handed back, and allowed to fail as
-/// what it is — see [`executable`], which is where a broken one gets caught with
-/// something specific to say.
-fn present(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        // A directory named `pnpm` is not the pnpm we are looking for.
-        Ok(metadata) => !metadata.is_dir(),
-        Err(_) => false,
+/// Resolved rather than compared as text: on macOS and Linux the `dsh` a shell
+/// finds is `~/.local/bin/dsh`, which is a symlink to the launcher, and on
+/// Windows the two spellings can differ in case alone.
+fn same_file(found: &Path, ours: Option<PathBuf>) -> bool {
+    let Some(ours) = ours else { return false };
+    match (found.canonicalize(), ours.canonicalize()) {
+        (Ok(found), Ok(ours)) => found == ours,
+        _ => false,
     }
 }
 
-/// Whether `path` resolves to something that can actually be run.
+/// How long the probe below gets. It is a shell reading the user's own profile,
+/// which is theirs to make as slow as they like; the panel draws without it and
+/// fills the row in when it arrives.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What a `dsh` typed into the user's own terminal resolves to.
 ///
-/// [`present`] deliberately accepts a dangling symlink, so somebody has to be
-/// the one that notices. This is it: `metadata` follows the link, so this is
-/// false exactly when the shim points at nothing — and on Unix it also checks
-/// the executable bit, because a global bin that lost it fails to spawn with an
-/// error no more helpful than the dangling case.
-fn executable(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
+/// Deliberately not `env::var("PATH")`. This process's environment was captured
+/// when the app started, so it is missing the entry `install-deps` writes during
+/// a first launch — the one launch where the answer matters most — and on macOS
+/// a GUI launch never had the user's login PATH in the first place. So the
+/// question goes to something that reads the environment fresh.
+///
+/// Nothing is done with the answer but show it. The app runs its own dsh by
+/// absolute path and does not consult PATH, and a dsh that is not ours is not
+/// ours to touch — see the note in `Add-Path` about what prepending can and
+/// cannot win.
+#[cfg(windows)]
+fn terminal_dsh() -> Option<PathBuf> {
+    // The machine's PATH followed by the user's, which is the order Windows
+    // composes them in and the reason our own entry cannot outrank a `dsh`
+    // installed machine-wide. `GetEnvironmentVariable` expands `REG_EXPAND_SZ`
+    // for us; that is right here, where the value is being resolved rather than
+    // written back.
+    //
+    // `dsh.cmd` before `dsh.ps1` because the .cmd is the one that can be spawned
+    // for a `--version`. Within a single directory PowerShell would prefer the
+    // .ps1, but npm writes all of them for the same install, so the answer to
+    // "which dsh" is the same either way.
+    const PROBE: &str = "\
+        $path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + \
+                [Environment]::GetEnvironmentVariable('Path','User'); \
+        foreach ($dir in ($path -split ';')) { \
+            if (-not $dir) { continue } \
+            foreach ($name in 'dsh.cmd','dsh.exe','dsh.bat','dsh.ps1','dsh') { \
+                $file = Join-Path $dir $name; \
+                if (Test-Path -LiteralPath $file -PathType Leaf) { $file; exit } \
+            } \
+        }";
+
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", PROBE])
+        .stdin(Stdio::null());
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    found(printed(command, PROBE_TIMEOUT))
+}
+
+/// The login shell's own answer, because only it knows what the user's profile
+/// does to PATH: `~/.local/bin`, where the launcher is linked, is not on a
+/// stock macOS PATH until something puts it there.
+///
+/// `-l` for the login files and `-i` for the interactive ones — `~/.zshrc` is
+/// read for the second, `~/.zprofile` for the first, and a user can have either.
+/// A shell that refuses the combination (dash has no `-l`) is asked again
+/// without it rather than reported as "no dsh at all".
+#[cfg(not(windows))]
+fn terminal_dsh() -> Option<PathBuf> {
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+
+    let ask = |flags: &str| {
+        let mut command = Command::new(&shell);
+        command.args([flags, "command -v dsh"]).stdin(Stdio::null());
+        found(printed(command, PROBE_TIMEOUT))
     };
-    if metadata.is_dir() {
-        return false;
-    }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        return metadata.permissions().mode() & 0o111 != 0;
-    }
-    #[cfg(not(unix))]
-    true
+    ask("-lic").or_else(|| ask("-c"))
 }
 
-/// What [`look_up`] found, as the three states a caller actually has to tell
-/// apart.
-///
-/// A pair of `Option`-returning calls — one for "is it there", one for "is it
-/// broken" — makes the interesting state the *absence* of one answer and the
-/// presence of another, which every caller has to reassemble correctly and no
-/// single call can answer. It also walks the search path twice, so the two
-/// answers can describe different files if the directory changes in between.
-/// One enum from one walk removes both problems.
-pub enum Tool {
-    /// There and runnable.
-    ///
-    /// No path: every caller so far only needs to know that it is usable,
-    /// because what actually runs it is dsh through [`apply_path`] rather than
-    /// this app spawning it directly. Carrying one nobody reads is a promise
-    /// that the value has been checked for the caller's purpose, which it has
-    /// not.
-    Ready,
-    /// There but not runnable, with the reason spelled out for the user. The
-    /// state that used to be invisible: the name is in the prefix, so nothing
-    /// reinstalls it, and every attempt to run it fails far from the cause.
-    Broken(String),
-    /// Not on the search path at all.
-    Missing,
-}
-
-/// Resolve one tool by its platform names, in one walk of the search path.
-pub fn tool(app: &AppHandle, names: &[&str]) -> Tool {
-    let Some(path) = look_up(app, names) else {
-        return Tool::Missing;
-    };
-    if executable(&path) {
-        return Tool::Ready;
-    }
-
-    let shown = path.display();
-    Tool::Broken(match std::fs::read_link(&path) {
-        // The common one: npm's symlink outliving what it pointed at.
-        //
-        // `read_link` hands back the target exactly as stored, and npm writes a
-        // relative one (`../lib/node_modules/pnpm/bin/pnpm.cjs`). Testing that
-        // as-is would resolve it against this process's working directory —
-        // wherever the app happens to have been started — and call a perfectly
-        // good shim dangling. So it is resolved against the link's own directory,
-        // which is what the kernel does.
-        Ok(target) if !resolve(&path, &target).exists() => t!(
-            "{} 指向的目标已经不存在（{}）。这通常是切换过 Node 版本（nvm / fnm / asdf / volta）或全局包被删掉一半留下的断链。",
-            "{} points at something that no longer exists ({}). That is usually a dangling link left by switching Node versions (nvm/fnm/asdf/volta) or a half-removed global package.",
-            shown,
-            target.display()
-        ),
-        Ok(target) => t!(
-            "{} 指向 {}，但它不可执行。",
-            "{} points at {}, which is not executable.",
-            shown,
-            target.display()
-        ),
-        Err(_) => t!(
-            "{} 存在，但不可执行。",
-            "{} exists but is not executable.",
-            shown
-        ),
-    })
-}
-
-/// A symlink's target as an absolute path: relative to the directory the link
-/// sits in, which is how the kernel reads it. An already-absolute target is
-/// returned unchanged.
-fn resolve(link: &Path, target: &Path) -> PathBuf {
-    if target.is_absolute() {
-        return target.to_path_buf();
-    }
-    link.parent().unwrap_or(Path::new(".")).join(target)
+/// The probe's output as a path, and `None` for the empty line a probe that
+/// found nothing prints.
+fn found(printed: Option<String>) -> Option<PathBuf> {
+    let path = printed?;
+    let path = path.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 /// The dsh command this launch will run.
 pub struct Install {
-    /// What to execute. On Windows this is npm's `dsh.cmd` shim, which std
-    /// routes through cmd.exe with the correct argument quoting.
-    pub bin: PathBuf,
+    /// The executable to spawn: our Node, or whatever `DSH_BIN` named.
+    program: PathBuf,
+    /// What goes before dsh's own arguments — the entry script, when `program`
+    /// is our Node. `None` for a `DSH_BIN`, which is a dsh already.
+    prelude: Option<PathBuf>,
     pub version: Version,
-    /// The npm global prefix this dsh sits in, when the tree around it is one
-    /// `npm install -g` built; see [`prefix_of`]. Whether an update can actually
-    /// be written there is [`updatable`]'s question.
-    prefix: Option<PathBuf>,
+}
+
+impl Install {
+    /// A command that runs this dsh, for the caller to add arguments to.
+    ///
+    /// Built here rather than by each caller, because the two halves have to
+    /// stay together: spawning `program` without `prelude` starts a bare Node
+    /// REPL, which fails in a way that says nothing about why.
+    pub fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        if let Some(entry) = &self.prelude {
+            command.arg(entry);
+        }
+        command
+    }
+
+    /// Whether this is the runtime the app installed, and so the one an update
+    /// may replace. A `DSH_BIN` is the developer's own business.
+    pub fn ours(&self) -> bool {
+        self.prelude.is_some()
+    }
 }
 
 /// Find it, the same way for every caller, so that the version being checked is
 /// the version that will run.
 ///
-/// 1. `DSH_BIN` — an explicit choice, so it wins outright.
-/// 2. `dsh` in the npm prefix the bootstrap script recorded, or on PATH.
-///
-/// `None` means the machine has no dsh at all, which [`gate`] answers by
-/// installing one — including the case where the name is in the prefix but the
-/// shim behind it is broken, which is reinstalled over rather than left as a dsh
-/// that cannot run. [`tool`] is what turns that into something to say.
+/// `None` means the machine has no runtime yet, which [`gate`] answers by
+/// installing one. There is no third state to report: the tree is ours, so it is
+/// either there or it is not, and a half-written one fails the manifest read.
 pub fn current(app: &AppHandle) -> Option<Install> {
-    let bin = match std::env::var_os("DSH_BIN") {
-        Some(bin) => PathBuf::from(bin),
-        None => {
-            let found = look_up(app, DSH)?;
-            // A dangling shim is not a dsh. Saying so here means `gate`
-            // reinstalls instead of handing back an install whose every command
-            // fails, and `version_of` below is not asked to run a broken link.
-            if !executable(&found) {
-                eprintln!(
-                    "dsh-desktop: {} is not runnable; treating this machine as having no dsh",
-                    found.display()
-                );
-                return None;
-            }
-            found
-        }
-    };
-
-    let version = manifest_version(&root_of(&bin)).or_else(|| version_of(bin.as_os_str()))?;
-    let prefix = prefix_of(&bin);
+    if let Some(bin) = pinned() {
+        return Some(Install {
+            version: version_of(bin.as_os_str())?,
+            program: bin,
+            prelude: None,
+        });
+    }
 
     Some(Install {
-        bin,
-        version,
-        prefix,
+        program: node(app)?,
+        prelude: Some(entry(app)?),
+        version: manifest_version(app)?,
     })
 }
 
-/// The npm global prefix holding `bin`, if the tree around it is the one a
-/// global install builds.
-///
-/// On Windows the shim sits in the prefix with the package under the
-/// `node_modules` beside it; everywhere else the shim is in `<prefix>/bin` and
-/// the package under `<prefix>/lib/node_modules`. Something laid out a third way
-/// is a version manager's shim, a pnpm link, or a `DSH_BIN` pointing into a
-/// checkout, and `npm install -g --prefix` aimed at it would build a *second*
-/// dsh in a directory nothing on PATH looks at rather than replacing the one
-/// that is there.
-fn prefix_of(bin: &Path) -> Option<PathBuf> {
-    let dir = bin.parent()?;
-    let manifest = Path::new("node_modules").join(PACKAGE).join("package.json");
-
-    if dir.join(&manifest).is_file() {
-        return Some(dir.to_path_buf());
-    }
-
-    let prefix = dir.parent()?;
-    prefix
-        .join("lib")
-        .join(&manifest)
-        .is_file()
-        .then(|| prefix.to_path_buf())
-}
-
-/// The prefix to install an update into: the one this dsh is in, once npm has
-/// somewhere it can actually write. A `sudo npm i -g` into `/usr/local`, or a
-/// distribution's `/usr`, answers `None` — asking for a password is no more on
-/// the table here than it is in the install script.
-///
-/// Probed rather than read off a permission bit: Windows has ACLs rather than a
-/// mode, and on Unix the answer depends on the user's groups, so the only
-/// reliable form of the question is the one npm is about to ask anyway. It is
-/// not part of [`current`] because that one only wants to know where dsh is, and
-/// writing to answer it would be a side effect on every launch.
-fn updatable(installed: &Install) -> Option<&Path> {
-    let prefix = installed.prefix.as_deref()?;
-    writable(&package_root(prefix)).then_some(prefix)
-}
-
-/// Whether a file can be created in `dir` — the only reliable form of the
-/// question, for the reasons in [`updatable`]. Shared with
-/// [`unwritable_prefix`] so the update path and the plugin path cannot come to
-/// different conclusions about the same directory.
-fn writable(dir: &Path) -> bool {
-    // The pid keeps two copies of the app out of each other's way. There is only
-    // ever meant to be one — see the single-instance plugin — but a file left
-    // behind by a crash would otherwise be a permanent "no".
-    let probe = dir.join(format!(".dsh-write-probe-{}", std::process::id()));
-    let allowed = std::fs::write(&probe, b"").is_ok();
-    let _ = std::fs::remove_file(&probe);
-    allowed
-}
-
-/// The npm global prefix a `-g` install would land in, when this process cannot
-/// write to it — `None` when it can, or when there is no prefix to check.
-///
-/// This is the Linux failure the plugin panel used to report as a bare npm exit
-/// code: a distribution's Node keeps its global prefix under `/usr`, so
-/// `npm install -g pnpm` fails with `EACCES` for reasons that have nothing to do
-/// with the network or the registry. Windows never sees it, because npm's prefix
-/// there is a per-user directory under `%APPDATA%`.
-///
-/// The probe is aimed at the deepest directory that already exists, since npm
-/// creates the rest: probing a missing `lib/node_modules` would report every
-/// fresh prefix as unwritable.
-pub fn unwritable_prefix(app: &AppHandle) -> Option<PathBuf> {
-    let prefix = bootstrap(app)
-        .prefix
-        .or_else(|| current(app).and_then(|install| install.prefix))?;
-
-    // A prefix that is not there at all is not reported as unwritable:
-    // "missing" is a different problem, and the advice below — move npm's
-    // prefix — would not address it.
-    if !prefix.is_dir() {
-        return None;
-    }
-
-    // The deepest level that exists, which is the one npm would write into and
-    // so the one worth naming. `usable_prefix` asks the same question of the
-    // same directory; this reports *which* directory rather than yes or no, so
-    // they stay in agreement by construction.
-    let existing = deepest_existing(&prefix)?;
-    (!writable(&existing)).then_some(existing)
-}
-
-/// The deepest directory under `prefix` that already exists, walking up from the
-/// `node_modules` a `-g` install lands in. `None` when `prefix` itself is gone.
-///
-/// npm creates the levels below, so probing a missing `lib/node_modules` would
-/// reject a perfectly good fresh prefix. The walk stops at `prefix` because
-/// stepping above it reaches directories npm would never touch — accepting one
-/// of those is how a nonexistent prefix passes for a usable one.
-fn deepest_existing(prefix: &Path) -> Option<PathBuf> {
-    package_root(prefix)
-        .ancestors()
-        .take_while(|dir| dir.starts_with(prefix))
-        .find(|dir| dir.is_dir())
-        .map(Path::to_path_buf)
-}
-
-/// Where a `-g` install of a tool this app needs should go, and whether that had
-/// to be chosen rather than left to npm.
-///
-/// `install-deps.sh` already solves this for dsh itself — see `find_prefix`
-/// there: it takes npm's configured global prefix when the user can write to it,
-/// and otherwise falls back to a prefix of the app's own under the application
-/// data directory, because installing as the user who will run it is the point
-/// and asking for a password is not on the table.
-///
-/// Nothing was applying that reasoning to pnpm. `npm install -g pnpm` let npm
-/// pick, so on a Mac with the nodejs.org pkg or a Linux box with a distribution
-/// Node the install went at `/usr/local` or `/usr` and failed with `EACCES` —
-/// while the dsh beside it had been carefully placed somewhere writable. Worse,
-/// npm could succeed into a prefix that is not the one [`search_path`] looks in,
-/// leaving a pnpm that exists and cannot be found.
-///
-/// So the prefix is chosen here, explicitly, and handed to npm as `--prefix`:
-///
-/// 1. The prefix the bootstrap script recorded, when it is writable. That is
-///    where dsh is, so pnpm lands beside it and [`search_path`] finds it.
-/// 2. The prefix the running dsh sits in, when that is writable — covers a dsh
-///    the user installed themselves, with no marker to read.
-/// 3. The app's own prefix under the data directory. Always writable, because
-///    the app owns it.
-///
-/// `None` only when there is no application data directory to fall back to,
-/// which is a machine this app cannot run on anyway.
-pub fn tool_prefix(app: &AppHandle) -> Option<PathBuf> {
-    let recorded = bootstrap(app).prefix;
-    let installed = current(app).and_then(|install| install.prefix);
-
-    if let Some(usable) = first_writable_prefix([recorded, installed]) {
-        return Some(usable);
-    }
-
-    // Ours, and made if it is not there. This is the same directory the shell
-    // script falls back to, so a machine that took that path keeps one prefix
-    // rather than growing a second.
-    let own = app_dir(app)?.join("npm");
-    if let Err(error) = std::fs::create_dir_all(&own) {
-        eprintln!(
-            "dsh-desktop: could not create a prefix at {}: {error}",
-            own.display()
-        );
-        return None;
-    }
-    Some(own)
-}
-
-/// The first candidate a `-g` install could actually write into. Split out from
-/// [`tool_prefix`] so the choice can be tested without an `AppHandle`.
-fn first_writable_prefix<C>(candidates: C) -> Option<PathBuf>
-where
-    C: IntoIterator<Item = Option<PathBuf>>,
-{
-    candidates
-        .into_iter()
-        .flatten()
-        .find(|candidate| usable_prefix(candidate))
-}
-
-/// Whether a `-g` install aimed at `prefix` would land somewhere this process
-/// can write.
-///
-/// The prefix itself has to exist. Walking up to *any* writable ancestor — which
-/// is what an unguarded `ancestors()` does — accepts a prefix that is not there
-/// at all because its parent happens to be writable, and npm would then create a
-/// tree nothing else in this app looks at. Only the levels npm itself creates
-/// (`lib/node_modules`, or `node_modules` on Windows) may be missing, so the
-/// probe walks up from the package root and stops at the prefix.
-fn usable_prefix(prefix: &Path) -> bool {
-    deepest_existing(prefix).is_some_and(|dir| writable(&dir))
-}
-
-/// The `node_modules` an update lands in: under `lib` on the layout npm uses
-/// everywhere but Windows, and directly under the prefix on that one. Answered
-/// by looking rather than by `cfg`, because it is the layout [`prefix_of`]
-/// matched that decides.
-fn package_root(prefix: &Path) -> PathBuf {
-    let lib = prefix.join("lib").join("node_modules");
-    if lib.join(PACKAGE).is_dir() {
-        lib
-    } else {
-        prefix.join("node_modules")
-    }
-}
-
-/// The directory holding the `node_modules` a global install put dsh in.
-///
-/// On Windows npm puts the shim in the prefix and the package under the
-/// `node_modules` beside it, so the shim's own directory is it. Everywhere else
-/// the shim is a symlink in `<prefix>/bin` and the package is under
-/// `<prefix>/lib/node_modules`, which is one level up and across.
-///
-/// Falling back to the shim's directory covers a `DSH_BIN` pointing at a tree
-/// laid out some third way; the callers all treat a root with nothing under it
-/// as nothing to do.
-fn root_of(bin: &Path) -> PathBuf {
-    let dir = bin.parent().unwrap_or(Path::new(".")).to_path_buf();
-
-    #[cfg(not(windows))]
-    if let Some(lib) = dir.parent().map(|prefix| prefix.join("lib")) {
-        if lib.join("node_modules/@deepseek-ai/dsh").is_dir() {
-            return lib;
-        }
-    }
-
-    dir
-}
-
 /// The `version` field of the installed package's manifest — a file read rather
-/// than a `dsh --version`, which costs a Node startup.
-fn manifest_version(root: &Path) -> Option<Version> {
-    let manifest = root.join("node_modules/@deepseek-ai/dsh/package.json");
+/// than a `dsh --version`, which costs a Node startup on the way to the window.
+fn manifest_version(app: &AppHandle) -> Option<Version> {
+    let manifest = modules(app)?.join(PACKAGE).join("package.json");
     let manifest = std::fs::read_to_string(manifest).ok()?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
     Version::parse(manifest.get("version")?.as_str()?).ok()
 }
 
-/// Ask a dsh what version it is. The fallback for a `DSH_BIN` pointing at
-/// something whose tree is laid out differently — a version manager's shim, a
-/// checkout — where the manifest is not where npm would have put it.
+/// Ask a dsh what version it is.
+///
+/// Only for `DSH_BIN`, which can point at a checkout laid out however the
+/// developer likes and so has no manifest where one would expect it. The
+/// runtime's version is read off its own manifest above.
 fn version_of(bin: &OsStr) -> Option<Version> {
     let mut command = Command::new(bin);
     command.arg("--version").stdin(Stdio::null());
@@ -665,12 +478,22 @@ pub type Report<'a> = dyn Fn(&str, f64) + 'a;
 /// [`CHECK_TIMEOUT`], and a check that fails or times out boots what is already
 /// on disk. The dialogs block, so this must run off the main thread.
 pub fn gate(app: &AppHandle, report: &Report) -> bool {
-    let Some(installed) = current(app) else {
-        // Nothing to run. The installer either failed to get dsh onto the
-        // machine or never ran at all, and this is a `tauri dev` build — either
-        // way the fix is the same, and the machine has an npm by now or is
-        // about to get one.
-        return bootstrap_now(app, report);
+    // Two ways to end up in `provision`, and they run the same command.
+    //
+    // There is no runtime: a fresh machine, or a `tauri dev` build. Nothing is
+    // looked for and nothing is borrowed — `-Mode install` fetches the Node it
+    // needs and builds the tree from nothing, on purpose.
+    //
+    // Or there is one, and an older release of this app laid it down. See
+    // [`provisioned`]: what the script installs is free to change between
+    // releases, and this is what makes that reach a machine that already has a
+    // working runtime.
+    //
+    // A `DSH_BIN` is neither. It is the developer's own checkout, there is no
+    // runtime of ours behind it, and provisioning one would fetch 185 MB that
+    // nothing is going to run.
+    let Some(installed) = current(app).filter(|dsh| !dsh.ours() || provisioned(app)) else {
+        return provision(app, report);
     };
 
     if checked_recently(app) {
@@ -692,14 +515,14 @@ pub fn gate(app: &AppHandle, report: &Report) -> bool {
         return true;
     }
 
-    // Nothing here can aim an install at that tree, so telling the user is the
-    // whole of it — and recording it as skipped is what keeps that to once per
-    // release rather than every time the six hours are up.
-    let Some(prefix) = updatable(&installed) else {
+    // A `DSH_BIN` is the developer's checkout and not ours to replace. Telling
+    // them is the whole of it, and recording it as skipped keeps that to once
+    // per release rather than every time the six hours are up.
+    if !installed.ours() {
         tell(app, &installed.version, &latest);
         skip(app, &latest);
         return true;
-    };
+    }
 
     if !ask(app, &installed.version, &latest) {
         skip(app, &latest);
@@ -709,7 +532,7 @@ pub fn gate(app: &AppHandle, report: &Report) -> bool {
     // Nothing is running yet, so there is nothing to stop and nothing to restart
     // for: npm replaces the tree in place and the boot carries straight on into
     // the new version.
-    update(app, prefix, &installed.version, report)
+    update(app, &installed.version, report)
 }
 
 /// What the window shows while this is waiting on npm, and `""` when the wait is
@@ -718,13 +541,16 @@ pub fn gate(app: &AppHandle, report: &Report) -> bool {
 pub type Saying<'a> = dyn Fn(&str) + 'a;
 
 /// A dsh update the user asked for from the menu, rather than one a launch
-/// happened to find. Answers with the prefix to install into once they have
+/// happened to find. Answers with the version being replaced once they have
 /// agreed to it, for the caller to hand to [`update`] with dsh stopped.
+///
+/// There is no prefix to hand back any more: [`update`] installs into the
+/// runtime, which is where dsh already is and the only place it can be.
 ///
 /// Every outcome is reported, including "nothing to do": a menu item that does
 /// nothing visible looks broken. A version turned down earlier is offered again
 /// — the whole point of this is being asked.
-pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)> {
+pub fn requested(app: &AppHandle, saying: &Saying) -> Option<Version> {
     // `latest` is a `npm view`, which is the network and up to CHECK_TIMEOUT of
     // it. Everything after it is instant, so the line comes down here rather
     // than in front of each of the dialogs below.
@@ -773,34 +599,32 @@ pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)>
         return None;
     }
 
-    let Some(prefix) = updatable(&installed).map(Path::to_path_buf) else {
+    if !installed.ours() {
         tell(app, &installed.version, &latest);
         return None;
-    };
+    }
 
     if !confirm(app, &installed.version, &latest) {
         return None;
     }
 
-    Some((prefix, installed.version))
+    Some(installed.version)
 }
 
-/// Replace the dsh in `prefix` with the newest release, reporting progress onto
-/// the loading page. `false` means the app quit while npm was still running.
+/// Replace the dsh in the runtime with the newest release, reporting progress
+/// onto the loading page. `false` means the app quit while npm was still
+/// running.
 ///
-/// The prefix is passed to the script rather than left to the npm it runs with:
-/// a dsh the user installed themselves lives in their own global prefix, and an
-/// npm of ours would default to a different one and install a second copy there.
+/// No prefix is passed and none is worked out. `install` and `update` are the
+/// same npm command into the same directory, which is why this is now the
+/// script's shortest mode — where it used to have to be told which of the
+/// machine's global prefixes held the dsh being replaced, because installing
+/// into the wrong one built a second copy nothing would ever run.
 ///
 /// Failure is reported here and answers `true` all the same — there is a working
 /// dsh on disk either way, which is the one the caller goes on to run.
-pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Report) -> bool {
-    let args = [
-        OsStr::new("-Mode"),
-        OsStr::new("update"),
-        OsStr::new("-Prefix"),
-        prefix.as_os_str(),
-    ];
+pub fn update(app: &AppHandle, installed: &Version, report: &Report) -> bool {
+    let args = [OsStr::new("-Mode"), OsStr::new("update")];
 
     match run(app, &args, report) {
         Ok(true) => {
@@ -828,13 +652,83 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
     }
 }
 
-/// Get a dsh onto a machine that has none, which may mean getting it a Node
-/// first. `false` if the app quit while it was running.
-fn bootstrap_now(app: &AppHandle, report: &Report) -> bool {
+/// Ask before deleting it. Blocking, like every other dialog here.
+///
+/// Everything this is about to do is spelled out, because none of it is
+/// recoverable by clicking again: what goes, what stays, and that the app is
+/// leaving. The default is the one that changes nothing.
+pub fn confirm_removal(app: &AppHandle) -> bool {
+    crate::dialog::confirm(
+        app,
+        crate::dialog::Ask {
+            title: t!("移除 dsh 运行时", "Remove the dsh runtime").to_string(),
+            body: t!(
+                "将删除应用自己安装的 Node 和 dsh（约 {}），以及终端里的 dsh 命令。\n\n\
+                 你自己安装的 Node 和 dsh 不受影响，dsh 的配置和会话记录也会保留。\n\n\
+                 正在运行的 dsh 会先停下，应用随后退出。下次启动时会重新安装一份。",
+                "This deletes the Node and dsh the app installed ({}), and the dsh \
+                 command in your terminal.\n\n\
+                 A Node or a dsh you installed yourself is untouched, and dsh's own \
+                 settings and sessions are kept.\n\n\
+                 The running dsh is stopped first and the app then quits. The next \
+                 launch installs a fresh copy.",
+                installed_size()
+            ),
+            choices: vec![
+                crate::dialog::Choice::new("cancel", t!("取消", "Cancel")),
+                crate::dialog::Choice::primary("remove", t!("移除并退出", "Remove and quit")),
+            ],
+            answered: Box::new(|_, _| {}),
+        },
+        "remove",
+    )
+}
+
+/// Delete the runtime: `<app data>/runtime`, the launcher, and the PATH entry or
+/// symlink that pointed at it. `false` if the app quit while it was running.
+///
+/// The same `-Mode uninstall` the Windows uninstaller offers, reached from the
+/// settings panel so that macOS and Linux — where nothing has ever called it —
+/// have a way to it at all. What it can name is the app's own directory and
+/// nothing else; see the function in either script.
+pub fn remove(app: &AppHandle, report: &Report) -> bool {
+    report(t!("正在移除 dsh 运行时…", "Removing the dsh runtime…"), -1.0);
+
+    match run(app, &[OsStr::new("-Mode"), OsStr::new("uninstall")], report) {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(error) => {
+            eprintln!("dsh-desktop: removing the runtime failed: {error}");
+            report("", -1.0);
+            note(
+                app,
+                t!("移除失败", "Could not remove it"),
+                &t!(
+                    "删除 dsh 运行时时出错。\n\n{}",
+                    "Something went wrong deleting the dsh runtime.\n\n{}",
+                    error
+                ),
+            );
+            false
+        }
+    }
+}
+
+/// Build the runtime this release wants, on every platform, at first launch.
+///
+/// This is the only caller of `-Mode install` there is. The Windows installer
+/// used to run it too, from `NSIS_HOOK_POSTINSTALL`, which made Windows the one
+/// platform where the script re-ran on an app upgrade — and so the one platform
+/// a bumped `NODE_VERSION` ever reached. Taking that out left one code path, one
+/// place an install can fail, and one progress bar to report it on.
+///
+/// `false` if the app quit while it was running.
+fn provision(app: &AppHandle, report: &Report) -> bool {
     report(t!("正在准备运行环境…", "Preparing the runtime…"), -1.0);
 
     match run(app, &[OsStr::new("-Mode"), OsStr::new("install")], report) {
         Ok(true) => {
+            mark_provisioned(app);
             report("", -1.0);
             true
         }
@@ -982,31 +876,21 @@ fn latest(app: &AppHandle) -> Option<Version> {
 /// installed a Node of its own, that Node is the one whose global prefix holds
 /// the dsh being asked about.
 pub fn npm(app: &AppHandle) -> Option<Command> {
-    let state = bootstrap(app);
-    let (node, cli) = match (state.node, state.npm) {
-        (Some(node), Some(cli)) if node.is_file() && cli.is_file() => (node, cli),
-        _ => {
-            // Beside the binary on Windows, and one level up under `lib`
-            // everywhere else — the same two layouts `root_of` covers.
-            //
-            // `executable` rather than bare presence: `look_up` deliberately
-            // reports a dangling shim so it can be named, and a Node that cannot
-            // run is no use to the caller, which is about to spawn it. Bailing
-            // here turns it into "no npm to install pnpm with" rather than a
-            // spawn failure from inside the install.
-            let node = look_up(app, NODE).filter(|node| executable(node))?;
-            let dir = node.parent()?;
-            let cli = [
-                dir.join("node_modules/npm/bin/npm-cli.js"),
-                dir.parent()
-                    .unwrap_or(dir)
-                    .join("lib/node_modules/npm/bin/npm-cli.js"),
-            ]
-            .into_iter()
-            .find(|candidate| candidate.is_file())?;
-            (node, cli)
-        }
-    };
+    let node = node(app)?;
+    // The npm that Node's own archive ships, in the place that archive puts it:
+    // beside `node.exe` on Windows, and under `lib` on the Unix tarballs. Two
+    // fixed spellings rather than a search — the whole of what this function
+    // used to be was working out which of the machine's Nodes had an npm and
+    // where that npm kept its entry point.
+    let root = runtime(app)?.join("node");
+    let cli = if cfg!(windows) { root } else { root.join("lib") }
+        .join("node_modules")
+        .join("npm")
+        .join("bin")
+        .join("npm-cli.js");
+    if !cli.is_file() {
+        return None;
+    }
 
     let mut command = Command::new(node);
     command.arg(cli).stdin(Stdio::null());
@@ -1117,27 +1001,27 @@ fn confirm(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
     )
 }
 
-/// Tell the user about an update to a dsh that is not laid out as one
-/// `npm install -g` this app can point npm at, and leave it at that.
+/// Tell the user about an update to a dsh the app is not running out of its own
+/// runtime, and leave it at that.
 ///
-/// Nothing here offers to apply it, because doing so would not land where the
-/// working copy is: see [`prefix_of`] for what rules a tree out. So the command
-/// goes in the message instead, for the user to run against whatever they
-/// actually installed it with.
+/// The only way to reach this is `DSH_BIN`, which is a developer pointing the
+/// app at their own checkout. Updating it would overwrite work in progress, and
+/// the app has no idea what put it there — so the command goes in the message
+/// instead. Every other install is in the runtime, where an update is just the
+/// same npm command again.
 fn tell(app: &AppHandle, installed: &Version, latest: &Version) {
     note(
         app,
         t!("dsh 有可用更新", "A dsh update is available"),
         &t!(
             "dsh 有新版本 {}（当前 {}）。\n\n\
-             这份 dsh 不在应用能写的 npm 全局目录里（比如用版本管理器装的，\
-             或者装在只有管理员能写的地方），应用不会去改动它。要更新的话，\
-             用你当初安装它的方式，在终端里执行：\n\nnpm install -g {}@latest",
+             当前运行的是 DSH_BIN 指定的 dsh，不是应用自己安装的那份，\
+             应用不会去改动它。要更新的话，用你当初安装它的方式，\
+             在终端里执行：\n\nnpm install -g {}@latest",
             "dsh {} is available (this machine has {}).\n\n\
-             This dsh is not in an npm global directory the app can write to — a \
-             version manager put it there, or it needs administrator rights — so \
-             the app will not touch it. To update it, use whatever you installed \
-             it with:\n\nnpm install -g {}@latest",
+             The app is running the dsh that DSH_BIN points at rather than its \
+             own, so it will not touch it. To update that one, use whatever you \
+             installed it with:\n\nnpm install -g {}@latest",
             latest,
             installed,
             PACKAGE
@@ -1204,6 +1088,50 @@ fn checked_file(app: &AppHandle) -> Option<PathBuf> {
     Some(app_dir(app)?.join("dsh-checked"))
 }
 
+/// Whether the runtime on disk was laid down by *this* build of the app.
+///
+/// The install script installs whatever it currently says to install: a pinned
+/// Node version, a launcher with a particular body, a set of directories on
+/// PATH, whatever migration the release needed. Every one of those can change,
+/// and none of them changes on a machine the script does not run on again.
+///
+/// Which used to mean they only reached Windows. `NSIS_HOOK_POSTINSTALL` re-ran
+/// `-Mode install` on every upgrade, and nothing did on macOS or Linux — a
+/// runtime there was provisioned once, on the day of first launch, and then
+/// left alone forever. A bumped `NODE_VERSION` would have split the platforms
+/// silently.
+///
+/// So the app records which version built the tree and re-runs the script when
+/// that stops matching. Re-running is cheap: the Node download is skipped when
+/// the stamp beside it already names the pinned version, and npm's cache is
+/// per-user, so the packages are usually already there.
+///
+/// The record lives inside the runtime rather than beside it, so that removing
+/// the runtime removes the claim that one exists; see `-Mode uninstall`.
+fn provisioned(app: &AppHandle) -> bool {
+    let Some(path) = provisioned_file(app) else {
+        return false;
+    };
+    let wanted = app.package_info().version.to_string();
+
+    std::fs::read_to_string(path).is_ok_and(|by| by.trim() == wanted)
+}
+
+/// Write down which version built it, once it is built.
+fn mark_provisioned(app: &AppHandle) {
+    let Some(path) = provisioned_file(app) else { return };
+
+    if let Err(error) = std::fs::write(&path, app.package_info().version.to_string()) {
+        // The cost is one more `-Mode install` on the next launch, which is
+        // idempotent and mostly cache hits. Not worth interrupting anyone over.
+        eprintln!("dsh-desktop: could not record what provisioned the runtime: {error}");
+    }
+}
+
+fn provisioned_file(app: &AppHandle) -> Option<PathBuf> {
+    Some(runtime(app)?.join(".provisioned"))
+}
+
 /// `%LOCALAPPDATA%\<identifier>`, `~/Library/Application Support/<identifier>`,
 /// `~/.local/share/<identifier>`. Both bootstrap scripts and
 /// `installer-hooks.nsh` build the same path out of the platform's own variable
@@ -1263,18 +1191,61 @@ pub fn note(app: &AppHandle, title: &str, detail: &str) {
     );
 }
 
-/// Put the directories dsh needs at the front of a child's PATH.
+/// Put the runtime's own directories at the front of a child's PATH.
 ///
-/// Two things depend on this. A Node the bootstrap script installed is on
-/// nobody's PATH — not the user's, and so not this process's either — so
-/// without it `dsh.cmd` would run and fail to find the `node` it shells out to.
-/// And dsh shells out to `node` again for workers and plugin tooling, which
-/// should reach the same one the app is running it with, not whichever one a
-/// version manager happens to have active.
+/// Two constants, where this used to be a three-level search with the inherited
+/// PATH behind it. dsh shells out to `node` for workers and plugin tooling, and
+/// it runs pnpm for every plugin install; both have to reach ours rather than
+/// whichever Node a version manager happens to have active, because that is the
+/// one dsh's native modules were built against.
+///
+/// The inherited PATH still follows, so everything else the user has stays
+/// reachable — this decides which `node` wins, not which commands exist.
 pub fn apply_path(app: &AppHandle, command: &mut Command) {
-    if let Ok(path) = std::env::join_paths(search_path(app)) {
+    if let Ok(path) = std::env::join_paths(child_path(app)) {
         command.env("PATH", path);
     }
+}
+
+/// The PATH a child of ours gets: three directories of the runtime's, then
+/// whatever this process inherited.
+///
+/// One definition, because [`apply_path`] and [`terminal`] both need it and a
+/// terminal whose PATH disagreed with the app's would run a different dsh than
+/// the window does — which is the confusing half of every bug report this
+/// module has ever produced.
+fn child_path(app: &AppHandle) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    // The launcher first, so a bare `dsh` here is the one the window runs. It
+    // has to come before the Node directory rather than after it: on Windows
+    // that directory *is* npm's global prefix, so an `npm i -g` typed into the
+    // terminal this opens lands a second `dsh` shim in it — and a shim ahead of
+    // our launcher would be the one answering, in this terminal only, which is
+    // the sort of difference nobody would ever guess at.
+    if let Some(dir) = app_dir(app) {
+        dirs.push(dir.join("bin"));
+    }
+    // Then our Node, so that a `node` spelled bare by dsh, by a plugin's install
+    // script, or by npm's own shim resolves to the Node its native modules were
+    // built against rather than to whatever a version manager has active. The
+    // launcher directory holds one file and none of these three names, so
+    // putting it in front costs this nothing.
+    if let Some(node) = node_dir(app) {
+        dirs.push(node);
+    }
+    // npm's shims for the local install, which is how dsh finds `pnpm`.
+    if let Some(modules) = modules(app) {
+        dirs.push(modules.join(".bin"));
+    }
+
+    // Behind ours rather than instead of it: this decides which `node` wins,
+    // not which commands exist, and everything else the user has stays
+    // reachable.
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    dirs.extend(std::env::split_paths(&inherited));
+
+    dirs
 }
 
 /// Drop the `\\?\` prefix Tauri's path APIs come back with on Windows. Rust's
@@ -1296,17 +1267,19 @@ fn simplified(path: PathBuf) -> PathBuf {
 
 /// Open a terminal that has dsh in it.
 ///
-/// The app knows where dsh and its Node are — it resolved them at startup and
-/// hands them to every child it runs (see [`apply_path`]). The user's shell does
-/// not, and deliberately: nothing here writes to their PATH, because a desktop
-/// app editing the environment of every terminal on the machine is a change they
-/// did not ask for and cannot see. The cost of that decision is that on a machine
-/// where this app installed Node itself, `dsh` is a command the user cannot type.
+/// Less load-bearing than it used to be. The install script puts
+/// `<app data>/bin` on the user's PATH, so `dsh` is a command they can type in
+/// any shell — this used to be the *only* way to reach the CLI, because nothing
+/// was written to PATH at all and a machine where the app had installed its own
+/// Node had a working dsh the user could not name.
 ///
-/// This is the way out. One terminal with the same PATH the app's own children
-/// get, for as long as it is open, and nothing left behind when it closes. It is
-/// how the CLI gets used at all on such a machine — `dsh plugin`, `dsh` itself,
-/// anything the window does not put a button on.
+/// It is still worth having. Writing the entry can fail — a locked registry, a
+/// PATH already at the length limit — and on Windows it cannot outrank a dsh on
+/// the machine PATH however it is written; this reaches the app's copy either
+/// way, because the PATH it hands the shell is built here rather than read.
+///
+/// What it opens is one terminal with the same PATH the app's own children get,
+/// for as long as it is open, and nothing left behind when it closes.
 ///
 /// The environment travels by inheritance rather than as a command to run: the
 /// child is spawned with the PATH already set and the shell it opens inherits
@@ -1337,7 +1310,7 @@ pub fn terminal(app: &AppHandle) -> Result<(), String> {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let path = std::env::join_paths(search_path(app))
+        let path = std::env::join_paths(child_path(app))
             .map_err(|error| error.to_string())?
             .to_string_lossy()
             .into_owned();
@@ -1399,366 +1372,60 @@ fn shell_quote(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        executable, first_writable_prefix, marker, package_root, prefix_of, present, resolve,
-        shim_dir, writable, PACKAGE,
-    };
-    use std::path::{Path, PathBuf};
+    use super::bin_field;
 
-    /// A directory of this test's own, gone again when the test ends. Both
-    /// layouts below are built on disk, because what [`prefix_of`] answers is a
-    /// question about which files are where.
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(name: &str) -> Self {
-            let unique = format!("dsh-prefix-{name}-{}", std::process::id());
-            let dir = std::env::temp_dir().join(unique);
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("a scratch directory under the temp dir");
-            Self(dir)
-        }
-
-        /// An empty shim, and the package tree npm would have put beside it.
-        fn install(&self, shim: &str, root: &str) -> PathBuf {
-            let package = self.0.join(root).join("node_modules").join(PACKAGE);
-            std::fs::create_dir_all(&package).expect("the package directory");
-            std::fs::write(package.join("package.json"), b"{}").expect("the manifest");
-            self.shim(shim)
-        }
-
-        fn shim(&self, shim: &str) -> PathBuf {
-            let bin = self.0.join(shim);
-            std::fs::create_dir_all(bin.parent().expect("the shim has a directory"))
-                .expect("the shim directory");
-            std::fs::write(&bin, b"").expect("the shim");
-            bin
-        }
-
-        fn at(&self, path: &str) -> PathBuf {
-            self.0.join(path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// Verbatim from a machine where the app reported no dsh: the marker was
-    /// right about everything, and unreadable because of the three bytes in
-    /// front of it.
-    const MARKER: &str = concat!(
-        "\u{feff}",
-        r#"{
-    "prefix":  "C:\\Users\\me\\AppData\\Local\\ai.deepseek.dsh.desktop\\node",
-    "dsh":  "managed",
-    "node":  "managed",
-    "npmCli":  "C:\\Users\\me\\AppData\\Local\\ai.deepseek.dsh.desktop\\node\\node_modules\\npm\\bin\\npm-cli.js",
-    "nodeExe":  "C:\\Users\\me\\AppData\\Local\\ai.deepseek.dsh.desktop\\node\\node.exe"
-}"#
-    );
-
-    #[test]
-    fn reads_a_marker_that_powershell_wrote_a_bom_onto() {
-        let state = marker(MARKER);
-
-        assert_eq!(
-            state.prefix,
-            Some(PathBuf::from(
-                r"C:\Users\me\AppData\Local\ai.deepseek.dsh.desktop\node"
-            ))
-        );
-        assert_eq!(
-            state.node,
-            Some(PathBuf::from(
-                r"C:\Users\me\AppData\Local\ai.deepseek.dsh.desktop\node\node.exe"
-            ))
-        );
-        assert!(state.npm.is_some(), "npm's entry point is recorded too");
-    }
-
-    #[test]
-    fn reads_a_marker_without_one_the_same_way() {
-        assert_eq!(
-            marker(MARKER.trim_start_matches('\u{feff}')).prefix,
-            marker(MARKER).prefix,
-            "the BOM is the only difference between these two files"
-        );
-    }
-
-    #[test]
-    fn a_marker_that_is_not_json_leaves_the_search_to_the_path() {
-        let state = marker("not json at all");
-
-        assert!(state.prefix.is_none());
-        assert!(state.node.is_none());
-        assert!(state.npm.is_none());
-    }
-
-    #[test]
-    fn takes_the_directory_a_windows_shim_sits_in() {
-        let scratch = Scratch::new("windows");
-        let shim = scratch.install("prefix/dsh.cmd", "prefix");
-
-        assert_eq!(prefix_of(&shim), Some(scratch.at("prefix")));
-    }
-
-    #[test]
-    fn takes_the_directory_above_a_unix_bin() {
-        let scratch = Scratch::new("unix");
-        let shim = scratch.install("prefix/bin/dsh", "prefix/lib");
-
-        assert_eq!(prefix_of(&shim), Some(scratch.at("prefix")));
-    }
-
-    /// A version manager's shim, or a `DSH_BIN` pointing into a checkout: there
-    /// is no global install around it for npm to replace.
-    #[test]
-    fn refuses_a_shim_with_no_package_around_it() {
-        let scratch = Scratch::new("bare");
-        let shim = scratch.shim("elsewhere/dsh");
-
-        assert_eq!(prefix_of(&shim), None);
-    }
-
-    #[test]
-    fn refuses_a_shim_at_the_root_of_the_filesystem() {
-        assert_eq!(prefix_of(Path::new("/")), None);
-    }
-
-    /// The bug this pair is here for: npm's global shims are symlinks on every
-    /// platform but Windows, and `is_file` follows them. A shim whose target is
-    /// gone — a Node switched by a version manager, a half-removed global
-    /// package — read as *absent*, so the app announced there was no pnpm and no
-    /// dsh on a machine where both names were sitting in the prefix, then
-    /// reinstalled over the top and reported the wrong cause when that failed.
+    /// Most of what used to be tested here is gone with what it covered: a
+    /// marker parser that had to strip a BOM, a `prefix_of` that told npm's two
+    /// global layouts apart, a `present`/`executable` pair whose whole job was
+    /// to call a dangling symlink "there but broken", and six functions probing
+    /// prefixes for writability. None of those questions can be asked any more
+    /// — the runtime sits at a constant path, it is a local install with one
+    /// layout on every platform, it contains no symlinks, and the app owns the
+    /// directory it is in.
     ///
-    /// Unix-only because it is about symlink semantics; the Windows shim is a
-    /// plain file and was never affected.
-    #[cfg(unix)]
+    /// What is left is the one thing still genuinely parsed on this side: the
+    /// `bin` field of a manifest we did not write. `install-deps.ps1` reads the
+    /// same field to build the terminal launcher — see `Get-DshEntry` — so the
+    /// two have to agree about what it can look like.
+
     #[test]
-    fn finds_a_shim_whose_symlink_target_is_gone() {
-        let scratch = Scratch::new("dangling");
-        let target = scratch.at("lib/node_modules/pnpm/bin/pnpm.cjs");
-        let link = scratch.at("bin/pnpm");
-        std::fs::create_dir_all(link.parent().expect("the bin directory"))
-            .expect("the bin directory");
-        std::os::unix::fs::symlink(&target, &link).expect("the shim symlink");
-
-        assert!(!target.exists(), "the target is deliberately absent");
-        assert!(
-            present(&link),
-            "a dangling shim is still an entry npm left behind"
-        );
-        assert!(
-            !executable(&link),
-            "and it is exactly what cannot be run, which is what gets reported"
-        );
-    }
-
-    /// The healthy Unix layout: a symlink to a real executable is both found and
-    /// runnable, so nothing reinstalls over a working pnpm.
-    #[cfg(unix)]
-    #[test]
-    fn accepts_a_shim_that_is_a_symlink_to_something_runnable() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let scratch = Scratch::new("linked");
-        let target = scratch.shim("lib/node_modules/pnpm/bin/pnpm.cjs");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
-            .expect("the executable bit");
-
-        let link = scratch.at("bin/pnpm");
-        std::fs::create_dir_all(link.parent().expect("the bin directory"))
-            .expect("the bin directory");
-        std::os::unix::fs::symlink(&target, &link).expect("the shim symlink");
-
-        assert!(present(&link));
-        assert!(executable(&link));
-    }
-
-    /// A global bin that lost its executable bit fails to spawn with an error no
-    /// clearer than the dangling case, so it is caught the same way.
-    #[cfg(unix)]
-    #[test]
-    fn rejects_a_shim_without_its_executable_bit() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let scratch = Scratch::new("unreadable");
-        let shim = scratch.shim("bin/pnpm");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o644))
-            .expect("the permissions");
-
-        assert!(present(&shim), "it is there");
-        assert!(!executable(&shim), "but it cannot be run");
-    }
-
-    /// A directory named `pnpm` on the search path is not the pnpm anybody wants
-    /// to execute.
-    #[test]
-    fn ignores_a_directory_with_the_name_of_a_shim() {
-        let scratch = Scratch::new("dir");
-        let dir = scratch.at("bin/pnpm");
-        std::fs::create_dir_all(&dir).expect("the directory");
-
-        assert!(!present(&dir));
-        assert!(!executable(&dir));
+    fn reads_a_bin_field_written_as_a_bare_string() {
+        let manifest: serde_json::Value = serde_json::from_str(r#"{"bin": "./cli.js"}"#).unwrap();
+        assert_eq!(bin_field(manifest.get("bin").unwrap()), Some("cli.js"));
     }
 
     #[test]
-    fn a_missing_path_is_neither_present_nor_executable() {
-        let scratch = Scratch::new("absent");
-        let nothing = scratch.at("bin/pnpm");
-
-        assert!(!present(&nothing));
-        assert!(!executable(&nothing));
+    fn reads_a_bin_field_written_as_an_object() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(r#"{"bin": {"dsh": "./bin/dsh.js"}}"#).unwrap();
+        assert_eq!(bin_field(manifest.get("bin").unwrap()), Some("bin/dsh.js"));
     }
 
-    /// npm writes its shim targets as relative paths, so the liveness test has
-    /// to resolve them against the link's directory rather than this process's
-    /// working directory — which would call a healthy shim dangling depending on
-    /// where the app was started from.
+    /// A package that names binaries but not one called `dsh` is not a dsh.
+    /// Saying so here is what makes [`super::current`] report an unusable
+    /// runtime rather than hand back an entry point belonging to something else.
     #[test]
-    fn resolves_a_relative_symlink_target_against_the_link() {
-        let link = Path::new("/usr/local/bin/pnpm");
-
-        assert_eq!(
-            resolve(link, Path::new("../lib/node_modules/pnpm/bin/pnpm.cjs")),
-            Path::new("/usr/local/bin/../lib/node_modules/pnpm/bin/pnpm.cjs")
-        );
-        // An absolute target is already the answer.
-        assert_eq!(
-            resolve(link, Path::new("/opt/pnpm/bin/pnpm.cjs")),
-            Path::new("/opt/pnpm/bin/pnpm.cjs")
-        );
+    fn refuses_an_object_that_names_no_dsh() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(r#"{"bin": {"dshx": "./cli.js"}}"#).unwrap();
+        assert_eq!(bin_field(manifest.get("bin").unwrap()), None);
     }
 
-    /// The same thing on disk: a relative link to a real file is not reported as
-    /// broken, whatever the working directory is.
-    #[cfg(unix)]
+    /// `./` is npm's spelling of "here" and not part of the path, but only at
+    /// the front. Trimming every `./` would corrupt a nested one.
     #[test]
-    fn a_relative_shim_to_a_real_target_is_not_broken() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let scratch = Scratch::new("relative");
-        let target = scratch.shim("lib/node_modules/pnpm/bin/pnpm.cjs");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
-            .expect("the executable bit");
-
-        let link = scratch.at("bin/pnpm");
-        std::fs::create_dir_all(link.parent().expect("the bin directory"))
-            .expect("the bin directory");
-        std::os::unix::fs::symlink("../lib/node_modules/pnpm/bin/pnpm.cjs", &link)
-            .expect("the relative shim symlink");
-
-        let stored = std::fs::read_link(&link).expect("the target");
-        assert!(stored.is_relative(), "npm stores a relative target");
-        assert!(
-            resolve(&link, &stored).exists(),
-            "and it resolves to the real file"
-        );
-        assert!(present(&link) && executable(&link));
+    fn strips_only_the_leading_dot_slash() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(r#"{"bin": "lib/./cli.js"}"#).unwrap();
+        assert_eq!(bin_field(manifest.get("bin").unwrap()), Some("lib/./cli.js"));
     }
 
-    /// The prefix choice behind `--prefix`: the first candidate that can be
-    /// written to wins, a nonexistent one is skipped rather than created, and
-    /// nothing usable answers `None` so the caller falls back to its own prefix.
-    ///
-    /// This is what stops the macOS/Linux `EACCES`: pnpm goes where dsh already
-    /// is when that is writable, and never into a `/usr` prefix chosen by npm.
+    /// A `bin` that is neither a string nor an object — npm would reject the
+    /// package, but the manifest is not ours and a panic here is a window that
+    /// never opens.
     #[test]
-    fn takes_the_first_prefix_it_can_write_to() {
-        let scratch = Scratch::new("toolprefix");
-        let good = scratch.at("writable");
-        std::fs::create_dir_all(&good).expect("the writable prefix");
-
-        // A prefix that is not there is not a candidate — even though its
-        // ancestors are writable, which an unguarded `ancestors()` walk would
-        // have accepted, sending npm off to build a tree nothing looks at. This
-        // assertion is here because the first version of the code did exactly
-        // that and this test caught it.
-        let missing = scratch.at("no/such/prefix");
-
-        assert_eq!(
-            first_writable_prefix([Some(missing.clone()), Some(good.clone())]),
-            Some(good.clone()),
-            "an unusable candidate is skipped for the next one"
-        );
-        assert_eq!(
-            first_writable_prefix([Some(good.clone()), Some(missing.clone())]),
-            Some(good),
-            "and the first usable one wins"
-        );
-        assert_eq!(
-            first_writable_prefix([None, Some(missing)]),
-            None,
-            "nothing usable means the caller uses its own prefix"
-        );
-        assert_eq!(first_writable_prefix([]), None);
-    }
-
-    /// A prefix that exists but has no `lib/node_modules` yet is still usable —
-    /// npm creates those itself. Rejecting it would push every fresh install
-    /// into the fallback prefix and defeat the point of installing beside dsh.
-    #[test]
-    fn accepts_a_prefix_npm_has_not_filled_in_yet() {
-        let scratch = Scratch::new("freshprefix");
-        let fresh = scratch.at("fresh");
-        std::fs::create_dir_all(&fresh).expect("an empty prefix");
-
-        assert!(
-            !package_root(&fresh).is_dir(),
-            "the package root is deliberately absent"
-        );
-        assert_eq!(
-            first_writable_prefix([Some(fresh.clone())]),
-            Some(fresh),
-            "an empty but writable prefix is where npm should go"
-        );
-    }
-
-    /// The one definition both the search path and the `--prefix` install rely
-    /// on. If these two ever disagree, a tool is installed into a directory
-    /// nothing looks in — which is the failure `tool_prefix` exists to prevent,
-    /// so it is pinned per platform rather than left to a `cfg!` written twice.
-    #[test]
-    fn puts_shims_where_npm_puts_them() {
-        let prefix = Path::new("/some/prefix");
-
-        if cfg!(windows) {
-            assert_eq!(shim_dir(prefix), prefix);
-        } else {
-            assert_eq!(shim_dir(prefix), prefix.join("bin"));
-        }
-    }
-
-    /// The probe behind the `EACCES` message: it answers for a directory that
-    /// exists and refuses one that does not, so a fresh prefix is not reported as
-    /// unwritable.
-    #[test]
-    fn probes_a_directory_it_can_write_to() {
-        let scratch = Scratch::new("probe");
-
-        assert!(writable(&scratch.0));
-        assert!(!writable(&scratch.at("does/not/exist")));
-    }
-
-    /// What the write probe is aimed at, which is the directory npm replaces.
-    #[test]
-    fn puts_the_package_root_where_the_package_is() {
-        let scratch = Scratch::new("root");
-        scratch.install("prefix/bin/dsh", "prefix/lib");
-
-        let prefix = scratch.at("prefix");
-        assert_eq!(
-            package_root(&prefix),
-            prefix.join("lib").join("node_modules")
-        );
-        assert_eq!(
-            package_root(&scratch.at("nothing-here")),
-            scratch.at("nothing-here").join("node_modules")
-        );
+    fn refuses_a_bin_field_that_is_not_a_name_at_all() {
+        let manifest: serde_json::Value = serde_json::from_str(r#"{"bin": ["./cli.js"]}"#).unwrap();
+        assert_eq!(bin_field(manifest.get("bin").unwrap()), None);
     }
 }

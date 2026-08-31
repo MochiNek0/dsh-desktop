@@ -5,17 +5,15 @@
 //! `$DSH_HOME/profiles/web`, runs `pnpm <args…>` in it, and reconciles the
 //! `dsh.profile.bundles` list against what pnpm actually installed. Which means
 //! installing a plugin needs three things on the machine: dsh, the Node under
-//! it, and pnpm. This app already goes to some trouble to get the first two onto
-//! a machine that has neither — and then leaves them where only it can reach
-//! them, because it does not write to the user's PATH (see `dsh`). So a user who
-//! arrived with no Node has a working dsh, no `dsh` command in their terminal,
-//! and no way to type the command that would add a plugin to it.
+//! it, and pnpm. All three are in the app's runtime, which `install-deps.ps1`
+//! fills in — pnpm included, in the same npm command as dsh.
 //!
-//! Hence this module. It runs that command with the paths the app resolved,
-//! puts pnpm beside them when it is missing, and prints the whole thing onto a
-//! panel drawn over whatever the window is showing (see `panel`). There is
-//! nothing here the user could not have done in a terminal; the point is that
-//! this user cannot open one that has dsh in it.
+//! Hence this module. It runs that command with the runtime's own paths, puts
+//! pnpm there itself if the runtime somehow lacks it, and prints the whole thing
+//! onto a panel drawn over whatever the window is showing (see `panel`). There
+//! is nothing here the user could not do in a terminal — the launcher on their
+//! PATH runs the same dsh — but a panel with a checklist beats reading a
+//! `dsh plugin --profile web add` invocation off a README.
 //!
 //! ## The preset list
 //!
@@ -63,11 +61,13 @@ use std::sync::Mutex;
 
 use tauri::AppHandle;
 
-/// The shim names and the three states one can be in, from the module that owns
-/// finding them; see [`crate::dsh::DSH`]. Imported rather than requalified at
-/// each of the five call sites below, so that the names this module asks about
-/// are visibly the same ones the app resolves dsh with.
-use crate::dsh::{Tool, DSH, PNPM};
+// There is nothing left to import from `dsh` but the questions themselves.
+//
+// This used to be `use crate::dsh::{Tool, DSH, PNPM}` — a three-state enum and
+// two lists of shim names — because a tool could be present, absent, or present
+// with a dangling symlink behind it, and telling those apart meant naming the
+// shims here as well as there. The runtime is the app's own directory now, so
+// `dsh` answers both questions with a `bool` and there are no names to share.
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -375,31 +375,25 @@ pub fn install(
         return Err(t!("没有选择任何插件", "nothing was selected").to_string());
     }
 
+    // One state, not three. `current` used to answer `None` both for a machine
+    // with no dsh and for one whose shim was a symlink left dangling by a Node
+    // version switch, and the second had to be named separately or the message
+    // contradicted the working `dsh` in the user's terminal. The runtime holds
+    // no symlinks and nothing outside it can move, so "not installed" is the
+    // only way to be without one.
     let dsh = crate::dsh::current(app).ok_or_else(|| {
-        // `current` answers `None` both for a machine with no dsh and for one
-        // whose `dsh` shim is present but broken — a dangling symlink left by a
-        // Node version switch. Those need different things done about them, and
-        // telling the second user there is "no dsh" contradicts the working
-        // `dsh` in their terminal.
-        match crate::dsh::tool(app, DSH) {
-            Tool::Broken(why) => t!(
-                "找到了 dsh，但它无法运行。{}请重新安装 dsh 之后再装插件：npm install -g @deepseek-ai/dsh",
-                "dsh is here but cannot run. {}Reinstall dsh before installing plugins: npm install -g @deepseek-ai/dsh",
-                why
-            ),
-            _ => t!(
-                "这台机器上还没有装好的 dsh，插件没有可以装进去的地方。",
-                "there is no working dsh on this machine for a plugin to go into."
-            )
-            .to_string(),
-        }
+        t!(
+            "这台机器上还没有装好的 dsh，插件没有可以装进去的地方。重启应用会再装一次。",
+            "there is no working dsh on this machine for a plugin to go into. Restarting the app installs one."
+        )
+        .to_string()
     })?;
 
     ensure_pnpm(app, log)?;
 
     log(&t!("正在安装：{}", "Installing: {}", specs.join(" ")));
 
-    let mut command = Command::new(&dsh.bin);
+    let mut command = dsh.command();
     command.args(["plugin", "--profile", PROFILE, "add"]);
     // The profile directory is a pnpm workspace whose only package is itself —
     // `packages: [.]`, in the `pnpm-workspace.yaml` dsh writes when it first
@@ -440,7 +434,7 @@ pub fn install(
                 names.join("、")
             ));
 
-            let mut retry = Command::new(&dsh.bin);
+            let mut retry = dsh.command();
             retry.args(["plugin", "--profile", PROFILE, "add"]);
             if profile_dir(app).join("pnpm-workspace.yaml").is_file() {
                 retry.arg("-w");
@@ -458,21 +452,16 @@ pub fn install(
             Ok(())
         }
         // 127 is what dsh answers with when pnpm is not on the PATH it was
-        // given. Reaching it means `ensure_pnpm` said yes to something that then
-        // could not be executed, so the shim it accepted is re-examined: a
-        // broken one has a specific cause worth printing, and blaming the
-        // install step for a pnpm that was already there and already broken sent
-        // the user after the wrong thing.
-        127 => Err(match crate::dsh::tool(app, PNPM) {
-            Tool::Broken(why) => {
-                t!("dsh 无法运行 pnpm。{}", "dsh could not run pnpm. {}", why)
-            }
-            _ => t!(
-                "dsh 找不到 pnpm。插件安装需要 pnpm，自动安装它这一步没有成功。",
-                "dsh could not find pnpm. Installing plugins needs it, and installing pnpm did not work."
-            )
-            .to_string(),
-        }),
+        // given — see `crate::dsh::child_path`, which puts the runtime's
+        // `node_modules/.bin` on it. Reaching it means `ensure_pnpm` claimed
+        // success over a pnpm that then could not be executed, which the
+        // runtime makes very unlikely: it checks the package is there rather
+        // than trusting npm's exit code, and there is no shim to dangle.
+        127 => Err(t!(
+            "dsh 找不到 pnpm。插件安装需要 pnpm，自动安装它这一步没有成功。",
+            "dsh could not find pnpm. Installing plugins needs it, and installing pnpm did not work."
+        )
+        .to_string()),
         _ => Err(diagnose(app, &outcome, false)),
     }
 }
@@ -551,132 +540,75 @@ fn diagnose(app: &AppHandle, outcome: &Outcome, removing: bool) -> String {
 
 /// Put pnpm where the dsh we are about to run will find it.
 ///
-/// `npm install -g pnpm`, into the same global prefix the app's dsh lives in, so
-/// that [`crate::dsh::apply_path`] puts it on the child's PATH along with
-/// everything else. Downloading a standalone pnpm would mean a second installer
-/// in this app — a fetch, a checksum, an archive to unpack, a mirror list to
-/// walk — to arrive at a binary npm can place in one command.
+/// One `npm install` into the runtime, beside dsh, which is also where
+/// `install-deps.ps1` puts it on a fresh machine — this is the repair path for a
+/// runtime that predates that or lost it, not the ordinary way it arrives.
+/// Downloading a standalone pnpm would mean a second installer in this app — a
+/// fetch, a checksum, an archive to unpack, a mirror list to walk — to arrive at
+/// a binary npm can place in one command.
+///
+/// What used to be here was three times this length, and none of it was about
+/// pnpm. `npm install -g pnpm` let npm choose the destination, which gave two
+/// distinct failures: an `EACCES` on a prefix under `/usr` that the user cannot
+/// write to, and a *success* into a prefix that was not the one the app searched
+/// — a pnpm that existed and could not be found. So a prefix had to be chosen
+/// here (`tool_prefix`), probed for writability, and reported on afterwards
+/// (`unwritable_prefix`), and the failure message had to say which of the two
+/// directories it was talking about. The runtime is one directory the app owns
+/// and can always write to, so all of that is gone and a failure here is a
+/// network failure.
 fn ensure_pnpm(app: &AppHandle, log: &Log) -> Result<(), String> {
-    // A pnpm that is there and runs is the whole check. A pnpm that is there and
-    // does *not* run has to be named: reinstalling over a dangling symlink is
-    // what npm is about to be asked to do, and if that fails the user needs to
-    // know it was already broken rather than merely absent.
-    //
-    // Both arms are built into a `String` before logging. `t!` hands back a
-    // `&'static str` with no arguments and a `String` with them, so taking the
-    // owned form in both keeps this a single `log` call instead of two that
-    // differ only by an `&`.
-    let announce = match crate::dsh::tool(app, PNPM) {
-        Tool::Ready => return Ok(()),
-        Tool::Missing => t!(
-            "没有找到 pnpm，先安装它（dsh 的插件安装是转发给 pnpm 的）…",
-            "No pnpm found; installing it first (dsh forwards plugin installs to pnpm)…"
-        )
-        .to_string(),
-        Tool::Broken(why) => t!(
-            "已有的 pnpm 无法运行。{}正在重新安装…",
-            "The pnpm already here cannot run. {}Reinstalling it now…",
-            why
-        ),
-    };
-    log(&announce);
+    if crate::dsh::pnpm_ready(app) {
+        return Ok(());
+    }
 
-    let mut npm = crate::dsh::npm(app).ok_or_else(|| {
+    log(t!(
+        "没有找到 pnpm，先安装它（dsh 的插件安装是转发给 pnpm 的）…",
+        "No pnpm found; installing it first (dsh forwards plugin installs to pnpm)…"
+    ));
+
+    let runtime = crate::dsh::runtime(app).ok_or_else(|| {
         t!(
-            "找不到 npm，无法安装 pnpm。",
-            "no npm to install pnpm with."
+            "找不到应用数据目录，无法安装 pnpm。",
+            "no application data directory to install pnpm into."
         )
         .to_string()
     })?;
-    npm.args(["install", "-g", "pnpm"]);
 
-    // Where it goes is chosen rather than left to npm; see `tool_prefix`. Two
-    // failures come from letting npm decide: an `EACCES` on a prefix under
-    // `/usr` or `/usr/local` that the user cannot write to, and a success into
-    // some prefix that is not the one `search_path` looks in — a pnpm that
-    // exists and cannot be found.
-    //
-    // `--prefix` rather than a `PATH` trick, because it is npm's own answer to
-    // this question and it is what `install-deps.sh` already passes for dsh.
-    let prefix = crate::dsh::tool_prefix(app);
-    if let Some(prefix) = prefix.as_deref() {
-        npm.arg("--prefix").arg(prefix);
-        log(&t!(
-            "把 pnpm 装到 {}",
-            "Installing pnpm into {}",
-            prefix.display()
-        ));
-    }
+    let mut npm = crate::dsh::npm(app).ok_or_else(|| {
+        t!(
+            "运行时里没有可用的 npm，无法安装 pnpm。重启应用会重新安装运行时。",
+            "the runtime has no usable npm to install pnpm with. Restarting the app reinstalls it."
+        )
+        .to_string()
+    })?;
+
+    // Local, not `-g`, and aimed at the runtime — the same command the install
+    // script runs, so pnpm lands in the one `node_modules` the app looks in.
+    npm.args(["install", "--no-audit", "--no-fund", "pnpm"]);
+    npm.arg("--prefix").arg(&runtime);
 
     // Only the exit code matters here: this runs npm, not pnpm, so there are no
     // `ERR_PNPM_*` codes to switch on.
     match run(npm, log)?.code {
-        // npm exiting 0 is not the same as pnpm being runnable: it will report
-        // success having written a shim whose target the next step cannot
-        // execute, or into a prefix nothing on the search path looks at. The
-        // claim this function makes is that pnpm runs, so it is checked.
-        0 => match crate::dsh::tool(app, PNPM) {
-            Tool::Ready => {
-                log(t!("pnpm 安装完成。", "pnpm installed."));
-                Ok(())
-            }
-            Tool::Broken(why) => Err(t!(
-                "npm 报告 pnpm 安装成功，但它仍然无法运行。{}",
-                "npm reported pnpm installed, but it still cannot run. {}",
-                why
-            )),
-            Tool::Missing => Err(t!(
-                "npm 报告 pnpm 安装成功，但在 dsh 会搜索的目录里找不到它。",
-                "npm reported pnpm installed, but it is not in any directory dsh searches."
-            )
-            .to_string()),
-        },
-        // A prefix was chosen above precisely so that the permission failure
-        // cannot happen, so this is no longer assumed to be one. It is still
-        // *checked*, and both halves of the answer matter: which directory npm
-        // was aimed at, and whether the machine's own global prefix is one the
-        // user cannot write to.
-        //
-        // The unwritable prefix is reported whenever there is one, including
-        // when a `--prefix` of our own was passed. Those coexist: `tool_prefix`
-        // falls back to the app's own directory exactly because the machine's
-        // prefix was unwritable, so on the `/usr` Node this is all about, the
-        // install is aimed somewhere writable *and* the standing problem is
-        // still worth naming — it is why dsh and pnpm are not on the user's own
-        // PATH, and moving npm's prefix is what fixes that for good.
-        code => Err(match (prefix, crate::dsh::unwritable_prefix(app)) {
-            // Aimed at a directory of ours, and the machine's global prefix is
-            // also unwritable: say both, so neither the target nor the advice
-            // has to be guessed at.
-            (Some(target), Some(blocked)) => t!(
-                "安装 pnpm 失败（npm 退出码 {}），目标目录是 {}。另外，npm 的全局目录 {} 不可写——把它换到你自己拥有的位置可以一并解决终端里找不到 dsh 的问题：npm config set prefix ~/.npm-global（并把 ~/.npm-global/bin 加进 PATH）。上面是 npm 的完整输出。",
-                "Installing pnpm failed (npm exit code {}) with {} as the target. Separately, npm's global directory {} is not writable — pointing it at a prefix you own also fixes dsh not being found in your terminal: npm config set prefix ~/.npm-global (and add ~/.npm-global/bin to your PATH). npm's full output is above.",
-                code,
-                target.display(),
-                blocked.display()
-            ),
-            // Installed into a directory this app picked and can write to, and
-            // nothing else is known to be blocked — so permissions are not it.
-            (Some(target), None) => t!(
-                "安装 pnpm 失败（npm 退出码 {}），目标目录是 {}。这不是权限问题——上面是 npm 的完整输出，通常是网络或注册表访问失败。",
-                "Installing pnpm failed (npm exit code {}) with {} as the target. This is not a permission problem — npm's full output is above, and it is usually a network or registry failure.",
-                code,
-                target.display()
-            ),
-            // No prefix of our own to aim at, so npm chose, and it chose one the
-            // user cannot write to: the plain permission case.
-            (None, Some(blocked)) => t!(
-                "安装 pnpm 失败（npm 退出码 {}）：全局目录 {} 不可写，需要管理员权限。可以把 npm 的全局目录换到你自己拥有的位置再重试：npm config set prefix ~/.npm-global（并把 ~/.npm-global/bin 加进 PATH）。",
-                "Installing pnpm failed (npm exit code {}): the global directory {} is not writable and needs administrator rights. Point npm at a prefix you own and retry: npm config set prefix ~/.npm-global (and add ~/.npm-global/bin to your PATH).",
-                code,
-                blocked.display()
-            ),
-            (None, None) => t!(
-                "安装 pnpm 失败，npm 退出码 {}。上面是它的完整输出。",
-                "installing pnpm failed; npm exited with code {}. Its full output is above.",
-                code
-            ),
-        }),
+        // npm exiting 0 is not the same as pnpm being there. The claim this
+        // function makes is that the next step will find it, so that is what is
+        // checked rather than what npm said.
+        0 if crate::dsh::pnpm_ready(app) => {
+            log(t!("pnpm 安装完成。", "pnpm installed."));
+            Ok(())
+        }
+        0 => Err(t!(
+            "npm 报告 pnpm 安装成功，但运行时目录里找不到它。",
+            "npm reported pnpm installed, but it is not in the runtime directory."
+        )
+        .to_string()),
+        code => Err(t!(
+            "安装 pnpm 失败，npm 退出码 {}。目标目录是 {}，是应用自己的目录，所以这不是权限问题——上面是 npm 的完整输出，通常是网络或注册表访问失败。",
+            "Installing pnpm failed; npm exited with code {}. The target was {}, a directory the app owns, so this is not a permission problem — npm's full output is above, and it is usually a network or registry failure.",
+            code,
+            runtime.display()
+        )),
     }
 }
 
@@ -948,19 +880,11 @@ pub fn remove(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String
     }
 
     let dsh = crate::dsh::current(app).ok_or_else(|| {
-        // The same two cases as in `install`; see the note there.
-        match crate::dsh::tool(app, DSH) {
-            Tool::Broken(why) => t!(
-                "找到了 dsh，但它无法运行。{}请先重新安装 dsh：npm install -g @deepseek-ai/dsh",
-                "dsh is here but cannot run. {}Reinstall dsh first: npm install -g @deepseek-ai/dsh",
-                why
-            ),
-            _ => t!(
-                "这台机器上还没有装好的 dsh。",
-                "there is no working dsh on this machine."
-            )
-            .to_string(),
-        }
+        t!(
+            "这台机器上还没有装好的 dsh。重启应用会再装一次。",
+            "there is no working dsh on this machine. Restarting the app installs one."
+        )
+        .to_string()
     })?;
 
     ensure_pnpm(app, log)?;
@@ -970,7 +894,7 @@ pub fn remove(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String
     // Built twice, because the retry below needs a `Command` of its own — they
     // are not reusable once run.
     let removal = || {
-        let mut command = Command::new(&dsh.bin);
+        let mut command = dsh.command();
         command.args(["plugin", "--profile", PROFILE, "remove"]);
         command.args(&names);
         crate::dsh::apply_path(app, &mut command);
@@ -1005,18 +929,11 @@ pub fn remove(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String
             log(t!("插件已卸载。", "Plugins removed."));
             Ok(())
         }
-        // As in `install`: a broken shim is a different problem from a missing
-        // one, and only one of them is fixed by installing pnpm again.
-        127 => Err(match crate::dsh::tool(app, PNPM) {
-            Tool::Broken(why) => {
-                t!("dsh 无法运行 pnpm。{}", "dsh could not run pnpm. {}", why)
-            }
-            _ => t!(
-                "dsh 找不到 pnpm。卸载插件同样需要它。",
-                "dsh could not find pnpm. Removing a plugin needs it too."
-            )
-            .to_string(),
-        }),
+        127 => Err(t!(
+            "dsh 找不到 pnpm。卸载插件同样需要它。",
+            "dsh could not find pnpm. Removing a plugin needs it too."
+        )
+        .to_string()),
         _ => Err(diagnose(app, &outcome, true)),
     }
 }

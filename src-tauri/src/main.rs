@@ -527,7 +527,7 @@ fn update_dsh(app: &tauri::AppHandle) {
         // in there is nothing to show but the page the user was already on, and
         // fifteen seconds of that is a menu item that did nothing.
         let saying = |text: &str| controls::busy(&app, text);
-        let Some((prefix, installed)) = dsh::requested(&app, &saying) else {
+        let Some(installed) = dsh::requested(&app, &saying) else {
             return;
         };
         let Some(window) = app.get_webview_window("main") else {
@@ -563,11 +563,98 @@ fn update_dsh(app: &tauri::AppHandle) {
 
         // False means the app is quitting and took npm down with it.
         let report = reporter(&session.splash, &window);
-        if !dsh::update(&app, &prefix, &installed, &report) {
+        if !dsh::update(&app, &installed, &report) {
             return;
         }
 
         start_serving(&app, &window, &session);
+    });
+}
+
+/// Put the settings panel up over whatever the window is showing.
+///
+/// Drawn into that page rather than being one, like the plugin panel and for the
+/// same reason: dsh keeps running behind it and nothing reloads.
+fn open_settings(app: &tauri::AppHandle) {
+    let session = app.state::<Session>().inner().clone();
+    let app = app.clone();
+
+    // Off the navigation callback that delivered the click. `dsh::facts` reads
+    // two files, and the webview is blocked until this returns.
+    std::thread::spawn(move || {
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+
+        session.splash.settings(&window, &dsh::facts(&app));
+    });
+}
+
+/// Delete the runtime this app installed, and leave.
+///
+/// The only caller of `-Mode uninstall` outside the Windows uninstaller, and on
+/// macOS and Linux the only one there has ever been: nothing runs when an app
+/// bundle goes to the Trash, so the runtime stayed behind forever.
+///
+/// It has to end in a quit. dsh is running out of the directory this deletes —
+/// on Windows it would hold its own files open and the deletion would fail —
+/// and once it is gone there is nothing left for the window to show. The next
+/// launch installs a fresh one; see `dsh::gate`.
+fn remove_runtime(app: &tauri::AppHandle) {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        dsh::note(
+            app,
+            t!("请稍等", "One moment"),
+            t!(
+                "dsh 正在启动或更新中，等它忙完再试。",
+                "dsh is starting or updating; try again once it has finished."
+            ),
+        );
+        return;
+    }
+
+    let session = app.state::<Session>().inner().clone();
+    let app = app.clone();
+
+    std::thread::spawn(move || {
+        let _busy = Busy;
+
+        if !dsh::confirm_removal(&app) {
+            return;
+        }
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+
+        stop_server(&session);
+        session.splash.rearm();
+
+        let handle = app.clone();
+        let back = window.clone();
+        let home = session.home.read().unwrap().clone();
+        let _ = app.run_on_main_thread(move || {
+            // The window is very often in the tray by now, which is no place
+            // for the last thing this app does.
+            reveal(&handle);
+            match home {
+                Some(home) => {
+                    if let Err(error) = back.navigate(home) {
+                        eprintln!("dsh-desktop: could not return to the loading page: {error}");
+                    }
+                }
+                None => eprintln!(
+                    "dsh-desktop: the loading page's address is not known yet;                      the removal has nowhere to report progress"
+                ),
+            }
+        });
+
+        let report = reporter(&session.splash, &window);
+        // A failure has already been reported by `dsh::remove`, and it leaves a
+        // working runtime behind — so the app stays up rather than quitting
+        // into a state the user did not ask for.
+        if dsh::remove(&app, &report) {
+            quit(&app);
+        }
     });
 }
 
@@ -1127,6 +1214,13 @@ impl Splash {
     /// both lists wrong the moment it succeeds.
     fn plugin_lists(&self, window: &WebviewWindow, listing: &str) {
         self.call(window, "__dshPluginLists", &[listing]);
+    }
+
+    /// Open the settings panel, with the three versions it shows read off disk
+    /// just now. Nothing else about it is pushed: the two switches arrive on
+    /// every page load already, from `sync_autostart` and `sync_notify`.
+    fn settings(&self, window: &WebviewWindow, facts: &str) {
+        self.call(window, "__dshSettings", &[facts]);
     }
 
     /// Take it away again. What it was drawn over was never navigated away

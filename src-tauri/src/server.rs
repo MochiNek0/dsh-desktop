@@ -225,17 +225,17 @@ impl Drop for Job {
 
 /// The command that boots the browser UI.
 ///
-/// [`crate::dsh::current`] resolves it to an absolute path — `DSH_BIN`, or the
-/// npm shim in the global prefix — rather than leaving the lookup to
-/// `Command::new`, which would search the PATH this process started with. On a
-/// machine the installer has just put Node on, that PATH is already out of date.
+/// [`crate::dsh::current`] builds it out of the runtime's own Node and dsh's
+/// entry script, both absolute — rather than leaving the lookup to
+/// `Command::new`, which would search the PATH this process started with and
+/// find whatever Node the user's version manager last selected.
 ///
-/// Falling back to the bare name is for the case where nothing was found at
-/// all: the error from a failed spawn is what the loading page reports, and
+/// Falling back to the bare name is for the case where the runtime is not there
+/// at all: the error from a failed spawn is what the loading page reports, and
 /// "dsh 不存在" is a better one than "找不到应用数据目录".
 fn command(app: &tauri::AppHandle) -> Command {
     let mut command = match crate::dsh::current(app) {
-        Some(dsh) => Command::new(dsh.bin),
+        Some(dsh) => dsh.command(),
         None => Command::new(if cfg!(windows) { "dsh.cmd" } else { "dsh" }),
     };
 

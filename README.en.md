@@ -35,7 +35,7 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 - **Out of the Box**: Automatically detects and sets up Node.js and the `dsh` runtime without requiring administrator privileges.
 - **Port Conflict-Free**: Starts on an auto-assigned loopback port, coexisting seamlessly with manual `dsh web` instances.
 - **Native Experience**: Modern frameless UI featuring theme synchronization, a bilingual interface, native system notifications, and auto-start support.
-- **Shared Environment**: Shares the same global `dsh` CLI environment, with startup checks and one-click upgrades.
+- **Available in Your Terminal**: After installation the `dsh` command works in your own shell, and keeps working when you switch Node versions with nvm, fnm or volta.
 - **Plugin Management**: Built-in visual panel to install and remove dsh plugins effortlessly. Alternatively, use the integrated terminal pre-configured with the correct `PATH`.
 - **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit. Automatically offers a restart if `dsh web` crashes unexpectedly.
 
@@ -63,7 +63,8 @@ Download the latest release package for your operating system from the [Releases
 The app includes a built-in visual plugin panel, allowing you to easily manage dsh plugins without using the command line:
 
 - **Visual Management**: Click **Menu → Plugins…** to open the panel. You can install from a preset list, or enter any valid npm package name / GitHub repository (e.g., `github:owner/repo`). 
-- **Terminal Access**: If you prefer the CLI, use **Menu → Open a terminal** to open a shell pre-configured with `dsh` and all necessary environment variables, without modifying your global system PATH.
+- **Terminal Access**: If you prefer the CLI, use **Menu → Open a terminal** to open a shell pre-configured with `dsh`. The app puts exactly one directory on your PATH, holding only the `dsh` command, so it cannot shadow your own `node`, `npm` or `npx`. That directory goes first, so the `dsh` in your terminal is the one the window runs: it calls the app's own Node by absolute path and puts the app's own `pnpm` first on PATH, so installing a plugin from a terminal lands where installing it from the panel does. Uninstalling the app takes the directory back off your PATH.
+- **Settings**: **Menu → Settings…** holds the login item, turn notifications, the app / dsh / Node versions, and "Remove the dsh runtime" — which deletes the copy this app installed and leaves a Node or dsh you installed yourself alone.
 
 > **Note on `github:` plugins**: pnpm blocks build scripts from git repositories by default for security. If the installation fails, the panel will show the pnpm output. You will need to open the plugin folder and manually add the package to `allowBuilds` in `$DSH_HOME/profiles/web/pnpm-workspace.yaml`.
 
@@ -73,7 +74,7 @@ The application behavior can be customized via environment variables:
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
-| `DSH_BIN` | Absolute path to the `dsh` executable (highest priority) | Auto-detected from `PATH` |
+| `DSH_BIN` | Absolute path to the `dsh` executable (highest priority; the app will not update it) | The app's own runtime |
 | `DSH_HOME` | Directory for storing `dsh` data, credentials, and configs | `~/.dsh` |
 
 ## Development & Build
@@ -111,7 +112,7 @@ dsh-desktop/
 
 ## Notes
 
-- **Network on First Launch**: The app requires an active internet connection on first launch if local components need to be downloaded.
+- **Network on First Launch**: The first launch downloads a dedicated Node and dsh (about 220 MB together) into the app's own directory, so it needs a connection. That runtime is unrelated to any Node on the machine — switching versions with nvm, fnm or volta cannot affect it. After an app update, the first launch tops it up again if the new release pins a different runtime.
 - **Auto Update**: Integrated auto-updater support (Linux supports AppImage format only).
 
 ## Disclaimer

@@ -20,12 +20,18 @@
 //!
 //! ## The menu
 //!
-//! Beside them is the app's own menu — updating dsh, checking for a new app,
-//! the login item, quitting. It was all in the tray, where it could not be
-//! styled at all: a tray menu is drawn by the OS, and the app has no say over
-//! anything but the words in it. Drawn here it is ours, and it is also where
-//! the user is looking. The tray keeps the two items that are only ever wanted
-//! when there is no window to look at — show, and quit.
+//! Beside them is the app's own menu — plugins, a terminal, restarting and
+//! updating dsh, settings, quitting. It was all in the tray, where it could not
+//! be styled at all: a tray menu is drawn by the OS, and the app has no say
+//! over anything but the words in it. Drawn here it is ours, and it is also
+//! where the user is looking. The tray keeps the two items that are only ever
+//! wanted when there is no window to look at — show, and quit.
+//!
+//! It holds six items because the things that carried state left. The login
+//! item and notifications were checkmarks here, and the app's update check was
+//! a row nobody visits twice; all three are on the settings panel now, where
+//! they can say what they do instead of fitting in a menu row. See
+//! [`crate::panel`].
 //!
 //! ## Talking back
 //!
@@ -50,7 +56,9 @@
 //! Three things travel the other way, each pushed rather than asked for, because
 //! the page has no way to see any of them: whether the window is maximised
 //! ([`sync`]), whether the login item is on ([`sync_autostart`]), and whatever
-//! slow thing is running right now ([`busy`]).
+//! slow thing is running right now ([`busy`]). The first and the last are drawn
+//! by the titlebar below; the middle one is now drawn by the settings panel,
+//! and reaches it through the same one-line `window.eval`.
 
 use tauri::{AppHandle, Manager, Url, WebviewWindow};
 use tauri_plugin_autostart::ManagerExt;
@@ -101,6 +109,11 @@ pub enum Action {
     PluginsDirectory,
     /// A shell with dsh on its PATH.
     Terminal,
+    /// The settings panel; see [`crate::panel`].
+    Settings,
+    /// Delete the runtime the app installed, and leave. Asked for from that
+    /// panel, which is the only way to it on macOS and Linux.
+    RemoveRuntime,
     /// Start `dsh web` again after it exited on its own.
     RestartDsh,
     /// A notification the page raised; see [`crate::notify`].
@@ -139,6 +152,8 @@ pub fn action(url: &Url) -> Option<Action> {
         "plugins-done" => Some(Action::PluginsDone),
         "plugins-directory" => Some(Action::PluginsDirectory),
         "terminal" => Some(Action::Terminal),
+        "settings" => Some(Action::Settings),
+        "runtime-remove" => Some(Action::RemoveRuntime),
         "restart-dsh" => Some(Action::RestartDsh),
         "open" => {
             url.query_pairs()
@@ -179,6 +194,8 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::PluginsDone => return crate::leave_plugins(app),
         Action::PluginsDirectory => return crate::plugins::open_directory(app),
         Action::RestartDsh => return crate::restart_dsh(app),
+        Action::Settings => return crate::open_settings(app),
+        Action::RemoveRuntime => return crate::remove_runtime(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),
         Action::Answered(url) => return crate::dialog::answered(app, &url),
         Action::OpenUrl(target) => {
@@ -308,11 +325,9 @@ pub fn script() -> String {
     let terminal = label(t!("打开终端", "Open a terminal"));
     let restart_dsh = label(t!("重启 dsh", "Restart dsh"));
     let update_dsh = label(t!("更新 dsh…", "Update dsh…"));
-    let check_app = label(t!("检查应用更新…", "Check for app updates…"));
-    let autostart = label(t!("开机自启动", "Start at login"));
-    // Not "Notify when a turn finishes": the switch behind it gates every
-    // notification this app raises, a plugin's included. See `crate::settings`.
-    let notify = label(t!("通知", "Notifications"));
+    // The two switches and the app's update check moved into it; see `panel`.
+    // What is left in the menu is what somebody might click twice in a day.
+    let settings = label(t!("设置…", "Settings…"));
     let quit = label(t!("退出 dsh", "Quit dsh"));
 
     format!(
@@ -344,30 +359,27 @@ pub fn script() -> String {
     close: '<path d="M2.9 2.9l4.2 4.2m0-4.2l-4.2 4.2"/>'
   }};
 
-  // The menu, top to bottom. `check` marks the one item that carries state.
-  // The labels come from Rust so there is one place the two languages live;
-  // see `i18n`.
+  // The menu, top to bottom. The labels come from Rust so there is one place
+  // the two languages live; see `i18n`.
+  //
+  // No item carries state any more. The two that did -- the login item and
+  // notifications -- were checkmarks here and are switches in the settings
+  // panel now, which is also where the app's own update check went. Eight rows
+  // was too many to draw on every open for the sake of three nobody touches.
   var ITEMS = [
     {{ verb: 'plugins', label: {plugins} }},
     {{ verb: 'terminal', label: {terminal} }},
     {{ separator: true }},
     {{ verb: 'restart-dsh', label: {restart_dsh} }},
     {{ verb: 'update-dsh', label: {update_dsh} }},
-    {{ verb: 'check-app', label: {check_app} }},
     {{ separator: true }},
-    {{ verb: 'autostart', label: {autostart}, check: true }},
-    {{ verb: 'notify-turns', label: {notify}, check: true }},
-    {{ separator: true }},
+    {{ verb: 'settings', label: {settings} }},
     {{ verb: 'quit', label: {quit} }}
   ];
 
   var MENU_GLYPH = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" ' +
     'stroke="currentColor" stroke-width="1.4" stroke-linecap="round">' +
     '<path d="M3 4.5h8M3 7h8M3 9.5h8"/></svg>';
-
-  var TICK = '<svg class="dsh-wc-tick" width="11" height="11" viewBox="0 0 12 12" ' +
-    'fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" ' +
-    'stroke-linejoin="round"><path d="M2.4 6.4l2.3 2.3 4.9-5.1"/></svg>';
 
   function svg(shape) {{
     return '<svg width="8" height="8" viewBox="0 0 10 10" fill="none" ' +
@@ -522,8 +534,6 @@ pub fn script() -> String {
       '.dsh-wc-pop button:hover{{background:var(--dsh-wc-hover)}}' +
       '.dsh-wc-pop hr{{border:0;height:1px;margin:5px 8px;' +
       'background:var(--dsh-wc-line)}}' +
-      '.dsh-wc-tick{{margin-left:auto;opacity:0;transition:opacity .12s ease}}' +
-      '.dsh-wc-pop button.dsh-wc-checked .dsh-wc-tick{{opacity:1}}' +
       // What is running right now, beside the menu button that started it.
       '.dsh-wc-toast{{display:flex;align-items:center;gap:7px;margin-left:12px;' +
       'color:var(--dsh-wc-fg);font:12px/1 {FONT};white-space:nowrap;' +
@@ -605,7 +615,6 @@ pub fn script() -> String {
 
     var pop = document.createElement('div');
     pop.className = 'dsh-wc-pop';
-    var checks = {{}};
 
     ITEMS.forEach(function (item) {{
       if (item.separator) {{
@@ -618,10 +627,6 @@ pub fn script() -> String {
       var label = document.createElement('span');
       label.textContent = item.label;
       entry.appendChild(label);
-      if (item.check) {{
-        entry.insertAdjacentHTML('beforeend', TICK);
-        checks[item.verb] = entry;
-      }}
       entry.addEventListener('click', function () {{
         // Closed first: the verb can end in a modal, and a menu still hanging
         // open behind it is a menu that is open again when the modal goes.
@@ -665,18 +670,9 @@ pub fn script() -> String {
       if (open) shut();
     }});
 
-    // Called from Rust; see `sync_autostart`, `sync_notify` and `busy`.
-    function mark(verb, on) {{
-      var entry = checks[verb];
-      if (entry) entry.classList.toggle('dsh-wc-checked', !!on);
-    }}
-
-    window.__dshAutostart = function (on) {{
-      mark('autostart', on);
-    }};
-    window.__dshNotifyTurns = function (on) {{
-      mark('notify-turns', on);
-    }};
+    // Called from Rust; see `busy`. The login item and notifications used to
+    // be pushed in here too, as checkmarks; they are switches on the settings
+    // panel now and `panel.rs` takes those calls.
     window.__dshBusy = function (text) {{
       said.textContent = text || '';
       toast.classList.toggle('dsh-wc-shown', !!text);
@@ -843,6 +839,20 @@ mod tests {
 
         let url_no_param = Url::parse("dsh-window://open").unwrap();
         assert!(action(&url_no_param).is_none());
+    }
+
+    /// The two verbs the settings panel signals on. Both are new, and both are
+    /// reachable only from a panel with no other way back to Rust.
+    #[test]
+    fn parses_settings_actions() {
+        assert!(matches!(
+            action(&Url::parse("dsh-window://settings").unwrap()),
+            Some(Action::Settings)
+        ));
+        assert!(matches!(
+            action(&Url::parse("dsh-window://runtime-remove").unwrap()),
+            Some(Action::RemoveRuntime)
+        ));
     }
 
     #[test]

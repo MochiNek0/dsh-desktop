@@ -9,23 +9,29 @@
 # progress on the loading page — the same path Windows falls back to when its
 # installer could not reach the network.
 #
-# Nothing here needs root. Node goes under the app's own data directory, npm
-# writes to a prefix inside it, and the only thing touched outside is a marked
-# block appended to the user's shell profile.
+# Nothing here needs root, and nothing outside the app's own data directory is
+# written except one symlink into `~/.local/bin`.
 #
-# A Node the machine already has is used as it is and never replaced; the same
-# goes for a dsh already on PATH — installing a second copy beside it would be
-# 327 MB nobody asked for. Updating one is a different matter: whoever installed
-# it, it is one `npm install -g` in some prefix, so `update` replaces it in place
-# in the prefix it is actually in. What this script installed is written down in
-# `bootstrap.json`, which is what keeps `uninstall` off a Node it did not put
-# there.
+# The app owns its runtime outright, which is what keeps the rest of this short:
+#
+#     <AppDir>/runtime/node/                  a pinned Node, ours alone
+#     <AppDir>/runtime/node_modules/          dsh and pnpm, a *local* install
+#     <AppDir>/bin/dsh                        the launcher, linked into PATH
+#
+# Nothing is detected and nothing is shared. A Node the machine already has is
+# not reused, a dsh the user installed themselves is never touched, and npm's
+# global prefix is not involved at all — so no version manager can move any of
+# it, and every path above is a constant. There is no marker file: the old
+# `bootstrap.json` is read once by `migrate_legacy` and never written again.
+#
+# The launcher is written here rather than left to npm because npm's generated
+# shim resolves `node` off PATH, which is the exact coupling this layout exists
+# to remove. `write_launcher` hard-codes ours.
 #
 # The flags are spelled the way `install-deps.ps1` spells them, because
 # `src-tauri/src/dsh.rs` calls both with the same arguments:
 #
-#   sh install-deps.sh -Mode install|update|uninstall [-Prefix <dir>]
-#                      [-RemoveDsh] [-RemoveNode] [-Progress]
+#   sh install-deps.sh -Mode install|update|uninstall [-Progress]
 #
 # Output is a plain log. Pass `-Progress` and it also emits `::status <text>`,
 # `::progress <percent>` and `::error <text>` lines for the app's loading page to
@@ -39,9 +45,6 @@ set -u
 # ------------------------------------------------------------------ options --
 
 MODE=install
-PREFIX=''
-REMOVE_DSH=0
-REMOVE_NODE=0
 PROGRESS=0
 
 while [ $# -gt 0 ]; do
@@ -51,18 +54,6 @@ while [ $# -gt 0 ]; do
             MODE=$2
             shift 2
             ;;
-        # `update` only: the npm global prefix holding the dsh to replace. The
-        # app resolves it from the copy it is actually running — see `prefix_of`
-        # in `src-tauri/src/dsh.rs` — because a dsh the user installed themselves
-        # sits in their own prefix, not in the one this script would pick. Empty
-        # falls back to the marker's prefix, and then to `find_prefix`.
-        -Prefix)
-            [ $# -ge 2 ] || { echo "-Prefix 后面要跟一个目录" >&2; exit 2; }
-            PREFIX=$2
-            shift 2
-            ;;
-        -RemoveDsh) REMOVE_DSH=1; shift ;;
-        -RemoveNode) REMOVE_NODE=1; shift ;;
         -Progress) PROGRESS=1; shift ;;
         *) echo "未知参数：$1" >&2; exit 2 ;;
     esac
@@ -82,22 +73,39 @@ case "$(uname -s)" in
     Darwin) APP_DIR="$HOME/Library/Application Support/$IDENTIFIER" ;;
     *) APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/$IDENTIFIER" ;;
 esac
-NODE_DIR="$APP_DIR/node"
-MARKER="$APP_DIR/bootstrap.json"
+# Everything below is a constant, and that is the point. `dsh.rs` derives the
+# same paths from `app_local_data_dir()` without reading anything — see
+# `runtime`, `node_dir` and `entry` there. The two have to agree.
+RUNTIME_DIR="$APP_DIR/runtime"
+NODE_DIR="$RUNTIME_DIR/node"
+BIN_DIR="$APP_DIR/bin"
+
+# npm's own entry point beside our Node. A constant now that the Node is always
+# ours; the Unix tarballs put it under `lib`, where the Windows zip does not.
+NPM_CLI="$NODE_DIR/lib/node_modules/npm/bin/npm-cli.js"
+
+# Where the launcher is linked so a terminal can find it. Most Linux
+# distributions already have this on PATH; macOS does not, which `link_launcher`
+# says out loud rather than editing a shell profile to fix.
+LINK_DIR="$HOME/.local/bin"
+
+# What the old scheme left behind, for `migrate_legacy` to clear away.
+LEGACY_NODE_DIR="$APP_DIR/node"
+LEGACY_NPM_DIR="$APP_DIR/npm"
+LEGACY_MARKER="$APP_DIR/bootstrap.json"
 
 # Pinned rather than resolved from `latest-v24.x`, so that what a user gets is a
 # visible commit here rather than whatever nodejs.org was serving that day.
 NODE_VERSION='24.19.0'
 
-# What an existing Node has to be for us to use it instead of installing our
-# own. dsh declares no `engines` field itself, but its direct dependency
-# commander@15 does — `>=22.12.0` — so anything under that will not run dsh at
-# all. Kept a little above that floor rather than pinned to it exactly.
+# There is no minimum-version floor any more, and no version check to go with
+# it. The floor existed to decide whether a Node the machine already had was
+# good enough to install dsh with; nothing is asked of the machine's Node now,
+# because nothing uses it. `$NODE_VERSION` above is what runs dsh, always.
 #
-# Has to match `$NodeMinimum` in `install-deps.ps1`: this decides whether a
-# machine downloads 30 MB of Node it did not need, and the two answering
-# differently means the same Node is fine on one platform and not on another.
-NODE_MINIMUM='22.19.0'
+# That also settles a coupling the floor could never have caught: dsh's native
+# modules (koffi, node-pty) are built against one Node's ABI and will not load
+# on another's. Pinning the Node pins the ABI for the life of the install.
 
 # The mirrors that carry Node's own layout — same paths, same SHASUMS256.txt.
 # Which one is used is decided by measuring them (see `rank_mirrors`); this order
@@ -193,117 +201,17 @@ have() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# `command -v "$1"`, and then the same question asked of a login, interactive
-# shell if that came up empty. A version manager like nvm adds itself in
-# `~/.bashrc` or `~/.zshrc`; a GUI launch of this app inherits neither, so a
-# node or dsh installed that way is otherwise invisible to this script even
-# though a terminal on the same machine finds it fine. Bounded to a few
-# seconds in case an rc file hangs on something.
-resolve() {
-    found=$(command -v "$1" 2>/dev/null)
-    if [ -n "$found" ]; then
-        printf '%s' "$found"
-        return 0
-    fi
-
-    shell=${SHELL:-}
-    [ -x "$shell" ] || return 1
-
-    out=$(mktemp "${TMPDIR:-/tmp}/dsh-path-XXXXXX") || return 1
-    # Single-quoted on purpose: `$PATH` has to expand inside the login shell
-    # this starts, once its rc files have had their say, not here.
-    # shellcheck disable=SC2016
-    "$shell" -ilc 'printf %s "$PATH"' >"$out" 2>/dev/null &
-    pid=$!
-
-    n=0
-    while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 5 ]; do
-        sleep 1
-        n=$((n + 1))
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null
-        wait "$pid" 2>/dev/null
-        rm -f "$out"
-        return 1
-    fi
-    wait "$pid" 2>/dev/null
-
-    extra=$(cat "$out" 2>/dev/null)
-    rm -f "$out"
-    [ -n "$extra" ] || return 1
-
-    found=$(PATH="$extra" command -v "$1" 2>/dev/null)
-    [ -n "$found" ] || return 1
-    printf '%s' "$found"
-}
-
-# ------------------------------------------------------------------- marker --
-
-# What this script installed, so that `uninstall` can leave alone what it did
-# not. Absent until something is actually installed — a machine that already had
-# both Node and dsh gets nothing written and nothing removed.
+# `resolve`, `marker_field` and `version_ge` are gone with what used them.
 #
-# Written and read by hand rather than with a JSON tool: there is no jq on a
-# stock macOS, the file has five string fields, and this is the only thing that
-# writes it on these platforms.
-M_NODE=''
-M_NODE_EXE=''
-M_NPM_CLI=''
-M_PREFIX=''
-M_DSH=''
-
-marker_field() {
-    [ -f "$MARKER" ] || return 0
-    sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MARKER" | head -n 1
-}
-
-read_marker() {
-    M_NODE=$(marker_field node)
-    M_NODE_EXE=$(marker_field nodeExe)
-    M_NPM_CLI=$(marker_field npmCli)
-    M_PREFIX=$(marker_field prefix)
-    M_DSH=$(marker_field dsh)
-}
-
-write_marker() {
-    mkdir -p "$APP_DIR" || return 1
-
-    JSON=''
-    json_field node "$M_NODE"
-    json_field nodeExe "$M_NODE_EXE"
-    json_field npmCli "$M_NPM_CLI"
-    json_field prefix "$M_PREFIX"
-    json_field dsh "$M_DSH"
-
-    printf '{\n%s\n}\n' "$JSON" > "$MARKER"
-}
-
-# One field, skipped when empty, with the comma the previous one needs.
-json_field() {
-    [ -n "$2" ] || return 0
-    if [ -n "$JSON" ]; then
-        JSON="$JSON,
-"
-    fi
-    JSON="$JSON  \"$1\": \"$2\""
-}
-
-# ------------------------------------------------------------------ versions --
-
-# Whether $1 is at least $2, compared field by field as numbers. `sort -V` would
-# be shorter and is not on a BSD userland worth relying on.
-version_ge() {
-    awk -v have="$1" -v want="$2" 'BEGIN {
-        n = split(have, a, "."); m = split(want, b, ".");
-        for (i = 1; i <= 3; i++) {
-            x = (i <= n ? a[i] + 0 : 0); y = (i <= m ? b[i] + 0 : 0);
-            if (x > y) exit 0;
-            if (x < y) exit 1;
-        }
-        exit 0
-    }'
-}
+# `resolve` asked `command -v`, and then asked a login interactive shell the
+# same question when that came up empty — a whole `$SHELL -ilc` with a five
+# second watchdog, because a version manager puts itself in `~/.bashrc` and a
+# GUI launch inherits neither that nor anything else a terminal would have.
+# Nothing needs it now: the app never looks for the machine's node or dsh.
+#
+# `marker_field` read `bootstrap.json`, and `version_ge` compared a found Node
+# against a minimum. There is no marker and no floor; see `migrate_legacy` and
+# the note where `NODE_MINIMUM` used to be.
 
 # ------------------------------------------------------------------ probing --
 
@@ -486,49 +394,21 @@ SOURCES
 
 # ---------------------------------------------------------------------- node --
 
-node_is_new_enough() {
-    printed=$("$1" --version 2>/dev/null) || return 1
-    [ -n "$printed" ] || return 1
-
-    # `v24.19.0`, and the `-nightly...` suffix a prerelease carries.
-    printed=${printed#v}
-    printed=${printed%%-*}
-    version_ge "$printed" "$NODE_MINIMUM"
+# Whether our Node is unpacked and runnable. The whole of what used to be
+# `find_node`, `find_any_node` and `node_is_new_enough`: there is one Node this
+# script will ever use, at one path, so the only question left is whether it is
+# there.
+node_ready() {
+    [ -x "$NODE_DIR/bin/node" ] && [ -f "$NPM_CLI" ]
 }
 
-# The Node this run will use: ours if a previous run installed one, otherwise
-# whatever is on PATH — and either way only if it is new enough to be worth it.
-# Prints nothing when there is none.
-find_node() {
-    if [ -x "$NODE_DIR/bin/node" ] && node_is_new_enough "$NODE_DIR/bin/node"; then
-        printf '%s' "$NODE_DIR/bin/node"
-        return 0
-    fi
-
-    found=$(resolve node) || return 1
-    if [ -n "$found" ] && node_is_new_enough "$found"; then
-        printf '%s' "$found"
-        return 0
-    fi
-
-    return 1
-}
-
-# The Node an update runs npm with, when the marker's pair is gone or was never
-# written. Unlike `find_node` this asks no version question: the minimum decides
-# whether the machine needs a Node of ours *installed*, and an update installs
-# nothing — it replaces a dsh that is already here, with the npm beside whatever
-# Node put it there. Refusing a Node a few releases short of the minimum would
-# leave exactly that install permanently un-updatable, which is the case this
-# whole path exists for.
-find_any_node() {
-    if [ -x "$NODE_DIR/bin/node" ]; then
-        printf '%s' "$NODE_DIR/bin/node"
-        return 0
-    fi
-
-    found=$(resolve node) || return 1
-    printf '%s' "$found"
+# Whether the Node in `$NODE_DIR` is the pinned one. A `$NODE_VERSION` bump in a
+# new release of this app has to replace it, and the unpacked tree no longer
+# carries its version in the path — `install_node` renames it — so the version is
+# stamped beside it instead.
+node_current() {
+    [ -f "$NODE_DIR/.dsh-node-version" ] || return 1
+    [ "$(cat "$NODE_DIR/.dsh-node-version" 2>/dev/null)" = "$NODE_VERSION" ]
 }
 
 # What the server says the body will be, for the bar to divide by. Its own
@@ -605,6 +485,12 @@ install_node() {
         fail '这台机器上没有 shasum 或 sha256sum，无法校验下载的 Node。'
     fi
 
+    # Whether there is a tree here to replace, read before anything deletes
+    # it. A replacement invalidates more than the Node; see the end of this
+    # function.
+    replacing=0
+    [ -e "$NODE_DIR" ] && replacing=1
+
     name="node-v$NODE_VERSION-$os-$arch"
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/dsh-node-XXXXXX") || fail '无法创建临时目录。'
 
@@ -654,11 +540,16 @@ install_node() {
         # Replaced rather than merged: a half-unpacked tree from an earlier
         # attempt would otherwise survive underneath the new one.
         rm -rf "$NODE_DIR"
-        mkdir -p "$APP_DIR"
+        mkdir -p "$RUNTIME_DIR"
         if ! mv "$scratch/$name" "$NODE_DIR"; then
             say '无法把 Node 移动到应用目录。'
             continue
         fi
+
+        # What `node_current` reads. The unpacked tree carries its version only
+        # in the directory name the archive came with, and that name is gone the
+        # moment it is renamed to `$NODE_DIR`.
+        printf '%s' "$NODE_VERSION" > "$NODE_DIR/.dsh-node-version"
 
         installed=1
         break
@@ -673,54 +564,44 @@ MIRRORS
     fi
 
     say "Node 已安装到 $NODE_DIR"
+
+    # The Node these were built against is gone, so they have to go too.
+    #
+    # Nothing else would notice. `npm install` decides from the lockfile and
+    # the tree that what it was asked for is already there, and dsh's native
+    # modules — koffi, node-pty — are then loaded by ABI at require time, a
+    # long way from here and with nothing to connect the failure back to a
+    # Node version that changed. Both ship prebuilds covering several ABIs,
+    # so this would usually survive; a package that fell back to compiling
+    # would not, and "usually" is not a thing to leave in the boot path.
+    #
+    # Only on a replacement. A first install has nothing here to throw away.
+    if [ "$replacing" = 1 ]; then
+        say '自带的 Node 版本变了，正在清掉按上一版装好的依赖…'
+        rm -rf "$RUNTIME_DIR/node_modules" "$RUNTIME_DIR/package-lock.json"
+    fi
 }
 
 # ----------------------------------------------------------------------- npm --
 
-# npm's own entry point next to `$1`, to be run through Node rather than through
-# the `npm` shim: no dependency on how the machine happens to resolve `npm`, and
-# the pair is what gets written down for the app to reuse.
-find_npm() {
-    dir=$(dirname "$1")
-    for candidate in \
-        "$dir/../lib/node_modules/npm/bin/npm-cli.js" \
-        "$dir/node_modules/npm/bin/npm-cli.js"
-    do
-        if [ -f "$candidate" ]; then
-            # Read again through `cd`, so the recorded path has no `..` in it —
-            # the app compares it against what it finds on disk.
-            printf '%s' "$(cd "$(dirname "$candidate")" && pwd)/npm-cli.js"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# Where `npm install -g` will be told to put things.
+# `find_npm` and `find_prefix` are gone. Both answered the same question — which
+# npm, and where will it put things — and both existed because the answer
+# depended on which Node was in hand and what the user's `.npmrc` said about it.
 #
-# For a Node this script installed that is the Node directory. For the machine's
-# own Node it is whatever npm has configured — unless that is somewhere only
-# root can write, which is the usual case for a distribution's `/usr` Node, and
-# then it is a prefix of our own under the app directory. Installing as the user
-# who will run it is the whole point; asking for a password is not on the table.
-find_prefix() {
-    node=$1
-    cli=$2
+# There is no global install any more. dsh and pnpm go into `$RUNTIME_DIR` as an
+# ordinary *local* install, so the destination is `--prefix` and nothing else:
+# not npm's configured prefix, not a fallback for when that turns out to be
+# root-owned, and not `npm prefix -g`, which on a machine running nvm answers
+# with a directory nvm moves out from under it. `$NPM_CLI` is a constant.
 
-    case "$node" in
-        "$NODE_DIR"/*) printf '%s' "$NODE_DIR"; return 0 ;;
-    esac
-
-    prefix=$("$node" "$cli" prefix -g 2>/dev/null)
-    if [ -n "$prefix" ] && mkdir -p "$prefix/lib/node_modules" 2>/dev/null &&
-        [ -w "$prefix/lib/node_modules" ] && mkdir -p "$prefix/bin" 2>/dev/null &&
-        [ -w "$prefix/bin" ]
-    then
-        printf '%s' "$prefix"
-        return 0
-    fi
-
-    printf '%s' "$APP_DIR/npm"
+# The `package.json` npm wants at the root of a local install. Without one npm
+# warns on every run and walks *up* looking for a project to install into,
+# which from the app data directory could find anything at all.
+write_runtime_manifest() {
+    mkdir -p "$RUNTIME_DIR" || return 1
+    [ -f "$RUNTIME_DIR/package.json" ] && return 0
+    printf '%s\n' '{"name":"dsh-desktop-runtime","version":"1.0.0","private":true}' \
+        > "$RUNTIME_DIR/package.json"
 }
 
 # One `npm install -g`, from one registry. npm's http log is read as it goes:
@@ -730,22 +611,28 @@ find_prefix() {
 # `$?` has to travel out of a pipeline, which sh has no `pipefail` for, so the
 # installer writes it to a file the caller reads.
 npm_install() {
-    node=$1
-    cli=$2
-    prefix=$3
-    registry=$4
-    from=$5
-    to=$6
+    specs=$1
+    registry=$2
+    from=$3
+    to=$4
 
+    node="$NODE_DIR/bin/node"
     code_file="$APP_DIR/.npm-exit"
     mkdir -p "$APP_DIR"
     rm -f "$code_file"
 
-    set -- "$cli" install -g --prefix "$prefix" --no-audit --no-fund --loglevel=http
+    # Local rather than `-g`, which is the whole change. `--prefix` on a local
+    # install names the directory holding `package.json` and `node_modules`, so
+    # the packages land at `$RUNTIME_DIR/node_modules/<name>` — the same layout
+    # the Windows side gets, and npm's global prefix is not consulted at all.
+    set -- "$NPM_CLI" install --prefix "$RUNTIME_DIR" --no-audit --no-fund --loglevel=http
     if [ -n "$registry" ]; then
         set -- "$@" "--registry=$registry"
     fi
-    set -- "$@" "$PACKAGE@latest"
+    # Unquoted on purpose: `$specs` is our own space-separated list and each
+    # word is one package spec.
+    # shellcheck disable=SC2086
+    set -- "$@" $specs
 
     {
         # stdin off the null device, not inherited: the caller's loop is reading
@@ -759,7 +646,7 @@ npm_install() {
         # unpacked, so without this every package with a build step dies with
         # `sh: 1: node: not found`; koffi and node-pty both do, and npm then
         # rolls the whole install back.
-        PATH="$(dirname "$node"):$PATH" "$node" "$@" 2>&1 < /dev/null
+        PATH="$NODE_DIR/bin:$PATH" "$node" "$@" 2>&1 < /dev/null
         printf '%s\n' "$?" > "$code_file"
     } | {
         # A subshell of its own: the count only has to live as long as the pipe,
@@ -785,15 +672,19 @@ npm_install() {
     [ "${code:-1}" = 0 ]
 }
 
-# Install through the fastest registry that works.
+# Install `$1` — a space-separated list of specs — through the fastest registry
+# that works.
+#
+# dsh and pnpm go in one command rather than two. They used to be installed by
+# different callers into different prefixes, which is how they could end up in
+# two places or how pnpm could end up somewhere the app then could not find. One
+# install into one directory cannot do either.
 install_package() {
-    node=$1
-    cli=$2
-    prefix=$3
-    from=$4
-    to=$5
+    specs=$1
+    from=$2
+    to=$3
 
-    rank_registries "$node" "$cli" "$from"
+    rank_registries "$NODE_DIR/bin/node" "$NPM_CLI" "$from"
     sources=$RANKED
 
     while IFS= read -r source; do
@@ -801,7 +692,7 @@ install_package() {
         url=${source#*|}
 
         step "正在安装 dsh（$label）…" "$from"
-        if npm_install "$node" "$cli" "$prefix" "$url" "$from" "$to"; then
+        if npm_install "$specs" "$url" "$from" "$to"; then
             say "dsh 安装完成（$label）。"
             return 0
         fi
@@ -813,26 +704,134 @@ SOURCES
     return 1
 }
 
+# ------------------------------------------------------------------ launcher --
+
+# dsh's entry point inside the runtime, read off the `bin` field of the package
+# npm just installed. Prints nothing and fails when there is none.
+#
+# npm writes the field either way round — `"bin": "./cli.js"` when the package
+# has one binary named after itself, or `"bin": { "dsh": "./cli.js" }` when it
+# names them — and dsh has used both spellings across releases, so both are read
+# rather than one being assumed. `bin_field` in `src-tauri/src/dsh.rs` parses the
+# same two shapes; the two have to agree.
+dsh_entry() {
+    dir="$RUNTIME_DIR/node_modules/$PACKAGE"
+    [ -f "$dir/package.json" ] || return 1
+
+    # The object form first, since it is the more specific match: a `"dsh":`
+    # key can only be the named-binary spelling. Falling through to the string
+    # form would otherwise match the first `"bin"` value it saw.
+    relative=$(sed -n 's/.*"bin"[[:space:]]*:[[:space:]]*{[^}]*"dsh"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$dir/package.json" | head -n 1)
+    if [ -z "$relative" ]; then
+        relative=$(sed -n 's/.*"bin"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "$dir/package.json" | head -n 1)
+    fi
+    [ -n "$relative" ] || return 1
+
+    relative=${relative#./}
+    [ -f "$dir/$relative" ] || return 1
+    printf '%s' "$dir/$relative"
+}
+
+# The `dsh` the user's terminal gets: a shell script of our own, naming our Node
+# and our dsh by absolute path.
+#
+# npm generates a shim at `$RUNTIME_DIR/node_modules/.bin/dsh`, and putting that
+# on PATH would undo the entire point of this layout — it resolves `node` off
+# PATH, which is the coupling we are removing. So the launcher is written here
+# and the npm shim is never referenced.
+#
+# Absolute paths rather than `$0`-relative ones, because `link_launcher` below
+# reaches this file through a symlink and `$0` would resolve against the link's
+# directory instead of this one.
+#
+# It also sets PATH, which does not contradict any of the above: naming Node and
+# dsh absolutely is what keeps *this* invocation off the user's PATH, and the
+# three directories prepended are what keep everything dsh goes on to spawn off
+# it too. dsh forwards every plugin install to pnpm and finds it by name —
+# `pnpm not found on PATH` is its own error message — so a terminal without that
+# line runs the user's pnpm on the user's Node, builds a plugin's native modules
+# against that ABI, and hands dsh a `.node` its own Node cannot load. That
+# failure lands at plugin-load time, nowhere near the install that caused it.
+#
+# The launcher's own directory goes first, ahead of the Node's. On Windows that
+# Node directory is npm's global prefix, so an `npm i -g` typed into a terminal
+# the app opened lands its shim there — and a `dsh` shim ahead of this launcher
+# would answer in that terminal and nowhere else. The launcher directory holds
+# one file, which is not named `node`, `npm` or `pnpm`, so leading with it costs
+# the rest of this nothing. The order matches `child_path` in
+# `src-tauri/src/dsh.rs`, so the terminal and the window run the same thing.
+write_launcher() {
+    entry=$(dsh_entry) || return 1
+    mkdir -p "$BIN_DIR" || return 1
+
+    cat > "$BIN_DIR/dsh" <<LAUNCHER
+#!/bin/sh
+# Generated by dsh-desktop's install-deps.sh. Edits are lost on the next
+# install or update. Every path here is ours and none depends on PATH.
+PATH="$BIN_DIR:$NODE_DIR/bin:$RUNTIME_DIR/node_modules/.bin:\$PATH"
+export PATH
+exec "$NODE_DIR/bin/node" "$entry" "\$@"
+LAUNCHER
+
+    chmod 755 "$BIN_DIR/dsh" || return 1
+    say "已写入 $BIN_DIR/dsh"
+}
+
 # ---------------------------------------------------------------------- path --
 
-# Nothing here writes to the user's PATH, and that is deliberate.
+# One symlink into `~/.local/bin`, and no edits to any file of the user's.
 #
-# The app does not need it: `dsh.rs` finds Node and dsh through `bootstrap.json`
-# and puts them in front of the PATH it hands the child itself — see
-# `search_path` and `apply_path` there. The only thing a PATH entry ever bought
-# was a bare `dsh` working in the user's own terminal, and the price was steep:
-# the directory that had to go on it is the Node directory, so it shadowed
-# whatever `node`, `npm` and `npx` a version manager like nvm had put there, and
-# a shim resolving `node` off PATH could then be paired with a Node of a
-# different major version than the one its native modules were built for.
+# Versions up to 0.1.2 appended a marked block to `~/.profile`, `~/.zshrc` and
+# `~/.bashrc`, which was wrong twice over: the directory it added is the Node
+# directory, so it shadowed whatever `node`, `npm` and `npx` a version manager
+# had put there — and `-Mode uninstall` has no caller on these platforms, so the
+# block went in and stayed forever. `clean_profiles` below takes those back out.
 #
-# It was also written and never taken back. `-Mode uninstall` has no caller on
-# these platforms — the .deb's uninstall runs as root and neither the .dmg nor
-# the .AppImage has one at all — so up to 0.1.2 the block went into the profile
-# and stayed there forever.
-#
-# What replaces it is a line of output saying where dsh is, for a user who wants
-# it in their terminal to act on themselves.
+# A symlink has neither problem. It exposes exactly one command, it is removed
+# by deleting one file, and it does not touch a shell profile at all. What it
+# cannot do is put the directory on PATH when it is not there already — common
+# on macOS — so that case is said out loud rather than fixed behind the user's
+# back.
+link_launcher() {
+    [ -x "$BIN_DIR/dsh" ] || return 1
+
+    if ! mkdir -p "$LINK_DIR" 2>/dev/null; then
+        say "无法创建 $LINK_DIR，跳过。想在终端里用 dsh，把 $BIN_DIR 加进 PATH 即可。"
+        return 1
+    fi
+
+    # `-f` so a link left by an earlier install is replaced rather than
+    # refused; the target may have moved between releases.
+    if ! ln -sf "$BIN_DIR/dsh" "$LINK_DIR/dsh" 2>/dev/null; then
+        say "无法在 $LINK_DIR 创建链接。想在终端里用 dsh，把 $BIN_DIR 加进 PATH 即可。"
+        return 1
+    fi
+
+    # Asked of the login shell's PATH rather than this process's: a GUI launch
+    # inherits an environment that says nothing about what a terminal will have.
+    case ":${PATH}:" in
+        *":$LINK_DIR:"*)
+            say "dsh 已经可以在终端里直接使用。"
+            return 0
+            ;;
+    esac
+
+    say "已把 dsh 链接到 $LINK_DIR/dsh。"
+    say "这个目录不在你的 PATH 上（macOS 默认如此）。想在终端里直接用 dsh，把下面这行加进 ~/.zshrc 或 ~/.profile："
+    say "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+}
+
+# Take the link back out. Only ours: `readlink` has to agree that it points at
+# our launcher, so a `dsh` the user put there themselves is left alone.
+unlink_launcher() {
+    [ -L "$LINK_DIR/dsh" ] || return 0
+    target=$(readlink "$LINK_DIR/dsh" 2>/dev/null)
+    [ "$target" = "$BIN_DIR/dsh" ] || return 0
+    rm -f "$LINK_DIR/dsh"
+    say "已移除 $LINK_DIR/dsh。"
+}
 
 # The files a login or interactive shell of the user's actually reads.
 #
@@ -852,7 +851,7 @@ profile_files() {
 # Take out the block a version up to 0.1.2 left behind. Run on every install
 # rather than only on uninstall, because on these platforms uninstall never
 # runs: an upgrade is the one moment this is reachable at all.
-remove_path() {
+clean_profiles() {
     profile_files | while IFS= read -r file; do
         [ -f "$file" ] || continue
         grep -qF "$BEGIN_MARK" "$file" || continue
@@ -869,218 +868,129 @@ remove_path() {
         fi
     done
 }
-
 # --------------------------------------------------------------------- modes --
 
-# Whether the machine can already run dsh. The prefix from a previous run comes
-# first: it is on the user's PATH but not necessarily on this process's, which
-# inherited its environment before that line was ever written.
-find_dsh() {
-    if [ -n "$M_PREFIX" ] && [ -x "$M_PREFIX/bin/dsh" ]; then
-        printf '%s' "$M_PREFIX/bin/dsh"
-        return 0
-    fi
-
-    found=$(resolve dsh) || return 1
-    printf '%s' "$found"
-}
-
-# The npm global prefix a dsh lives in, for `npm uninstall -g --prefix` to
-# unpick. Prints nothing and fails when there is no prefix to point npm at.
+# Clear away what the old scheme left in `$APP_DIR`: a Node under `node`, an npm
+# prefix under `npm`, the `bootstrap.json` that recorded where dsh had ended up,
+# and any block a version up to 0.1.2 wrote into a shell profile.
 #
-# The marker's prefix first — that is where this script installed — and then the
-# dsh on PATH, whose prefix is read off the layout `npm install -g` leaves: the
-# shim in `<prefix>/bin`, the package under `<prefix>/lib/node_modules`. Anything
-# else is not an npm global install, and npm cannot remove it.
-find_dsh_prefix() {
-    manifest="lib/node_modules/$PACKAGE/package.json"
+# Everything named here is inside our own application data directory, so all of
+# it is ours by construction and none of it needs the marker's permission to go —
+# the marker is deleted unread. The profile block is found by its own `BEGIN_MARK`
+# rather than by the prefix it named, so nothing outside `$APP_DIR` has to be
+# looked up either.
+#
+# The old Node is deleted rather than moved into the new tree. It would have
+# saved a 30 MB download, but a `-g --prefix` install put dsh *inside* that
+# directory too, so moving it wholesale would carry 327 MB of dead weight into
+# the runtime and picking Node's own files back out would mean knowing the
+# contents of Node's tarball. One download beats that.
+#
+# Run on every install rather than only the first: on these platforms uninstall
+# never runs at all, so an upgrade is the one moment this is reachable.
+migrate_legacy() {
+    clean_profiles
 
-    if [ -n "$M_PREFIX" ] && [ -f "$M_PREFIX/$manifest" ]; then
-        printf '%s' "$M_PREFIX"
+    if [ ! -e "$LEGACY_NODE_DIR" ] && [ ! -e "$LEGACY_NPM_DIR" ] &&
+        [ ! -f "$LEGACY_MARKER" ]
+    then
         return 0
     fi
 
-    # `$1` when the caller already has one. `find_dsh` can cost a login shell,
-    # and `install_all` has just paid for it.
-    found=${1:-}
-    [ -n "$found" ] || found=$(find_dsh) || return 1
-    prefix=$(cd "$(dirname "$found")/.." 2>/dev/null && pwd) || return 1
-    [ -f "$prefix/$manifest" ] || return 1
-    printf '%s' "$prefix"
+    say '正在清理旧版本留下的运行时…'
+    rm -rf "$LEGACY_NODE_DIR" "$LEGACY_NPM_DIR"
+    rm -f "$LEGACY_MARKER"
 }
 
 install_all() {
-    read_marker
+    migrate_legacy
 
-    # Anything a previous version wrote into the user's shell profile, taken
-    # back out. See the note above `profile_files`.
-    remove_path
-
-    # dsh first, and a Node only if there turns out to be something to install
-    # it with. A Node is not a thing this app wants on the machine for its own
-    # sake — it is what `npm install -g` needs — so a machine that already has a
-    # dsh, whoever put it there, needs no Node of ours and gets none. Doing this
-    # the other way round is how a machine with an nvm Node a few releases under
-    # the floor ends up with 120 MB of Node it never runs.
-    #
-    # The pairing matters as much as the download. dsh's native modules — koffi
-    # and node-pty — are built against one Node's ABI and refuse to load on
-    # another's, so the dsh that is already here has to be run with the Node it
-    # was installed with, not with one this script chose.
-    if dsh=$(find_dsh); then
-        say "检测到系统里已有 dsh（$dsh），跳过安装。"
-        [ -n "$M_DSH" ] || M_DSH=system
-
-        # Written down because the app cannot find this on its own: a dsh under
-        # nvm is on the user's PATH and not on the app's, and without a prefix
-        # in the marker `dsh.rs` looks for a dsh it cannot see, concludes there
-        # is none, and runs this script again on every launch.
-        [ -n "$M_PREFIX" ] || M_PREFIX=$(find_dsh_prefix "$dsh")
-
-        # The Node beside it — that is the one its native modules were built
-        # for. `find_any_node` asks no version question, and rightly: the floor
-        # decides whether a Node has to be installed, and here none does.
-        if [ ! -x "${M_NODE_EXE:-/nonexistent}" ] || [ ! -f "${M_NPM_CLI:-/nonexistent}" ]; then
-            node=''
-            if [ -n "$M_PREFIX" ] && [ -x "$M_PREFIX/bin/node" ]; then
-                node="$M_PREFIX/bin/node"
-            else
-                node=$(find_any_node) || node=''
-            fi
-            if [ -n "$node" ] && cli=$(find_npm "$node"); then
-                M_NODE_EXE=$node
-                M_NPM_CLI=$cli
-                [ -n "$M_NODE" ] || M_NODE=system
-            fi
-        fi
-
-        write_marker
-        return 0
-    fi
-
-    if node=$(find_node); then
-        say "检测到可用的 Node：$node"
-        [ -n "$M_NODE" ] || M_NODE=system
+    if node_ready && node_current; then
+        say "已有可用的 Node $NODE_VERSION（$NODE_DIR），跳过下载。"
+        report 35
     else
-        say "没有检测到 Node $NODE_MINIMUM 或更高版本，正在为你安装。"
         install_node
-        node="$NODE_DIR/bin/node"
-        M_NODE=managed
     fi
 
-    cli=$(find_npm "$node") || fail "这个 Node 旁边没有 npm（$node），无法安装 dsh。"
+    write_runtime_manifest || fail "无法写入 $RUNTIME_DIR/package.json。"
 
-    M_NODE_EXE=$node
-    M_NPM_CLI=$cli
-    write_marker
-
-    prefix=$(find_prefix "$node" "$cli")
-
+    # Both in one command. pnpm used to be installed separately by `plugins.rs`,
+    # into a prefix it had to work out for itself; installing it here means it
+    # lands beside dsh by construction and the app never has to look for it.
     step '正在下载 dsh，约 185 MB，请耐心等待…' 36
-    if ! install_package "$node" "$cli" "$prefix" 36 "$PROGRESS_CEILING"; then
+    if ! install_package "$PACKAGE@latest pnpm@latest" 36 "$PROGRESS_CEILING"; then
         fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
     fi
 
-    M_DSH=managed
-    M_PREFIX=$prefix
-    write_marker
+    if ! write_launcher; then
+        fail 'dsh 装好了，但在它的 package.json 里找不到入口，无法生成 dsh 命令。'
+    fi
 
-    # Said rather than done: the app runs this dsh through the marker and needs
-    # nothing on PATH, and a user who wants it in their own terminal can decide
-    # for themselves where — and whether — to put it.
-    say "dsh 已安装到 $prefix/bin/dsh"
-    say "想在终端里直接用 dsh，把 $prefix/bin 加进你的 PATH 即可。"
+    # The one thing that reaches outside `$APP_DIR`. A failure is not fatal: the
+    # app runs dsh by absolute path and does not need PATH at all.
+    link_launcher || true
+
     step 'dsh 安装完成。' 100
 }
 
+# The same npm command into the same directory as `install`. There is no prefix
+# to resolve and no dsh to find first, which is the whole of what this used to
+# be about.
 update_all() {
-    read_marker
+    node_ready || fail '运行时还没有装好，无法更新。重启应用会重新安装。'
 
-    # The pair that installed dsh, if it is still there: any npm can write into
-    # the prefix it is handed, but this one is known to work on this machine.
-    node=$M_NODE_EXE
-    cli=$M_NPM_CLI
-    if [ ! -x "${node:-/nonexistent}" ] || [ ! -f "${cli:-/nonexistent}" ]; then
-        node=$(find_any_node) || fail '这台机器上找不到 Node，无法更新 dsh。'
-        cli=$(find_npm "$node") || fail "这个 Node 旁边没有 npm（$node）。"
-        say "用 $node 更新 dsh。"
-    fi
-
-    # The prefix the dsh being replaced actually lives in — `-Prefix` from the
-    # app, or the one this script installed into. Without either, the one an
-    # install would pick, which is only right when dsh is already there.
-    prefix=$PREFIX
-    [ -n "$prefix" ] || prefix=$M_PREFIX
-    [ -n "$prefix" ] || prefix=$(find_prefix "$node" "$cli")
+    write_runtime_manifest || fail "无法写入 $RUNTIME_DIR/package.json。"
 
     step '正在更新 dsh…' 0
-    if ! install_package "$node" "$cli" "$prefix" 0 "$PROGRESS_CEILING"; then
+    if ! install_package "$PACKAGE@latest" 0 "$PROGRESS_CEILING"; then
         fail 'dsh 更新失败，默认源和几个备用镜像都没有成功。'
     fi
+
+    # Rewritten because a release is free to move its entry point, and the
+    # launcher names it directly rather than going through npm's shim.
+    write_launcher || true
+
     step 'dsh 更新完成。' 100
 }
 
+# Delete our runtime and take our link back out.
+#
+# No npm involved: unpicking a tree package by package would have npm walk 33k
+# files to arrive at the same place `rm -rf` reaches in one call. And nothing
+# here can name a file outside `$APP_DIR` except the symlink, which is removed
+# only after `readlink` confirms it points at our launcher — so a dsh or a Node
+# the user installed themselves is not reachable from this function even in
+# principle. That is the difference from the version this replaces, where the
+# uninstaller would `npm uninstall -g` a dsh it had never installed.
+#
+# There are no `-RemoveDsh` / `-RemoveNode` switches any more. They existed to
+# ask which half of a shared installation to take, and nothing is shared now.
 uninstall_all() {
-    read_marker
+    unlink_launcher
+    clean_profiles
 
-    # Only a Node of ours goes: one the machine already had is not this script's
-    # to take, whatever the flags say. dsh has no such reservation — it is one
-    # `npm install -g` either way, and the caller has just been asked about it by
-    # name.
-    #
-    # Node is also a Node program's only way to run, so taking it away while
-    # leaving dsh behind would leave a `dsh` command that cannot start.
-    drop_node=0
-    drop_dsh=0
-    [ "$REMOVE_NODE" = 1 ] && [ "$M_NODE" = managed ] && drop_node=1
-    { [ "$REMOVE_DSH" = 1 ] || [ "$drop_node" = 1 ]; } && drop_dsh=1
+    say '正在删除 dsh 运行时…'
 
-    if [ "$REMOVE_NODE" = 1 ] && [ "$drop_node" = 0 ]; then
-        say 'Node 是你自己装的，不会动它。'
+    # Checked rather than assumed. `rm -rf` on these platforms has none of the
+    # path-length trouble the Windows side had to work around, but it can still
+    # fail on a permission or a busy file — and reporting success over a tree
+    # that is still there is the one outcome worth ruling out.
+    stuck=''
+    for dir in "$RUNTIME_DIR" "$BIN_DIR" "$LEGACY_NODE_DIR" "$LEGACY_NPM_DIR"; do
+        [ -e "$dir" ] || continue
+        rm -rf "$dir"
+        [ -e "$dir" ] && stuck="$stuck
+  $dir"
+    done
+    rm -f "$LEGACY_MARKER"
+
+    if [ -n "$stuck" ]; then
+        say '以下目录没能删掉，通常是 dsh 还在运行；退出后手动删除即可：'
+        printf '%s\n' "$stuck"
+        exit 1
     fi
 
-    if [ "$drop_dsh" = 1 ]; then
-        prefix=$(find_dsh_prefix) || prefix=''
-
-        # Both of these are deleted outright when the Node goes; see below.
-        inside=0
-        case "$prefix" in "$NODE_DIR" | "$NODE_DIR"/* | "$APP_DIR"/*) inside=1 ;; esac
-
-        if [ -z "$prefix" ]; then
-            say '找不到 dsh 装在哪里（不是 npm 全局安装？），跳过卸载 dsh。'
-        elif [ "$drop_node" = 1 ] && [ "$inside" = 1 ]; then
-            # It lives inside the directory about to be deleted, and asking npm
-            # to walk 33k files first would only be slower.
-            say 'dsh 装在即将删除的 Node 目录里，会随它一起删掉。'
-        elif [ -x "${M_NODE_EXE:-/nonexistent}" ] && [ -f "${M_NPM_CLI:-/nonexistent}" ]; then
-            # npm has to unpick its own tree, pointed at the prefix holding it
-            # rather than at whatever this run would default to.
-            [ "$M_DSH" = managed ] || say '这份 dsh 不是本应用装的，按你的选择一并卸载。'
-            say "正在卸载 dsh（$prefix）…"
-            "$M_NODE_EXE" "$M_NPM_CLI" uninstall -g --prefix "$prefix" \
-                --loglevel=error "$PACKAGE" 2>&1 | while IFS= read -r line; do say "$line"; done
-        else
-            say '找不到可用的 npm，跳过卸载 dsh。'
-        fi
-    fi
-
-    if [ "$drop_node" = 1 ]; then
-        remove_path
-        say '正在删除 Node 和 dsh…'
-        rm -rf "$NODE_DIR"
-        # Only ours: a prefix under `$APP_DIR` is one this script made, and
-        # anywhere else belongs to the machine's own npm.
-        case "$M_PREFIX" in
-            "$APP_DIR"/*) rm -rf "$M_PREFIX" ;;
-        esac
-        rm -f "$MARKER"
-        return 0
-    fi
-
-    if [ "$drop_dsh" = 1 ]; then
-        M_DSH=''
-        write_marker
-    fi
+    say '已删除。你自己安装的 Node 和 dsh 没有被改动。'
 }
 
 case "$MODE" in
