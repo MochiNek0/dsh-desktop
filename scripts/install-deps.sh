@@ -6,25 +6,26 @@
 # There is no installer hook here, because neither a .dmg nor an .AppImage has
 # one and a .deb's runs as root, which is the wrong user to install a per-user
 # Node for. So on these platforms the first launch is what does it, with the
-# progress on the loading page — the same path Windows falls back to when its
-# installer could not reach the network.
+# progress on the loading page — which is now the only path on Windows too: its
+# installer used to run this script's counterpart and no longer does.
 #
 # Nothing here needs root. Node goes under the app's own data directory, npm
 # writes to a prefix inside it, and the only thing touched outside is a marked
 # block appended to the user's shell profile.
 #
-# A Node the machine already has is used as it is and never replaced; the same
-# goes for a dsh already on PATH — installing a second copy beside it would be
-# 327 MB nobody asked for. Updating one is a different matter: whoever installed
-# it, it is one `npm install -g` in some prefix, so `update` replaces it in place
-# in the prefix it is actually in. What this script installed is written down in
+# No mode here picks a Node. `switch` and `install-dsh` are handed the one the
+# user chose in the app's chooser, and `install-node` is the case where the user
+# asked for a fresh one because nothing on the machine would do. Updating is a
+# different matter: whoever installed the dsh, it is one `npm install -g` in some
+# prefix, so `update` replaces it in place in the prefix it is actually in. What this script installed is written down in
 # `bootstrap.json`, which is what keeps `uninstall` off a Node it did not put
 # there.
 #
 # The flags are spelled the way `install-deps.ps1` spells them, because
 # `src-tauri/src/dsh.rs` calls both with the same arguments:
 #
-#   sh install-deps.sh -Mode install|update|uninstall [-Prefix <dir>]
+#   sh install-deps.sh -Mode update|uninstall|list|switch|install-dsh|install-node
+#                      [-Prefix <dir>] [-NodeExe <path>]
 #                      [-RemoveDsh] [-RemoveNode] [-Progress]
 #
 # Output is a plain log. Pass `-Progress` and it also emits `::status <text>`,
@@ -38,8 +39,9 @@ set -u
 
 # ------------------------------------------------------------------ options --
 
-MODE=install
+MODE=''
 PREFIX=''
+NODE_EXE=''
 REMOVE_DSH=0
 REMOVE_NODE=0
 PROGRESS=0
@@ -47,7 +49,7 @@ PROGRESS=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -Mode)
-            [ $# -ge 2 ] || { echo "-Mode 后面要跟 install、update 或 uninstall" >&2; exit 2; }
+            [ $# -ge 2 ] || { echo "-Mode 后面要跟一个模式名" >&2; exit 2; }
             MODE=$2
             shift 2
             ;;
@@ -61,6 +63,14 @@ while [ $# -gt 0 ]; do
             PREFIX=$2
             shift 2
             ;;
+        # `switch` and `install-dsh` only: the `node` the user chose in the
+        # setup panel. Everything this script needs — npm, the prefix, the dsh
+        # that is or will be there — hangs off it.
+        -NodeExe)
+            [ $# -ge 2 ] || { echo "-NodeExe 后面要跟一个路径" >&2; exit 2; }
+            NODE_EXE=$2
+            shift 2
+            ;;
         -RemoveDsh) REMOVE_DSH=1; shift ;;
         -RemoveNode) REMOVE_NODE=1; shift ;;
         -Progress) PROGRESS=1; shift ;;
@@ -68,8 +78,12 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# No default. There used to be one — `install`, a mode that picked a Node itself
+# and installed dsh into it — and a bare run of this script is not a thing that
+# should still be able to change the machine.
 case "$MODE" in
-    install|update|uninstall) ;;
+    update|uninstall|list|switch|install-dsh|install-node) ;;
+    '') echo "要用 -Mode 指定一个模式" >&2; exit 2 ;;
     *) echo "未知的 -Mode：$MODE" >&2; exit 2 ;;
 esac
 
@@ -252,6 +266,10 @@ M_NODE_EXE=''
 M_NPM_CLI=''
 M_PREFIX=''
 M_DSH=''
+# The directory a `switch` or `install-node` put on the user's PATH, so a later
+# switch can take it back off before adding the new one rather than stacking
+# Node directories. Empty when nothing this script did touched PATH.
+M_PATH_ENTRY=''
 
 marker_field() {
     [ -f "$MARKER" ] || return 0
@@ -264,6 +282,7 @@ read_marker() {
     M_NPM_CLI=$(marker_field npmCli)
     M_PREFIX=$(marker_field prefix)
     M_DSH=$(marker_field dsh)
+    M_PATH_ENTRY=$(marker_field pathEntry)
 }
 
 write_marker() {
@@ -275,6 +294,7 @@ write_marker() {
     json_field npmCli "$M_NPM_CLI"
     json_field prefix "$M_PREFIX"
     json_field dsh "$M_DSH"
+    json_field pathEntry "$M_PATH_ENTRY"
 
     printf '{\n%s\n}\n' "$JSON" > "$MARKER"
 }
@@ -486,38 +506,29 @@ SOURCES
 
 # ---------------------------------------------------------------------- node --
 
-node_is_new_enough() {
+# The version a Node reports, as bare `24.19.0`, printed to stdout; nothing
+# printed for one that would not answer. Split out of [`node_is_new_enough`]
+# because the setup panel shows the number, not only the verdict, and listing
+# every Node on the machine needs the string.
+get_node_version() {
     printed=$("$1" --version 2>/dev/null) || return 1
     [ -n "$printed" ] || return 1
 
     # `v24.19.0`, and the `-nightly...` suffix a prerelease carries.
     printed=${printed#v}
     printed=${printed%%-*}
+    printf '%s' "$printed"
+}
+
+node_is_new_enough() {
+    printed=$(get_node_version "$1") || return 1
     version_ge "$printed" "$NODE_MINIMUM"
 }
 
-# The Node this run will use: ours if a previous run installed one, otherwise
-# whatever is on PATH — and either way only if it is new enough to be worth it.
-# Prints nothing when there is none.
-find_node() {
-    if [ -x "$NODE_DIR/bin/node" ] && node_is_new_enough "$NODE_DIR/bin/node"; then
-        printf '%s' "$NODE_DIR/bin/node"
-        return 0
-    fi
-
-    found=$(resolve node) || return 1
-    if [ -n "$found" ] && node_is_new_enough "$found"; then
-        printf '%s' "$found"
-        return 0
-    fi
-
-    return 1
-}
-
 # The Node an update runs npm with, when the marker's pair is gone or was never
-# written. Unlike `find_node` this asks no version question: the minimum decides
-# whether the machine needs a Node of ours *installed*, and an update installs
-# nothing — it replaces a dsh that is already here, with the npm beside whatever
+# written. It asks no version question, unlike everything the chooser drives: the
+# minimum decides whether a Node is worth *installing dsh into*, and an update
+# installs nothing — it replaces a dsh that is already here, with the npm beside whatever
 # Node put it there. Refusing a Node a few releases short of the minimum would
 # leave exactly that install permanently un-updatable, which is the case this
 # whole path exists for.
@@ -849,9 +860,11 @@ profile_files() {
     fi
 }
 
-# Take out the block a version up to 0.1.2 left behind. Run on every install
-# rather than only on uninstall, because on these platforms uninstall never
-# runs: an upgrade is the one moment this is reachable at all.
+# Take out the block a version up to 0.1.2 left behind, and the one the
+# interactive chooser briefly wrote back before this. Nothing writes one any
+# more. Run on every mode that used to add one rather than only on uninstall,
+# because on these platforms uninstall never runs: an upgrade is the one moment
+# this is reachable at all.
 remove_path() {
     profile_files | while IFS= read -r file; do
         [ -f "$file" ] || continue
@@ -901,96 +914,12 @@ find_dsh_prefix() {
     fi
 
     # `$1` when the caller already has one. `find_dsh` can cost a login shell,
-    # and `install_all` has just paid for it.
+    # and a caller that has already paid for it should not pay twice.
     found=${1:-}
     [ -n "$found" ] || found=$(find_dsh) || return 1
     prefix=$(cd "$(dirname "$found")/.." 2>/dev/null && pwd) || return 1
     [ -f "$prefix/$manifest" ] || return 1
     printf '%s' "$prefix"
-}
-
-install_all() {
-    read_marker
-
-    # Anything a previous version wrote into the user's shell profile, taken
-    # back out. See the note above `profile_files`.
-    remove_path
-
-    # dsh first, and a Node only if there turns out to be something to install
-    # it with. A Node is not a thing this app wants on the machine for its own
-    # sake — it is what `npm install -g` needs — so a machine that already has a
-    # dsh, whoever put it there, needs no Node of ours and gets none. Doing this
-    # the other way round is how a machine with an nvm Node a few releases under
-    # the floor ends up with 120 MB of Node it never runs.
-    #
-    # The pairing matters as much as the download. dsh's native modules — koffi
-    # and node-pty — are built against one Node's ABI and refuse to load on
-    # another's, so the dsh that is already here has to be run with the Node it
-    # was installed with, not with one this script chose.
-    if dsh=$(find_dsh); then
-        say "检测到系统里已有 dsh（$dsh），跳过安装。"
-        [ -n "$M_DSH" ] || M_DSH=system
-
-        # Written down because the app cannot find this on its own: a dsh under
-        # nvm is on the user's PATH and not on the app's, and without a prefix
-        # in the marker `dsh.rs` looks for a dsh it cannot see, concludes there
-        # is none, and runs this script again on every launch.
-        [ -n "$M_PREFIX" ] || M_PREFIX=$(find_dsh_prefix "$dsh")
-
-        # The Node beside it — that is the one its native modules were built
-        # for. `find_any_node` asks no version question, and rightly: the floor
-        # decides whether a Node has to be installed, and here none does.
-        if [ ! -x "${M_NODE_EXE:-/nonexistent}" ] || [ ! -f "${M_NPM_CLI:-/nonexistent}" ]; then
-            node=''
-            if [ -n "$M_PREFIX" ] && [ -x "$M_PREFIX/bin/node" ]; then
-                node="$M_PREFIX/bin/node"
-            else
-                node=$(find_any_node) || node=''
-            fi
-            if [ -n "$node" ] && cli=$(find_npm "$node"); then
-                M_NODE_EXE=$node
-                M_NPM_CLI=$cli
-                [ -n "$M_NODE" ] || M_NODE=system
-            fi
-        fi
-
-        write_marker
-        return 0
-    fi
-
-    if node=$(find_node); then
-        say "检测到可用的 Node：$node"
-        [ -n "$M_NODE" ] || M_NODE=system
-    else
-        say "没有检测到 Node $NODE_MINIMUM 或更高版本，正在为你安装。"
-        install_node
-        node="$NODE_DIR/bin/node"
-        M_NODE=managed
-    fi
-
-    cli=$(find_npm "$node") || fail "这个 Node 旁边没有 npm（$node），无法安装 dsh。"
-
-    M_NODE_EXE=$node
-    M_NPM_CLI=$cli
-    write_marker
-
-    prefix=$(find_prefix "$node" "$cli")
-
-    step '正在下载 dsh，约 185 MB，请耐心等待…' 36
-    if ! install_package "$node" "$cli" "$prefix" 36 "$PROGRESS_CEILING"; then
-        fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
-    fi
-
-    M_DSH=managed
-    M_PREFIX=$prefix
-    write_marker
-
-    # Said rather than done: the app runs this dsh through the marker and needs
-    # nothing on PATH, and a user who wants it in their own terminal can decide
-    # for themselves where — and whether — to put it.
-    say "dsh 已安装到 $prefix/bin/dsh"
-    say "想在终端里直接用 dsh，把 $prefix/bin 加进你的 PATH 即可。"
-    step 'dsh 安装完成。' 100
 }
 
 update_all() {
@@ -1083,10 +1012,330 @@ uninstall_all() {
     fi
 }
 
+# -------------------------------------------------------------- interactive --
+#
+# The four modes below are the chooser the app shows when a launch finds no dsh.
+# `list` is the only one that does no installing: it walks every Node the machine
+# has and prints what it found as one JSON line, for `setup.rs` to turn into a
+# panel. The other three act on the choice the user made there.
+
+# One candidate Node, recorded against a `seen` file so the same `node` is not
+# listed twice. The realpath is the key — nvm's `current` symlink, a Homebrew
+# `opt` link, and the Cellar directory itself all reach the same binary — while
+# the path shown to the user stays the one it was found at. `$SEEN_FILE` is set
+# by `find_all_nodes`; `$1` is the node binary, `$2` where it came from.
+_consider() {
+    [ -n "$1" ] || return 0
+    [ -x "$1" ] || return 0
+    _real=$(readlink -f "$1" 2>/dev/null || realpath "$1" 2>/dev/null || printf '%s' "$1")
+    if grep -qxF "$_real" "$SEEN_FILE" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "$_real" >> "$SEEN_FILE"
+    printf '%s\t%s\n' "$1" "$2"
+}
+
+# The user's PATH as a login interactive shell sees it, bounded to a few seconds
+# in case an rc file hangs — the same shape `resolve` uses. A version manager
+# like nvm adds itself in `~/.bashrc` or `~/.zshrc`; a GUI launch of this app
+# inherits neither, so a Node installed that way is otherwise invisible to
+# `find_all_nodes` even though a terminal on the same machine finds it fine.
+login_shell_path() {
+    _shell=${SHELL:-}
+    [ -x "$_shell" ] || return 1
+
+    _out=$(mktemp "${TMPDIR:-/tmp}/dsh-path-XXXXXX") || return 1
+    # Single-quoted on purpose: `$PATH` has to expand inside the login shell
+    # this starts, once its rc files have had their say, not here.
+    # shellcheck disable=SC2016
+    "$_shell" -ilc 'printf %s "$PATH"' >"$_out" 2>/dev/null &
+    _pid=$!
+
+    _n=0
+    while kill -0 "$_pid" 2>/dev/null && [ "$_n" -lt 5 ]; do
+        sleep 1
+        _n=$((_n + 1))
+    done
+    if kill -0 "$_pid" 2>/dev/null; then
+        kill "$_pid" 2>/dev/null
+        wait "$_pid" 2>/dev/null
+        rm -f "$_out"
+        return 1
+    fi
+    wait "$_pid" 2>/dev/null
+
+    _extra=$(cat "$_out" 2>/dev/null)
+    rm -f "$_out"
+    [ -n "$_extra" ] || return 1
+    printf '%s' "$_extra"
+}
+
+# Every Node on the machine, each tagged with where it was found, one
+# `exe<TAB>source` per line. The list is deliberately wide: a machine that
+# switched version managers leaves the old one's Nodes behind, and the one the
+# user wants may be any of them.
+find_all_nodes() {
+    SEEN_FILE=$(mktemp "${TMPDIR:-/tmp}/dsh-seen-XXXXXX") || return 0
+
+    _consider "$NODE_DIR/bin/node" managed
+
+    # PATH, as this process inherited it.
+    _oldifs=$IFS
+    IFS=:
+    for _dir in $PATH; do
+        IFS=$_oldifs
+        [ -n "$_dir" ] && _consider "$_dir/node" path
+    done
+    IFS=$_oldifs
+    # Plus whatever a login shell would add — nvm, fnm, asdf and friends.
+    _extra=$(login_shell_path) || _extra=''
+    if [ -n "$_extra" ]; then
+        _oldifs=$IFS
+        IFS=:
+        for _dir in $_extra; do
+            IFS=$_oldifs
+            [ -n "$_dir" ] && _consider "$_dir/node" shell
+        done
+        IFS=$_oldifs
+    fi
+
+    # nvm keeps every installed version under its versions directory.
+    _nvm_dir=${NVM_DIR:-$HOME/.nvm}
+    if [ -d "$_nvm_dir/versions/node" ]; then
+        for _d in "$_nvm_dir"/versions/node/v*; do
+            [ -d "$_d" ] && _consider "$_d/bin/node" nvm
+        done
+    fi
+
+    # fnm stores each version under its data directory.
+    case "$(uname -s)" in
+        Darwin) _fnm_root="$HOME/Library/Application Support/fnm/node-versions" ;;
+        *) _fnm_root="${XDG_DATA_HOME:-$HOME/.local/share}/fnm/node-versions" ;;
+    esac
+    if [ -d "$_fnm_root" ]; then
+        for _d in "$_fnm_root"/*/installation; do
+            [ -d "$_d" ] && _consider "$_d/bin/node" fnm
+        done
+    fi
+
+    # volta keeps Node images under its tools directory.
+    if [ -d "$HOME/.volta/tools/image/node" ]; then
+        for _d in "$HOME/.volta/tools/image/node"/*; do
+            [ -d "$_d" ] && _consider "$_d/bin/node" volta
+        done
+    fi
+
+    # asdf keeps installed Node versions under its installs directory.
+    if [ -d "$HOME/.asdf/installs/nodejs" ]; then
+        for _d in "$HOME/.asdf/installs/nodejs"/*; do
+            [ -d "$_d" ] && _consider "$_d/bin/node" asdf
+        done
+    fi
+
+    # Homebrew (mac): both the Apple Silicon and Intel prefixes, Cellar laid out
+    # as node/<version>. The `opt/node` symlinks are on PATH already and dedupe
+    # against these by realpath.
+    for _base in /opt/homebrew /usr/local; do
+        if [ -d "$_base/Cellar" ]; then
+            for _d in "$_base"/Cellar/node*/[0-9]*; do
+                [ -d "$_d" ] && _consider "$_d/bin/node" homebrew
+            done
+        fi
+    done
+
+    # System and snap installs, where nothing above found one.
+    _consider /usr/bin/node system
+    _consider /usr/local/bin/node system
+    _consider /opt/node/bin/node system
+    _consider /snap/bin/node snap
+
+    rm -f "$SEEN_FILE"
+}
+
+# Escape a string for a JSON string literal: backslash and double quote are the
+# only two a Unix path or a version can contain that JSON cares about.
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# The actual `npm prefix -g` for a Node — where dsh already is, or would be —
+# without the writable fallback `find_prefix` adds. That fallback is right for
+# *installing* (it picks somewhere this user can write), but for *detecting*
+# whether a Node already has dsh it is wrong: a system Node whose prefix is
+# `/usr/local` keeps its dsh there even though this user cannot write to it, and
+# `find_prefix` would answer `$APP_DIR/npm` and report no dsh.
+real_prefix() {
+    _rp=$("$1" "$2" prefix -g 2>/dev/null) || _rp=''
+    [ -n "$_rp" ] || _rp=$(dirname "$1")
+    printf '%s' "$_rp"
+}
+
+# One Node's worth of the chooser's payload, as a single-line JSON object.
+node_json() {
+    _p=$(json_escape "$1")
+    _v=$(json_escape "$2")
+    _pr=$(json_escape "$4")
+    _dv=$(json_escape "$6")
+    _s=$(json_escape "$7")
+    if [ -n "$_pr" ]; then _prjson="\"$_pr\""; else _prjson='null'; fi
+    if [ -n "$_dv" ]; then _dvjson="\"$_dv\""; else _dvjson='null'; fi
+    printf '{"path":"%s","version":"%s","meetsMinimum":%s,"prefix":%s,"hasDsh":%s,"dshVersion":%s,"source":"%s"}' \
+        "$_p" "$_v" "$3" "$_prjson" "$5" "$_dvjson" "$_s"
+}
+
+# Print one JSON line: an array of every usable Node on the machine. Broken
+# Nodes — ones that will not answer `--version` — are skipped, since the chooser
+# has nothing to offer for one and no install can target it.
+list_nodes() {
+    _tmp=$(mktemp "${TMPDIR:-/tmp}/dsh-list-XXXXXX") || { printf '[]\n'; return; }
+    find_all_nodes | while IFS='	' read -r _exe _src; do
+        [ -n "$_exe" ] || continue
+        _version=$(get_node_version "$_exe") || continue
+        [ -n "$_version" ] || continue
+        if version_ge "$_version" "$NODE_MINIMUM"; then _meets=true; else _meets=false; fi
+        _cli=$(find_npm "$_exe") || _cli=''
+        _prefix=''
+        _hasdsh=false
+        _dshver=''
+        if [ -n "$_cli" ]; then
+            _prefix=$(real_prefix "$_exe" "$_cli")
+            _manifest="$_prefix/lib/node_modules/$PACKAGE/package.json"
+            if [ -f "$_manifest" ]; then
+                _hasdsh=true
+                _dshver=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_manifest" | head -n 1)
+            fi
+        fi
+        node_json "$_exe" "$_version" "$_meets" "$_prefix" "$_hasdsh" "$_dshver" "$_src"
+        printf '\n'
+    done > "$_tmp"
+    _joined=$(paste -sd, "$_tmp" 2>/dev/null)
+    rm -f "$_tmp"
+    printf '[%s]\n' "$_joined"
+}
+
+# Adopt a Node that already has dsh: nothing to download, nothing installed,
+# just a marker recording which one so the app can find it.
+#
+# The marker is a fallback, not an override. If the Node the user picked is the
+# one their version manager currently points at, the app finds its dsh on PATH
+# and never reads this; the marker is what makes a Node they picked but have not
+# switched to reachable at all. See `search_path` in `dsh.rs`.
+switch_node() {
+    [ -n "$NODE_EXE" ] || fail 'switch 需要 -NodeExe。'
+    [ -x "$NODE_EXE" ] || fail "找不到指定的 Node：$NODE_EXE"
+
+    # The floor, checked here and not only in the panel that offered the button.
+    # A dsh already installed into a Node below it still cannot run: dsh's direct
+    # dependency commander@15 declares `>=22.12.0`, and its native modules (koffi,
+    # node-pty) are built against one Node ABI. Adopting such a Node would write a
+    # marker the app then boots from, and the failure would surface as a dsh that
+    # will not start rather than as the version problem it is.
+    node_is_new_enough "$NODE_EXE" || fail "这个 Node 的版本低于 dsh 需要的 $NODE_MINIMUM，无法用它运行 dsh。"
+    cli=$(find_npm "$NODE_EXE") || fail "这个 Node 旁边没有 npm（$NODE_EXE）。"
+    prefix=$(real_prefix "$NODE_EXE" "$cli")
+    manifest="$prefix/lib/node_modules/$PACKAGE/package.json"
+    [ -f "$manifest" ] || fail "这个 Node 里没有安装 dsh（$prefix），无法直接切换。"
+
+    read_marker
+    nodedir=$(dirname "$NODE_EXE")
+
+    # Nothing goes into the user's shell profiles — see the note above
+    # `remove_path`. What is left is taking out the block an earlier version of
+    # this mode wrote.
+    remove_path
+
+    M_NODE_EXE=$NODE_EXE
+    M_NPM_CLI=$cli
+    M_PREFIX=$prefix
+    M_PATH_ENTRY=''
+    [ -n "$M_NODE" ] || M_NODE=system
+    [ -n "$M_DSH" ] || M_DSH=system
+    write_marker
+    say "应用会使用 $nodedir 里的 Node 和 dsh。"
+    say "终端里用的还是你的版本管理器当前指定的那个 Node，本应用不会去改它。"
+}
+
+# `npm install -g @deepseek-ai/dsh` into a Node the user picked, and record it in
+# the marker. The mirror racing and progress reporting are the existing
+# `install_package`'s; this is only the framing around it.
+#
+# Nothing is made "active" beyond that: the user's PATH is not written, so if
+# this is the Node their version manager already points at, the app and their
+# terminal now share one dsh, and if it is not, the marker is what lets the app
+# reach it anyway.
+install_dsh_into() {
+    [ -n "$NODE_EXE" ] || fail 'install-dsh 需要 -NodeExe。'
+    [ -x "$NODE_EXE" ] || fail "找不到指定的 Node：$NODE_EXE"
+
+    # The floor, checked here and not only in the panel that offered the button.
+    # A dsh already installed into a Node below it still cannot run: dsh's direct
+    # dependency commander@15 declares `>=22.12.0`, and its native modules (koffi,
+    # node-pty) are built against one Node ABI. Adopting such a Node would write a
+    # marker the app then boots from, and the failure would surface as a dsh that
+    # will not start rather than as the version problem it is.
+    node_is_new_enough "$NODE_EXE" || fail "这个 Node 的版本低于 dsh 需要的 $NODE_MINIMUM，无法用它运行 dsh。"
+    cli=$(find_npm "$NODE_EXE") || fail "这个 Node 旁边没有 npm（$NODE_EXE），无法安装 dsh。"
+    prefix=$(find_prefix "$NODE_EXE" "$cli")
+
+    read_marker
+    M_NODE_EXE=$NODE_EXE
+    M_NPM_CLI=$cli
+    [ -n "$M_NODE" ] || M_NODE=system
+    write_marker
+
+    step '正在下载 dsh，约 185 MB，请耐心等待…' 0
+    if ! install_package "$NODE_EXE" "$cli" "$prefix" 0 "$PROGRESS_CEILING"; then
+        fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
+    fi
+
+    remove_path
+    M_DSH=managed
+    M_PREFIX=$prefix
+    M_PATH_ENTRY=''
+    write_marker
+    step 'dsh 安装完成。' 100
+}
+
+# The no-Node-at-all case: download one of ours, then install dsh into it. The
+# only mode that installs a Node, and it runs because the user pressed the button
+# that says so — nothing here decides on its own that the machine needs one.
+install_node_and_dsh() {
+    read_marker
+    # A previous switch's PATH block points at a Node the user is replacing in
+    # their mind with our own. Nothing writes one any more; this takes out what
+    # an earlier version left.
+    remove_path
+
+    say "没有可用的 Node，正在为你安装 Node $NODE_VERSION。"
+    install_node
+    node="$NODE_DIR/bin/node"
+    cli=$(find_npm "$node") || fail "这个 Node 旁边没有 npm（$node）。"
+
+    M_NODE_EXE=$node
+    M_NPM_CLI=$cli
+    M_NODE=managed
+    write_marker
+
+    prefix=$(find_prefix "$node" "$cli")
+    step '正在下载 dsh，约 185 MB，请耐心等待…' 36
+    if ! install_package "$node" "$cli" "$prefix" 36 "$PROGRESS_CEILING"; then
+        fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
+    fi
+
+    M_DSH=managed
+    M_PREFIX=$prefix
+    M_PATH_ENTRY=''
+    write_marker
+    step 'dsh 安装完成。' 100
+}
+
 case "$MODE" in
-    install) install_all ;;
     update) update_all ;;
     uninstall) uninstall_all ;;
+    list) list_nodes ;;
+    switch) switch_node ;;
+    install-dsh) install_dsh_into ;;
+    install-node) install_node_and_dsh ;;
 esac
 
 exit 0

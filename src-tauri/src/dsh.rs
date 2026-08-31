@@ -8,25 +8,42 @@
 //! next launch.
 //!
 //! Both the installing and the updating live in a script beside the app —
-//! `resources/install-deps.ps1` on Windows, which the NSIS installer also runs
-//! (see `src-tauri/installer-hooks.nsh`), and `resources/install-deps.sh` on
-//! macOS and Linux, where there is no installer hook to share it with and the
-//! first launch is the only thing that runs it. This module decides *whether* to
-//! run one and reports what it prints onto the loading page. Keeping one
-//! implementation per platform matters more than keeping it in Rust: the script
-//! has to detect Node, fetch and verify a Node archive, and measure a list of
-//! registry mirrors before walking it, and a second copy of all that would
-//! drift.
+//! `resources/install-deps.ps1` on Windows and `resources/install-deps.sh` on
+//! macOS and Linux. This module decides *whether* to run one and reports what it
+//! prints onto the loading page. Keeping one implementation per platform matters
+//! more than keeping it in Rust: the script has to detect Node, fetch and verify
+//! a Node archive, and measure a list of registry mirrors before walking it, and
+//! a second copy of all that would drift.
 //!
-//! Finding dsh cannot go through the process's own PATH. Nothing puts a Node of
-//! ours on it: a desktop app editing the environment of every terminal on the
-//! machine is a change the user did not ask for and cannot see, so the script
-//! writes down what it installed instead of publishing it. On a machine where
-//! it installed its own Node, `bootstrap.json` is therefore the *only* record of
-//! where that Node and its dsh are — the search below starts from it and falls
-//! back to PATH, rather than the other way round, and a marker it cannot read is
-//! an app that reports no dsh at all. See [`marker`], and [`terminal`] for what
-//! the user gets instead of a PATH entry.
+//! Nothing installs itself any more. It used to: a launch with no dsh ran the
+//! script's `install` mode, and the Windows installer ran the same mode at
+//! install time, and that mode picked the Node — the first one on PATH, or one
+//! it downloaded when nothing on PATH cleared the floor. On a machine that
+//! already had Node, just not the one the script would pick, that left a second
+//! Node beside the first; on a machine whose only Node was too old it made that
+//! choice while nobody was looking. Both callers are gone. [`gate`] now hands a
+//! machine with no dsh — or with a dsh behind a Node below [`NODE_MINIMUM`] — to
+//! [`crate::setup::present`], which lists every Node it can find and lets the
+//! user say which one, and the modes that script offers (`switch`,
+//! `install-dsh`, `install-node`) each act on an answer rather than a guess.
+//!
+//! Nothing here writes the user's PATH, either. A desktop app editing the
+//! environment of every terminal on the machine is a change the user did not ask
+//! for and cannot see, and on Windows it does not even work: the user PATH is
+//! searched after the machine PATH, so an entry written there loses to the
+//! symlink nvm-for-windows keeps on the machine PATH — the app would announce a
+//! switch the terminal never made. So the script writes down what it installed
+//! instead of publishing it.
+//!
+//! Which leaves two places a dsh can be, and [`search_path`] is where the order
+//! between them is decided: **the user's PATH first whenever it has a dsh on it,
+//! and `bootstrap.json` only when it does not.** Deferring to the PATH is what
+//! keeps this app and the user's terminal on the same install of the same
+//! package instead of one each. The marker still matters — a Node this app
+//! unpacked under its own data directory is on nobody's PATH, and there it is
+//! the *only* record of where that Node and its dsh are, so a marker that cannot
+//! be read is an app that reports no dsh at all. See [`marker`], and
+//! [`terminal`] for what the user gets instead of a PATH entry.
 
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read};
@@ -60,6 +77,19 @@ pub const DSH: &[&str] = &["dsh.cmd", "dsh"];
 pub const PNPM: &[&str] = &["pnpm.cmd", "pnpm"];
 /// Node's, which is what [`npm`] runs npm's own entry point with.
 const NODE: &[&str] = &["node.exe", "node"];
+
+/// The oldest Node a dsh may be run with.
+///
+/// dsh declares no `engines` field itself, but its direct dependency
+/// commander@15 declares `>=22.12.0`, so anything under that will not run dsh at
+/// all — and its native modules (koffi, node-pty) are built against one Node's
+/// ABI on top of that.
+///
+/// Has to match `$NodeMinimum` in `install-deps.ps1` and `NODE_MINIMUM` in
+/// `install-deps.sh`; [`tests::the_floor_matches_the_scripts`] is what keeps the
+/// three from drifting. The scripts decide which Nodes the chooser offers; this
+/// copy decides whether a machine that already has a dsh is asked at all.
+const NODE_MINIMUM: &str = "22.19.0";
 
 /// What a dsh install costs over the wire. Quoted to the user before they agree
 /// to it, because it is a lot. Measured, not estimated: 587 packages, 185 MB of
@@ -198,8 +228,27 @@ pub fn shim_dir(prefix: &Path) -> PathBuf {
     }
 }
 
-/// Every directory a command of ours might be in, most specific first: what the
-/// script installed, then whatever this process inherited.
+/// Every directory a command of ours might be in, in the order this launch is
+/// willing to take one from: the directories the marker records, and the PATH
+/// this process inherited — whichever of the two the user's own shell agrees
+/// with going first.
+///
+/// **The PATH wins whenever it has a dsh on it at all.** That is the whole of
+/// the rule, and it is what keeps the app and the terminal running the same
+/// binary rather than two installs of the same package. dsh is a global npm
+/// package: a user with a version manager can easily have one in each of two
+/// Nodes, and the marker used to decide between them on its own — the app ran
+/// the Node some earlier launch had recorded, the terminal ran whatever
+/// `nvm use` last pointed at, and nothing said so. Deferring to the PATH means
+/// there is only ever one answer to "which dsh is this", and it is the one the
+/// user can see for themselves by typing `dsh`.
+///
+/// The marker is then what it should always have been: a fallback for the dsh
+/// no shell can reach. A Node this app unpacked under its own data directory is
+/// on nobody's PATH — deliberately, since putting it there would shadow the
+/// user's own `node` — and neither is a Node the chooser adopted that is not the
+/// one the version manager currently points at. Both are found here, and only
+/// when the PATH has nothing to say.
 ///
 /// npm puts a global package's shims in the prefix itself on Windows and in
 /// `<prefix>/bin` everywhere else, so what the marker records is npm's prefix
@@ -222,12 +271,30 @@ fn search_path(app: &AppHandle) -> Vec<PathBuf> {
     // Last of the three, so a pnpm beside dsh still wins over a stale copy here.
     let own = app_dir(app).map(|dir| shim_dir(&dir.join("npm")));
 
-    let inherited = std::env::var_os("PATH").unwrap_or_default();
-    [shims, node_dir, own]
-        .into_iter()
-        .flatten()
-        .chain(std::env::split_paths(&inherited))
-        .collect()
+    let inherited: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    let marked: Vec<PathBuf> = [shims, node_dir, own].into_iter().flatten().collect();
+
+    // One block or the other first, never interleaved, so the Node found here is
+    // the one paired with the dsh found here. On Windows npm's `dsh.cmd` runs the
+    // `node.exe` beside it and the pairing takes care of itself; everywhere else
+    // the shim is a script with a `#!/usr/bin/env node` shebang, and a search
+    // that took dsh from one block and Node from the other would load native
+    // modules built for a different ABI than the Node loading them.
+    if dsh_on(&inherited) {
+        inherited.into_iter().chain(marked).collect()
+    } else {
+        marked.into_iter().chain(inherited).collect()
+    }
+}
+
+/// Whether any of `dirs` holds a dsh.
+///
+/// Asked against a plain list rather than through [`look_up`], because
+/// [`search_path`] is what calls it and the two would otherwise recurse.
+fn dsh_on(dirs: &[PathBuf]) -> bool {
+    dirs.iter()
+        .any(|dir| DSH.iter().any(|name| present(&dir.join(name))))
 }
 
 /// The first of `names` that exists in [`search_path`], as an absolute path.
@@ -382,12 +449,18 @@ pub struct Install {
 /// the version that will run.
 ///
 /// 1. `DSH_BIN` — an explicit choice, so it wins outright.
-/// 2. `dsh` in the npm prefix the bootstrap script recorded, or on PATH.
+/// 2. `dsh` on the user's own PATH — the one they get by typing `dsh`.
+/// 3. `dsh` in the npm prefix the bootstrap script recorded.
 ///
-/// `None` means the machine has no dsh at all, which [`gate`] answers by
-/// installing one — including the case where the name is in the prefix but the
-/// shim behind it is broken, which is reinstalled over rather than left as a dsh
-/// that cannot run. [`tool`] is what turns that into something to say.
+/// See [`search_path`] for why the middle one is not last: the app deferring to
+/// the terminal is what stops the two running different installs of the same
+/// package without saying so.
+///
+/// `None` means the machine has no dsh at all, which [`gate`] answers by putting
+/// the chooser up — including the case where the name is in the prefix but the
+/// shim behind it is broken, which is treated as no dsh rather than handed back
+/// as one whose every command fails. [`tool`] is what turns that into something
+/// to say.
 pub fn current(app: &AppHandle) -> Option<Install> {
     let bin = match std::env::var_os("DSH_BIN") {
         Some(bin) => PathBuf::from(bin),
@@ -651,6 +724,78 @@ fn version_of(bin: &OsStr) -> Option<Version> {
     Version::parse(&printed(command, VERSION_TIMEOUT)?).ok()
 }
 
+/// Whether the Node this launch would run dsh with is new enough to be worth
+/// starting, which is the question the marker cannot answer on its own.
+///
+/// A machine that installed dsh before this app asked anything has a marker
+/// pointing at whatever Node the old `install` mode picked — the first one on
+/// PATH, floor or no floor. [`current`] finds that dsh and reports it as
+/// perfectly good, because all it asks is whether dsh answers `--version`, and
+/// the app then boots a dsh whose native modules will not load. So the Node is
+/// asked too, and a machine below the floor goes to the chooser instead.
+///
+/// `true` whenever the question cannot be answered: no Node found, one that will
+/// not answer, a version that will not parse. Those are not grounds to put a
+/// chooser in front of someone whose dsh may well be fine — the floor is here to
+/// catch a Node that is *known* to be too old.
+fn node_is_new_enough(app: &AppHandle) -> bool {
+    // An explicit `DSH_BIN` is somebody running a checkout with a Node they
+    // chose. [`current`] takes their word for the dsh; this takes it for the
+    // Node.
+    if std::env::var_os("DSH_BIN").is_some() {
+        return true;
+    }
+
+    // Through [`look_up`], not the marker, so that the Node asked here is the
+    // one [`current`] would run the dsh it found with. Preferring the marker
+    // meant a launch that took its dsh from the user's PATH could be cleared by
+    // a Node sitting somewhere else entirely.
+    let Some(node) = look_up(app, NODE) else {
+        return true;
+    };
+
+    let mut command = Command::new(&node);
+    command.arg("--version").stdin(Stdio::null());
+
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let Some(printed) = printed(command, VERSION_TIMEOUT) else {
+        return true;
+    };
+    let Some(version) = node_version(&printed) else {
+        return true;
+    };
+
+    let floor = Version::parse(NODE_MINIMUM).expect("a parseable floor");
+    if version < floor {
+        eprintln!(
+            "dsh-desktop: {} is Node {version}, below the {floor} dsh needs; asking",
+            node.display()
+        );
+        return false;
+    }
+    true
+}
+
+/// What `node --version` prints, as a version: `v24.19.0`, and the `-nightly…`
+/// suffix a prerelease carries, which the scripts strip the same way.
+fn node_version(printed: &str) -> Option<Version> {
+    let text = printed.trim().trim_start_matches('v');
+    let text = text.split('-').next()?;
+    Version::parse(text).ok()
+}
+
+/// Whether this machine has to be asked about before anything can be started:
+/// no dsh at all, or a dsh behind a Node below [`NODE_MINIMUM`].
+///
+/// [`gate`] asks the two halves itself, because it has the answer to the first
+/// in hand either way. This is for the autostart path in `main`, which does not
+/// run the gate and must not reach a different conclusion than it would have.
+pub fn needs_setup(app: &AppHandle) -> bool {
+    current(app).is_none() || !node_is_new_enough(app)
+}
+
 /// What the loading page is told while the checks and the install they can lead
 /// to are running: a line of status text, and a percentage — negative to put
 /// the progress bar away.
@@ -658,20 +803,29 @@ pub type Report<'a> = dyn Fn(&str, f64) + 'a;
 
 /// Settle which dsh this launch runs, before one is started.
 ///
-/// Returns `true` to go ahead and boot, which is every outcome except a user
-/// who quit while an install was still running.
+/// Returns `true` to go ahead and boot, which is every outcome except a user who
+/// quit — at the chooser, or while an install it started was still running.
 ///
 /// Everything that can hold this up is bounded except the user: the check has
 /// [`CHECK_TIMEOUT`], and a check that fails or times out boots what is already
 /// on disk. The dialogs block, so this must run off the main thread.
 pub fn gate(app: &AppHandle, report: &Report) -> bool {
     let Some(installed) = current(app) else {
-        // Nothing to run. The installer either failed to get dsh onto the
-        // machine or never ran at all, and this is a `tauri dev` build — either
-        // way the fix is the same, and the machine has an npm by now or is
-        // about to get one.
-        return bootstrap_now(app, report);
+        // Nothing to run. Rather than install one unasked — which on a machine
+        // that already had a Node, just not the one this script would have
+        // picked, could put a second beside it — ask. [`setup::present`] lists
+        // every Node on the machine and lets the user choose: switch to one that
+        // already has dsh, install dsh into one, or install a fresh Node.
+        return crate::setup::present(app, report);
     };
+
+    // A dsh that is here but cannot run: same question, same chooser. Without
+    // this the whole chooser only ever reaches machines that had no dsh at all,
+    // and the machines this was written for — the ones an older version of this
+    // app installed a dsh onto, beside a Node nobody checked — never see it.
+    if !node_is_new_enough(app) {
+        return crate::setup::present(app, report);
+    }
 
     if checked_recently(app) {
         return true;
@@ -828,34 +982,13 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
     }
 }
 
-/// Get a dsh onto a machine that has none, which may mean getting it a Node
-/// first. `false` if the app quit while it was running.
-fn bootstrap_now(app: &AppHandle, report: &Report) -> bool {
-    report(t!("正在准备运行环境…", "Preparing the runtime…"), -1.0);
-
-    match run(app, &[OsStr::new("-Mode"), OsStr::new("install")], report) {
-        Ok(true) => {
-            report("", -1.0);
-            true
-        }
-        Ok(false) => false,
-        Err(error) => {
-            eprintln!("dsh-desktop: installing dsh failed: {error}");
-            report("", -1.0);
-            // Booting anyway: `server::start` is about to fail with a message
-            // that says what to do, and one failure report is better than two.
-            true
-        }
-    }
-}
-
 /// Run the bootstrap script with `args`, mirroring its progress onto the
 /// loading page. `Ok(false)` means the app quit while it was still working.
 ///
 /// The script emits `::status <text>` and `::progress <percent>` lines for
 /// this, and everything else it prints is npm's own log, which goes to stderr
 /// for whoever is watching the app from a console.
-fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<bool, String> {
+pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<bool, String> {
     let script = script(app).ok_or_else(|| format!("找不到安装脚本 {SCRIPT}"))?;
 
     let mut command = interpreter(&script);
@@ -1025,7 +1158,7 @@ pub fn npm(app: &AppHandle) -> Option<Command> {
 /// `DSH_BIN` names. So the pipe is drained on a thread of its own rather than
 /// after the wait below — a child that fills it would block on the write while
 /// this blocked on the exit, and nothing but the deadline would break the tie.
-fn printed(mut command: Command, timeout: Duration) -> Option<String> {
+pub(crate) fn printed(mut command: Command, timeout: Duration) -> Option<String> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1224,14 +1357,14 @@ const SCRIPT: &str = "install-deps.ps1";
 #[cfg(not(windows))]
 const SCRIPT: &str = "install-deps.sh";
 
-fn script(app: &AppHandle) -> Option<PathBuf> {
+pub(crate) fn script(app: &AppHandle) -> Option<PathBuf> {
     let script = resources(app)?.join(SCRIPT);
     script.is_file().then_some(script)
 }
 
 /// What to run the script with.
 #[cfg(windows)]
-fn interpreter(script: &Path) -> Command {
+pub(crate) fn interpreter(script: &Path) -> Command {
     let mut command = Command::new("powershell.exe");
     command
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
@@ -1243,7 +1376,7 @@ fn interpreter(script: &Path) -> Command {
 /// unpacked from a `.deb` does not reliably keep its executable bit, and there
 /// is nothing in the script that a stock `/bin/sh` cannot run.
 #[cfg(not(windows))]
-fn interpreter(script: &Path) -> Command {
+pub(crate) fn interpreter(script: &Path) -> Command {
     let mut command = Command::new("/bin/sh");
     command.arg(script);
     command
@@ -1400,10 +1533,73 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        executable, first_writable_prefix, marker, package_root, prefix_of, present, resolve,
-        shim_dir, writable, PACKAGE,
+        dsh_on, executable, first_writable_prefix, marker, node_version, package_root, prefix_of,
+        present, resolve, shim_dir, writable, DSH, NODE_MINIMUM, PACKAGE,
     };
     use std::path::{Path, PathBuf};
+
+    /// The floor lives in three files: this one, and the two scripts. Ours
+    /// decides whether a machine that already has a dsh is sent to the chooser;
+    /// theirs decides which Nodes the chooser will offer. Disagreeing means a
+    /// Node the app refuses to boot and the panel will not let the user fix.
+    #[test]
+    fn the_floor_matches_the_scripts() {
+        for (path, literal) in [
+            (
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.ps1"),
+                format!("$NodeMinimum = [version] '{NODE_MINIMUM}'"),
+            ),
+            (
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.sh"),
+                format!("NODE_MINIMUM='{NODE_MINIMUM}'"),
+            ),
+        ] {
+            let script = std::fs::read(path).expect("a readable bootstrap script");
+            let script = String::from_utf8_lossy(&script);
+            assert!(script.contains(&literal), "{path} does not say {literal}");
+        }
+    }
+
+    /// What `node --version` actually prints, including the shapes that would
+    /// not parse on their own — a version that does not parse is treated as no
+    /// answer, which boots rather than asks, so a mistake here is silent.
+    #[test]
+    fn reads_the_version_a_node_prints() {
+        assert_eq!(node_version("v24.19.0").map(|v| v.to_string()).as_deref(), Some("24.19.0"));
+        assert_eq!(node_version("24.19.0").map(|v| v.to_string()).as_deref(), Some("24.19.0"));
+        assert_eq!(
+            node_version("v25.0.0-nightly20260101abc").map(|v| v.to_string()).as_deref(),
+            Some("25.0.0")
+        );
+        assert!(node_version("").is_none());
+        assert!(node_version("not a version").is_none());
+    }
+
+    /// The question the whole search order turns on; see [`super::search_path`].
+    /// Answering it wrong in one direction runs a dsh the user's terminal cannot
+    /// see, and in the other ignores the marker on the one kind of machine where
+    /// it is the only record of where dsh is.
+    #[test]
+    fn spots_a_dsh_among_directories() {
+        let scratch = Scratch::new("dsh-on");
+
+        let empty = scratch.at("empty");
+        std::fs::create_dir_all(&empty).expect("an empty directory");
+        assert!(!dsh_on(std::slice::from_ref(&empty)));
+
+        // A directory that is not there matches nothing rather than panicking:
+        // the app's own prefix is listed unconditionally and usually absent.
+        assert!(!dsh_on(&[scratch.at("not-there")]));
+        assert!(!dsh_on(&[]));
+
+        // Both names are looked for on every platform, so both have to hit.
+        for name in DSH {
+            let dir = scratch.at(&format!("holding-{}", name.replace('.', "-")));
+            std::fs::create_dir_all(&dir).expect("the directory");
+            std::fs::write(dir.join(name), b"").expect("the shim");
+            assert!(dsh_on(&[empty.clone(), dir]), "did not spot {name}");
+        }
+    }
 
     /// A directory of this test's own, gone again when the test ends. Both
     /// layouts below are built on disk, because what [`prefix_of`] answers is a

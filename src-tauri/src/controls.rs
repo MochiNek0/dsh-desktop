@@ -99,6 +99,14 @@ pub enum Action {
     /// Show the profile directory in the file manager — the one step the panel
     /// does not take on the user's behalf. See [`crate::plugins`].
     PluginsDirectory,
+    /// A choice in the runtime chooser; see [`crate::setup`]. The index is the
+    /// Node's place in the list the chooser was given.
+    SetupUse(usize),
+    SetupInstallDsh(usize),
+    SetupInstallNode,
+    /// Look at the machine again, after a scan that could not.
+    SetupRescan,
+    SetupQuit,
     /// A shell with dsh on its PATH.
     Terminal,
     /// Start `dsh web` again after it exited on its own.
@@ -138,6 +146,13 @@ pub fn action(url: &Url) -> Option<Action> {
         "plugins-remove" => Some(Action::PluginsRemove(crate::plugins::wanted_gone(url))),
         "plugins-done" => Some(Action::PluginsDone),
         "plugins-directory" => Some(Action::PluginsDirectory),
+        // The runtime chooser's verbs; see `setup`. The Node index travels as
+        // `?i=` on the two that name one.
+        "setup-use" => setup_index(url).map(Action::SetupUse),
+        "setup-install-dsh" => setup_index(url).map(Action::SetupInstallDsh),
+        "setup-install-node" => Some(Action::SetupInstallNode),
+        "setup-rescan" => Some(Action::SetupRescan),
+        "setup-quit" => Some(Action::SetupQuit),
         "terminal" => Some(Action::Terminal),
         "restart-dsh" => Some(Action::RestartDsh),
         "open" => {
@@ -160,6 +175,15 @@ pub fn action(url: &Url) -> Option<Action> {
     }
 }
 
+/// The `?i=` a chooser verb carries: which Node in the list the user picked.
+/// `None` when it is missing or not a number, which leaves the verb to be
+/// ignored rather than acted on with a nonsense index.
+fn setup_index(url: &Url) -> Option<usize> {
+    url.query_pairs()
+        .find(|(key, _)| key == "i")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+}
+
 /// Do what the button asked. Every call is best effort — a window that will not
 /// minimise is not a reason to take the app down.
 ///
@@ -178,6 +202,13 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::PluginsRemove(names) => return crate::remove_plugins(app, names),
         Action::PluginsDone => return crate::leave_plugins(app),
         Action::PluginsDirectory => return crate::plugins::open_directory(app),
+        Action::SetupUse(i) => return crate::setup::answered(crate::setup::Choice::Use(i)),
+        Action::SetupInstallDsh(i) => {
+            return crate::setup::answered(crate::setup::Choice::InstallDsh(i))
+        }
+        Action::SetupInstallNode => return crate::setup::answered(crate::setup::Choice::InstallNode),
+        Action::SetupRescan => return crate::setup::answered(crate::setup::Choice::Rescan),
+        Action::SetupQuit => return crate::setup::answered(crate::setup::Choice::Quit),
         Action::RestartDsh => return crate::restart_dsh(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),
         Action::Answered(url) => return crate::dialog::answered(app, &url),

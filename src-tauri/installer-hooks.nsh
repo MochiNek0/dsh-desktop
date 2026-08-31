@@ -1,19 +1,16 @@
-﻿; Getting the machine to a working dsh, and taking it back off on the way out.
+﻿; Taking a previous install back off, and taking the whole thing off on the way
+; out.
 ;
-; Neither is implemented here. `resources/install-deps.ps1` does the work —
-; detect Node, install one under %LOCALAPPDATA% if the machine has none, then
-; `npm install -g @deepseek-ai/dsh` — and this file is the installer's half of
-; calling it. The app calls the same script when a launch finds no dsh; see
-; `src-tauri/src/dsh.rs`. Doing it here in NSIS as well would mean a second
-; implementation of SHA256 verification and zip extraction on top of certutil
-; and tar, kept in step with the first one by hand.
+; Getting dsh onto the machine is deliberately not here. It used to be: this
+; hook ran `install-deps.ps1 -Mode install`, which picked a Node itself and
+; installed dsh into it while the progress bar was still up. That decision is
+; the user's, and an installer is the one place in the product with no window
+; to ask it in — so it moved to the first launch, where the app lists every Node
+; on the machine and asks. See `src-tauri/src/setup.rs`.
 ;
-; The wait is put inside the installer's progress on purpose: an install pulls
-; 185 MB of dsh and possibly 35 MB of Node on top, and that is a wait a user
-; expects from an installer and does not expect from a window they just opened.
-; When it fails the install says so rather than quietly finishing without the
-; thing it runs — but it is no longer the only chance, because the app can now
-; run the same script itself.
+; What is left here is the reverse: removing what an install before this one
+; left behind (below), and running the same script's `uninstall` mode from the
+; uninstaller, which still has to happen while the files are there to remove.
 ;
 ; Nothing here needs elevation. The script writes under %LOCALAPPDATA% and to
 ; HKCU\Environment, both of which the current user owns.
@@ -327,24 +324,18 @@ FunctionEnd
 
   !insertmacro DshMigrate
 
+  ; Nothing is detected and nothing is installed here any more. The installer
+  ; used to run the script's `install` mode at this point, and that mode picked
+  ; a Node on the user's behalf — the first one on PATH — and installed 185 MB
+  ; of dsh into it without asking. On a machine with several Nodes that is a
+  ; decision the user never saw, and the marker it wrote is what kept the app's
+  ; runtime chooser from ever asking: the first launch found a dsh and ran it.
+  ;
+  ; So the question moves to the first launch, where there is a window to ask it
+  ; in. See `present` in `src-tauri/src/setup.rs`.
   SetDetailsPrint both
-  DetailPrint "正在检查 Node 和 dsh…"
+  DetailPrint "dsh 的运行环境会在首次启动应用时配置。"
   SetDetailsPrint lastused
-
-  ; Everything the script does — what it found, what it decided to install, and
-  ; npm's own http log while it runs — goes into the details pane, which is the
-  ; only thing moving during a download that takes minutes.
-  nsExec::ExecToLog '${DSH_POWERSHELL} "$INSTDIR\${DSH_SCRIPT}" -Mode install'
-  Pop $0
-
-  ${If} $0 != "0"
-    SetDetailsPrint both
-    DetailPrint "Node 或 dsh 安装失败（退出码 $0）。"
-    SetDetailsPrint lastused
-    ${IfNot} ${Silent}
-      MessageBox MB_OK|MB_ICONEXCLAMATION "dsh 没有安装成功。$\r$\n$\r$\n通常是网络或代理的问题 —— 安装过程需要从 nodejs.org 和 npm 下载。$\r$\n$\r$\n应用本身已经装好了，下次启动时它会再试一次；也可以换一个网络或代理后重新运行安装程序。"
-    ${EndIf}
-  ${EndIf}
 
   Pop $R5
   Pop $R0

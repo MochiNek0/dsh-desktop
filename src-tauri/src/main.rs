@@ -14,6 +14,7 @@ mod panel;
 mod plugins;
 mod server;
 mod settings;
+mod setup;
 mod theme;
 mod turn;
 mod update;
@@ -215,6 +216,9 @@ fn build_window(
         // The plugin panel, drawn over whatever page is showing when it is
         // asked for — dsh's included, which is the point of it being here.
         .initialization_script(panel::script())
+        // The runtime chooser, shown on the loading page when a launch finds no
+        // dsh; see `setup`.
+        .initialization_script(setup::script())
         // The app's own dialogs, in place of the window manager's; see `dialog`.
         .initialization_script(dialog::script())
         // Which language the pages pick their own strings out of; see `i18n`.
@@ -395,7 +399,7 @@ fn quit(app: &tauri::AppHandle) {
 }
 
 /// Bring the window back to the front, whatever it was hidden behind.
-fn reveal(app: &tauri::AppHandle) {
+pub(crate) fn reveal(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -406,6 +410,39 @@ fn reveal(app: &tauri::AppHandle) {
     // ask in now has one. Only ever a check the boot already finished with.
     if PENDING_CHECK.swap(false, Ordering::Relaxed) {
         check_for_updates(app);
+    }
+}
+
+/// Hand the setup panel its payload, queueing through the splash the way a
+/// dialog is — a chooser raised before the loading page has loaded is otherwise
+/// lost. See `setup`.
+pub(crate) fn deliver_setup(app: &tauri::AppHandle, payload: &str) {
+    if let Some(session) = app.try_state::<Session>() {
+        if let Some(window) = app.get_webview_window("main") {
+            let quoted = serde_json::to_string(payload)
+                .unwrap_or_else(|_| "\"\"".to_string());
+            session
+                .splash
+                .send(&window, format!("window.__dshSetup({quoted})"));
+        }
+    }
+}
+
+/// Take the setup panel down; see `setup`.
+///
+/// Queued through the splash like the delivery above, and for the same reason
+/// rather than a different one: the two have to arrive in the order they were
+/// made. A hide evaluated straight into the document while the show it undoes is
+/// still sitting in the queue would be a panel that comes back up after it was
+/// answered.
+pub(crate) fn hide_setup(app: &tauri::AppHandle) {
+    if let Some(session) = app.try_state::<Session>() {
+        if let Some(window) = app.get_webview_window("main") {
+            session.splash.send(
+                &window,
+                "window.__dshSetupHide && window.__dshSetupHide()".to_string(),
+            );
+        }
     }
 }
 
@@ -462,15 +499,30 @@ fn boot(app: tauri::AppHandle, window: WebviewWindow, session: Session) {
 
     std::thread::spawn(move || {
         let _busy = Busy;
-        // Skipped entirely on a login-item launch, which is sitting in the tray
-        // with nobody looking at it: a modal asking about a 185 MB download,
-        // from an app the user never opened, belongs to no window on screen. The
-        // next launch someone actually asks for does the check.
+        // The update check is skipped entirely on a login-item launch, which is
+        // sitting in the tray with nobody looking at it: a modal asking about a
+        // 185 MB download, from an app the user never opened, belongs to no
+        // window on screen. The next launch someone actually asks for does the
+        // check.
+        //
+        // The chooser is not skippable the same way. A login-item launch with
+        // nothing runnable cannot sit in the tray — there is nothing to run
+        // behind the icon — so the window comes up and the question is asked.
+        // The visible-launch path reaches the same place through `gate`, which
+        // runs the update check first and hands off to `setup::present` when
+        // there is no dsh, or one behind a Node too old to run it; the autostart
+        // path asks `dsh::needs_setup` the same question and goes straight
+        // there.
         //
         // False means the app is quitting and took the install running under
         // this call down with it. Starting a server now would be starting one
         // for a process that is already on its way out.
-        if window_is_visible(&app) && !dsh::gate(&app, &reporter(&session.splash, &window)) {
+        let report = reporter(&session.splash, &window);
+        if window_is_visible(&app) {
+            if !dsh::gate(&app, &report) {
+                return;
+            }
+        } else if dsh::needs_setup(&app) && !setup::present(&app, &report) {
             return;
         }
 

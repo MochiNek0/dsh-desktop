@@ -1,12 +1,17 @@
 // Stage what ships beside the app: the two bootstrap scripts, and nothing else.
 //
-// Neither Node nor dsh is shipped. The machine's Node is detected, one is
-// installed under the app's data directory if there is none, and then comes
-// `npm install -g @deepseek-ai/dsh` — all of it in `scripts/install-deps.ps1`
-// and its counterpart `scripts/install-deps.sh`, both copied into `resources/`
-// here so the bundler picks them up. On Windows the installer runs the first at
-// install time (see `src-tauri/installer-hooks.nsh`); everywhere else there is
-// no installer hook and the app's first launch runs the second.
+// Neither Node nor dsh is shipped. The machine's Nodes are listed, the user
+// picks one, and then comes `npm install -g @deepseek-ai/dsh` — all of it in
+// `scripts/install-deps.ps1` and its counterpart `scripts/install-deps.sh`, both
+// copied into `resources/` here so the bundler picks them up. The app's first
+// launch is what runs them, on every platform: the Windows installer used to run
+// the first one at install time and no longer does, because picking a Node is
+// the user's call and an installer has no window to ask it in. The uninstaller
+// still runs it (see `src-tauri/installer-hooks.nsh`).
+//
+// These two files are the source of truth and `resources/` is not: it is
+// gitignored, and the copy below overwrites whatever is sitting there on every
+// build and every `npm run dev`. Edit them here.
 //
 // One more file ships from that directory without passing through here:
 // `preset-plugins.json`, which is source rather than staged output and is
