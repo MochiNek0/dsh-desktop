@@ -36,8 +36,9 @@
 //! instead of publishing it.
 //!
 //! Which leaves two places a dsh can be, and [`search_path`] is where the order
-//! between them is decided: **the user's PATH first whenever it has a dsh on it,
-//! and `bootstrap.json` only when it does not.** Deferring to the PATH is what
+//! between them is decided: **the user's PATH first whenever it has a dsh the
+//! app can run, and `bootstrap.json` when it does not.** Deferring to the PATH is
+//! what
 //! keeps this app and the user's terminal on the same install of the same
 //! package instead of one each. The marker still matters — a Node this app
 //! unpacked under its own data directory is on nobody's PATH, and there it is
@@ -233,8 +234,9 @@ pub fn shim_dir(prefix: &Path) -> PathBuf {
 /// this process inherited — whichever of the two the user's own shell agrees
 /// with going first.
 ///
-/// **The PATH wins whenever it has a dsh on it at all.** That is the whole of
-/// the rule, and it is what keeps the app and the terminal running the same
+/// **The PATH wins whenever it has a dsh the app can run** — see
+/// [`usable_dsh_on_path`] for what that second half rules out. That is the whole
+/// of the rule, and it is what keeps the app and the terminal running the same
 /// binary rather than two installs of the same package. dsh is a global npm
 /// package: a user with a version manager can easily have one in each of two
 /// Nodes, and the marker used to decide between them on its own — the app ran
@@ -281,11 +283,47 @@ fn search_path(app: &AppHandle) -> Vec<PathBuf> {
     // the shim is a script with a `#!/usr/bin/env node` shebang, and a search
     // that took dsh from one block and Node from the other would load native
     // modules built for a different ABI than the Node loading them.
-    if dsh_on(&inherited) {
+    if usable_dsh_on_path() {
         inherited.into_iter().chain(marked).collect()
     } else {
         marked.into_iter().chain(inherited).collect()
     }
+}
+
+/// Whether the dsh on the PATH this process inherited is one the app can
+/// actually run — the condition [`search_path`] orders itself by.
+///
+/// Both halves are needed, and the second is not a nicety. A PATH whose dsh sits
+/// behind a Node below [`NODE_MINIMUM`] is exactly what an install predating the
+/// floor looks like, and deferring to it would be a loop with no way out: the
+/// launch resolves that dsh, [`node_is_new_enough`] rejects the Node under it,
+/// the chooser opens, the user picks a Node that works — and the next lookup
+/// walks straight past the marker they just wrote back to the same unusable dsh.
+/// Falling back to the marker is what lets their answer stick.
+///
+/// Answered once. The PATH does not change under a running process, and a
+/// version manager that repoints a symlink mid-session is not worth a
+/// `node --version` on every child spawn — [`apply_path`] is a caller.
+fn usable_dsh_on_path() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+    *ANSWER.get_or_init(|| {
+        let inherited: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+
+        if !dsh_on(&inherited) {
+            return false;
+        }
+        // No Node beside it is not a dsh to defer to. Nothing is lost by saying
+        // so: the marker goes first, and these directories are still on the end
+        // of the list for [`look_up`] to reach.
+        let Some(node) = first_on(&inherited, NODE) else {
+            return false;
+        };
+        // An unanswerable Node is not grounds to overrule the user's own PATH,
+        // the same way it is not grounds to open the chooser.
+        meets_floor(&node).unwrap_or(true)
+    })
 }
 
 /// Whether any of `dirs` holds a dsh.
@@ -293,8 +331,18 @@ fn search_path(app: &AppHandle) -> Vec<PathBuf> {
 /// Asked against a plain list rather than through [`look_up`], because
 /// [`search_path`] is what calls it and the two would otherwise recurse.
 fn dsh_on(dirs: &[PathBuf]) -> bool {
-    dirs.iter()
-        .any(|dir| DSH.iter().any(|name| present(&dir.join(name))))
+    first_on(dirs, DSH).is_some()
+}
+
+/// The first of `names` present in `dirs`, as an absolute path. What [`look_up`]
+/// is once the list of directories has been settled.
+fn first_on(dirs: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
+    dirs.iter().find_map(|dir| {
+        names
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|candidate| present(candidate))
+    })
 }
 
 /// The first of `names` that exists in [`search_path`], as an absolute path.
@@ -302,12 +350,7 @@ fn dsh_on(dirs: &[PathBuf]) -> bool {
 /// Resolved here rather than left to `Command::new`, which searches the PATH
 /// this process started with — the one that predates anything the installer did.
 pub fn look_up(app: &AppHandle, names: &[&str]) -> Option<PathBuf> {
-    search_path(app).into_iter().find_map(|dir| {
-        names
-            .iter()
-            .map(|name| dir.join(name))
-            .find(|candidate| present(candidate))
-    })
+    first_on(&search_path(app), names)
 }
 
 /// Whether npm left an entry at `path` — the question [`look_up`] is actually
@@ -754,28 +797,33 @@ fn node_is_new_enough(app: &AppHandle) -> bool {
         return true;
     };
 
-    let mut command = Command::new(&node);
+    match meets_floor(&node) {
+        Some(false) => {
+            eprintln!(
+                "dsh-desktop: {} is below the Node {NODE_MINIMUM} dsh needs; asking",
+                node.display()
+            );
+            false
+        }
+        // Answered yes, or did not answer at all. See the doc comment: the floor
+        // is here to catch a Node that is *known* to be too old.
+        _ => true,
+    }
+}
+
+/// Whether `node` is at or above [`NODE_MINIMUM`]. `None` when it cannot be
+/// asked — the binary will not run, will not answer in time, or prints something
+/// that is not a version — which every caller reads as "not grounds to act".
+fn meets_floor(node: &Path) -> Option<bool> {
+    let mut command = Command::new(node);
     command.arg("--version").stdin(Stdio::null());
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
 
-    let Some(printed) = printed(command, VERSION_TIMEOUT) else {
-        return true;
-    };
-    let Some(version) = node_version(&printed) else {
-        return true;
-    };
-
+    let version = node_version(&printed(command, VERSION_TIMEOUT)?)?;
     let floor = Version::parse(NODE_MINIMUM).expect("a parseable floor");
-    if version < floor {
-        eprintln!(
-            "dsh-desktop: {} is Node {version}, below the {floor} dsh needs; asking",
-            node.display()
-        );
-        return false;
-    }
-    true
+    Some(version >= floor)
 }
 
 /// What `node --version` prints, as a version: `v24.19.0`, and the `-nightly…`
