@@ -427,6 +427,10 @@ function Sort-Mirrors([string] $Name) {
         # Not `$host`, which is PowerShell's own read-only variable for the shell
         # it is running in.
         $where = [Uri]::new($mirror).Host
+        # Named as it is measured, not only once it has answered. Four probes at
+        # up to `$ProbeTimeout` each is half a minute in which one unchanging
+        # line and a bar that has not moved are indistinguishable from a hang.
+        Step "正在测试 $where…" 0
         $speed = Measure-Mirror "$mirror/v$NodeVersion/$Name.zip"
         if ($null -eq $speed) {
             Say "$where：太慢或连不上"
@@ -467,6 +471,9 @@ function Sort-Registries([string] $Exe, [string] $Cli, [double] $At) {
         # The default source is npm's own, and npm's own is the public registry —
         # the branch above is what handles it being anything else.
         $url = if ($source.Url) { $source.Url } else { $PublicRegistry }
+        # See `Sort-Mirrors`. This is the round an `install-dsh` waits on, and
+        # `$At` is 0 there, so without this it is a bar pinned at zero.
+        Step "正在测试 $($source.Label)…" $At
         $seconds = Measure-Source $url
         if ($null -eq $seconds) {
             Say "$($source.Label)：太慢或连不上"

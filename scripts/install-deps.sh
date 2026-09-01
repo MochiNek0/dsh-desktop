@@ -427,6 +427,10 @@ rank_mirrors() {
     scored=''
     while IFS= read -r mirror; do
         host=$(printf '%s' "$mirror" | sed -e 's|^[a-z]*://||' -e 's|/.*$||')
+        # Named as it is measured, not only once it has answered. Four probes,
+        # each with a timeout of its own, is half a minute in which one
+        # unchanging line and a bar that has not moved look the same as a hang.
+        step "正在测试 $host…" 0
         speed=$(measure_mirror "$mirror/v$NODE_VERSION/$1")
         if [ -z "$speed" ]; then
             say "$host：太慢或连不上"
@@ -486,6 +490,9 @@ rank_registries() {
     while IFS= read -r source; do
         label=${source%%|*}
         url=${source#*|}
+        # See `rank_mirrors`. This is the round an `install-dsh` waits on, and
+        # `$3` is 0 there, so without this it is a bar pinned at zero.
+        step "正在测试 $label…" "$3"
         # The default source is npm's own, and npm's own is the public registry —
         # the case above is what handles it being anything else.
         ms=$(measure_source "${url:-$PUBLIC_REGISTRY}")

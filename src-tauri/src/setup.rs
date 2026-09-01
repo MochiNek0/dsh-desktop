@@ -626,6 +626,13 @@ fn act(app: &AppHandle, choice: Choice, nodes: &[NodeInfo], report: &Report) -> 
             let Some(node) = nodes.get(index) else {
                 return Outcome::Failed(t!("找不到所选的 Node。", "The chosen Node is gone.").into());
             };
+            // Said here rather than left to the script's first `::status`.
+            // Between the confirm dialog closing and that line there is a
+            // PowerShell to start, a 1500-line script to parse and an
+            // `npm prefix -g` to run for the Node's global directory — seconds
+            // in which the card has greyed itself out and said nothing about
+            // why. Every other action below announces itself the same way.
+            report(t!("正在准备安装 dsh…", "Getting ready to install dsh…"), -1.0);
             crate::dsh::run(
                 app,
                 &[
@@ -638,6 +645,9 @@ fn act(app: &AppHandle, choice: Choice, nodes: &[NodeInfo], report: &Report) -> 
             )
         }
         Choice::InstallNode => {
+            // Same gap as `InstallDsh` above: the script's own first line comes
+            // after the mirror speed test has been set up.
+            report(t!("正在准备安装 Node…", "Getting ready to install Node…"), -1.0);
             crate::dsh::run(app, &[OsStr::new("-Mode"), OsStr::new("install-node")], report)
         }
         Choice::UninstallDsh(index) => {
