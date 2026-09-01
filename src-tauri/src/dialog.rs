@@ -593,9 +593,17 @@ pub fn script() -> String {
       'box-shadow:0 24px 64px rgba(0,0,0,.32),0 0 0 .5px var(--ask-line)}}' +
       '.dsh-ask-card h1{{font-size:17px;font-weight:600;line-height:1.4;margin:0 0 8px}}' +
       // `pre-wrap` because the update notes arrive with their own newlines.
+      //
+      // And `break-word` because half these questions name a path. `pre-wrap`
+      // only wraps where there is whitespace, and `C:\Users\...\node.exe` has
+      // none — so the line overflowed and `overflow:auto` answered with a
+      // horizontal scrollbar across the bottom of the card. Not `break-all`,
+      // which `.dsh-su-path` uses and can: that field is a path and nothing
+      // else, whereas this one is a paragraph, and `break-all` would break the
+      // prose around the path mid-word too.
       '.dsh-ask-body{{margin:0;color:var(--ask-muted);font-size:13px;' +
-      'white-space:pre-wrap;overflow:auto;min-height:0;' +
-      'user-select:text;-webkit-user-select:text}}' +
+      'white-space:pre-wrap;overflow-wrap:break-word;overflow:auto;' +
+      'min-height:0;user-select:text;-webkit-user-select:text}}' +
       '.dsh-ask-row{{display:flex;gap:8px;justify-content:flex-end;' +
       'flex-wrap:wrap;margin-top:20px}}' +
       // `-webkit-appearance` as well as the unprefixed property: the plain one

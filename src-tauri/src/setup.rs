@@ -1068,7 +1068,10 @@ pub fn script() -> String {
       '.dsh-su-err{{display:none;margin-bottom:14px;padding:11px 13px;' +
       'border:1px solid var(--su-bad);border-radius:10px;' +
       'background:rgba(178,35,24,.06);font-size:13px;color:var(--su-bad);' +
-      'white-space:pre-wrap;user-select:text;-webkit-user-select:text}}' +
+      // `break-word` for the same reason the dialog's body has it: what lands
+      // here is a script's failure, and those name the Node they failed on.
+      'white-space:pre-wrap;overflow-wrap:break-word;' +
+      'user-select:text;-webkit-user-select:text}}' +
       '.dsh-su-err.dsh-su-err-shown{{display:block}}' +
       '.dsh-su-foot{{display:flex;flex-wrap:wrap;align-items:center;' +
       'justify-content:flex-end;gap:10px;margin-top:14px}}' +
