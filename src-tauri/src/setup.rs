@@ -1182,13 +1182,6 @@ pub fn script() -> String {
         return;
       }}
       quit.hidden = false;
-      installNode.hidden = false;
-      // The same rule as the rows, and the one it costs the most to break: a
-      // fresh Node is a 185 MB download that arrives with its own dsh and a
-      // marker naming it, and while the app follows the PATH that marker is the
-      // loser of every lookup. Live again the moment the PATH has no dsh to
-      // follow.
-      installNode.disabled = managing && followsPath;
 
       var nodes = data.nodes || [];
       // `scanned: false` is a machine that could not be looked at, which is not
@@ -1218,6 +1211,26 @@ pub fn script() -> String {
         return node.source === 'managed' && !node.current;
       }});
       removeNode.hidden = !(managing && ours);
+
+      // A fresh Node is only worth offering when it would bring one this
+      // machine has not got. The app unpacks exactly one version — the one this
+      // button names — so an app-managed row already at that version makes the
+      // click 185 MB for a second copy of what is already there. Worse than
+      // wasteful, over the Node the app is running from: `install-node`
+      // replaces the directory outright, Windows will not delete a running
+      // `node.exe`, and the mirror loop reports that as "无法下载 Node" for a
+      // download that in fact worked.
+      //
+      // An app-managed Node at another version — an earlier release bundled an
+      // earlier Node — is a real upgrade, and keeps the button.
+      installNode.hidden = nodes.some(function (node) {{
+        return node.source === 'managed' && node.version === data.nodeVersion;
+      }});
+      // And dead where it would change nothing: a fresh Node arrives with its
+      // own dsh and a marker naming it, and while the app follows the PATH that
+      // marker is the loser of every lookup. Live again the moment the PATH has
+      // no dsh to follow.
+      installNode.disabled = managing && followsPath;
 
       statusBox.classList.remove('dsh-su-status-on');
       statusText.textContent = '';
