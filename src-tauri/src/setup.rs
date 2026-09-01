@@ -1102,6 +1102,22 @@ pub fn script() -> String {
       '.dsh-su-bar.dsh-su-bar-on{{display:block}}' +
       '.dsh-su-bar i{{display:block;height:100%;width:0;border-radius:999px;' +
       'background:var(--su-accent);transition:width .25s ease}}' +
+      // What the loading page has had all along and this panel had not:
+      // something that moves. Every action here prints a line and then runs
+      // for minutes -- an `npm i -g dsh`, or 185 MB of Node from a mirror
+      // that refuses HEAD and so leaves the bar at zero the whole way down --
+      // and a line that does not change is indistinguishable from a window
+      // that has stopped. The bar says how far, when the step knows; this says
+      // still working, which is the half that was missing.
+      '.dsh-su-spin{{display:inline-block;width:11px;height:11px;margin-right:7px;' +
+      'vertical-align:-1px;border-radius:50%;border:1.5px solid var(--su-line);' +
+      'border-top-color:var(--su-accent)}}' +
+      // Only while the line is up, for the reason `controls` spells out at
+      // its own spinner: a frame source the user cannot see keeps the
+      // compositor awake for as long as the app runs.
+      '.dsh-su-status.dsh-su-status-on .dsh-su-spin{{' +
+      'animation:dsh-su-spin .7s linear infinite}}' +
+      '@keyframes dsh-su-spin{{to{{transform:rotate(360deg)}}}}' +
       // Answered, and waiting for the app to take the panel away. The list goes
       // quiet; the status line does not, because reading it is the whole of what
       // there is to do while an install runs.
@@ -1118,6 +1134,7 @@ pub fn script() -> String {
     list = make('div', 'dsh-su-list', card);
 
     statusBox = make('div', 'dsh-su-status', card);
+    make('span', 'dsh-su-spin', statusBox);
     statusText = make('span', '', statusBox);
     var bar = make('div', 'dsh-su-bar', statusBox);
     statusFill = make('i', '', bar);
