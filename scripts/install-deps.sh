@@ -922,10 +922,7 @@ find_dsh_prefix() {
         return 0
     fi
 
-    # `$1` when the caller already has one. `find_dsh` can cost a login shell,
-    # and a caller that has already paid for it should not pay twice.
-    found=${1:-}
-    [ -n "$found" ] || found=$(find_dsh) || return 1
+    found=$(find_dsh) || return 1
     prefix=$(cd "$(dirname "$found")/.." 2>/dev/null && pwd) || return 1
     [ -f "$prefix/$manifest" ] || return 1
     printf '%s' "$prefix"
