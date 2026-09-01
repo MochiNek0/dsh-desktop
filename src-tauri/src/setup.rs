@@ -1076,10 +1076,19 @@ pub fn script() -> String {
       '.dsh-su-foot{{display:flex;flex-wrap:wrap;align-items:center;' +
       'justify-content:flex-end;gap:10px;margin-top:14px}}' +
       '.dsh-su-foot .dsh-su-spacer{{flex:1 1 auto}}' +
+      // `background` said out loud, because `appearance:none` does not clear
+      // it: the UA sheet's `buttonface` survives, and every button here that
+      // was not the primary one drew itself #f0f0f0. On the light card that is
+      // a muddy grey slab; on the dark one it is a light grey slab carrying
+      // `--su-fg`, which is white text on light grey. It also takes the UA's
+      // disabled fill out of the way, which was a second grey underneath
+      // `opacity`. `dialog` names its own background for this reason; this
+      // rule had simply left it out.
       '.dsh-su button{{-webkit-appearance:none;appearance:none;' +
       'display:inline-flex;align-items:center;justify-content:center;' +
       'height:32px;padding:0 15px;border-radius:8px;border:1px solid var(--su-line);' +
-      'cursor:pointer;font:13px/1 inherit;color:var(--su-fg);white-space:nowrap}}' +
+      'background:var(--su-bg);cursor:pointer;font:13px/1 inherit;' +
+      'color:var(--su-fg);white-space:nowrap}}' +
       '.dsh-su button:hover{{background:var(--su-soft)}}' +
       '.dsh-su button.dsh-su-primary{{background:var(--su-accent);' +
       'border-color:var(--su-accent);color:#fff}}' +
