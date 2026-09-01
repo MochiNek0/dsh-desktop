@@ -941,28 +941,37 @@ pub fn script() -> String {
     if (!node.meetsMinimum) {{
       var off = button(actions, TEXT.tooOld, function () {{}});
       off.disabled = true;
-    }} else if (node.current) {{
-      // Nothing to switch to; this is where the app already is.
-      var here = button(actions, TEXT.inUse, function () {{}});
-      here.disabled = true;
-    }} else if (node.hasDsh) {{
-      var pick = button(actions, TEXT.use, function () {{
-        signal('setup-use?i=' + index);
-      }}, true);
-      // Dead while the app follows the PATH: `switch` writes the marker, and
-      // the marker is what that PATH outranks, so the button is a restart that
-      // lands back on this same list. The lede is where the reason is written —
-      // a disabled button takes no pointer events, so a `title` on it would
-      // never be read.
-      pick.disabled = managing && followsPath;
-    }} else {{
+    }} else if (!node.hasDsh) {{
+      // Before `current`, and that ordering is the whole of this branch.
+      // `current` is `dsh::active_node` — the first `node` on the search path —
+      // and it says nothing about dsh. So the Node a first launch would run dsh
+      // with, on a machine that has one on PATH and no dsh anywhere, is marked
+      // current *and* has nothing to run: asking `current` first drew it the
+      // dead "in use" button and no way to install, on the one panel whose only
+      // job is to get dsh onto the machine. The chips never had this bug —
+      // theirs is `!meetsMinimum` then `!hasDsh` — so the row said "can install
+      // dsh" beside a button that would not.
       var add = button(actions, TEXT.installDsh, function () {{
         signal('setup-install-dsh?i=' + index);
       }});
-      // Dead for the same reason: an install ends in a marker too, and it is
-      // the marker the PATH outranks. The dsh would land in that Node and the
-      // app would go on running the terminal's.
+      // Dead while the app follows the PATH: an install ends in a marker, and
+      // the marker is what that PATH outranks. The dsh would land in that Node
+      // and the app would go on running the terminal's.
       add.disabled = managing && followsPath;
+    }} else if (node.current) {{
+      // Nothing to switch to; this is where the app already is, and it has a
+      // dsh — the branch above is the case where it has not.
+      var here = button(actions, TEXT.inUse, function () {{}});
+      here.disabled = true;
+    }} else {{
+      var pick = button(actions, TEXT.use, function () {{
+        signal('setup-use?i=' + index);
+      }}, true);
+      // Dead for the same reason as the install above: `switch` writes the
+      // marker too, so the button is a restart that lands back on this same
+      // list. The lede is where the reason is written — a disabled button takes
+      // no pointer events, so a `title` on it would never be read.
+      pick.disabled = managing && followsPath;
     }}
 
     // Taking dsh out is offered wherever there is one, floor or no floor: a dsh
