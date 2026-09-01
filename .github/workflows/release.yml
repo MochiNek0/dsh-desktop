@@ -83,8 +83,52 @@ jobs:
           dash -n scripts/install-deps.sh
           shellcheck --shell=sh scripts/install-deps.sh
 
+  # The same for `install-deps.ps1`, which had no check at all: 1400-odd lines
+  # that are the only way a Windows machine gets a Node and a dsh, and nothing
+  # here would have noticed a syntax error until a user's first launch.
+  #
+  # A job of its own rather than a step on the one above, because both things it
+  # checks are properties of Windows PowerShell 5.1 and neither can be asked of
+  # it from Linux. `shell: powershell` is 5.1 — `pwsh` would be 7, whose parser
+  # accepts more than the shell this script actually runs under.
+  #
+  # This is the `dash -n` half. There is no `shellcheck` half yet: PSScriptAnalyzer
+  # on a file this size wants a pass of triage first, and turning it on
+  # unexamined would break the release pipeline rather than guard it.
+  lint-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: check install-deps.ps1
+        shell: powershell
+        run: |
+          # Resolved once and absolutely: the .NET calls below take a path from
+          # the process's working directory, which is not the same thing as
+          # PowerShell's own location.
+          $script = (Resolve-Path 'scripts\install-deps.ps1').Path
+
+          # The BOM first, because its absence is the failure a parse cannot
+          # see: 5.1 reads a BOM-less file in the ANSI code page, so the script
+          # goes on working and every Chinese message in it reaches the user as
+          # mojibake. See the note at the top of the file.
+          $opening = [System.IO.File]::ReadAllBytes($script)
+          if ($opening[0] -ne 0xEF -or $opening[1] -ne 0xBB -or $opening[2] -ne 0xBF) {
+              Write-Host "$script is not UTF-8 with a BOM; Windows PowerShell 5.1 would read it in the ANSI code page and every message in it would reach the user as mojibake."
+              exit 1
+          }
+
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref] $null, [ref] $errors)
+          if ($errors) {
+              $errors | ForEach-Object { Write-Host "$($_.Extent.StartLineNumber): $($_.Message)" }
+              exit 1
+          }
+
+          Write-Host "$script is UTF-8 with a BOM and parses clean."
+
   bundle:
-    needs: [lint]
+    needs: [lint, lint-windows]
     # A tag is the only thing worth bundling for. A run started by hand stops
     # after the checks above.
     if: startsWith(github.ref, 'refs/tags/v')
