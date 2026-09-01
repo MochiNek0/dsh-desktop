@@ -108,6 +108,17 @@ struct NodeInfo {
     /// Where the Node came from — `nvm`, `fnm`, `path`, `managed`… — for the
     /// panel's label.
     source: String,
+    /// The directory `delete-node` would remove, for the Nodes it will remove at
+    /// all: one version under one version manager's root. `None` for every other
+    /// Node the scan lists, which is most of them — the official installer's, a
+    /// distro package's, a PATH entry of unknown provenance — and the panel draws
+    /// no delete button for those.
+    ///
+    /// Decided by the script rather than here, off the `source` string: which
+    /// directory holds a version is a fact about how each manager lays its
+    /// versions out, and that knowledge already lives in the two scripts. This
+    /// module only shows what they answered and passes the Node back.
+    removable: Option<PathBuf>,
     /// Whether this is the Node the app is running dsh with right now. Filled in
     /// by [`mark_current`] rather than by the script: which Node is in use is a
     /// question about [`crate::dsh::search_path`], not about the machine.
@@ -129,6 +140,16 @@ pub enum Choice {
     /// Delete the Node this app installed, and the dsh in it (`remove-node`).
     /// [`Mode::Manage`] only, and only when there is one.
     RemoveNode,
+    /// Delete Node `i` itself, where a version manager installed it and the app
+    /// is not running on it (`delete-node`). [`Mode::Manage`] only.
+    ///
+    /// The neighbour above is about the one Node this app unpacked, and clears
+    /// the marker and PATH entry that came with it; this one is about somebody
+    /// else's Node, and the script will only touch the narrow set its
+    /// `removable` field named. The two are kept apart rather than merged
+    /// because what they may delete, and what they have to clean up after, are
+    /// not the same.
+    DeleteNode(usize),
     /// Look again. The button only appears when the scan failed, which is the
     /// one state a user can do something about without restarting the app.
     Rescan,
@@ -242,6 +263,10 @@ fn parse_nodes(json: &str) -> Option<Vec<NodeInfo>> {
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_string();
+            let removable = node
+                .get("removable")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from);
 
             Some(NodeInfo {
                 path,
@@ -250,6 +275,7 @@ fn parse_nodes(json: &str) -> Option<Vec<NodeInfo>> {
                 has_dsh,
                 dsh_version,
                 source,
+                removable,
                 current: false,
             })
         })
@@ -296,7 +322,7 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
     // user cannot answer, and the autostart path reaches this with it hidden.
     reveal(app);
 
-    let mut nodes = scan(app, report);
+    let mut nodes = scan(app, report, mode);
     let mut error = None::<String>;
     loop {
         // A fresh channel each time round: a failed action re-shows the panel,
@@ -327,9 +353,15 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
                 return true;
             }
             Ok(Choice::Rescan) => {
-                crate::hide_setup(app);
+                // Same as everywhere else in this loop: the menu's panel stays
+                // up and reports onto itself, and taking it down first would be
+                // a blink of the page behind it on the way to putting it
+                // straight back.
+                if mode == Mode::Required {
+                    crate::hide_setup(app);
+                }
                 error = None;
-                nodes = scan(app, report);
+                nodes = scan(app, report, mode);
                 continue;
             }
             Ok(choice) => {
@@ -344,8 +376,31 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
                     continue;
                 }
 
-                crate::hide_setup(app);
+                // Deleting somebody else's Node is the one action here that
+                // changes nothing about the dsh the window behind is running:
+                // no marker moves, nothing is installed, and the panel never
+                // offers it for the Node in use. So it goes back to the list
+                // with the row gone, rather than through a restart that would
+                // take a session with it for a directory the app was not using.
+                let listed_again = matches!(choice, Choice::DeleteNode(_));
+
+                // The menu's panel stays up while the action runs. Its own
+                // status line is the only thing on screen that can report one —
+                // see [`crate::setup_status`] — and hidden, an `install-dsh`
+                // was several minutes of a window that had simply gone quiet.
+                // `signal` has already put the card in its busy state, which is
+                // what that state is for. The boot's comes down onto the
+                // loading page, which has a status line of its own.
+                if mode == Mode::Required {
+                    crate::hide_setup(app);
+                }
                 match act(app, choice, listed, report) {
+                    Outcome::Done if mode == Mode::Manage && listed_again => {
+                        error = None;
+                        nodes = scan(app, report, mode);
+                        reveal(app);
+                        continue;
+                    }
                     Outcome::Done if mode == Mode::Manage => {
                         // Which dsh runs is settled once, at boot, by
                         // `dsh::current` — and the server, the plugin list and
@@ -364,7 +419,7 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
                         // the list a second choice is made from should be the
                         // machine as it is now.
                         error = Some(message);
-                        nodes = scan(app, report);
+                        nodes = scan(app, report, mode);
                         reveal(app);
                         continue;
                     }
@@ -391,10 +446,20 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
     }
 }
 
-/// Look at the machine, with the loading page saying so. Slow enough to need the
-/// status line: the scripts ask a login shell for its PATH and then run every
-/// `node` they find.
-fn scan(app: &AppHandle, report: &Report) -> Option<Vec<NodeInfo>> {
+/// Look at the machine, with something on screen saying so. Slow enough to need
+/// the status line: the scripts ask a login shell for its PATH and then run
+/// every `node` they find, which is a second on a quiet machine and several on
+/// one with a version manager or two.
+///
+/// The menu's panel is put up empty first. Its status line is drawn on the card
+/// itself — see [`crate::setup_status`] — so until the card exists the line
+/// below lands nowhere, and the whole of the scan was a menu item that looked
+/// like it had missed. The boot's panel is already over the loading page, which
+/// has a status line of its own.
+fn scan(app: &AppHandle, report: &Report, mode: Mode) -> Option<Vec<NodeInfo>> {
+    if mode == Mode::Manage {
+        crate::deliver_setup(app, &scanning());
+    }
     report(t!("正在检测运行环境…", "Scanning for a runtime…"), -1.0);
     enumerate(app)
 }
@@ -484,6 +549,33 @@ fn confirm(app: &AppHandle, choice: &Choice, nodes: &[NodeInfo]) -> bool {
                 t!("卸载并重启", "Uninstall and restart"),
             )
         }
+        Choice::DeleteNode(index) => {
+            let Some(node) = nodes.get(*index) else {
+                return false;
+            };
+            // The directory, not the `node` binary inside it: what goes is the
+            // whole version, and the path the script answered with is the one
+            // thing that says so exactly.
+            let Some(dir) = node.removable.as_deref() else {
+                return false;
+            };
+            let mut body = t!(
+                "会删掉这个目录，以及里面的一切：\n{}\n\n你的其他 Node 一个都不会动，版本管理器本身也不会。",
+                "This directory goes, and everything in it:\n{}\n\nEvery other Node is left alone, and so is the version manager itself.",
+                dir.display()
+            );
+            if node.has_dsh {
+                body.push_str(t!(
+                    "\n\n装在这个 Node 里的 dsh 会跟着一起没了。应用现在用的不是它，所以不受影响。",
+                    "\n\nThe dsh installed into this Node goes with it. It is not the one the app is running, so nothing in use is affected."
+                ));
+            }
+            (
+                t!("删除 Node {}？", "Delete Node {}?", node.version),
+                body,
+                t!("删除", "Delete"),
+            )
+        }
         Choice::RemoveNode => (
             t!("删除应用装的 Node？", "Delete the Node the app installed?").to_string(),
             t!(
@@ -564,6 +656,22 @@ fn act(app: &AppHandle, choice: Choice, nodes: &[NodeInfo], report: &Report) -> 
                 report,
             )
         }
+        Choice::DeleteNode(index) => {
+            let Some(node) = nodes.get(index) else {
+                return Outcome::Failed(t!("找不到所选的 Node。", "The chosen Node is gone.").into());
+            };
+            report(t!("正在删除这个 Node…", "Deleting that Node…"), -1.0);
+            crate::dsh::run(
+                app,
+                &[
+                    OsStr::new("-Mode"),
+                    OsStr::new("delete-node"),
+                    OsStr::new("-NodeExe"),
+                    node.path.as_os_str(),
+                ],
+                report,
+            )
+        }
         Choice::RemoveNode => {
             report(
                 t!("正在删除应用安装的 Node…", "Deleting the app's Node…"),
@@ -593,6 +701,26 @@ enum Outcome {
     Failed(String),
 }
 
+/// The same panel with its list not filled in yet, delivered by [`scan`] before
+/// the script runs so there is a card on screen for the scan to report onto.
+///
+/// [`Mode::Manage`] only, so `manage` is asserted rather than passed. Nothing in
+/// it can be clicked: no answer is pending yet — [`show`] opens that channel
+/// after the scan — and a button that swallows the click and freezes the card is
+/// worse than no button, so the panel puts them all away until the real payload
+/// arrives.
+fn scanning() -> String {
+    json!({
+        "nodes": [],
+        "scanned": true,
+        "scanning": true,
+        "nodeVersion": NODE_VERSION,
+        "error": null,
+        "manage": true,
+    })
+    .to_string()
+}
+
 /// The JSON the panel takes: the nodes, whether the machine could be looked at
 /// at all, the version a fresh install would bring, and the error from a
 /// previous attempt when there was one.
@@ -608,6 +736,7 @@ fn payload(nodes: Option<&[NodeInfo]>, error: Option<&str>, mode: Mode) -> Strin
                 "hasDsh": node.has_dsh,
                 "dshVersion": node.dsh_version.clone().unwrap_or_default(),
                 "source": node.source,
+                "removable": node.removable.as_ref().map(|dir| dir.display().to_string()),
                 "current": node.current,
             })
         })
@@ -621,6 +750,14 @@ fn payload(nodes: Option<&[NodeInfo]>, error: Option<&str>, mode: Mode) -> Strin
         // What the panel keys its two shapes off: which way out it offers, and
         // whether the verbs that remove things are drawn at all.
         "manage": mode == Mode::Manage,
+        // Whether this launch is following the dsh on the user's PATH rather
+        // than the marker. While it is, switching Node here settles nothing —
+        // `switch` writes the marker, and the marker is what that PATH outranks
+        // on the next launch — so the panel says so and draws those buttons
+        // dead. Read from the process rather than passed in: it is a fact about
+        // the PATH this app inherited, and [`crate::dsh::usable_dsh_on_path`]
+        // answers it once for the whole run.
+        "followsPath": crate::dsh::usable_dsh_on_path(),
     })
     .to_string()
 }
@@ -667,6 +804,9 @@ pub fn script() -> String {
             "没能列出这台机器上的 Node —— 检测脚本没有跑起来，或者跑得太久。如果你确定机器上装过 Node，先点“重新检测”；也可以直接装一个新的 Node。",
             "The machine's Nodes could not be listed — the scan would not run, or took too long. If you know this machine has a Node, scan again; installing a fresh one is the other way out."
         ),
+        // The same words `scan` reports, so the line does not change under the
+        // user when the report lands a moment after the card.
+        "scanning": t!("正在检测运行环境…", "Scanning for a runtime…"),
         "use": t!("使用这个", "Use this one"),
         "installDsh": t!("在此安装 dsh", "Install dsh here"),
         "tooOld": t!("版本过低", "Too old"),
@@ -674,8 +814,16 @@ pub fn script() -> String {
         "canInstall": t!("可安装 dsh", "Can install dsh"),
         "installNode": t!("安装新的 Node", "Install a fresh Node"),
         "uninstallDsh": t!("卸载 dsh", "Uninstall dsh"),
+        "deleteNode": t!("删除这个 Node", "Delete this Node"),
         "removeNode": t!("删除应用装的 Node", "Delete the app's Node"),
         "inUse": t!("使用中", "In use"),
+        // Added to the manage lede when the app is following the PATH's dsh.
+        // Without it the dead buttons are a panel that has stopped working for
+        // no stated reason.
+        "ledeFollows": t!(
+            "应用现在跟着终端走 —— 用的是 PATH 上的那个 dsh，所以在这里换 Node、装 dsh 都改不了应用用哪一个。要换，先在终端里把 Node 切过去（nvm use 之类），或者把 PATH 上的那个 dsh 卸掉。",
+            "The app follows your terminal: it runs the dsh on your PATH, so switching Node or installing one here would not change which dsh it runs. Point your terminal at the Node you want (nvm use, and so on), or uninstall the dsh that is on your PATH."
+        ),
         "rescan": t!("重新检测", "Scan again"),
         "close": t!("关闭", "Close"),
         "quit": t!("退出", "Quit"),
@@ -712,6 +860,9 @@ pub fn script() -> String {
   var sent = false;
   // Set from every payload; see the `manage` field in `payload`.
   var managing = false;
+  // And the `followsPath` field beside it: the app is running the PATH's dsh,
+  // which no answer given here can change.
+  var followsPath = false;
 
   // One answer per showing. The panel stays up until the app takes it down, and
   // a second click in that gap would be read against a list the next payload is
@@ -785,13 +936,23 @@ pub fn script() -> String {
       var here = button(actions, TEXT.inUse, function () {{}});
       here.disabled = true;
     }} else if (node.hasDsh) {{
-      button(actions, TEXT.use, function () {{
+      var pick = button(actions, TEXT.use, function () {{
         signal('setup-use?i=' + index);
       }}, true);
+      // Dead while the app follows the PATH: `switch` writes the marker, and
+      // the marker is what that PATH outranks, so the button is a restart that
+      // lands back on this same list. The lede is where the reason is written —
+      // a disabled button takes no pointer events, so a `title` on it would
+      // never be read.
+      pick.disabled = managing && followsPath;
     }} else {{
-      button(actions, TEXT.installDsh, function () {{
+      var add = button(actions, TEXT.installDsh, function () {{
         signal('setup-install-dsh?i=' + index);
       }});
+      // Dead for the same reason: an install ends in a marker too, and it is
+      // the marker the PATH outranks. The dsh would land in that Node and the
+      // app would go on running the terminal's.
+      add.disabled = managing && followsPath;
     }}
 
     // Taking dsh out is offered wherever there is one, floor or no floor: a dsh
@@ -803,6 +964,19 @@ pub fn script() -> String {
         signal('setup-uninstall-dsh?i=' + index);
       }});
       drop.className = 'dsh-su-danger';
+    }}
+
+    // And taking the Node itself away, for the ones a version manager installed
+    // — `removable` is the script's answer for which those are, and it is null
+    // for every Node that belongs to something else. Never for the row the app
+    // is running out of: deleting that from under a serving dsh is not an undo,
+    // it is a machine with no dsh and a window still open on one.
+    if (managing && node.removable && !node.current) {{
+      var wipe = button(actions, TEXT.deleteNode, function () {{
+        signal('setup-delete-node?i=' + index);
+      }});
+      wipe.className = 'dsh-su-danger';
+      wipe.title = node.removable;
     }}
 
     return line;
@@ -977,9 +1151,44 @@ pub fn script() -> String {
       sent = false;
       root.classList.remove('dsh-su-busy');
 
-      // Read before the rows are built: `row` keys the destructive verbs off it.
+      // Read before the rows are built: `row` keys the destructive verbs off
+      // the first and the switch button off the second.
       managing = data.manage === true;
+      followsPath = data.followsPath === true;
       quit.textContent = managing ? TEXT.close : TEXT.quit;
+
+      // The card before the list: `scan` puts this up while the script walks the
+      // machine, which is a second or more of a menu item that had otherwise
+      // done nothing visible. Every button goes away rather than being drawn
+      // dead — there is no answer to give yet — and `busy` is the state that
+      // already means exactly this: the list quiet, the status line not.
+      if (data.scanning === true) {{
+        root.classList.add('dsh-su-busy');
+        // Escape is still wired, and it is the one way a click could still be
+        // made from here. Latched, so it is ignored rather than swallowed.
+        sent = true;
+        lede.textContent = TEXT.ledeManage;
+        errBox.classList.remove('dsh-su-err-shown');
+        errText.textContent = '';
+        list.textContent = '';
+        statusText.textContent = TEXT.scanning;
+        statusBox.classList.add('dsh-su-status-on');
+        statusFill.parentNode.classList.remove('dsh-su-bar-on');
+        quit.hidden = true;
+        rescan.hidden = true;
+        removeNode.hidden = true;
+        installNode.hidden = true;
+        root.classList.add('dsh-su-shown');
+        return;
+      }}
+      quit.hidden = false;
+      installNode.hidden = false;
+      // The same rule as the rows, and the one it costs the most to break: a
+      // fresh Node is a 185 MB download that arrives with its own dsh and a
+      // marker naming it, and while the app follows the PATH that marker is the
+      // loser of every lookup. Live again the moment the PATH has no dsh to
+      // follow.
+      installNode.disabled = managing && followsPath;
 
       var nodes = data.nodes || [];
       // `scanned: false` is a machine that could not be looked at, which is not
@@ -989,11 +1198,25 @@ pub fn script() -> String {
         ? TEXT.ledeFailed
         : (managing ? TEXT.ledeManage
           : (nodes.length ? TEXT.ledeNodes : TEXT.ledeNone));
+      // Only on the menu's panel, and only where it is true. The boot's panel
+      // is a launch with no dsh to follow, and it is the one screen that has to
+      // stay answerable.
+      if (managing && followsPath && scanned) {{
+        lede.textContent += ' ' + TEXT.ledeFollows;
+      }}
       rescan.hidden = scanned;
 
-      // Only where there is one to delete. The row's own `managed` source is
-      // the only thing that says this app unpacked a Node.
-      var ours = nodes.some(function (node) {{ return node.source === 'managed'; }});
+      // Only where there is one to delete, and not while the app is running out
+      // of it — the same rule the rows follow, and the app's own Node is only
+      // ever deletable from here, so this is where that rule has to hold. A
+      // Node cannot be pulled out from under the dsh serving the window behind:
+      // on Windows the running `node.exe` will not delete at all, and the mode
+      // clears the marker and the PATH entry either way, so what is left is a
+      // half-deleted directory the app no longer knows it installed. Switching
+      // to another Node first brings the button back.
+      var ours = nodes.some(function (node) {{
+        return node.source === 'managed' && !node.current;
+      }});
       removeNode.hidden = !(managing && ours);
 
       statusBox.classList.remove('dsh-su-status-on');
@@ -1044,8 +1267,8 @@ mod tests {
     #[test]
     fn parses_what_the_scripts_print() {
         let json = r#"[
-          {"path":"/usr/local/bin/node","version":"24.9.0","meetsMinimum":true,"prefix":"/usr/local","hasDsh":true,"dshVersion":"0.1.8","source":"homebrew"},
-          {"path":"/usr/bin/node","version":"18.4.0","meetsMinimum":false,"prefix":"/usr","hasDsh":false,"dshVersion":null,"source":"system"}
+          {"path":"/home/a/.nvm/versions/node/v24.9.0/bin/node","version":"24.9.0","meetsMinimum":true,"prefix":"/usr/local","hasDsh":true,"dshVersion":"0.1.8","source":"nvm","removable":"/home/a/.nvm/versions/node/v24.9.0"},
+          {"path":"/usr/bin/node","version":"18.4.0","meetsMinimum":false,"prefix":"/usr","hasDsh":false,"dshVersion":null,"source":"system","removable":null}
         ]"#;
 
         let nodes = parse_nodes(json).expect("a scan, not a failure");
@@ -1057,6 +1280,13 @@ mod tests {
         assert!(!nodes[1].has_dsh);
         assert!(nodes[1].dsh_version.is_none());
         assert!(!nodes[1].meets_minimum);
+        // The field the delete button hangs off: a directory for the version a
+        // manager unpacked, nothing for the Node the distro owns.
+        assert_eq!(
+            nodes[0].removable.as_deref(),
+            Some(std::path::Path::new("/home/a/.nvm/versions/node/v24.9.0"))
+        );
+        assert!(nodes[1].removable.is_none());
     }
 
     /// A null `dshVersion` is the common case — most Nodes have no dsh — and a
@@ -1099,6 +1329,21 @@ mod tests {
         assert!(failed.contains("\"scanned\":false"));
     }
 
+    /// The card `scan` puts up before the script runs says it is a scan in
+    /// progress, and says it is the menu's panel — the branch that draws it
+    /// hides every button, so a payload that reached the boot's chooser with
+    /// this flag would be a screen with no way forward at all.
+    #[test]
+    fn the_scanning_payload_is_the_menu_panel_with_no_list_yet() {
+        let scanning = super::scanning();
+
+        assert!(scanning.contains("\"scanning\":true"));
+        assert!(scanning.contains("\"manage\":true"));
+        assert!(scanning.contains("\"nodes\":[]"));
+        // And the finished one is not mistaken for it.
+        assert!(!super::payload(Some(&[]), None, super::Mode::Manage).contains("\"scanning\":true"));
+    }
+
     /// The other flag the panel keys off. Wrong, and either the boot's chooser
     /// grows a button that quits to nowhere, or the menu's loses the only way
     /// out it has.
@@ -1106,6 +1351,19 @@ mod tests {
     fn the_payload_says_which_panel_this_is() {
         assert!(super::payload(Some(&[]), None, super::Mode::Manage).contains("\"manage\":true"));
         assert!(super::payload(Some(&[]), None, super::Mode::Required).contains("\"manage\":false"));
+    }
+
+    /// The field the panel greys its switch buttons off, and the panel's read
+    /// of it. Written in two places with nothing else making them agree: a
+    /// rename on either side is an `undefined` on the other, which reads as
+    /// false — every "use this one" live again, and each one a restart that
+    /// lands back on the same list.
+    #[test]
+    fn the_panel_reads_the_follows_path_field_the_payload_sends() {
+        let sent = super::payload(Some(&[]), None, super::Mode::Manage);
+
+        assert!(sent.contains("\"followsPath\":"));
+        assert!(super::script().contains("data.followsPath"));
     }
 
     /// The version on the install-a-Node button is this module's copy of a
@@ -1163,6 +1421,7 @@ mod tests {
                 "setup-use?i=",
                 "setup-install-dsh?i=",
                 "setup-uninstall-dsh?i=",
+                "setup-delete-node?i=",
                 "setup-install-node",
                 "setup-remove-node",
                 "setup-rescan",
@@ -1193,6 +1452,7 @@ mod tests {
             "install-node",
             "uninstall-dsh",
             "remove-node",
+            "delete-node",
         ] {
             // The list above is only worth checking if it is still the list this
             // module actually runs.

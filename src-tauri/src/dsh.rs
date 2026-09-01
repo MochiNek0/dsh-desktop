@@ -293,6 +293,11 @@ fn search_path(app: &AppHandle) -> Vec<PathBuf> {
 /// Whether the dsh on the PATH this process inherited is one the app can
 /// actually run — the condition [`search_path`] orders itself by.
 ///
+/// Also what the runtime panel greys its switch buttons off: while this is true
+/// the marker a switch writes is the loser of that ordering on every launch, so
+/// adopting another Node from the panel would buy a restart and the same list
+/// back. See `setup::payload`.
+///
 /// Both halves are needed, and the second is not a nicety. A PATH whose dsh sits
 /// behind a Node below [`NODE_MINIMUM`] is exactly what an install predating the
 /// floor looks like, and deferring to it would be a loop with no way out: the
@@ -304,7 +309,7 @@ fn search_path(app: &AppHandle) -> Vec<PathBuf> {
 /// Answered once. The PATH does not change under a running process, and a
 /// version manager that repoints a symlink mid-session is not worth a
 /// `node --version` on every child spawn — [`apply_path`] is a caller.
-fn usable_dsh_on_path() -> bool {
+pub fn usable_dsh_on_path() -> bool {
     static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
     *ANSWER.get_or_init(|| {

@@ -63,9 +63,10 @@ while [ $# -gt 0 ]; do
             PREFIX=$2
             shift 2
             ;;
-        # `switch` and `install-dsh` only: the `node` the user chose in the
-        # setup panel. Everything this script needs — npm, the prefix, the dsh
-        # that is or will be there — hangs off it.
+        # `switch`, `install-dsh`, `uninstall-dsh` and `delete-node` only: the
+        # `node` the user chose in the setup panel. Everything this script needs
+        # — npm, the prefix, the dsh that is or will be there, the version
+        # directory holding it — hangs off it.
         -NodeExe)
             [ $# -ge 2 ] || { echo "-NodeExe 后面要跟一个路径" >&2; exit 2; }
             NODE_EXE=$2
@@ -81,8 +82,16 @@ done
 # No default. There used to be one — `install`, a mode that picked a Node itself
 # and installed dsh into it — and a bare run of this script is not a thing that
 # should still be able to change the machine.
+#
+# The three the runtime panel's undo runs — `uninstall-dsh`, `remove-node` and
+# `delete-node` — belong here too. They were dispatched at the bottom of this
+# file but never accepted here, so on macOS and Linux every one of them exited
+# with "未知的 -Mode" before it did anything; the panel reported the failure and
+# the button did nothing. The list at the bottom is the one that has to match
+# this, and `setup.rs` has a test that reads it.
 case "$MODE" in
     update|uninstall|list|switch|install-dsh|install-node) ;;
+    uninstall-dsh|remove-node|delete-node) ;;
     '') echo "要用 -Mode 指定一个模式" >&2; exit 2 ;;
     *) echo "未知的 -Mode：$MODE" >&2; exit 2 ;;
 esac
@@ -1073,6 +1082,65 @@ login_shell_path() {
     printf '%s' "$_extra"
 }
 
+# The version managers that keep one directory per Node version, and where, one
+# `root<TAB>source<TAB>leaf` per line.
+#
+# One list rather than one per caller: `find_all_nodes` walks these to find the
+# Nodes, and `version_dir` measures a Node against them to work out which
+# directory holding it `delete-node` may remove. Two copies of these paths would
+# drift, and the way they would drift is a Node listed as nvm's that the delete
+# no longer recognises as nvm's.
+#
+# `leaf` is where the binary sits inside one version directory — the managers
+# disagree about that, which is why the version cannot be counted off the exe's
+# path.
+#
+# Homebrew is deliberately not here. Its Cellar is laid out the same way, but a
+# `node@22` removed by deleting its directory leaves brew still believing it is
+# installed; `brew uninstall node` is the only thing that should do that.
+manager_roots() {
+    printf '%s\t%s\t%s\n' "${NVM_DIR:-$HOME/.nvm}/versions/node" nvm 'bin/node'
+    case "$(uname -s)" in
+        Darwin) _mr_fnm="$HOME/Library/Application Support/fnm/node-versions" ;;
+        *) _mr_fnm="${XDG_DATA_HOME:-$HOME/.local/share}/fnm/node-versions" ;;
+    esac
+    printf '%s\t%s\t%s\n' "$_mr_fnm" fnm 'installation/bin/node'
+    printf '%s\t%s\t%s\n' "$HOME/.volta/tools/image/node" volta 'bin/node'
+    printf '%s\t%s\t%s\n' "$HOME/.asdf/installs/nodejs" asdf 'bin/node'
+}
+
+# The directory one version manager keeps one version of Node in — the whole of
+# what `delete-node` is allowed to delete — or nothing at all for a Node that is
+# not one of theirs.
+#
+# Measured against `manager_roots` rather than counted off the exe's path: nvm
+# puts `node` in `<version>/bin` and fnm in `<version>/installation/bin`, so
+# there is no fixed number of `..`s that is right for both. The rule that does
+# hold is that the version is the first segment under the manager's own root.
+#
+# Nothing for everything else, and that is most of the list: a distro package's
+# Node, a Homebrew Cellar, a snap and a PATH entry this script cannot place all
+# belong to something that should be asked to remove them. A symlink is refused
+# too — a manager's "current" can sit inside its own root, and deleting that is
+# deleting the switch rather than a version.
+version_dir() {
+    manager_roots | while IFS='	' read -r _vd_root _vd_src _vd_leaf; do
+        case "$1" in
+            "$_vd_root"/*) ;;
+            *) continue ;;
+        esac
+        _vd_rest=${1#"$_vd_root"/}
+        _vd_first=${_vd_rest%%/*}
+        [ -n "$_vd_first" ] || continue
+        # The exe straight in the root is not a version directory; there is
+        # nothing between it and the manager itself to delete.
+        [ "$_vd_rest" = "$_vd_first" ] && continue
+        [ -L "$_vd_root/$_vd_first" ] && continue
+        printf '%s' "$_vd_root/$_vd_first"
+        break
+    done
+}
+
 # Every Node on the machine, each tagged with where it was found, one
 # `exe<TAB>source` per line. The list is deliberately wide: a machine that
 # switched version managers leaves the old one's Nodes behind, and the one the
@@ -1102,38 +1170,13 @@ find_all_nodes() {
         IFS=$_oldifs
     fi
 
-    # nvm keeps every installed version under its versions directory.
-    _nvm_dir=${NVM_DIR:-$HOME/.nvm}
-    if [ -d "$_nvm_dir/versions/node" ]; then
-        for _d in "$_nvm_dir"/versions/node/v*; do
-            [ -d "$_d" ] && _consider "$_d/bin/node" nvm
+    # nvm, fnm, volta and asdf, each from its own root; see `manager_roots`.
+    manager_roots | while IFS='	' read -r _root _src _leaf; do
+        [ -d "$_root" ] || continue
+        for _d in "$_root"/*; do
+            [ -d "$_d" ] && _consider "$_d/$_leaf" "$_src"
         done
-    fi
-
-    # fnm stores each version under its data directory.
-    case "$(uname -s)" in
-        Darwin) _fnm_root="$HOME/Library/Application Support/fnm/node-versions" ;;
-        *) _fnm_root="${XDG_DATA_HOME:-$HOME/.local/share}/fnm/node-versions" ;;
-    esac
-    if [ -d "$_fnm_root" ]; then
-        for _d in "$_fnm_root"/*/installation; do
-            [ -d "$_d" ] && _consider "$_d/bin/node" fnm
-        done
-    fi
-
-    # volta keeps Node images under its tools directory.
-    if [ -d "$HOME/.volta/tools/image/node" ]; then
-        for _d in "$HOME/.volta/tools/image/node"/*; do
-            [ -d "$_d" ] && _consider "$_d/bin/node" volta
-        done
-    fi
-
-    # asdf keeps installed Node versions under its installs directory.
-    if [ -d "$HOME/.asdf/installs/nodejs" ]; then
-        for _d in "$HOME/.asdf/installs/nodejs"/*; do
-            [ -d "$_d" ] && _consider "$_d/bin/node" asdf
-        done
-    fi
+    done
 
     # Homebrew (mac): both the Apple Silicon and Intel prefixes, Cellar laid out
     # as node/<version>. The `opt/node` symlinks are on PATH already and dedupe
@@ -1195,10 +1238,15 @@ node_json() {
     _pr=$(json_escape "$4")
     _dv=$(json_escape "$6")
     _s=$(json_escape "$7")
+    _rm=$(json_escape "$8")
     if [ -n "$_pr" ]; then _prjson="\"$_pr\""; else _prjson='null'; fi
     if [ -n "$_dv" ]; then _dvjson="\"$_dv\""; else _dvjson='null'; fi
-    printf '{"path":"%s","version":"%s","meetsMinimum":%s,"prefix":%s,"hasDsh":%s,"dshVersion":%s,"source":"%s"}' \
-        "$_p" "$_v" "$3" "$_prjson" "$5" "$_dvjson" "$_s"
+    # What `delete-node` would remove, for the panel to put in front of the user
+    # before they agree to it — and null for the Nodes it will not touch, which
+    # is how the panel knows not to offer.
+    if [ -n "$_rm" ]; then _rmjson="\"$_rm\""; else _rmjson='null'; fi
+    printf '{"path":"%s","version":"%s","meetsMinimum":%s,"prefix":%s,"hasDsh":%s,"dshVersion":%s,"source":"%s","removable":%s}' \
+        "$_p" "$_v" "$3" "$_prjson" "$5" "$_dvjson" "$_s" "$_rmjson"
 }
 
 # Print one JSON line: an array of every usable Node on the machine. Broken
@@ -1223,7 +1271,8 @@ list_nodes() {
                 _dshver=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_manifest" | head -n 1)
             fi
         fi
-        node_json "$_exe" "$_version" "$_meets" "$_prefix" "$_hasdsh" "$_dshver" "$_src"
+        _removable=$(version_dir "$_exe")
+        node_json "$_exe" "$_version" "$_meets" "$_prefix" "$_hasdsh" "$_dshver" "$_src" "$_removable"
         printf '\n'
     done > "$_tmp"
     _joined=$(paste -sd, "$_tmp" 2>/dev/null)
@@ -1402,6 +1451,43 @@ remove_managed_node() {
     step '已删除。' 100
 }
 
+# Delete one version a version manager installed, and whatever is inside it —
+# the dsh in it included, which is why the panel says so before asking.
+#
+# Narrow on purpose. `version_dir` is the whole of the policy: a directory one
+# manager keeps one version in, and nothing else. A distro package's Node, a
+# Homebrew Cellar and a snap are not deleted by removing their directory — the
+# package manager that put them there goes on believing they are installed — so
+# those answer nothing there and get no button in the panel.
+#
+# Nothing checks whether the version being deleted is the one the app is running
+# with, because the panel does: the row the app is using draws no delete button.
+# The check that does belong here is the one below — that this is not the Node
+# this script unpacked, which has a mode of its own that also clears the marker
+# and the profile block that came with it.
+delete_node() {
+    [ -n "$NODE_EXE" ] || fail 'delete-node 需要 -NodeExe。'
+    case "$NODE_EXE" in
+        "$NODE_DIR"/*) fail '这是本应用自己装的 Node，请用“删除应用装的 Node”。' ;;
+    esac
+
+    dir=$(version_dir "$NODE_EXE")
+    [ -n "$dir" ] || fail "这个 Node 不是 nvm/fnm/volta/asdf 装的，应用不会删它：$NODE_EXE"
+    [ -d "$dir" ] || fail "这个 Node 已经不在了：$dir"
+
+    step "正在删除 $dir…" 0
+    rm -rf "$dir" || fail "删除失败：$dir"
+
+    # A marker pointing into the directory that just went describes nothing. It
+    # is cleared rather than left for `search_path` to fall back onto and find a
+    # gap — and the app then asks which Node to use, which is the right question.
+    read_marker
+    case "$M_NODE_EXE" in
+        "$dir"/*) rm -f "$MARKER" ;;
+    esac
+    step '已删除。' 100
+}
+
 case "$MODE" in
     update) update_all ;;
     uninstall) uninstall_all ;;
@@ -1411,6 +1497,7 @@ case "$MODE" in
     install-node) install_node_and_dsh ;;
     uninstall-dsh) uninstall_dsh_from ;;
     remove-node) remove_managed_node ;;
+    delete-node) delete_node ;;
 esac
 
 exit 0

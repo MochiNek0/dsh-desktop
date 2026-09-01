@@ -108,6 +108,8 @@ pub enum Action {
     SetupUninstallDsh(usize),
     /// Delete the Node this app installed, and the dsh in it.
     SetupRemoveNode,
+    /// Delete Node `i` itself, where a version manager installed it.
+    SetupDeleteNode(usize),
     /// Look at the machine again, after a scan that could not.
     SetupRescan,
     /// Put the panel away. The menu's way out, where [`Action::SetupQuit`] is
@@ -162,6 +164,7 @@ pub fn action(url: &Url) -> Option<Action> {
         "setup-install-node" => Some(Action::SetupInstallNode),
         "setup-uninstall-dsh" => setup_index(url).map(Action::SetupUninstallDsh),
         "setup-remove-node" => Some(Action::SetupRemoveNode),
+        "setup-delete-node" => setup_index(url).map(Action::SetupDeleteNode),
         "setup-rescan" => Some(Action::SetupRescan),
         "setup-close" => Some(Action::SetupClose),
         "setup-quit" => Some(Action::SetupQuit),
@@ -224,6 +227,9 @@ pub fn perform(app: &AppHandle, action: Action) {
             return crate::setup::answered(crate::setup::Choice::UninstallDsh(i))
         }
         Action::SetupRemoveNode => return crate::setup::answered(crate::setup::Choice::RemoveNode),
+        Action::SetupDeleteNode(i) => {
+            return crate::setup::answered(crate::setup::Choice::DeleteNode(i))
+        }
         Action::SetupRescan => return crate::setup::answered(crate::setup::Choice::Rescan),
         Action::SetupClose => return crate::setup::answered(crate::setup::Choice::Close),
         Action::SetupQuit => return crate::setup::answered(crate::setup::Choice::Quit),

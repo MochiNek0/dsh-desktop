@@ -43,14 +43,16 @@ param(
     # `npm install -g` against a Node the user picked. `install-node` is the
     # no-Node-at-all case: download one of ours, then install dsh into it.
     #
-    # `uninstall-dsh` and `remove-node` are the same panel's undo, reachable from
-    # the runtime menu item rather than only from a launch that cannot start.
-    # Both are explicit where `uninstall`'s switches are not: `uninstall-dsh`
-    # takes dsh out of the Node named by `-NodeExe`, whichever of the machine's
-    # Nodes that is, and `remove-node` deletes the Node this script unpacked and
-    # nothing else. `uninstall` works off the marker, so it can only ever act on
-    # the one dsh the app happens to have recorded — fine for an uninstaller,
-    # useless for a machine with a dsh in three Nodes.
+    # `uninstall-dsh`, `remove-node` and `delete-node` are the same panel's undo,
+    # reachable from the runtime menu item rather than only from a launch that
+    # cannot start. All three are explicit where `uninstall`'s switches are not:
+    # `uninstall-dsh` takes dsh out of the Node named by `-NodeExe`, whichever of
+    # the machine's Nodes that is, `remove-node` deletes the Node this script
+    # unpacked and nothing else, and `delete-node` deletes one version a version
+    # manager installed — see `Remove-Node` for the narrow set of Nodes that is.
+    # `uninstall` works off the marker, so it can only ever act on the one dsh the
+    # app happens to have recorded — fine for an uninstaller, useless for a
+    # machine with a dsh in three Nodes.
     #
     # None of them writes the user's PATH. See the note above `Remove-Path`.
     #
@@ -59,7 +61,7 @@ param(
     # not a thing that should still be able to change the machine.
     [Parameter(Mandatory)]
     [ValidateSet('update', 'uninstall', 'list', 'switch', 'install-dsh', 'install-node',
-        'uninstall-dsh', 'remove-node')]
+        'uninstall-dsh', 'remove-node', 'delete-node')]
     [string] $Mode,
 
     # `update` only: the npm global prefix holding the dsh to replace. The app
@@ -69,9 +71,10 @@ param(
     # falls back to the marker's prefix, and then to npm's own default.
     [string] $Prefix = '',
 
-    # `switch`, `install-dsh` and `uninstall-dsh` only: the `node.exe` the user
-    # chose in the runtime panel. Everything this script needs — npm, the prefix, the dsh that
-    # is or will be there — hangs off it.
+    # `switch`, `install-dsh`, `uninstall-dsh` and `delete-node` only: the
+    # `node.exe` the user chose in the runtime panel. Everything this script needs
+    # — npm, the prefix, the dsh that is or will be there, the version directory
+    # holding it — hangs off it.
     [string] $NodeExe = '',
 
     # `uninstall` only. Node cannot go without dsh going too: dsh is a Node
@@ -188,6 +191,19 @@ function Say([string] $Text) {
     Write-Host $Text
 }
 
+# One percentage, spelled the way `run` in `src-tauri/src/dsh.rs` parses it:
+# `f64::from_str`, which takes `45.5` and nothing else.
+#
+# Not `-f '{0:N1}'`, which is what this was. The format operator goes through
+# `CurrentCulture`, and .NET takes that from the machine's regional settings — so
+# on a French or German Windows the same call emitted `::progress 45,5`, the
+# parse failed, and every one of these lines was dropped. The bar then sat where
+# it was for the whole of a Node download and a dsh install, on those machines
+# only. `install-deps.sh` prints the number as given and was never affected.
+function Percent([double] $Value) {
+    return $Value.ToString('F1', [Globalization.CultureInfo]::InvariantCulture)
+}
+
 # A line for the log and, when asked, a line for the loading page. A negative
 # percentage puts the progress bar away.
 function Step([string] $Text, [double] $Percent = -1) {
@@ -195,11 +211,11 @@ function Step([string] $Text, [double] $Percent = -1) {
         Say $Text
         if ($Progress) { Write-Host "::status $Text" }
     }
-    if ($Progress) { Write-Host ('::progress {0:N1}' -f $Percent) }
+    if ($Progress) { Write-Host ('::progress ' + (Percent $Percent)) }
 }
 
 function Report([double] $Percent) {
-    if ($Progress) { Write-Host ('::progress {0:N1}' -f $Percent) }
+    if ($Progress) { Write-Host ('::progress ' + (Percent $Percent)) }
 }
 
 function Fail([string] $Text) {
@@ -984,6 +1000,87 @@ function Resolve-NodeExe([string] $Exe) {
     return $Exe
 }
 
+# The version managers that keep one directory per Node version, and where.
+#
+# One list rather than one per caller: `Find-AllNodes` walks these to find the
+# Nodes, and `Get-VersionDir` measures a Node against them to work out which
+# directory holding it `delete-node` may remove. Two copies of these paths would
+# drift, and the way they would drift is a Node listed as nvm's that the delete
+# no longer recognises as nvm's.
+#
+# `Leaf` is where the binary sits inside one version directory — the managers
+# disagree about that, which is why the version cannot be counted off the exe's
+# path — and `Match` is what a version directory is named there.
+function Get-ManagerRoots {
+    $roots = New-Object System.Collections.ArrayList
+
+    # nvm-windows keeps every installed version side by side under NVM_HOME.
+    $nvmHome = $env:NVM_HOME
+    if (-not $nvmHome) {
+        try { $nvmHome = (Get-ItemProperty -Path 'HKCU:\Environment' -Name NVM_HOME -ErrorAction SilentlyContinue).NVM_HOME } catch {}
+    }
+    if ($nvmHome) {
+        [void]$roots.Add(([pscustomobject]@{ Root = $nvmHome; Source = 'nvm'; Leaf = 'node.exe'; Match = 'v*' }))
+    }
+
+    # fnm stores each version under its data directory.
+    [void]$roots.Add(([pscustomobject]@{
+                Root = (Join-Path $env:LOCALAPPDATA 'fnm\node-versions')
+                Source = 'fnm'; Leaf = 'installation\node.exe'; Match = '*'
+            }))
+
+    # volta keeps Node images under its tools directory.
+    [void]$roots.Add(([pscustomobject]@{
+                Root = (Join-Path $env:LOCALAPPDATA 'Volta\tools\image\node')
+                Source = 'volta'; Leaf = 'node.exe'; Match = '*'
+            }))
+
+    return @($roots | Where-Object { $_.Root -and (Test-Path -LiteralPath $_.Root) })
+}
+
+# The directory one version manager keeps one version of Node in — which is the
+# whole of what `delete-node` is allowed to delete — or `$null` for a Node that
+# is not one of theirs.
+#
+# Measured against `Get-ManagerRoots` rather than counted off the exe's path:
+# nvm puts `node.exe` in the version directory itself and fnm puts it a level
+# down in `installation`, so there is no fixed number of `..`s that is right for
+# both. The rule that does hold is that the version is the first segment under
+# the manager's own root.
+#
+# `$null` for everything else, and that is most of the list: the official
+# installer's Node, a system package's, a PATH entry of unknown provenance and
+# scoop's `current` junction all belong to something that should be asked to
+# remove them. A reparse point is refused too — a manager's "current" symlink
+# can sit inside its own root, and deleting that is deleting the switch rather
+# than a version.
+function Get-VersionDir([string] $Exe) {
+    if (-not $Exe) { return $null }
+    try { $full = [IO.Path]::GetFullPath($Exe) } catch { return $null }
+
+    foreach ($manager in Get-ManagerRoots) {
+        try { $root = [IO.Path]::GetFullPath($manager.Root).TrimEnd('\') } catch { continue }
+        if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+
+        $rest = $full.Substring($root.Length + 1)
+        $first = $rest.Split('\')[0]
+        # The exe sitting straight in the root is not a version directory; there
+        # is nothing between it and the manager itself to delete.
+        if (-not $first -or $rest -eq $first) { continue }
+
+        $dir = Join-Path $root $first
+        try {
+            $item = Get-Item -LiteralPath $dir -Force -ErrorAction Stop
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $null }
+        } catch {
+            return $null
+        }
+        return $dir
+    }
+
+    return $null
+}
+
 # Every Node on the machine, each tagged with where it was found. The list is
 # deliberately wide: a machine that switched version managers leaves the old
 # one's Nodes behind, and the one the user wants may be any of them.
@@ -998,32 +1095,15 @@ function Find-AllNodes {
         [void]$raw.Add(([pscustomobject]@{ Exe = (Join-Path $dir 'node.exe'); Source = 'path' }))
     }
 
-    # nvm-windows keeps every installed version side by side under NVM_HOME.
-    $nvmHome = $env:NVM_HOME
-    if (-not $nvmHome) {
-        try { $nvmHome = (Get-ItemProperty -Path 'HKCU:\Environment' -Name NVM_HOME -ErrorAction SilentlyContinue).NVM_HOME } catch {}
-    }
-    if ($nvmHome -and (Test-Path -LiteralPath $nvmHome)) {
-        Get-ChildItem -LiteralPath $nvmHome -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like 'v*' } | ForEach-Object {
-                [void]$raw.Add(([pscustomobject]@{ Exe = (Join-Path $_.FullName 'node.exe'); Source = 'nvm' }))
+    # nvm, fnm and volta, each from its own root; see `Get-ManagerRoots`.
+    foreach ($manager in Get-ManagerRoots) {
+        Get-ChildItem -LiteralPath $manager.Root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like $manager.Match } | ForEach-Object {
+                [void]$raw.Add(([pscustomobject]@{
+                            Exe = (Join-Path $_.FullName $manager.Leaf)
+                            Source = $manager.Source
+                        }))
             }
-    }
-
-    # fnm stores each version under its data directory.
-    $fnmRoot = Join-Path $env:LOCALAPPDATA 'fnm\node-versions'
-    if (Test-Path -LiteralPath $fnmRoot) {
-        Get-ChildItem -LiteralPath $fnmRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-            [void]$raw.Add(([pscustomobject]@{ Exe = (Join-Path $_.FullName 'installation\node.exe'); Source = 'fnm' }))
-        }
-    }
-
-    # volta keeps Node images under its tools directory.
-    $voltaRoot = Join-Path $env:LOCALAPPDATA 'Volta\tools\image\node'
-    if (Test-Path -LiteralPath $voltaRoot) {
-        Get-ChildItem -LiteralPath $voltaRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-            [void]$raw.Add(([pscustomobject]@{ Exe = (Join-Path $_.FullName 'node.exe'); Source = 'volta' }))
-        }
     }
 
     # scoop: nodejs, nodejs-lts, and the odd -beta, each under apps\<name>\current.
@@ -1106,6 +1186,10 @@ function List-Nodes {
                 hasDsh       = [bool]$hasDsh
                 dshVersion   = $dshVersion
                 source       = $n.Source
+                # What `delete-node` would remove, for the panel to put in front
+                # of the user before they agree to it — and `$null` for the Nodes
+                # it will not touch, which is how the panel knows not to offer.
+                removable    = (Get-VersionDir $n.Exe)
             }))
     }
 
@@ -1312,6 +1396,50 @@ function Remove-ManagedNode {
     Step '已删除。' 100
 }
 
+# Delete one version a version manager installed, and whatever is inside it —
+# the dsh in it included, which is why the panel says so before asking.
+#
+# Narrow on purpose. `Get-VersionDir` is the whole of the policy: a directory one
+# manager keeps one version in, and nothing else. The Node the official installer
+# put in `Program Files` is not deleted by removing its directory — that is an
+# MSI's job, and doing it by hand leaves the machine believing Node is still
+# installed — so that one, a system package's Node, and a PATH entry this script
+# cannot place all answer `$null` here and get no button in the panel.
+#
+# Nothing checks whether the version being deleted is the one the app is running
+# with, because the panel does: the row the app is using draws no delete button.
+# The check that does belong here is the one below — that this is not the Node
+# this script unpacked, which has a mode of its own that also clears the marker
+# and the PATH entry that came with it.
+function Remove-Node {
+    if (-not $NodeExe) { Fail 'delete-node 需要 -NodeExe。' }
+    if ($NodeExe.StartsWith($NodeDir, [StringComparison]::OrdinalIgnoreCase)) {
+        Fail '这是本应用自己装的 Node，请用“删除应用装的 Node”。'
+    }
+
+    $dir = Get-VersionDir $NodeExe
+    if (-not $dir) {
+        Fail "这个 Node 不是 nvm/fnm/volta 装的，应用不会删它：$NodeExe"
+    }
+    if (-not (Test-Path -LiteralPath $dir)) { Fail "这个 Node 已经不在了：$dir" }
+
+    Step "正在删除 $dir…" 0
+    try {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction Stop
+    } catch {
+        Fail "删除失败：$($_.Exception.Message)"
+    }
+
+    # A marker pointing into the directory that just went describes nothing. It
+    # is cleared rather than left for `search_path` to fall back onto and find a
+    # gap — and the app then asks which Node to use, which is the right question.
+    $state = Read-Marker
+    if (([string]$state['nodeExe']).StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
+    }
+    Step '已删除。' 100
+}
+
 switch ($Mode) {
     'update' { Update-All }
     'uninstall' { Uninstall-All }
@@ -1321,6 +1449,7 @@ switch ($Mode) {
     'install-node' { Install-NodeAndDsh }
     'uninstall-dsh' { Uninstall-DshFrom }
     'remove-node' { Remove-ManagedNode }
+    'delete-node' { Remove-Node }
 }
 
 exit 0
