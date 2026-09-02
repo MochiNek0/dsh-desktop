@@ -1304,8 +1304,20 @@ pub fn script() -> String {
   /** Progress for an action started from the menu; see `setup_status`. */
   window.__dshSetupStatus = function (text, percent) {{
     if (!root || !statusBox) return;
-    statusText.textContent = text || '';
-    statusBox.classList.toggle('dsh-su-status-on', !!text);
+    // The two kinds of report are independent, and a percentage carries no
+    // text: `dsh::run` calls its reporter with an empty string for every
+    // `::progress` line the script prints. Clearing the line on those is what
+    // made this whole panel look dead — the scripts emit `::status` and
+    // `::progress` as a pair, so every sentence was erased by the percentage
+    // that followed it a byte later, and a download's once-a-second progress
+    // then kept the box hidden (spinner and all) for the whole install. The
+    // loading page's reporter has always skipped the empty half; see
+    // `reporter` in `main`. Cleared by `__dshSetup` when the list comes back,
+    // which is the one place that means "nothing is happening".
+    if (text) {{
+      statusText.textContent = text;
+      statusBox.classList.add('dsh-su-status-on');
+    }}
 
     var value = parseFloat(percent);
     var known = !isNaN(value) && value >= 0;
