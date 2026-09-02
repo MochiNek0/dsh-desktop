@@ -98,6 +98,16 @@ esac
 
 PACKAGE='@deepseek-ai/dsh'
 
+# dsh forwards plugin installs to pnpm, so a machine running dsh ends up with one
+# too — installed on demand by `ensure_pnpm` in `plugins.rs`, into whichever
+# prefix the running dsh sits in. This script never installs it; what it needs to
+# know is which prefixes hold *our* pnpm rather than one the user put there
+# themselves, and that is what the file below records. `ensure_pnpm` writes it
+# beside its install and nothing else ever writes one, so a pnpm without it is
+# the user's and is never touched from here.
+PNPM='pnpm'
+PNPM_MARK='.dsh-owns-pnpm'
+
 # The same directory Tauri resolves as `app_local_data_dir()`. The two have to
 # agree; see `app_dir` in `src-tauri/src/dsh.rs`.
 IDENTIFIER='ai.deepseek.dsh.desktop'
@@ -1004,6 +1014,14 @@ uninstall_all() {
             say "正在卸载 dsh（$prefix）…"
             "$M_NODE_EXE" "$M_NPM_CLI" uninstall -g --prefix "$prefix" \
                 --loglevel=error "$PACKAGE" 2>&1 | while IFS= read -r line; do say "$line"; done
+            # Same rule as `uninstall_dsh_from`: the pnpm installed for this dsh
+            # goes with it where it was ours, and stays where it was the user's.
+            if pnpm_is_ours "$prefix"; then
+                say "正在卸载 pnpm（$prefix）…"
+                "$M_NODE_EXE" "$M_NPM_CLI" uninstall -g --prefix "$prefix" \
+                    --loglevel=error "$PNPM" 2>&1 | while IFS= read -r line; do say "$line"; done
+                rm -f "$prefix/$PNPM_MARK"
+            fi
         else
             say '找不到可用的 npm，跳过卸载 dsh。'
         fi
@@ -1235,6 +1253,16 @@ node_prefix() {
     real_prefix "$1" "$2"
 }
 
+# Whether a `-g` install into this prefix put a pnpm there, and whether it was
+# ours. Read-only, both of them: the same prefix layout the dsh check above uses.
+pnpm_present() {
+    [ -f "$1/lib/node_modules/$PNPM/package.json" ]
+}
+
+pnpm_is_ours() {
+    [ -f "$1/$PNPM_MARK" ]
+}
+
 # One Node's worth of the chooser's payload, as a single-line JSON object.
 node_json() {
     _p=$(json_escape "$1")
@@ -1249,8 +1277,8 @@ node_json() {
     # before they agree to it — and null for the Nodes it will not touch, which
     # is how the panel knows not to offer.
     if [ -n "$_rm" ]; then _rmjson="\"$_rm\""; else _rmjson='null'; fi
-    printf '{"path":"%s","version":"%s","meetsMinimum":%s,"prefix":%s,"hasDsh":%s,"dshVersion":%s,"source":"%s","removable":%s}' \
-        "$_p" "$_v" "$3" "$_prjson" "$5" "$_dvjson" "$_s" "$_rmjson"
+    printf '{"path":"%s","version":"%s","meetsMinimum":%s,"prefix":%s,"hasDsh":%s,"dshVersion":%s,"source":"%s","removable":%s,"hasPnpm":%s,"pnpmOurs":%s}' \
+        "$_p" "$_v" "$3" "$_prjson" "$5" "$_dvjson" "$_s" "$_rmjson" "$9" "${10}"
 }
 
 # Print one JSON line: an array of every usable Node on the machine. Broken
@@ -1267,6 +1295,8 @@ list_nodes() {
         _prefix=''
         _hasdsh=false
         _dshver=''
+        _haspnpm=false
+        _pnpmours=false
         if [ -n "$_cli" ]; then
             _prefix=$(node_prefix "$_exe" "$_cli")
             _manifest="$_prefix/lib/node_modules/$PACKAGE/package.json"
@@ -1274,9 +1304,14 @@ list_nodes() {
                 _hasdsh=true
                 _dshver=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_manifest" | head -n 1)
             fi
+            if pnpm_present "$_prefix"; then
+                _haspnpm=true
+                if pnpm_is_ours "$_prefix"; then _pnpmours=true; fi
+            fi
         fi
         _removable=$(version_dir "$_exe")
-        node_json "$_exe" "$_version" "$_meets" "$_prefix" "$_hasdsh" "$_dshver" "$_src" "$_removable"
+        node_json "$_exe" "$_version" "$_meets" "$_prefix" "$_hasdsh" "$_dshver" "$_src" "$_removable" \
+            "$_haspnpm" "$_pnpmours"
         printf '\n'
     done > "$_tmp"
     _joined=$(paste -sd, "$_tmp" 2>/dev/null)
@@ -1417,6 +1452,18 @@ uninstall_dsh_from() {
     step "正在卸载 dsh（$prefix）…" 0
     "$NODE_EXE" "$cli" uninstall -g --prefix "$prefix" --loglevel=error "$PACKAGE" 2>&1 |
         while IFS= read -r line; do say "$line"; done
+
+    # And the pnpm that came with it, where that pnpm is ours. Nothing else in
+    # this prefix wants one: it is here because dsh forwards plugin installs to
+    # it, and dsh has just gone. A pnpm the user installed themselves has no
+    # marker file and is left exactly where it is — the same rule `uninstall_all`
+    # applies to a dsh the app merely adopted.
+    if pnpm_is_ours "$prefix"; then
+        step "正在卸载 pnpm（$prefix）…" 60
+        "$NODE_EXE" "$cli" uninstall -g --prefix "$prefix" --loglevel=error "$PNPM" 2>&1 |
+            while IFS= read -r line; do say "$line"; done
+        rm -f "$prefix/$PNPM_MARK"
+    fi
 
     # A marker pointing at the dsh just removed describes nothing. Cleared rather
     # than left for `search_path` to fall back onto and find a gap.

@@ -617,6 +617,9 @@ fn ensure_pnpm(app: &AppHandle, log: &Log) -> Result<(), String> {
         // claim this function makes is that pnpm runs, so it is checked.
         0 => match crate::dsh::tool(app, PNPM) {
             Tool::Ready => {
+                if let Some(prefix) = prefix.as_deref() {
+                    claim_pnpm(prefix);
+                }
                 log(t!("pnpm 安装完成。", "pnpm installed."));
                 Ok(())
             }
@@ -677,6 +680,36 @@ fn ensure_pnpm(app: &AppHandle, log: &Log) -> Result<(), String> {
                 code
             ),
         }),
+    }
+}
+
+/// The file [`ensure_pnpm`] drops in a prefix to say that the pnpm in it is
+/// ours.
+///
+/// Nothing else writes one, which is the whole point: a pnpm without it was
+/// installed by the user, and `uninstall-dsh` leaves it alone. Kept as a file
+/// beside the install rather than as a field in the bootstrap marker because
+/// pnpm is per-prefix — a machine with three Nodes can end up with three, and
+/// the marker records one of everything — and because the scripts are what read
+/// it, in a mode that is handed a Node rather than the marker's.
+///
+/// The name is spelled again in `install-deps.sh` and `install-deps.ps1`, which
+/// are the readers. Changing it here means changing it there.
+const PNPM_MARK: &str = ".dsh-owns-pnpm";
+
+/// Record that the pnpm now in `prefix` is one this app installed.
+///
+/// Best effort. A prefix that cannot be written to is not a failure of the
+/// install that just succeeded — npm had to write there for it to succeed at all
+/// — and the only cost of a missing file is a pnpm that outlives the dsh it came
+/// for, which is exactly where this app was before the file existed.
+fn claim_pnpm(prefix: &std::path::Path) {
+    let mark = prefix.join(PNPM_MARK);
+    if let Err(error) = std::fs::write(&mark, b"") {
+        eprintln!(
+            "dsh-desktop: could not record that {} is ours: {error}",
+            mark.display()
+        );
     }
 }
 

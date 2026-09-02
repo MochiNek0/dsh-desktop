@@ -119,6 +119,17 @@ struct NodeInfo {
     /// versions out, and that knowledge already lives in the two scripts. This
     /// module only shows what they answered and passes the Node back.
     removable: Option<PathBuf>,
+    /// Whether this Node's prefix has a pnpm in it. dsh forwards plugin installs
+    /// to pnpm, so one turns up beside every dsh that has ever installed a
+    /// plugin — see [`crate::plugins::ensure_pnpm`] — and until this field
+    /// existed the panel described a machine it was only telling half the truth
+    /// about.
+    has_pnpm: bool,
+    /// And whether that pnpm is the one this app installed, which is the only
+    /// kind `uninstall-dsh` takes away with it. The scripts answer it off the
+    /// marker file `ensure_pnpm` leaves in the prefix, so a pnpm the user
+    /// installed themselves reads as `false` here and is never removed.
+    pnpm_ours: bool,
     /// Whether this is the Node the app is running dsh with right now. Filled in
     /// by [`mark_current`] rather than by the script: which Node is in use is a
     /// question about [`crate::dsh::search_path`], not about the machine.
@@ -267,6 +278,14 @@ fn parse_nodes(json: &str) -> Option<Vec<NodeInfo>> {
                 .get("removable")
                 .and_then(|value| value.as_str())
                 .map(PathBuf::from);
+            let has_pnpm = node
+                .get("hasPnpm")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let pnpm_ours = node
+                .get("pnpmOurs")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
 
             Some(NodeInfo {
                 path,
@@ -276,6 +295,8 @@ fn parse_nodes(json: &str) -> Option<Vec<NodeInfo>> {
                 dsh_version,
                 source,
                 removable,
+                has_pnpm,
+                pnpm_ours,
                 current: false,
             })
         })
@@ -533,6 +554,22 @@ fn confirm(app: &AppHandle, choice: &Choice, nodes: &[NodeInfo]) -> bool {
                 "dsh will be uninstalled from:\n{}\n\nYour sessions, credentials and settings ($DSH_HOME) are left alone.",
                 node.path.display()
             );
+            // pnpm is only here because dsh forwards plugin installs to it, so
+            // ours goes when dsh does. Said out loud, because an uninstall that
+            // quietly removes a second package is not one the user agreed to —
+            // and the other half is worth saying too, since a user looking at
+            // the "pnpm（你装的）" chip has every reason to wonder.
+            if node.pnpm_ours {
+                body.push_str(t!(
+                    "\n\n这个 Node 里的 pnpm 是应用为 dsh 装的，会一起卸掉。",
+                    "\n\nThe pnpm in this Node was installed by the app for dsh, and goes with it."
+                ));
+            } else if node.has_pnpm {
+                body.push_str(t!(
+                    "\n\n里面的 pnpm 是你自己装的，不会动它。",
+                    "\n\nThe pnpm in it is your own, and is left alone."
+                ));
+            }
             if node.current {
                 body.push_str(t!(
                     "\n\n这正是应用现在用的那一份。卸载并重启之后，应用会再问你选哪一个。",
@@ -570,6 +607,17 @@ fn confirm(app: &AppHandle, choice: &Choice, nodes: &[NodeInfo]) -> bool {
                     "\n\nThe dsh installed into this Node goes with it. It is not the one the app is running, so nothing in use is affected."
                 ));
             }
+            // Whoever installed it. This is an `rm -rf` of the whole version
+            // directory, not an npm uninstall, so the ownership rule the other
+            // two verbs follow does not apply and cannot: a pnpm the user
+            // installed into this Node goes too, and they should hear that
+            // before they agree rather than discover it afterwards.
+            if node.has_pnpm {
+                body.push_str(t!(
+                    "\n\n里面的 pnpm 也一样，无论是谁装的。",
+                    "\n\nSo does the pnpm in it, whoever installed it."
+                ));
+            }
             (
                 t!("删除 Node {}？", "Delete Node {}?", node.version),
                 body,
@@ -579,8 +627,8 @@ fn confirm(app: &AppHandle, choice: &Choice, nodes: &[NodeInfo]) -> bool {
         Choice::RemoveNode => (
             t!("删除应用装的 Node？", "Delete the Node the app installed?").to_string(),
             t!(
-                "会删掉本应用自己装的那个 Node，以及装在它里面的 dsh。你自己装的 Node 一个都不会动。",
-                "The Node this app unpacked goes, and the dsh inside it. None of the Nodes you installed yourself are touched."
+                "会删掉本应用自己装的那个 Node，以及装在它里面的 dsh 和 pnpm。你自己装的 Node 一个都不会动。",
+                "The Node this app unpacked goes, and the dsh and pnpm inside it. None of the Nodes you installed yourself are touched."
             )
             .to_string(),
             t!("删除并重启", "Delete and restart"),
@@ -747,6 +795,8 @@ fn payload(nodes: Option<&[NodeInfo]>, error: Option<&str>, mode: Mode) -> Strin
                 "dshVersion": node.dsh_version.clone().unwrap_or_default(),
                 "source": node.source,
                 "removable": node.removable.as_ref().map(|dir| dir.display().to_string()),
+                "hasPnpm": node.has_pnpm,
+                "pnpmOurs": node.pnpm_ours,
                 "current": node.current,
             })
         })
@@ -821,6 +871,12 @@ pub fn script() -> String {
         "installDsh": t!("在此安装 dsh", "Install dsh here"),
         "tooOld": t!("版本过低", "Too old"),
         "hasDsh": t!("已装 dsh", "Has dsh"),
+        // dsh installs plugins through pnpm, so the two travel together and the
+        // list would be lying by omission without this. Two chips rather than
+        // one, because which of them it is decides what an uninstall does: the
+        // app's own goes with dsh, and the user's stays.
+        "pnpmOurs": t!("pnpm（应用装的）", "pnpm (app-installed)"),
+        "pnpmTheirs": t!("pnpm（你装的）", "pnpm (yours)"),
         "canInstall": t!("可安装 dsh", "Can install dsh"),
         "installNode": t!("安装新的 Node", "Install a fresh Node"),
         "uninstallDsh": t!("卸载 dsh", "Uninstall dsh"),
@@ -927,6 +983,12 @@ pub fn script() -> String {
     if (node.hasDsh) {{
       head.appendChild(chip('have',
         node.dshVersion ? TEXT.hasDsh + ' ' + node.dshVersion : TEXT.hasDsh));
+    }}
+    // After dsh, and in the same quiet style: pnpm is a consequence of dsh
+    // rather than a thing the user chose, and the row is about the Node.
+    if (node.hasPnpm) {{
+      head.appendChild(chip('have',
+        node.pnpmOurs ? TEXT.pnpmOurs : TEXT.pnpmTheirs));
     }}
     if (!node.meetsMinimum) {{
       head.appendChild(chip('bad', TEXT.tooOld));
@@ -1340,8 +1402,8 @@ mod tests {
     #[test]
     fn parses_what_the_scripts_print() {
         let json = r#"[
-          {"path":"/home/a/.nvm/versions/node/v24.9.0/bin/node","version":"24.9.0","meetsMinimum":true,"prefix":"/usr/local","hasDsh":true,"dshVersion":"0.1.8","source":"nvm","removable":"/home/a/.nvm/versions/node/v24.9.0"},
-          {"path":"/usr/bin/node","version":"18.4.0","meetsMinimum":false,"prefix":"/usr","hasDsh":false,"dshVersion":null,"source":"system","removable":null}
+          {"path":"/home/a/.nvm/versions/node/v24.9.0/bin/node","version":"24.9.0","meetsMinimum":true,"prefix":"/usr/local","hasDsh":true,"dshVersion":"0.1.8","source":"nvm","removable":"/home/a/.nvm/versions/node/v24.9.0","hasPnpm":true,"pnpmOurs":true},
+          {"path":"/usr/bin/node","version":"18.4.0","meetsMinimum":false,"prefix":"/usr","hasDsh":false,"dshVersion":null,"source":"system","removable":null,"hasPnpm":false,"pnpmOurs":false}
         ]"#;
 
         let nodes = parse_nodes(json).expect("a scan, not a failure");
@@ -1360,6 +1422,12 @@ mod tests {
             Some(std::path::Path::new("/home/a/.nvm/versions/node/v24.9.0"))
         );
         assert!(nodes[1].removable.is_none());
+        // The pair that decides both the chip and what an uninstall takes with
+        // it. A pnpm the scripts did not find is not one this app may remove.
+        assert!(nodes[0].has_pnpm);
+        assert!(nodes[0].pnpm_ours);
+        assert!(!nodes[1].has_pnpm);
+        assert!(!nodes[1].pnpm_ours);
     }
 
     /// A null `dshVersion` is the common case — most Nodes have no dsh — and a

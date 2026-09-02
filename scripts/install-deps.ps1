@@ -100,6 +100,16 @@ if ($Progress) {
 
 $Package = '@deepseek-ai/dsh'
 
+# dsh forwards plugin installs to pnpm, so a machine running dsh ends up with one
+# too — installed on demand by `ensure_pnpm` in `plugins.rs`, into whichever
+# prefix the running dsh sits in. This script never installs it; what it needs to
+# know is which prefixes hold *our* pnpm rather than one the user put there
+# themselves, and that is what the file below records. `ensure_pnpm` writes it
+# beside its install and nothing else ever writes one, so a pnpm without it is
+# the user's and is never touched from here.
+$Pnpm = 'pnpm'
+$PnpmMark = '.dsh-owns-pnpm'
+
 # The same directory Tauri resolves as `app_local_data_dir()` and
 # `installer-hooks.nsh` builds out of `$LOCALAPPDATA` and `${BUNDLEID}`. All
 # three have to agree.
@@ -713,6 +723,18 @@ function Get-NodePrefix([string] $Exe, [string] $Cli) {
     return (Get-Prefix $Exe $Cli)
 }
 
+# Whether a `-g` install into this prefix put a pnpm there, and whether it was
+# ours. Read-only, both of them: the same prefix layout the dsh checks use.
+function Test-Pnpm([string] $Prefix) {
+    if (-not $Prefix) { return $false }
+    return (Test-Path -LiteralPath (Join-Path $Prefix "node_modules\$Pnpm\package.json"))
+}
+
+function Test-OwnPnpm([string] $Prefix) {
+    if (-not $Prefix) { return $false }
+    return (Test-Path -LiteralPath (Join-Path $Prefix $PnpmMark))
+}
+
 # What npm resolves `registry` to, which is the user's own `.npmrc` if they have
 # one. Empty when npm cannot be asked, which `Sort-Registries` reads as nothing
 # configured.
@@ -960,6 +982,14 @@ function Uninstall-All {
             if ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli)) {
                 Say "正在卸载 dsh（$prefix）…"
                 Invoke-Native $node @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null | Out-Null
+                # Same rule as `Uninstall-DshFrom`: the pnpm installed for this
+                # dsh goes with it where it was ours, and stays where it was the
+                # user's.
+                if (Test-OwnPnpm $prefix) {
+                    Say "正在卸载 pnpm（$prefix）…"
+                    Invoke-Native $node @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Pnpm) $null | Out-Null
+                    Remove-Item -LiteralPath (Join-Path $prefix $PnpmMark) -Force -ErrorAction SilentlyContinue
+                }
             } else {
                 Say '找不到可用的 npm，跳过卸载 dsh。'
             }
@@ -1197,6 +1227,8 @@ function List-Nodes {
                 # of the user before they agree to it — and `$null` for the Nodes
                 # it will not touch, which is how the panel knows not to offer.
                 removable    = (Get-VersionDir $n.Exe)
+                hasPnpm      = [bool](Test-Pnpm $prefix)
+                pnpmOurs     = [bool](Test-OwnPnpm $prefix)
             }))
     }
 
@@ -1365,6 +1397,17 @@ function Uninstall-DshFrom {
 
     Step "正在卸载 dsh（$prefix）…" 0
     Invoke-Native $NodeExe @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null | Out-Null
+
+    # And the pnpm that came with it, where that pnpm is ours. Nothing else in
+    # this prefix wants one: it is here because dsh forwards plugin installs to
+    # it, and dsh has just gone. A pnpm the user installed themselves has no
+    # marker file and is left exactly where it is — the same rule `Uninstall-All`
+    # applies to a dsh the app merely adopted.
+    if (Test-OwnPnpm $prefix) {
+        Step "正在卸载 pnpm（$prefix）…" 60
+        Invoke-Native $NodeExe @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Pnpm) $null | Out-Null
+        Remove-Item -LiteralPath (Join-Path $prefix $PnpmMark) -Force -ErrorAction SilentlyContinue
+    }
 
     # A marker pointing at the dsh just removed describes nothing. Cleared rather
     # than left for `search_path` to fall back onto and find a gap.
