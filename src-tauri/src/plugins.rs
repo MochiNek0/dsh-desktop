@@ -368,6 +368,16 @@ pub fn install(
         specs.push(preset.spec.clone());
     }
     if let Some(extra) = extra.map(str::trim).filter(|extra| !extra.is_empty()) {
+        if !is_package_spec(extra) {
+            return Err(t!(
+                "{} 不是可以装的插件。这里接受 npm 上的包（@scope/name、name@1.2.3）\
+                 和 github:owner/repo；本地路径、tarball 地址和其它协议都不行。",
+                "{} is not something this can install. This field takes a package on npm — \
+                 `@scope/name`, `name@1.2.3` — or `github:owner/repo`. Not a local path, \
+                 a tarball URL, or another scheme.",
+                extra
+            ));
+        }
         specs.push(extra.to_string());
     }
 
@@ -480,6 +490,111 @@ pub fn install(
 /// The pnpm error code for a package younger than the `minimumReleaseAge`
 /// cooldown the machine is configured with.
 const RELEASE_AGE: &str = "ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION";
+
+/// Whether a hand-typed spec is something this app is willing to install.
+///
+/// The panel's other field is a list of ids looked up in the preset manifest, so
+/// a name that is not on it is refused before anything runs. This one is free
+/// text and goes straight into the argument list of `dsh plugin add`, where pnpm
+/// takes a great deal more than a package name: a tarball URL, a `file:` path,
+/// `git+ssh://`, a local directory. Each of those installs code from somewhere
+/// that never passed through a registry, and each is reachable from any script
+/// running in the window — `dsh-window://` is recognised on every top-level
+/// navigation, whoever made it, so the payload is the only thing there is to be
+/// strict about. See [`crate::controls::is_web_link`], which is the same
+/// argument about the other sharp verb on that channel.
+///
+/// What is left through is what the panel actually offers: a registry spec, and
+/// the `github:owner/repo` its placeholder shows. That is a deliberate hole —
+/// a repository is not a registry — and it is here because installing a plugin
+/// straight from GitHub is a feature of this box rather than an oversight in it.
+/// What it does buy is the two forms that are only ever an attack: a payload
+/// already sitting on the disk, which needs no network and no publishing at all,
+/// and any other scheme's idea of where to fetch from.
+///
+/// The leading `-` goes with them for a second reason: these are `args`, so
+/// `--registry=…` would be read as a flag to pnpm rather than as a package.
+fn is_package_spec(spec: &str) -> bool {
+    if spec.is_empty() || spec.starts_with('-') || spec.contains(['\\', ' ', '\t']) {
+        return false;
+    }
+
+    match spec.split_once(':') {
+        // A scheme, and only one of them is allowed. This is also what turns
+        // away `C:/…`, whose drive letter parses as one.
+        Some((scheme, rest)) => scheme == "github" && is_repository(rest),
+        None => is_registry_spec(spec),
+    }
+}
+
+/// `[@scope/]name[@range]`.
+fn is_registry_spec(spec: &str) -> bool {
+    // The range separator, if one was typed. A scoped name opens with `@`, which
+    // is why it is the *last* one and why position zero is not it.
+    let (name, range) = match spec.rfind('@') {
+        Some(at) if at > 0 => (&spec[..at], Some(&spec[at + 1..])),
+        _ => (spec, None),
+    };
+
+    let ranged = match range {
+        None => true,
+        // `1.2.3`, `latest`, `^1.0.0`, `~2.1`, `1.x`, `*`. Not a `/`, which is
+        // what every path and URL form needs to say where it points.
+        Some(range) => {
+            !range.is_empty()
+                && range.chars().all(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '.' | '-' | '+' | '^' | '~' | '>' | '<' | '=' | '*' | '|')
+                })
+        }
+    };
+
+    ranged
+        && match name.strip_prefix('@') {
+            // The one `/` a package name may contain, and only after a scope.
+            Some(scoped) => match scoped.split_once('/') {
+                Some((scope, bare)) => is_name_part(scope) && is_name_part(bare),
+                None => false,
+            },
+            None => is_name_part(name),
+        }
+}
+
+/// What follows `github:` — `owner/repo`, optionally pinned with `#<ref>`.
+fn is_repository(rest: &str) -> bool {
+    let (path, reference) = match rest.split_once('#') {
+        Some((path, reference)) => (path, Some(reference)),
+        None => (rest, None),
+    };
+
+    let Some((owner, repo)) = path.split_once('/') else {
+        return false;
+    };
+
+    is_name_part(owner)
+        && is_name_part(repo)
+        && match reference {
+            None => true,
+            // A branch, a tag or a commit. Slashes are ordinary in branch names.
+            Some(reference) => {
+                !reference.is_empty()
+                    && reference
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
+            }
+        }
+}
+
+/// One segment of a name — a scope, a package, a repository owner. npm's own
+/// rule, minus anything that could be read as a path or, in the leading
+/// position, as a flag.
+fn is_name_part(part: &str) -> bool {
+    !part.is_empty()
+        && !part.starts_with(['.', '_', '-'])
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
 
 /// The package name a pnpm spec installs under, as far as it can be known
 /// without fetching anything.
@@ -1074,8 +1189,8 @@ pub fn open_directory(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dependencies_of, parse, pnpm_blamed, pnpm_codes, requested, spec_name, wanted_gone,
-        Outcome, PRESETS, RELEASE_AGE,
+        dependencies_of, is_package_spec, parse, pnpm_blamed, pnpm_codes, requested, spec_name,
+        wanted_gone, Outcome, PRESETS, RELEASE_AGE,
     };
     use tauri::Url;
 
@@ -1330,5 +1445,61 @@ mod tests {
 
         assert_eq!(ids, ["a", "b"]);
         assert!(spec.is_none());
+    }
+    /// What a user actually types into the panel's box.
+    #[test]
+    fn takes_the_package_names_a_plugin_is_published_under() {
+        for spec in [
+            "dsh-plugin-thing",
+            "@dsh/plugin-thing",
+            "@dsh/plugin-thing@1.2.3",
+            "@dsh/plugin-thing@latest",
+            "dsh-plugin-thing@^1.0.0",
+            "dsh-plugin-thing@~2.1",
+            "dsh-plugin-thing@1.x",
+            "dsh-plugin-thing@*",
+            "a.b_c-d",
+            "github:owner/repo",
+            "github:owner/repo#main",
+            "github:owner/repo#feature/x",
+            "github:owner/repo#0b1f2e3",
+        ] {
+            assert!(is_package_spec(spec), "{spec} is a package name");
+        }
+    }
+
+    /// Every shape pnpm would also accept, each of which fetches code from
+    /// somewhere no registry ever saw. See [`is_package_spec`].
+    #[test]
+    fn refuses_everything_that_is_not_a_package_name() {
+        for spec in [
+            "",
+            "https://example.com/payload.tgz",
+            "http://example.com/payload.tgz",
+            "file:../payload",
+            "file:///C:/payload",
+            "git+ssh://git@example.com/o/r.git",
+            "gitlab:owner/repo",
+            "github:owner",
+            "github:owner/repo#",
+            "github:../../evil",
+            "owner/repo",
+            "../payload",
+            "./payload",
+            "/abs/payload",
+            "C:\\payload",
+            ".hidden",
+            "-g",
+            "--registry=http://example.com",
+            "two words",
+            "@dsh",
+            "@dsh/",
+            "@/name",
+            "name@",
+            "name@1.2.3/../..",
+            "name@file:../payload",
+        ] {
+            assert!(!is_package_spec(spec), "{spec} is not a package name");
+        }
     }
 }
