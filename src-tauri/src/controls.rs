@@ -42,10 +42,20 @@
 //! the OS — the page only has to say when it starts.
 //!
 //! Everything the menu added to that list is something the user can already do
-//! from the tray, and none of it reads anything back — the widest of them starts
-//! an `npm install` of one hard-coded package, or quits. What the page cannot do
-//! is ask a question and get an answer, which is what the IPC door would have
+//! from the tray, and none of it reads anything back. What the page cannot do is
+//! ask a question and get an answer, which is what the IPC door would have
 //! opened.
+//!
+//! What it *can* do is press every button, and that is worth being plain about.
+//! [`action`] recognises `dsh-window://` on any top-level navigation the window
+//! makes and has no way to tell one this module's chrome sent from one a script
+//! in the page sent. Nor can it be given one: the initialization scripts share a
+//! JavaScript context with dsh's own code, so a token handed to them is a token
+//! the page can read, and a button only they draw is a button the page can still
+//! `click()`. So the verbs are not authenticated. The two that lead somewhere
+//! sharp are narrowed at their payload instead — see [`is_web_link`] for the one
+//! that hands a target to the system, and [`crate::plugins::is_package_spec`]
+//! for the one that installs a package.
 //!
 //! Three things travel the other way, each pushed rather than asked for, because
 //! the page has no way to see any of them: whether the window is maximised
@@ -174,7 +184,7 @@ pub fn action(url: &Url) -> Option<Action> {
         "open" => {
             url.query_pairs()
                 .find_map(|(key, value)| if key == "url" { Some(value.into_owned()) } else { None })
-                .filter(|target| !target.is_empty())
+                .filter(|target| is_web_link(target))
                 .map(Action::OpenUrl)
         }
         // The only one carrying a payload the app reads rather than acts on,
@@ -189,6 +199,35 @@ pub fn action(url: &Url) -> Option<Action> {
             None
         }
     }
+}
+
+/// Whether a target this app is being asked to hand to the system is a link
+/// rather than something to run.
+///
+/// [`Action::OpenUrl`] ends in `opener::open_url`, which is `ShellExecute` on
+/// Windows and `open`/`xdg-open` elsewhere. Given a path or a registered scheme
+/// those launch a program; given `http` they open a browser. The verb exists for
+/// the second — a link in the dsh page belongs in the user's browser rather than
+/// in place of the session they are working in — and every such link is `http`,
+/// `https` or `mailto`. So those three are what it accepts, and a `file:`, a
+/// `ms-settings:` or a bare `C:\Windows\...` is declined here instead of
+/// executed.
+///
+/// The payload is the only thing there is to be strict about, because this
+/// channel takes no account of who asked: `dsh-window://` is recognised on any
+/// top-level navigation the window makes, which is every document dsh loads as
+/// well as this app's own pages. A page that can run script can reach every verb
+/// on the list, so the ones that lead somewhere sharp are narrowed at the
+/// payload — this, and the package specifier in [`crate::plugins::install`].
+///
+/// Nothing legitimate is turned away by this. The click handler below hands over
+/// every scheme it does not recognise, but dsh renders its own links through a
+/// protocol allowlist of `http`, `https` and `mailto` and leaves everything else
+/// inert — so a scheme this declines is one no dsh page made clickable in the
+/// first place. Relative targets fail to parse and are declined with the rest:
+/// nothing that reaches here is relative to anything.
+fn is_web_link(target: &str) -> bool {
+    Url::parse(target).is_ok_and(|target| matches!(target.scheme(), "http" | "https" | "mailto"))
 }
 
 /// The `?i=` a chooser verb carries: which Node in the list the user picked.
@@ -904,6 +943,40 @@ mod tests {
 
         let url_no_param = Url::parse("dsh-window://open").unwrap();
         assert!(action(&url_no_param).is_none());
+    }
+
+    #[test]
+    fn opens_mail_links_too() {
+        let url = Url::parse("dsh-window://open?url=mailto%3Ahi%40example.com").unwrap();
+        match action(&url) {
+            Some(Action::OpenUrl(target)) => assert_eq!(target, "mailto:hi@example.com"),
+            _ => panic!("expected Action::OpenUrl"),
+        }
+    }
+
+    /// Everything `open` hands to the system that would run rather than browse.
+    /// See [`is_web_link`].
+    #[test]
+    fn declines_open_targets_that_are_not_links() {
+        for target in [
+            "file:///C:/Windows/System32/cmd.exe",
+            "file:///etc/passwd",
+            "C:\\Windows\\System32\\cmd.exe",
+            "\\\\server\\share\\payload.exe",
+            "ms-settings:windowsupdate",
+            "vscode://file/etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "/usr/bin/open",
+            "./payload.sh",
+        ] {
+            let mut url = Url::parse("dsh-window://open").unwrap();
+            url.query_pairs_mut().append_pair("url", target);
+            assert!(
+                action(&url).is_none(),
+                "{target} is not a link and must not be handed to the system"
+            );
+        }
     }
 
     #[test]
