@@ -91,7 +91,13 @@ pub fn paint(window: &WebviewWindow, preference: Preference) {
     let _ = window.set_background_color(Some(background));
 }
 
-fn settings_file() -> Option<PathBuf> {
+/// `$DSH_HOME/settings.yaml`, wherever that resolves to.
+///
+/// Public because the theme is not the only thing this app takes from dsh
+/// rather than deciding for itself: [`crate::i18n`] reads the language the
+/// user picked out of the same file, and the rule for finding it belongs in
+/// one place.
+pub fn settings_file() -> Option<PathBuf> {
     #[allow(deprecated)]
     let home = match std::env::var_os("DSH_HOME") {
         Some(home) if !home.is_empty() => PathBuf::from(home),
