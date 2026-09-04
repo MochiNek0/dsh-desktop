@@ -1,4 +1,4 @@
-//! Two languages, settled once from the language dsh is in.
+//! Two languages, taken from the language dsh is in.
 //!
 //! Every string the user reads is written twice, inline, at the place it is
 //! used — see [`t`]. The alternative is a key table somewhere else, and a key
@@ -14,34 +14,68 @@
 //! setting rather than asking the question a second time in a second place. The
 //! system locale is what is left when dsh has not been asked, which is also
 //! where dsh itself starts.
+//!
+//! The file answers the question at startup. After that the page does:
+//! switching the language inside dsh swaps its copy live without reloading the
+//! document, and [`crate::controls`] watches `<html lang>` for exactly that and
+//! calls [`switch`]. Which is why this is not settled once — see the note there
+//! about what a change has to repaint.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 /// Whether the Chinese half of each pair is the one shown.
 ///
-/// Settled once, on the paths — every dialog, every status line — where asking
-/// again would be pure cost.
+/// Every `t!` in the app goes through here, so it is an atomic load and the
+/// file is read once, behind the [`OnceLock`], on the first call.
+pub fn chinese() -> bool {
+    cell().load(Ordering::Relaxed)
+}
+
+/// Take the language from the page, which has just switched to it. `true` when
+/// that was a change.
 ///
-/// Once means dsh can be switched to the other language while this is running
-/// and the frame will not follow until the next launch. That is the bargain
-/// [`crate::theme`] already makes with the theme, and here it is the harder one
-/// to avoid: the theme reaches the injected chrome as part of the page's own
-/// repaint, but every label in that chrome is baked into the script at the
-/// moment it is injected, and a language switch inside dsh does not reload the
-/// document it was injected into.
+/// A change is the caller's cue to repaint, and the caller has to, because
+/// making this move is only half of it. Strings that go through `t!` when they
+/// are needed — every dialog, every notification, every status line — come out
+/// in the new language on their own. Strings already drawn do not: the menu
+/// labels were baked into the injected script when the document loaded, and the
+/// tray menu's were built when the app started. See [`crate::controls::relabel`]
+/// and the tray in `main`.
+pub fn switch(tag: &str) -> bool {
+    let chinese = is_chinese(tag);
+    cell().swap(chinese, Ordering::Relaxed) != chinese
+}
+
+/// What the injected scripts and the loading page switch on; see
+/// `dist/index.html`. The pages carry their own strings — pushing every label
+/// across from Rust would mean a `window.eval` per word.
+pub fn tag() -> &'static str {
+    if chinese() {
+        "zh"
+    } else {
+        "en"
+    }
+}
+
+fn cell() -> &'static AtomicBool {
+    static CHINESE: OnceLock<AtomicBool> = OnceLock::new();
+    CHINESE.get_or_init(|| AtomicBool::new(settled()))
+}
+
+/// The language to open in, before any page has had a chance to say otherwise.
 ///
 /// dsh ships `zh` and `en`, and lets plugins register further languages whose
 /// fallback chain has to terminate at `en`. There are two halves here, so
 /// anything that is not Chinese gets the English one — which is where dsh's own
 /// chain would have ended up too.
-pub fn chinese() -> bool {
-    static CHINESE: OnceLock<bool> = OnceLock::new();
-    *CHINESE.get_or_init(|| match dsh_locale() {
+fn settled() -> bool {
+    match dsh_locale() {
         Some(locale) => is_chinese(&locale),
         // A locale nothing can be made of answers Chinese, which is what every
         // string in this app was before there were two of them.
         None => sys_locale::get_locale().is_none_or(|locale| is_chinese(&locale)),
-    })
+    }
 }
 
 /// `zh`, `zh-CN`, `zh-Hans-CN`: the language subtag is the whole question.
@@ -98,17 +132,6 @@ fn parse(text: &str) -> Option<String> {
     None
 }
 
-/// What the injected scripts and the loading page switch on; see
-/// `dist/index.html`. The pages carry their own strings — pushing every label
-/// across from Rust would mean a `window.eval` per word.
-pub fn tag() -> &'static str {
-    if chinese() {
-        "zh"
-    } else {
-        "en"
-    }
-}
-
 /// One string in both languages, Chinese first.
 ///
 /// With no further arguments it is a `&'static str`, so it can go anywhere a
@@ -158,10 +181,7 @@ mod tests {
 
     #[test]
     fn reads_the_language_dsh_was_set_to() {
-        assert_eq!(
-            parse("locale:\n  preference: en\n").as_deref(),
-            Some("en")
-        );
+        assert_eq!(parse("locale:\n  preference: en\n").as_deref(), Some("en"));
     }
 
     #[test]
@@ -177,8 +197,8 @@ web-search-free:
         assert_eq!(parse(settings).as_deref(), Some("zh"));
     }
 
-    /// `ui-theme` has a `preference` of its own, and it is the one directly
-    /// above this section in a real file.
+    /// `ui-theme` has a `preference` of its own, and in a real file it is the
+    /// section directly above this one.
     #[test]
     fn ignores_the_field_in_another_section() {
         let settings = "\
@@ -197,7 +217,10 @@ agent-default-model:
 
     #[test]
     fn takes_a_quoted_value_and_declines_an_empty_one() {
-        assert_eq!(parse("locale:\n  preference: \"en\"\n").as_deref(), Some("en"));
+        assert_eq!(
+            parse("locale:\n  preference: \"en\"\n").as_deref(),
+            Some("en")
+        );
         assert_eq!(parse("locale:\n  preference:\n"), None);
     }
 

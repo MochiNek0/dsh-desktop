@@ -319,14 +319,16 @@ fn build_window(
     Ok(window)
 }
 
-/// The tray icon: how the window comes back once it has been closed, and the
-/// only way to actually quit while it is away.
+/// The tray icon's id, so [`switch_language`] can find it again.
+const TRAY: &str = "main";
+
+/// The two items in it, in the language of the moment.
 ///
-/// Two items, and deliberately: everything else the app can be asked to do is in
-/// the window's own menu (see [`controls`]), where it can be drawn to look like
-/// the app rather than like a system context menu. What is left here is what is
-/// only ever wanted when there is no window to look at.
-fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+/// Built rather than kept, because a menu cannot be relabelled in place: the
+/// items are handed to the OS when the tray is built, and the way to change
+/// what they say is to hand it another menu. The ids are what
+/// `on_menu_event` matches, and they are not translated.
+fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let show = MenuItem::with_id(
         app,
         "show",
@@ -335,9 +337,46 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let quit = MenuItem::with_id(app, "quit", t!("退出 dsh", "Quit dsh"), true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
 
-    let mut tray = TrayIconBuilder::new()
+    Menu::with_items(app, &[&show, &quit])
+}
+
+/// Follow dsh into the language it has just been switched to.
+///
+/// Reached from the page, which is the only thing that sees the switch happen:
+/// dsh writes it through to `<html lang>` without loading the document again,
+/// and [`controls`] watches for that. Everything drawn from here on reads the
+/// new language on its own — what needs saying out loud is the two menus that
+/// were drawn before it.
+fn switch_language(app: &tauri::AppHandle, tag: &str) {
+    if !i18n::switch(tag) {
+        return;
+    }
+
+    controls::relabel(app);
+
+    let Some(tray) = app.tray_by_id(TRAY) else {
+        return;
+    };
+    match tray_menu(app) {
+        Ok(menu) => {
+            let _ = tray.set_menu(Some(menu));
+        }
+        Err(error) => eprintln!("dsh-desktop: could not relabel the tray menu: {error}"),
+    }
+}
+
+/// The tray icon: how the window comes back once it has been closed, and the
+/// only way to actually quit while it is away.
+///
+/// Two items, and deliberately: everything else the app can be asked to do is in
+/// the window's own menu (see [`controls`]), where it can be drawn to look like
+/// the app rather than like a system context menu. What is left here is what is
+/// only ever wanted when there is no window to look at.
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let menu = tray_menu(app)?;
+
+    let mut tray = TrayIconBuilder::with_id(TRAY)
         .tooltip("dsh desktop")
         .menu(&menu)
         // Left click reveals the window; the menu belongs on the right button.

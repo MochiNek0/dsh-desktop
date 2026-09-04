@@ -57,9 +57,10 @@
 //! that hands a target to the system, and [`crate::plugins::is_package_spec`]
 //! for the one that installs a package.
 //!
-//! Three things travel the other way, each pushed rather than asked for, because
+//! Four things travel the other way, each pushed rather than asked for, because
 //! the page has no way to see any of them: whether the window is maximised
-//! ([`sync`]), whether the login item is on ([`sync_autostart`]), and whatever
+//! ([`sync`]), whether the login item is on ([`sync_autostart`]), the menu's own
+//! labels when dsh changes language under it ([`relabel`]), and whatever
 //! slow thing is running right now ([`busy`]).
 
 use tauri::{AppHandle, Manager, Url, WebviewWindow};
@@ -97,6 +98,9 @@ pub enum Action {
     /// Turn the finished-turn notification on or off; see [`crate::settings`].
     NotifyTurns,
     Quit,
+    /// dsh switched language under a document that is not going to load
+    /// again; see [`relabel`]. Carries the tag `<html lang>` moved to.
+    Locale(String),
     /// Open the plugin panel on the loading page.
     Plugins,
     /// Install what was ticked in it, and whatever was typed into its box.
@@ -181,6 +185,13 @@ pub fn action(url: &Url) -> Option<Action> {
         "runtime" => Some(Action::Runtime),
         "terminal" => Some(Action::Terminal),
         "restart-dsh" => Some(Action::RestartDsh),
+        // Not a request for anything: the page saying what it has already
+        // done, so the chrome around it can catch up. See [`relabel`].
+        "locale" => url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "tag").then(|| value.into_owned()))
+            .filter(|tag| !tag.is_empty())
+            .map(Action::Locale),
         "open" => {
             url.query_pairs()
                 .find_map(|(key, value)| if key == "url" { Some(value.into_owned()) } else { None })
@@ -252,6 +263,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::Autostart => return crate::toggle_autostart(app),
         Action::NotifyTurns => return crate::toggle_notify_turns(app),
         Action::Quit => return crate::quit(app),
+        Action::Locale(tag) => return crate::switch_language(app, &tag),
         Action::Plugins => return crate::open_plugins(app),
         Action::PluginsInstall(ids, spec) => return crate::install_plugins(app, ids, spec),
         Action::PluginsRemove(names) => return crate::remove_plugins(app, names),
@@ -379,6 +391,64 @@ fn eval(app: &AppHandle, call: &str) {
     }
 }
 
+/// Every menu label, against the verb its entry signals, as the object the
+/// script indexes by verb.
+///
+/// One list rather than a name apiece, because the menu is written twice now:
+/// into [`script`] when a document loads, and again by [`relabel`] when dsh
+/// changes language under a document that is not going to load a second time.
+/// Two copies of these strings would be exactly the drift [`crate::i18n`] is
+/// arranged to prevent.
+///
+/// JSON rather than the bare text: this is pasted into a JavaScript literal,
+/// and a label is one apostrophe away from being a syntax error that takes the
+/// whole titlebar with it.
+fn labels() -> String {
+    let labels = [
+        ("plugins", t!("插件…", "Plugins…")),
+        ("terminal", t!("打开终端", "Open a terminal")),
+        ("restart-dsh", t!("重启 dsh", "Restart dsh")),
+        ("update-dsh", t!("更新 dsh…", "Update dsh…")),
+        ("runtime", t!("运行环境…", "Runtime…")),
+        (
+            "check-app",
+            t!("检查应用更新…", "Check for app updates…"),
+        ),
+        ("autostart", t!("开机自启动", "Start at login")),
+        // Not "Notify when a turn finishes": the switch behind it gates every
+        // notification this app raises, a plugin's included. See
+        // `crate::settings`.
+        ("notify-turns", t!("通知", "Notifications")),
+        ("quit", t!("退出 dsh", "Quit dsh")),
+    ];
+
+    let map: serde_json::Map<String, serde_json::Value> = labels
+        .into_iter()
+        .map(|(verb, label)| (verb.to_string(), label.into()))
+        .collect();
+
+    serde_json::to_string(&map).expect("a map of strings is always serializable")
+}
+
+/// Put the menu into the language dsh has just switched to.
+///
+/// Only what is already drawn needs this. Everything else in the app reads the
+/// language at the moment it draws — see [`crate::i18n::switch`] — but the menu
+/// was drawn when the document loaded, and a language switch inside dsh does
+/// not load another one.
+pub fn relabel(app: &AppHandle) {
+    // First, so that anything the pages draw in response to the labels below is
+    // already in the new language; see `dist/index.html`.
+    eval(
+        app,
+        &format!("window.__DSH_LANG__ = {:?};", crate::i18n::tag()),
+    );
+    eval(
+        app,
+        &format!("window.__dshRelabel && window.__dshRelabel({})", labels()),
+    );
+}
+
 /// The script that draws all of it, injected into every document the window
 /// loads.
 ///
@@ -395,21 +465,7 @@ pub fn script() -> String {
     let gap = DOT_GAP;
     let pad = ROW_PAD;
 
-    // JSON rather than the bare text: these are pasted into a JavaScript
-    // literal, and a label is one apostrophe away from being a syntax error
-    // that takes the whole titlebar with it.
-    let label = |text: &str| serde_json::to_string(text).expect("a string is always serializable");
-    let plugins = label(t!("插件…", "Plugins…"));
-    let terminal = label(t!("打开终端", "Open a terminal"));
-    let runtime = label(t!("运行环境…", "Runtime…"));
-    let restart_dsh = label(t!("重启 dsh", "Restart dsh"));
-    let update_dsh = label(t!("更新 dsh…", "Update dsh…"));
-    let check_app = label(t!("检查应用更新…", "Check for app updates…"));
-    let autostart = label(t!("开机自启动", "Start at login"));
-    // Not "Notify when a turn finishes": the switch behind it gates every
-    // notification this app raises, a plugin's included. See `crate::settings`.
-    let notify = label(t!("通知", "Notifications"));
-    let quit = label(t!("退出 dsh", "Quit dsh"));
+    let labels = labels();
 
     format!(
         r#"(function () {{
@@ -440,25 +496,28 @@ pub fn script() -> String {
     close: '<path d="M2.9 2.9l4.2 4.2m0-4.2l-4.2 4.2"/>'
   }};
 
-  // The menu, top to bottom. `check` marks the one item that carries state.
   // The labels come from Rust so there is one place the two languages live;
-  // see `i18n`.
+  // see `i18n`. Keyed by verb rather than laid out in order, because
+  // `__dshRelabel` sends this same shape again when dsh changes language.
+  var LABELS = {labels};
+
+  // The menu, top to bottom. `check` marks the one item that carries state.
   var ITEMS = [
-    {{ verb: 'plugins', label: {plugins} }},
-    {{ verb: 'terminal', label: {terminal} }},
+    {{ verb: 'plugins' }},
+    {{ verb: 'terminal' }},
     {{ separator: true }},
-    {{ verb: 'restart-dsh', label: {restart_dsh} }},
-    {{ verb: 'update-dsh', label: {update_dsh} }},
+    {{ verb: 'restart-dsh' }},
+    {{ verb: 'update-dsh' }},
     // One item for the whole of which Node and which dsh, rather than one per
     // verb: the panel behind it can switch, install and uninstall, and this
     // menu is already long. See `setup`.
-    {{ verb: 'runtime', label: {runtime} }},
-    {{ verb: 'check-app', label: {check_app} }},
+    {{ verb: 'runtime' }},
+    {{ verb: 'check-app' }},
     {{ separator: true }},
-    {{ verb: 'autostart', label: {autostart}, check: true }},
-    {{ verb: 'notify-turns', label: {notify}, check: true }},
+    {{ verb: 'autostart', check: true }},
+    {{ verb: 'notify-turns', check: true }},
     {{ separator: true }},
-    {{ verb: 'quit', label: {quit} }}
+    {{ verb: 'quit' }}
   ];
 
   var MENU_GLYPH = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" ' +
@@ -706,6 +765,9 @@ pub fn script() -> String {
     var pop = document.createElement('div');
     pop.className = 'dsh-wc-pop';
     var checks = {{}};
+    // Kept for the same reason `checks` is: something out here changes them
+    // after they are drawn. See `__dshRelabel`.
+    var spans = {{}};
 
     ITEMS.forEach(function (item) {{
       if (item.separator) {{
@@ -716,7 +778,8 @@ pub fn script() -> String {
       var entry = document.createElement('button');
       entry.type = 'button';
       var label = document.createElement('span');
-      label.textContent = item.label;
+      label.textContent = LABELS[item.verb];
+      spans[item.verb] = label;
       entry.appendChild(label);
       if (item.check) {{
         entry.insertAdjacentHTML('beforeend', TICK);
@@ -781,6 +844,34 @@ pub fn script() -> String {
       said.textContent = text || '';
       toast.classList.toggle('dsh-wc-shown', !!text);
     }};
+    // Called from Rust after the language moved; see `relabel`.
+    window.__dshRelabel = function (next) {{
+      for (var verb in next) {{
+        if (spans[verb]) spans[verb].textContent = next[verb];
+      }}
+    }};
+
+    // -------------------------------------------------------- the language --
+
+    // dsh's language is the page's, the way its theme is: Settings writes the
+    // choice through to `<html lang>` and swaps the copy live, without loading
+    // the document again -- so the labels above, pasted in when this script was
+    // injected, would keep the language they were pasted in. Report the move
+    // and let Rust send them back.
+    //
+    // Only a move. What the document opened with is never reported: the loading
+    // page declares a language in its markup, and taking that for an answer
+    // would let it overrule the one dsh actually holds.
+    var lang = document.documentElement.lang;
+    new MutationObserver(function () {{
+      var next = document.documentElement.lang;
+      if (next === lang) return;
+      lang = next;
+      if (next) signal('locale?tag=' + encodeURIComponent(next));
+    }}).observe(document.documentElement, {{
+      attributes: true,
+      attributeFilter: ['lang']
+    }});
 
     // ----------------------------------------------------------- the theme --
 
@@ -943,6 +1034,50 @@ mod tests {
 
         let url_no_param = Url::parse("dsh-window://open").unwrap();
         assert!(action(&url_no_param).is_none());
+    }
+
+    /// Every entry in the menu has a label and every label has an entry.
+    /// They are two lists now — see [`super::labels`] — and a verb in one and
+    /// not the other is a blank row, or a string nothing ever draws.
+    #[test]
+    fn every_menu_entry_is_labelled() {
+        let script = super::script();
+        let labels: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&super::labels()).unwrap();
+
+        let verbs: Vec<&str> = script
+            .split("verb: '")
+            .skip(1)
+            .filter_map(|rest| rest.split('\'').next())
+            .collect();
+
+        assert_eq!(verbs.len(), labels.len(), "{verbs:?} against {labels:?}");
+        for verb in verbs {
+            assert!(labels.contains_key(verb), "{verb} has no label");
+        }
+    }
+
+    /// The page reporting what dsh just did to it; see `relabel`.
+    #[test]
+    fn reads_the_language_the_page_moved_to() {
+        let url = Url::parse("dsh-window://locale?tag=en").unwrap();
+        match action(&url) {
+            Some(Action::Locale(tag)) => assert_eq!(tag, "en"),
+            _ => panic!("expected Action::Locale"),
+        }
+    }
+
+    /// A tag is the whole of what this verb carries, so without one there is
+    /// nothing to act on and the navigation is left alone.
+    #[test]
+    fn declines_a_locale_with_nothing_in_it() {
+        for url in [
+            "dsh-window://locale",
+            "dsh-window://locale?tag=",
+            "dsh-window://locale?lang=en",
+        ] {
+            assert!(action(&Url::parse(url).unwrap()).is_none(), "{url}");
+        }
     }
 
     #[test]
