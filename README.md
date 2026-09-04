@@ -4,10 +4,11 @@
 
 DeepSeek Harness (`dsh web`) 的跨平台 Tauri 桌面客户端
 
-[English](README.en.md) · **简体中文**
+**[官方网站 · 下载](https://dsh-desktop.cc.cd/)** · [English](README.en.md) · **简体中文**
 
 <br/>
 
+[![Website](https://img.shields.io/badge/Website-dsh--desktop.cc.cd-2ea44f?logo=googlechrome&logoColor=white)](https://dsh-desktop.cc.cd/)
 [![Release](https://img.shields.io/github/v/release/MochiNek0/dsh-desktop?color=blue)](https://github.com/MochiNek0/dsh-desktop/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
@@ -28,7 +29,7 @@ DeepSeek Harness (`dsh web`) 的跨平台 Tauri 桌面客户端
 
 ## 概述
 
-**dsh desktop** 启动时会自动在后台拉起本地 `dsh web` 服务并内嵌至原生桌面窗口。无需手动打开终端或管理端口，会话记录、凭证与配置均与 CLI 全局共享（存储于 `$DSH_HOME`，默认 `~/.dsh`）。
+**dsh desktop**（DeepSeek Harness 桌面版）启动时会自动在后台拉起本地 `dsh web` 服务并内嵌至原生桌面窗口。无需手动打开终端或管理端口，会话记录、凭证与配置均与 CLI 全局共享（存储于 `$DSH_HOME`，默认 `~/.dsh`）。
 
 ## 特性
 
@@ -43,7 +44,7 @@ DeepSeek Harness (`dsh web`) 的跨平台 Tauri 桌面客户端
 
 > **重要提示**：建议用户安装 **v0.1.3 及以后的版本**，之前的版本可能存在一些已知问题。目前应用已在 **Windows** 和 **Linux（Debian系统）** 上完成验证。
 
-前往 [Releases 页面](https://github.com/MochiNek0/dsh-desktop/releases) 下载适用于您操作系统的最新安装包：
+前往 **[官方网站 dsh-desktop.cc.cd](https://dsh-desktop.cc.cd/)** 或 [GitHub Releases 页面](https://github.com/MochiNek0/dsh-desktop/releases) 下载适用于您操作系统的最新安装包：
 
 | 操作系统 | 安装包格式 | 说明 |
 | :--- | :--- | :--- |
@@ -113,6 +114,17 @@ dsh-desktop/
 
 - **首次启动联网**：应用首次启动时若未检测到本地环境，需联网拉取 `dsh` 核心组件，请保持网络连通。
 - **自动更新**：支持桌面端应用自动检查并安装更新（Linux 环境仅支持 AppImage 格式）。
+
+## 相关链接
+
+- **官方网站（中文）**：<https://dsh-desktop.cc.cd/>
+- **Official Website (English)**：<https://dsh-desktop.cc.cd/en/>
+- **GitHub 仓库**：<https://github.com/MochiNek0/dsh-desktop>
+- **版本下载**：<https://github.com/MochiNek0/dsh-desktop/releases>
+- **问题反馈**：<https://github.com/MochiNek0/dsh-desktop/issues>
+- **上游项目 DeepSeek Harness**：<https://github.com/deepseek-ai/deepseek-harness>
+
+<sub>关键词：dsh desktop、DeepSeek Harness 桌面版、dsh web 客户端、DeepSeek 桌面客户端、Tauri、Windows / macOS / Linux AI 编程助手 GUI。</sub>
 
 ## 声明
 

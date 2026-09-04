@@ -3,6 +3,24 @@
   "version": "0.1.9",
   "private": true,
   "description": "Desktop client for the DeepSeek Harness browser UI (dsh web)",
+  "homepage": "https://dsh-desktop.cc.cd/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MochiNek0/dsh-desktop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MochiNek0/dsh-desktop/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-desktop",
+    "deepseek",
+    "deepseek-harness",
+    "tauri",
+    "desktop-client",
+    "ai-coding-agent"
+  ],
+  "license": "MIT",
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",

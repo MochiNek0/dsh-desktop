@@ -4,10 +4,11 @@
 
 A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 
-**English** · [简体中文](README.md)
+**[Official Website · Download](https://dsh-desktop.cc.cd/en/)** · **English** · [简体中文](README.md)
 
 <br/>
 
+[![Website](https://img.shields.io/badge/Website-dsh--desktop.cc.cd-2ea44f?logo=googlechrome&logoColor=white)](https://dsh-desktop.cc.cd/en/)
 [![Release](https://img.shields.io/github/v/release/MochiNek0/dsh-desktop?color=blue)](https://github.com/MochiNek0/dsh-desktop/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
@@ -28,7 +29,7 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 
 ## Overview
 
-**dsh desktop** automatically starts the local `dsh web` service in the background and embeds it into a native window upon launch. There is no need to manually manage terminal sessions or port allocations. Sessions, credentials, and configurations are shared seamlessly with the CLI (`$DSH_HOME`, default `~/.dsh`).
+**dsh desktop** (the DeepSeek Harness desktop app) automatically starts the local `dsh web` service in the background and embeds it into a native window upon launch. There is no need to manually manage terminal sessions or port allocations. Sessions, credentials, and configurations are shared seamlessly with the CLI (`$DSH_HOME`, default `~/.dsh`).
 
 ## Features
 
@@ -43,7 +44,7 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 
 > **Important**: It is recommended to install **v0.1.3 and later versions**, as previous versions may have some known issues. Currently, the application has been verified on **Windows** and **Linux (Debian-based systems)**.
 
-Download the latest release package for your operating system from the [Releases page](https://github.com/MochiNek0/dsh-desktop/releases):
+Download the latest release package for your operating system from the **[official website dsh-desktop.cc.cd](https://dsh-desktop.cc.cd/en/)** or the [GitHub Releases page](https://github.com/MochiNek0/dsh-desktop/releases):
 
 | Operating System | Package Format | Details |
 | :--- | :--- | :--- |
@@ -113,6 +114,17 @@ dsh-desktop/
 
 - **Network on First Launch**: The app requires an active internet connection on first launch if local components need to be downloaded.
 - **Auto Update**: Integrated auto-updater support (Linux supports AppImage format only).
+
+## Links
+
+- **Official Website (English)**: <https://dsh-desktop.cc.cd/en/>
+- **官方网站（中文）**: <https://dsh-desktop.cc.cd/>
+- **GitHub Repository**: <https://github.com/MochiNek0/dsh-desktop>
+- **Downloads / Releases**: <https://github.com/MochiNek0/dsh-desktop/releases>
+- **Issue Tracker**: <https://github.com/MochiNek0/dsh-desktop/issues>
+- **Upstream project — DeepSeek Harness**: <https://github.com/deepseek-ai/deepseek-harness>
+
+<sub>Keywords: dsh desktop, DeepSeek Harness desktop app, dsh web GUI client, DeepSeek desktop client, Tauri, AI coding agent GUI for Windows / macOS / Linux.</sub>
 
 ## Disclaimer
 
