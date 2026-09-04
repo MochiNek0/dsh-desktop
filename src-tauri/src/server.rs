@@ -1,9 +1,17 @@
 //! The managed `dsh web` child process.
 //!
-//! `dsh web --no-open --port 0` binds a free loopback port and prints one
-//! line — `dsh web: http://127.0.0.1:<port>` — which is both the readiness
+//! `dsh web --no-open --port <port>` binds a loopback port — `0` for any free
+//! one — and prints one line, `dsh web: <url>`, which is both the readiness
 //! signal and the URL the window navigates to. `--no-open` suppresses the
 //! default-browser handoff newer dsh does, since this window is the browser.
+//!
+//! Since dsh 0.1.2 that URL carries a one-time launch token: the window
+//! navigates to `http://127.0.0.1:<port>/?token=<base64url>`, dsh answers 303
+//! to a clean `/` and sets a signed browser cookie. The cookie is bound to the
+//! authority it was minted for and signed with a secret that lives in dsh's
+//! credential store rather than in the process — which is what makes a
+//! same-port restart invisible to a page that is already loaded. See
+//! [`crate::resume`].
 
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
@@ -51,8 +59,17 @@ pub struct Server {
 
 /// Spawn `dsh web` and return the handle plus a channel that yields exactly one
 /// [`Event`].
-pub fn start(app: &tauri::AppHandle) -> std::io::Result<(Server, Receiver<Event>)> {
-    let mut child = command(app)
+///
+/// `port` is a request rather than a claim: `None` lets the OS pick, which is
+/// what a first start does, and a number asks for the one a server that has just
+/// died was already on. See [`crate::resume`] for why that is worth asking for,
+/// and note that a port already taken is a spawn that starts and then exits —
+/// an [`Event::Failed`], not an error from here.
+pub fn start(
+    app: &tauri::AppHandle,
+    port: Option<u16>,
+) -> std::io::Result<(Server, Receiver<Event>)> {
+    let mut child = command(app, port)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -233,13 +250,16 @@ impl Drop for Job {
 /// Falling back to the bare name is for the case where nothing was found at
 /// all: the error from a failed spawn is what the loading page reports, and
 /// "dsh 不存在" is a better one than "找不到应用数据目录".
-fn command(app: &tauri::AppHandle) -> Command {
+fn command(app: &tauri::AppHandle, port: Option<u16>) -> Command {
     let mut command = match crate::dsh::current(app) {
         Some(dsh) => Command::new(dsh.bin),
         None => Command::new(if cfg!(windows) { "dsh.cmd" } else { "dsh" }),
     };
 
-    command.args(["web", "--no-open", "--port", "0"]);
+    // `--port 0` is dsh's own way of saying "any free one"; a number is the one
+    // a reconnect is trying to land back on.
+    let port = port.map_or_else(|| "0".to_string(), |port| port.to_string());
+    command.args(["web", "--no-open", "--port", &port]);
     // `--no-open` keeps dsh from handing the URL to the system's default
     // browser: this app's own window navigates to it, so a second tab in the
     // user's browser is a leftover from running `dsh web` in a terminal, not
@@ -341,5 +361,34 @@ mod tests {
     #[test]
     fn ignores_other_output() {
         assert_eq!(parse_url("listening on http://127.0.0.1:1"), None);
+    }
+
+    /// The shape dsh has printed since 0.1.2. The trailing trim exists to drop
+    /// punctuation the line ends in, and the token is the one thing on the line
+    /// it must not touch: base64url spends `-` and `_`, neither of which is
+    /// alphanumeric.
+    ///
+    /// That holds today by arithmetic rather than by design. dsh's token is 32
+    /// random bytes, which base64url encodes as 43 characters — 258 bits for
+    /// 256 — so the last character carries two significant bits and can only be
+    /// one of the sixteen whose alphabet index is a multiple of four. `-` and
+    /// `_` are indices 62 and 63, so neither ever lands last. Change the token
+    /// length upstream and that stops being true, which is what this is here to
+    /// catch.
+    #[test]
+    fn keeps_the_launch_token() {
+        let url = "http://127.0.0.1:63170/?token=DT8oXJ58ruxVOPtmFLiQDBLJ0M5oh22XI_C8TgecGj0";
+        assert_eq!(parse_url(&format!("dsh web: {url}")).as_deref(), Some(url));
+    }
+
+    #[test]
+    fn keeps_the_launch_token_past_the_lan_suffix() {
+        assert_eq!(
+            parse_url(
+                "dsh web: http://127.0.0.1:3080/?token=ab_cd (LAN: http://192.168.1.7:3080/?token=ab_cd)"
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:3080/?token=ab_cd")
+        );
     }
 }

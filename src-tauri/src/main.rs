@@ -23,7 +23,7 @@ mod waiting;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -49,6 +49,26 @@ type Home = Arc<RwLock<Option<Url>>>;
 
 /// How long to sit on the boot message before telling the user it is slow.
 const SLOW_BOOT: Duration = Duration::from_secs(20);
+
+/// How many times in a row a `dsh web` that died young is started again before
+/// the app stops trying and says so; see [`watch`].
+///
+/// "In a row" is the load-bearing half. A server that had been up for [`STEADY`]
+/// before it went is a fresh incident and gets the whole budget again — without
+/// that, a machine where dsh dies once an hour would eventually spend a lifetime
+/// counter and stop being restarted for no reason the user could see. What is
+/// given up on is only a dsh that cannot stay up.
+const RESTARTS: usize = 3;
+
+/// How long a server has to have been serving for its exit to count as an
+/// incident of its own rather than another turn of a crash loop.
+const STEADY: Duration = Duration::from_secs(60);
+
+/// How long a restarted server gets to print its URL before the attempt is
+/// called a failure. [`serve`] waits for as long as it takes and says so on the
+/// loading page; this one runs behind a page the user is still working in, where
+/// the only thing it has to say it with is a line of status text.
+const RESUME_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Passed by the login item the tray menu creates. The app is starting because
 /// the machine did, not because anyone asked to see it, so it waits in the tray
@@ -656,7 +676,7 @@ fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Sessi
     session.splash.status(window, t!("正在启动 dsh…", "Starting dsh…"));
     session.splash.progress(window, -1.0);
 
-    match server::start(app) {
+    match server::start(app, None) {
         Ok((child, events)) => {
             *session.server.lock().unwrap() = Some(child);
             if serve(window, &session.origin, &session.splash, &events) {
@@ -715,79 +735,248 @@ fn stop_server(session: &Session) {
     *session.origin.write().unwrap() = None;
 }
 
-/// Wait for the running server to exit, and put the window somewhere the user
-/// can see that it did.
+/// Wait for the running server to exit, start it again where that is worth
+/// doing, and put the window somewhere the user can see it when it is not.
 ///
 /// Without this the failure is silent in the worst way: `dsh web` dies, the
 /// window goes on showing the page it served, and every click on it fails in
 /// whatever way that page fails when its backend is gone. The process exiting is
 /// the signal — not a port probe on a timer, which is a second thing that can be
 /// wrong about a question the pipe already answers exactly.
+///
+/// What it does about it is [`resume`], which in the ordinary case the user
+/// never sees: dsh comes back on the port it was on and the page reconnects
+/// itself. Only a dsh that will not come back, or one that comes back and dies
+/// again [`RESTARTS`] times over, reaches [`give_up`] and the loading page.
 fn watch(window: &WebviewWindow, session: &Session, events: Receiver<server::Event>) {
     let epoch = session.epoch.load(Ordering::SeqCst);
     let session = session.clone();
     let window = window.clone();
 
     std::thread::spawn(move || {
-        // Every other event is behind us — this loop starts after `serve`
-        // returned on a `Ready`.
-        let Some(output) = events.into_iter().find_map(|event| match event {
-            server::Event::Exited(output) => Some(output),
-            _ => None,
-        }) else {
-            // The channel closed without an exit, which is the app shutting
-            // down. Nothing to report and nowhere left to report it.
-            return;
+        let mut events = events;
+        // Quick deaths in a row. Reset rather than incremented by one that took
+        // its time; see [`RESTARTS`].
+        let mut flaps = 0usize;
+
+        let last = loop {
+            let started = Instant::now();
+
+            // Every other event is behind us — this loop is entered after a
+            // `Ready`, from `serve` the first time and from `resume` after that.
+            let Some(output) = events.iter().find_map(|event| match event {
+                server::Event::Exited(output) => Some(output),
+                _ => None,
+            }) else {
+                // The channel closed without an exit, which is the app shutting
+                // down. Nothing to report and nowhere left to report it.
+                return;
+            };
+
+            if session.epoch.load(Ordering::SeqCst) != epoch {
+                // We stopped it: an update or a plugin install, either of which is
+                // already showing the user what it is doing.
+                return;
+            }
+
+            // The parent is gone but the slot still holds it, and on Unix an
+            // unreaped child is a zombie until something waits on it. `stop` waits,
+            // and takes down any of the tree that outlived its parent while it is
+            // there.
+            if let Some(mut dead) = session.server.lock().unwrap().take() {
+                dead.stop();
+            }
+
+            flaps = if started.elapsed() < STEADY { flaps + 1 } else { 1 };
+            if flaps > RESTARTS {
+                break output;
+            }
+
+            // Nothing else may be starting a dsh while this starts one. A flag
+            // already held is a boot, an update, a plugin install or a restart,
+            // and every one of those starts dsh itself when it is finished — so
+            // this steps aside, and silently, because whatever holds the flag is
+            // already saying on screen what it is doing.
+            //
+            // The block is the whole of the borrow: the wait above must not hold
+            // the flag, or a user who wanted to update dsh would be told to wait
+            // for a server that is running perfectly well.
+            let resumed = {
+                if BUSY.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let _busy = Busy;
+                resume(&window, &session)
+            };
+
+            match resumed {
+                Ok(next) => events = next,
+                Err(failed) => break failed,
+            }
         };
 
-        if session.epoch.load(Ordering::SeqCst) != epoch {
-            // We stopped it: an update or a plugin install, either of which is
-            // already showing the user what it is doing.
-            return;
-        }
-
-        // The parent is gone but the slot still holds it, and on Unix an
-        // unreaped child is a zombie until something waits on it. `stop` waits,
-        // and takes down any of the tree that outlived its parent while it is
-        // there.
-        if let Some(mut dead) = session.server.lock().unwrap().take() {
-            dead.stop();
-        }
-        *session.origin.write().unwrap() = None;
-        session.splash.rearm();
-
-        let handle = window.app_handle().clone();
-        let target = handle.clone();
-        let back = window.clone();
-        let home = session.home.read().unwrap().clone();
-        let _ = handle.run_on_main_thread(move || {
-            reveal(&target);
-            if let Some(home) = home {
-                if let Err(error) = back.navigate(home) {
-                    eprintln!("dsh-desktop: could not return to the loading page: {error}");
-                }
-            }
-        });
-
-        // Queued by `rearm` until the loading page above has loaded.
-        session.splash.fail_retry(
-            &window,
-            t!("dsh 已退出", "dsh exited"),
-            &if output.is_empty() {
-                t!(
-                    "dsh 意外退出了，且没有留下任何输出。",
-                    "dsh exited unexpectedly, without printing anything."
-                )
-                .to_string()
-            } else {
-                t!(
-                    "dsh 意外退出了。它最后的输出：\n\n{}",
-                    "dsh exited unexpectedly. Its last output:\n\n{}",
-                    output
-                )
-            },
-        );
+        give_up(&window, &session, &last);
     });
+}
+
+/// Start `dsh web` again after it exited on its own, without taking the window
+/// off the page dsh was serving.
+///
+/// The port it was on is asked for again, and that is the whole point of this
+/// function. Since 0.1.2 dsh authenticates a browser with a cookie bound to the
+/// authority it was minted for, signed with a secret that lives in dsh's
+/// credential store rather than in the process — so a server that comes back on
+/// the same port is one the loaded page is *still authenticated against*, and
+/// dsh's own client reconnects to it unprompted, backing off from half a second
+/// to ten and never giving up. Nothing here navigates, so nothing is lost: not
+/// the draft in the composer, not the scroll position, not the session being
+/// read. What the user sees is dsh's own connection indicator go and come back.
+///
+/// Which is also why the reporting goes through [`crate::controls::busy`] rather
+/// than the splash: the page underneath is dsh's, and it is staying.
+///
+/// `Err` carries the output of the attempt that failed.
+fn resume(window: &WebviewWindow, session: &Session) -> Result<Receiver<server::Event>, String> {
+    let app = window.app_handle();
+    controls::busy(
+        app,
+        t!("dsh 已断开，正在重新启动…", "dsh disconnected; restarting it…"),
+    );
+
+    let was = served_port(&session.origin);
+    let mut outcome = attempt(window, session, was);
+
+    // A port is a request, not a reservation, and dsh was not holding this one
+    // for the moment it took to notice. Losing it costs the page its own
+    // reconnect — the cookie is bound to the authority — so the second try takes
+    // whatever it is given and navigates, which is a reload rather than a
+    // failure.
+    if outcome.is_err() && was.is_some() {
+        outcome = attempt(window, session, None);
+    }
+
+    // Down either way: dsh draws its own connection status now, so a line of
+    // ours saying the same thing over the top of it is one too many — and on the
+    // failing path `give_up` is about to put the whole loading page up.
+    controls::busy(app, "");
+    outcome
+}
+
+/// One start, waited out. The child goes into the session's slot before the wait
+/// rather than after it, so that a quit landing midway takes it down with
+/// everything else instead of leaving a `dsh web` with no owner.
+fn attempt(
+    window: &WebviewWindow,
+    session: &Session,
+    port: Option<u16>,
+) -> Result<Receiver<server::Event>, String> {
+    let app = window.app_handle();
+
+    let (child, events) = server::start(app, port).map_err(|error| error.to_string())?;
+    *session.server.lock().unwrap() = Some(child);
+
+    match events.recv_timeout(RESUME_TIMEOUT) {
+        Ok(server::Event::Ready(url)) => {
+            let Ok(url) = Url::parse(&url) else {
+                return stillborn(
+                    session,
+                    t!(
+                        "无法解析 dsh 输出的地址：{}",
+                        "dsh printed an address that cannot be parsed: {}",
+                        url
+                    ),
+                );
+            };
+
+            let origin = url.origin().ascii_serialization();
+            let same = session.origin.read().unwrap().as_deref() == Some(origin.as_str());
+            *session.origin.write().unwrap() = Some(origin);
+
+            // Only when the port moved. On the same one the page is already
+            // pointed at a server that is back, and reloading it would throw
+            // away the very thing staying put is for.
+            if !same {
+                let window = window.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if let Err(error) = window.navigate(url) {
+                        eprintln!("dsh-desktop: could not follow dsh to its new port: {error}");
+                    }
+                });
+            }
+            Ok(events)
+        }
+        // `Failed` is the port already taken, and every other way a start dies
+        // before it serves. `Exited` cannot come first — the pump only sends one
+        // once a URL has gone past — but it would be the same news.
+        Ok(server::Event::Failed(output) | server::Event::Exited(output)) => {
+            stillborn(session, output)
+        }
+        Err(_) => stillborn(
+            session,
+            t!(
+                "dsh 启动后一直没有开始服务。",
+                "dsh started but never began serving."
+            )
+            .to_string(),
+        ),
+    }
+}
+
+/// Take back a child that was started and never served, and answer with why.
+fn stillborn(session: &Session, why: String) -> Result<Receiver<server::Event>, String> {
+    if let Some(mut dead) = session.server.lock().unwrap().take() {
+        dead.stop();
+    }
+    Err(why)
+}
+
+/// The port the running server bound, read back out of the origin [`serve`]
+/// recorded. Kept nowhere else on purpose: a second copy of the same fact is a
+/// second thing that can be out of date.
+fn served_port(origin: &Origin) -> Option<u16> {
+    let origin = origin.read().unwrap().clone()?;
+    Url::parse(&origin).ok()?.port()
+}
+
+/// Put the window back on the loading page with the failure on it, once starting
+/// dsh again has stopped being worth trying.
+fn give_up(window: &WebviewWindow, session: &Session, output: &str) {
+    *session.origin.write().unwrap() = None;
+    session.splash.rearm();
+
+    let handle = window.app_handle().clone();
+    let target = handle.clone();
+    let back = window.clone();
+    let home = session.home.read().unwrap().clone();
+    let _ = handle.run_on_main_thread(move || {
+        reveal(&target);
+        if let Some(home) = home {
+            if let Err(error) = back.navigate(home) {
+                eprintln!("dsh-desktop: could not return to the loading page: {error}");
+            }
+        }
+    });
+
+    // Queued by `rearm` until the loading page above has loaded.
+    session.splash.fail_retry(
+        window,
+        t!("dsh 已退出", "dsh exited"),
+        &if output.is_empty() {
+            t!(
+                "dsh 意外退出了，重新启动也没能让它回来，且没有留下任何输出。",
+                "dsh exited unexpectedly and did not come back when it was restarted, \
+                 without printing anything."
+            )
+            .to_string()
+        } else {
+            t!(
+                "dsh 意外退出了，重新启动也没能让它回来。它最后的输出：\n\n{}",
+                "dsh exited unexpectedly and did not come back when it was restarted. \
+                 Its last output:\n\n{}",
+                output
+            )
+        },
+    );
 }
 
 /// Start `dsh web` again. Two callers reach this: the menu's "Restart dsh"
