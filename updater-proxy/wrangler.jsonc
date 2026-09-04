@@ -1,0 +1,21 @@
+{
+  // Deploys `worker.js` onto the download path of the site named in the README.
+  //
+  // The route needs dsh-desktop.cc.cd to be a zone in the same Cloudflare
+  // account — Worker routes are matched per zone, and they win over a Pages
+  // project sitting on the same hostname, so `/updater/*` is taken over and the
+  // rest of the site is untouched. If the domain reaches Cloudflare as a CNAME
+  // from someone else's DNS instead, there is no zone to attach a route to:
+  // deploy `worker.js` as a Pages Function instead (its last line says how) and
+  // this file goes unused.
+  "name": "dsh-desktop-updater",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-01",
+  "routes": [
+    {
+      "pattern": "dsh-desktop.cc.cd/updater/*",
+      "zone_name": "dsh-desktop.cc.cd"
+    }
+  ],
+  "observability": { "enabled": true }
+}

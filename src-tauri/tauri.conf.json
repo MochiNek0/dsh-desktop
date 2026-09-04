@@ -17,6 +17,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
+        "https://dsh-desktop.cc.cd/updater/latest.json",
         "https://github.com/MochiNek0/dsh-desktop/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhCOTkyNUJDNjA1OTBFQ0QKUldUTkRsbGd2Q1daaTJNUnBUTmN0d291b1A5SGlpUG05My81bXdkOGlCU2o0Y0Y1N1pUdFBQUkIK"
