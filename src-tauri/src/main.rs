@@ -6,6 +6,7 @@
 #[macro_use]
 mod i18n;
 
+mod auth;
 mod controls;
 mod dialog;
 mod dsh;
@@ -100,6 +101,9 @@ struct Session {
     /// a watcher whose number is no longer current knows the exit was ours and
     /// says nothing.
     epoch: Arc<AtomicU64>,
+    /// The second try at `dsh web`'s token exchange, for the webviews that need
+    /// one; see [`auth`].
+    auth: auth::Retry,
 }
 
 fn main() {
@@ -133,6 +137,7 @@ fn main() {
             let origin: Origin = Arc::new(RwLock::new(None));
             let home: Home = Arc::new(RwLock::new(None));
             let splash = Splash::default();
+            let auth = auth::Retry::default();
             let visible = !std::env::args().any(|argument| argument == AUTOSTART_FLAG);
 
             // The window comes up first now: the update check runs behind it and
@@ -143,6 +148,7 @@ fn main() {
                 origin.clone(),
                 home.clone(),
                 splash.clone(),
+                auth.clone(),
                 preference,
                 visible,
             )?;
@@ -153,6 +159,7 @@ fn main() {
                 server: setup_server.clone(),
                 home,
                 epoch: Arc::new(AtomicU64::new(0)),
+                auth,
             };
             app.manage(session.clone());
 
@@ -186,6 +193,7 @@ fn build_window(
     origin: Origin,
     home: Home,
     splash: Splash,
+    auth: auth::Retry,
     preference: theme::Preference,
     visible: bool,
 ) -> tauri::Result<WebviewWindow> {
@@ -273,6 +281,9 @@ fn build_window(
                 controls::sync(&webview);
                 controls::sync_autostart(webview.app_handle());
                 controls::sync_notify(webview.app_handle());
+                // Last, and only where the page that just loaded is dsh
+                // refusing to serve one: it replaces the page.
+                auth.recover(&webview);
             }
         })
         .on_navigation(move |url| {
@@ -718,7 +729,7 @@ fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Sessi
     match server::start(app, None) {
         Ok((child, events)) => {
             *session.server.lock().unwrap() = Some(child);
-            if serve(window, &session.origin, &session.splash, &events) {
+            if serve(window, &session.origin, &session.splash, &session.auth, &events) {
                 watch(window, session, events);
             }
         }
@@ -935,6 +946,8 @@ fn attempt(
             // pointed at a server that is back, and reloading it would throw
             // away the very thing staying put is for.
             if !same {
+                session.auth.arm(&url);
+
                 let window = window.clone();
                 let _ = app.run_on_main_thread(move || {
                     if let Err(error) = window.navigate(url) {
@@ -1320,6 +1333,7 @@ fn serve(
     window: &WebviewWindow,
     origin: &Origin,
     splash: &Splash,
+    auth: &auth::Retry,
     events: &Receiver<server::Event>,
 ) -> bool {
     loop {
@@ -1340,6 +1354,8 @@ fn serve(
 
                 *origin.write().unwrap() = Some(url.origin().ascii_serialization());
                 splash.status(window, t!("正在打开界面…", "Opening the interface…"));
+
+                auth.arm(&url);
 
                 let handle = window.app_handle().clone();
                 let window = window.clone();

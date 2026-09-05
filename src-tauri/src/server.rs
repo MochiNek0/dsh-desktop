@@ -5,13 +5,14 @@
 //! signal and the URL the window navigates to. `--no-open` suppresses the
 //! default-browser handoff newer dsh does, since this window is the browser.
 //!
-//! Since dsh 0.1.2 that URL carries a one-time launch token: the window
+//! Since dsh 0.1.2 that URL carries this dsh process's launch token: the window
 //! navigates to `http://127.0.0.1:<port>/?token=<base64url>`, dsh answers 303
 //! to a clean `/` and sets a signed browser cookie. The cookie is bound to the
 //! authority it was minted for and signed with a secret that lives in dsh's
 //! credential store rather than in the process — which is what makes a
 //! same-port restart invisible to a page that is already loaded. See
-//! [`crate::resume`].
+//! [`crate::resume`], and [`crate::auth`] for the webviews the exchange has to
+//! be spelled out to.
 
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
