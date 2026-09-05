@@ -23,7 +23,7 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 
 <br/>
 
-> **Disclaimer**: This is a third-party desktop client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It is not affiliated with, sponsored, or endorsed by DeepSeek.
+> **Disclaimer**: This is a third-party desktop client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It is not affiliated with, sponsored, or endorsed by DeepSeek. It is intended for convenience and personal use — please feel free to open an [Issue](https://github.com/MochiNek0/dsh-desktop/issues) or submit a Pull Request.
 
 ---
 
@@ -33,22 +33,21 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 
 ## Features
 
-- **Out of the Box**: Automatically detects and sets up Node.js and the `dsh` runtime without requiring administrator privileges.
-- **Port Conflict-Free**: Starts on an auto-assigned loopback port, coexisting seamlessly with manual `dsh web` instances.
-- **Native Experience**: Modern frameless UI featuring theme synchronization, a bilingual interface, native system notifications, and auto-start support.
-- **Shared Environment**: Shares the same global `dsh` CLI environment, with startup checks and one-click upgrades.
+- **Out of the Box**: Detects the Node.js installations on your machine and installs `dsh` where needed — no administrator privileges required.
+- **Port Conflict-Free**: `dsh web` listens on an auto-assigned loopback port, coexisting seamlessly with manual instances started from a terminal.
+- **Native Experience**: Frameless window with the controls drawn inside the page; theme and interface language follow the settings dsh itself keeps in `$DSH_HOME/settings.yaml`, and switching the language inside dsh takes effect without a restart. Tray-resident, with optional start at login.
+- **Smart Notifications**: No plugin required — a native notification is raised when a turn finishes, or when dsh is waiting on you (a tool approval, a plan review, a question). Suppressed while the window is in front.
+- **Runtime Management**: A built-in **Runtime** panel enumerates every Node on the machine and lets you switch between them, install dsh into one, or install a fresh Node. Also handles dsh version checks and one-click upgrades.
 - **Plugin Management**: Built-in visual panel to install and remove dsh plugins effortlessly. Alternatively, use the integrated terminal pre-configured with the correct `PATH`.
-- **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit. Automatically offers a restart if `dsh web` crashes unexpectedly.
+- **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit. Returns to the loading page and offers a restart if `dsh web` crashes unexpectedly.
 
 ## Installation
-
-> **Important**: It is recommended to install **v0.1.3 and later versions**, as previous versions may have some known issues. Currently, the application has been verified on **Windows** and **Linux (Debian-based systems)**.
 
 Download the latest release package for your operating system from the **[official website dsh-desktop.cc.cd](https://dsh-desktop.cc.cd/en/)** or the [GitHub Releases page](https://github.com/MochiNek0/dsh-desktop/releases):
 
 | Operating System | Package Format | Details |
 | :--- | :--- | :--- |
-| **Windows** | `.exe` installer | Requires WebView2 (automatically prompted/downloaded if missing) **[Verified]** |
+| **Windows** | `.exe` (NSIS) | Requires WebView2 (automatically prompted/downloaded if missing) **[Verified]** |
 | **macOS** | `.dmg` image | Universal binary supporting both Apple Silicon and Intel **[Unverified, feedback welcome]** |
 | **Linux** | `.AppImage` / `.deb` | `.AppImage` is recommended for built-in self-updater support **[Verified on Debian]** |
 
@@ -59,12 +58,24 @@ Download the latest release package for your operating system from the **[offici
 > xattr -dr com.apple.quarantine /Applications/dsh-desktop.app
 > ```
 
-## Plugins
+## Menu
 
-The app includes a built-in visual plugin panel, allowing you to easily manage dsh plugins without using the command line:
+The titlebar menu (and the tray menu) offers:
 
-- **Visual Management**: Click **Menu → Plugins…** to open the panel. You can install from a preset list, or enter any valid npm package name / GitHub repository (e.g., `github:owner/repo`). 
-- **Terminal Access**: If you prefer the CLI, use **Menu → Open a terminal** to open a shell pre-configured with `dsh` and all necessary environment variables, without modifying your global system PATH.
+| Item | Description |
+| :--- | :--- |
+| **Plugins…** | Open the visual plugin panel |
+| **Open a terminal** | A shell pre-configured with `dsh` and its environment, without modifying your global system PATH |
+| **Restart dsh** | Restart the background `dsh web` process |
+| **Update dsh…** | Check for and install a newer `dsh` |
+| **Runtime…** | Manage Node.js: list, switch, install, or remove |
+| **Check for app updates…** | Check for a newer version of the desktop app itself |
+| **Start at login** / **Notifications** | Toggles |
+| **Quit dsh** | Quit for real (closing the window only parks it in the tray) |
+
+### Plugins
+
+The plugin panel installs from a preset list, or from any valid npm package name / GitHub repository (e.g., `github:owner/repo`).
 
 > **Note on `github:` plugins**: pnpm blocks build scripts from git repositories by default for security. If the installation fails, the panel will show the pnpm output. You will need to open the plugin folder and manually add the package to `allowBuilds` in `$DSH_HOME/profiles/web/pnpm-workspace.yaml`.
 
@@ -74,15 +85,20 @@ The application behavior can be customized via environment variables:
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
-| `DSH_BIN` | Absolute path to the `dsh` executable (highest priority) | Auto-detected from `PATH` |
+| `DSH_BIN` | Absolute path to the `dsh` executable (highest priority; also skips the Node version check) | Auto-detected from `PATH` |
 | `DSH_HOME` | Directory for storing `dsh` data, credentials, and configs | `~/.dsh` |
 
 ## Development & Build
 
 ### Prerequisites
 
-- **Rust**: Stable toolchain (`stable`)
-- **Node.js**: 18.0 or higher
+- **Rust**: Stable toolchain, 1.82 or newer
+- **Node.js**: 22 or newer (build only; CI uses Node 22)
+- **Additional Linux dependencies**:
+  ```sh
+  sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+    librsvg2-dev patchelf libxdo-dev libssl-dev build-essential
+  ```
 
 ### Commands
 
@@ -97,38 +113,39 @@ npm run dev
 npm run build
 ```
 
+Platform-specific bundle targets are merged in automatically from `tauri.linux.conf.json` / `tauri.macos.conf.json` — no extra flags needed.
+
 ## Project Structure
 
 ```text
 dsh-desktop/
 ├── dist/index.html               # Frontend loading and error feedback page
-├── scripts/                      # Dependency setup and runtime packaging scripts
+├── docs/                         # README images
+├── scripts/                      # Bootstrap scripts (install-deps.ps1 / .sh) and build helpers
 ├── src-tauri/
 │   ├── Cargo.toml                # Rust dependencies and build configuration
-│   ├── tauri.*.conf.json         # Platform-specific Tauri configurations
-│   └── src/                      # Rust core (window management, process supervisor, tray, updater)
-└── package.json
+│   ├── tauri.conf.json           # Base configuration (Windows: NSIS)
+│   ├── tauri.{linux,macos}.conf.json  # Platform-specific bundle targets
+│   ├── installer-hooks.nsh       # NSIS install / uninstall hooks
+│   └── src/                      # Rust core (window, process supervisor, tray, plugins, runtime, updater)
+├── updater-proxy/                # Cloudflare Worker proxying the update endpoint
+└── .github/workflows/release.yml # Tag-triggered multi-platform build, signing, and draft release
 ```
 
 ## Notes
 
-- **Network on First Launch**: The app requires an active internet connection on first launch if local components need to be downloaded.
+- **Node.js Requirement**: `dsh` needs Node.js **22.19.0** or newer. If no suitable Node is found, the app opens the **Runtime** panel on launch so you can pick an existing one or install a fresh Node 24.
+- **Network on First Launch**: Neither Node nor `dsh` is bundled in the installer, so the first launch needs an internet connection if the local components are missing.
+- **Closing Parks in the Tray**: Closing the window leaves the app running in the tray (so an in-flight task is not torn down). Use **Quit dsh** in the menu to exit for real.
 - **Auto Update**: Integrated auto-updater support (Linux supports AppImage format only).
 
 ## Links
 
-- **Official Website (English)**: <https://dsh-desktop.cc.cd/en/>
-- **官方网站（中文）**: <https://dsh-desktop.cc.cd/>
-- **GitHub Repository**: <https://github.com/MochiNek0/dsh-desktop>
-- **Downloads / Releases**: <https://github.com/MochiNek0/dsh-desktop/releases>
-- **Issue Tracker**: <https://github.com/MochiNek0/dsh-desktop/issues>
-- **Upstream project — DeepSeek Harness**: <https://github.com/deepseek-ai/deepseek-harness>
+- **Official Website**: [English](https://dsh-desktop.cc.cd/en/) · [中文](https://dsh-desktop.cc.cd/)
+- **GitHub**: [Repository](https://github.com/MochiNek0/dsh-desktop) · [Releases](https://github.com/MochiNek0/dsh-desktop/releases) · [Issues](https://github.com/MochiNek0/dsh-desktop/issues)
+- **Upstream project**: [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 <sub>Keywords: dsh desktop, DeepSeek Harness desktop app, dsh web GUI client, DeepSeek desktop client, Tauri, AI coding agent GUI for Windows / macOS / Linux.</sub>
-
-## Disclaimer
-
-This is a third-party open-source client intended for convenience and personal use. If you encounter any problems or have suggestions, please feel free to open an [Issue](https://github.com/MochiNek0/dsh-desktop/issues) or submit a Pull Request.
 
 ## License
 
