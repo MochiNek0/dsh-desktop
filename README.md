@@ -139,6 +139,12 @@ dsh-desktop/
 - **关闭即最小化**：关闭窗口只会将应用收进托盘（避免中断进行中的任务），真正退出请使用菜单中的「退出 dsh」。
 - **自动更新**：支持桌面端应用自动检查并安装更新（Linux 环境仅支持 AppImage 格式）。
 
+## 友情链接
+
+### DSH Market
+
+[dsh-market](https://github.com/dsh-market/dsh-market)——dsh 里的可视化插件市场：浏览、搜索、一键安装社区插件（2300+ 且每天在涨）。本应用插件面板推荐位的第一条就是它，装完重启 `dsh web`，在「设置 → 插件市场」里打开。[dshmarket.com](https://dshmarket.com)
+
 ## 相关链接
 
 - **官方网站**：[中文](https://dsh-desktop.cc.cd/) · [English](https://dsh-desktop.cc.cd/en/)

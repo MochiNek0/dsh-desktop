@@ -139,6 +139,12 @@ dsh-desktop/
 - **Closing Parks in the Tray**: Closing the window leaves the app running in the tray (so an in-flight task is not torn down). Use **Quit dsh** in the menu to exit for real.
 - **Auto Update**: Integrated auto-updater support (Linux supports AppImage format only).
 
+## Friends
+
+### DSH Market
+
+[dsh-market](https://github.com/dsh-market/dsh-market) — the visual plugin market inside dsh: browse, search and install community plugins (2300+, growing daily) in one click. It is the first entry in this app's recommended plugin list — install it, restart `dsh web`, then open **Settings → Plugin Market**. [dshmarket.com](https://dshmarket.com)
+
 ## Links
 
 - **Official Website**: [English](https://dsh-desktop.cc.cd/en/) · [中文](https://dsh-desktop.cc.cd/)
