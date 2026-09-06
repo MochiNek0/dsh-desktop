@@ -18,13 +18,19 @@
 # ── What has to be configured, once ────────────────────────────────────
 # In this repository's Settings → Secrets and variables → Actions:
 #
-#   SITE_DISPATCH_TOKEN   a fine-grained PAT whose only repository is
-#                         MochiNek0/dsh-desktop-site, with
-#                         Repository permissions → Contents: Read and write.
-#                         That is the permission the repository-dispatch API
-#                         asks for; nothing else needs granting.
+#   SITE_DISPATCH_TOKEN   a token that may POST to the site repository's
+#                         dispatches endpoint. What the REST docs specify for
+#                         it is a *classic* PAT with the `repo` scope — they
+#                         list no fine-grained equivalent for this endpoint.
 #
-# The built-in GITHUB_TOKEN cannot stand in for it: it is scoped to this
+#                         A fine-grained token limited to dsh-desktop-site with
+#                         Contents: read and write does work, and is the
+#                         narrower grant, but it has to be created from the
+#                         MochiNek0 account: fine-grained tokens reach only
+#                         repositories their resource owner owns, so one made
+#                         by a collaborator cannot see that repository at all.
+#
+# The built-in GITHUB_TOKEN cannot stand in for either: it is scoped to this
 # repository and cannot reach another one.
 #
 # If the token is missing or has expired, this job fails on its own — the
