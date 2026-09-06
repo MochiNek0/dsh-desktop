@@ -1,0 +1,56 @@
+# Tell the download site that a release has gone out, so it can rebuild with
+# the new version number, installer sizes and download links.
+#
+# The site bakes all of that into prerendered HTML at build time — deliberately,
+# because its users are the ones who cannot reach GitHub in the first place — so
+# it only learns about a release when something pushes to its repository. This
+# is that something: it asks the site's own `sync-release.yml` to re-run its
+# sync script and commit the result, and Cloudflare Workers Builds deploys on
+# that push.
+#
+# ── Why this is not a step in release.yml ───────────────────────────────
+# That workflow only ever creates a *draft* release, on purpose. The site's
+# sync script ignores drafts and prereleases — as it should, since the updater
+# endpoint points at `releases/latest` — so a dispatch sent from the bundle job
+# would find nothing to sync and would never fire again. The moment that
+# matters is someone pressing Publish, which is what `release: published` is.
+#
+# ── What has to be configured, once ────────────────────────────────────
+# In this repository's Settings → Secrets and variables → Actions:
+#
+#   SITE_DISPATCH_TOKEN   a fine-grained PAT whose only repository is
+#                         MochiNek0/dsh-desktop-site, with
+#                         Repository permissions → Contents: Read and write.
+#                         That is the permission the repository-dispatch API
+#                         asks for; nothing else needs granting.
+#
+# The built-in GITHUB_TOKEN cannot stand in for it: it is scoped to this
+# repository and cannot reach another one.
+#
+# If the token is missing or has expired, this job fails on its own — the
+# release is already out and is not affected, and the site still catches up
+# within 24 hours via its daily download-total commit, which triggers the same
+# rebuild. So a red run here means "the site is up to a day behind", not
+# "the release is broken".
+name: notify site
+
+on:
+  release:
+    types: [published]
+  # For re-sending by hand, e.g. if the token had expired at the time.
+  workflow_dispatch:
+
+# Nothing here touches this repository; the PAT above carries the only
+# permission this job needs.
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ask the site to resync
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/MochiNek0/dsh-desktop-site/dispatches \
+            -f event_type=release-published
