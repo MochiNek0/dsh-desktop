@@ -10,16 +10,6 @@
     "url": "https://github.com/dsh-market/dsh-market"
   },
   {
-    "id": "dsh-better-sidebar",
-    "package": "dsh-better-sidebar",
-    "spec": "github:omdsh-dev/DSH-better-sidebar",
-    "section": "recommended",
-    "name": "DSH Better Sidebar",
-    "description": "类似 VSCode 的右侧边栏（文件树 / 编辑器 / 终端 / git / 浏览器），按会话隔离，并对外提供注册侧边栏页签与文件预览的接口。",
-    "descriptionEn": "A VSCode-like right sidebar (explorer, editor, terminal, git, browser), isolated per session, exposing a service other plugins can register tabs and file viewers with.",
-    "url": "https://github.com/omdsh-dev/DSH-better-sidebar"
-  },
-  {
     "id": "dsh-web-search-free",
     "package": "dsh-web-search-free",
     "spec": "dsh-web-search-free",

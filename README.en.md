@@ -38,7 +38,7 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 - **Native Experience**: Frameless window with the controls drawn inside the page; theme and interface language follow the settings dsh itself keeps in `$DSH_HOME/settings.yaml`, and switching the language inside dsh takes effect without a restart. Tray-resident, with optional start at login.
 - **Smart Notifications**: No plugin required — a native notification is raised when a turn finishes, or when dsh is waiting on you (a tool approval, a plan review, a question). Suppressed while the window is in front.
 - **Runtime Management**: A built-in **Runtime** panel enumerates every Node on the machine and lets you switch between them, install dsh into one, or install a fresh Node. Also handles dsh version checks and one-click upgrades.
-- **Plugin Management**: Built-in visual panel to install and remove dsh plugins effortlessly. Alternatively, use the integrated terminal pre-configured with the correct `PATH`.
+- **Plugin Management**: Built-in visual panel to install and remove dsh plugins effortlessly — [DSH Market](https://github.com/dsh-market/dsh-market) sits first in the recommended list, so the whole community catalogue is one click away. Alternatively, use the integrated terminal pre-configured with the correct `PATH`.
 - **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit. Returns to the loading page and offers a restart if `dsh web` crashes unexpectedly.
 
 ## Installation
