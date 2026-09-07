@@ -49,12 +49,12 @@ use tauri::AppHandle;
 /// name that promised only the finished-turn toast was describing a narrower
 /// switch than the one actually wired up. The menu item says the same thing:
 /// "Notifications", not "Notify when a turn finishes".
+///
+/// The old name is not read as a fallback. Both the switch and the rename
+/// landed before v0.1.7, so no released build ever wrote `notifyOnTurnEnd` and
+/// there is no file in the wild holding one — the fallback only ever covered a
+/// dev build of the branch it was written on.
 const NOTIFY_KEY: &str = "notifications";
-
-/// What the key was called while this was a turn-only switch, still read so a
-/// preference set by an earlier build of this branch is not silently reset. Only
-/// ever read; a write always uses [`NOTIFY_KEY`].
-const NOTIFY_KEY_WAS: &str = "notifyOnTurnEnd";
 
 const NOTIFY_DEFAULT: bool = true;
 
@@ -63,7 +63,6 @@ pub fn notifications(app: &AppHandle) -> bool {
     let document = read(app);
     document
         .get(NOTIFY_KEY)
-        .or_else(|| document.get(NOTIFY_KEY_WAS))
         .and_then(Value::as_bool)
         .unwrap_or(NOTIFY_DEFAULT)
 }
@@ -134,7 +133,9 @@ mod tests {
     use serde_json::{json, Map, Value};
 
     /// The read half of `read`, without the `AppHandle` a test cannot build.
-    /// Kept in step with it by `parses_like_the_reader`, below.
+    /// A copy of it, and nothing pins the two together: a change to how the
+    /// reader treats a document has to be made here as well or these tests go
+    /// on passing against the old behaviour.
     fn parse(text: &str) -> Map<String, Value> {
         match serde_json::from_str::<Value>(text) {
             Ok(Value::Object(map)) => map,
@@ -146,7 +147,6 @@ mod tests {
         let document = parse(text);
         document
             .get(super::NOTIFY_KEY)
-            .or_else(|| document.get(super::NOTIFY_KEY_WAS))
             .and_then(Value::as_bool)
             .unwrap_or(super::NOTIFY_DEFAULT)
     }
@@ -157,25 +157,11 @@ mod tests {
         assert!(notify(r#"{"notifications": true}"#));
     }
 
-    /// The key this was called while it was a turn-only switch still reads, so
-    /// someone who turned notifications off on an earlier build of this branch
-    /// does not find them back on.
+    /// The name this switch had before v0.1.7 is not a fallback: it reads as
+    /// any other key this build does not know, which is to say the default.
     #[test]
-    fn still_reads_the_old_key() {
-        assert!(!notify(r#"{"notifyOnTurnEnd": false}"#));
-        assert!(notify(r#"{"notifyOnTurnEnd": true}"#));
-    }
-
-    /// With both present the current name wins: it is the only one ever
-    /// written, so it is the one that was set most recently.
-    #[test]
-    fn the_current_key_beats_the_old_one() {
-        assert!(notify(
-            r#"{"notifications": true, "notifyOnTurnEnd": false}"#
-        ));
-        assert!(!notify(
-            r#"{"notifications": false, "notifyOnTurnEnd": true}"#
-        ));
+    fn the_name_it_had_first_is_just_an_unknown_key() {
+        assert!(notify(r#"{"notifyOnTurnEnd": false}"#));
     }
 
     /// Every way the file can be unusable ends at the default, because a

@@ -491,6 +491,8 @@ pub fn script() -> String {
     let scheme = crate::controls::SCHEME;
     let font = crate::controls::FONT;
     let dismissed = DISMISSED;
+    let maker = crate::controls::dom_make();
+    let watcher = crate::controls::theme_watcher("dsh-ask-dark");
 
     format!(
         r#"(function () {{
@@ -530,40 +532,9 @@ pub fn script() -> String {
     return row.querySelectorAll('button');
   }}
 
-  function make(tag, className, parent) {{
-    var node = document.createElement(tag);
-    if (className) node.className = className;
-    if (parent) parent.appendChild(node);
-    return node;
-  }}
+{maker}
 
-  // dsh's theme is the page's, not the window's. Read exactly the way the
-  // titlebar and the plugin panel read it; see controls.rs.
-  function paint(node) {{
-    var media = window.matchMedia('(prefers-color-scheme:dark)');
-
-    function dark() {{
-      if (document.body.hasAttribute('data-ds-dark-theme')) return true;
-      var declared = getComputedStyle(document.documentElement).colorScheme || '';
-      var light = declared.indexOf('light') !== -1;
-      var night = declared.indexOf('dark') !== -1;
-      return night !== light ? night : media.matches;
-    }}
-
-    function repaint() {{
-      node.classList.toggle('dsh-ask-dark', dark());
-    }}
-
-    repaint();
-    var watch = new MutationObserver(repaint);
-    watch.observe(document.documentElement, {{
-      attributes: true, attributeFilter: ['style', 'class', 'data-theme']
-    }});
-    watch.observe(document.body, {{
-      attributes: true, attributeFilter: ['style', 'class', 'data-ds-dark-theme']
-    }});
-    media.addEventListener('change', repaint);
-  }}
+{watcher}
 
   function build() {{
     var style = document.createElement('style');

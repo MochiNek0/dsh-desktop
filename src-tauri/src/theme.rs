@@ -59,8 +59,11 @@ pub fn preference() -> Preference {
     read().unwrap_or_default()
 }
 
-/// `None` when the file could not be read at all, which the poll below tells
-/// apart from a file that simply says nothing about the theme.
+/// `None` when the file could not be read at all, which is a different thing
+/// from a file that is readable and says nothing about the theme — that one
+/// answers `Some(default)`. [`preference`] collapses the two, since the default
+/// is the answer either way; the distinction is kept here because this is where
+/// it is still knowable.
 fn read() -> Option<Preference> {
     let text = std::fs::read_to_string(settings_file()?).ok()?;
     Some(parse(&text).unwrap_or_default())
@@ -108,14 +111,26 @@ pub fn settings_file() -> Option<PathBuf> {
     Some(home.join("settings.yaml"))
 }
 
-/// Read `ui-theme.preference` out of the settings document.
+/// One indented field out of one top-level section of the settings document,
+/// unquoted and trimmed. `None` when the section is absent or holds no such
+/// field; `Some("")` when it holds the field with nothing after the colon,
+/// which is a distinction both callers care about.
 ///
-/// Every namespace is a top-level key with its section indented under it, so
-/// the field is the one `preference:` inside the block that starts at column
-/// zero with `ui-theme:` — which is little enough of YAML to be worth reading
-/// directly rather than pulling in a parser for one string.
-fn parse(text: &str) -> Option<Preference> {
-    let mut section = false;
+/// Every namespace in the file is a top-level key with its section indented
+/// under it, so the field wanted is the first `<name>:` inside the block that
+/// starts at column zero with `<section>:`. That is little enough of YAML to
+/// read directly rather than pull in a parser for one string — and the rest of
+/// the file belongs to dsh's plugins, which this has no business parsing.
+///
+/// Public to the crate because two things are read this way: the theme below
+/// and the language in [`crate::i18n`]. It was written out once per caller,
+/// which put the one tricky part — that a `preference:` only counts inside the
+/// right section, and `ui-theme` and `locale` both have one — in two places at
+/// once.
+pub(crate) fn field<'a>(text: &'a str, section: &str, name: &str) -> Option<&'a str> {
+    let heading = format!("{section}:");
+    let key = format!("{name}:");
+    let mut inside = false;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -124,24 +139,31 @@ fn parse(text: &str) -> Option<Preference> {
         }
 
         if !line.starts_with([' ', '\t']) {
-            section = trimmed == "ui-theme:";
+            inside = trimmed == heading;
             continue;
         }
-        if !section {
+        if !inside {
             continue;
         }
 
-        if let Some(value) = trimmed.strip_prefix("preference:") {
-            return match value.trim().trim_matches(['"', '\'']) {
-                "light" => Some(Preference::Light),
-                "dark" => Some(Preference::Dark),
-                "system" => Some(Preference::System),
-                _ => None,
-            };
+        if let Some(value) = trimmed.strip_prefix(&key) {
+            return Some(value.trim().trim_matches(['"', '\'']));
         }
     }
 
     None
+}
+
+/// Read `ui-theme.preference` out of the settings document. Anything the file
+/// says that is not one of the three known values is `None`, the same as
+/// saying nothing.
+fn parse(text: &str) -> Option<Preference> {
+    match field(text, "ui-theme", "preference")? {
+        "light" => Some(Preference::Light),
+        "dark" => Some(Preference::Dark),
+        "system" => Some(Preference::System),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

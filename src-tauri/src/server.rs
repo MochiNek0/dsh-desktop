@@ -260,11 +260,12 @@ fn command(app: &tauri::AppHandle, port: Option<u16>) -> Command {
     // `--port 0` is dsh's own way of saying "any free one"; a number is the one
     // a reconnect is trying to land back on.
     let port = port.map_or_else(|| "0".to_string(), |port| port.to_string());
-    command.args(["web", "--no-open", "--port", &port]);
     // `--no-open` keeps dsh from handing the URL to the system's default
     // browser: this app's own window navigates to it, so a second tab in the
     // user's browser is a leftover from running `dsh web` in a terminal, not
     // something the desktop client wants. Newer dsh defaults to opening it.
+    command.args(["web", "--no-open", "--port", &port]);
+
     // dsh shells out to `node` for workers and plugin tooling, and the shim
     // itself needs one. See `dsh::apply_path`.
     crate::dsh::apply_path(app, &mut command);
