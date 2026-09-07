@@ -653,95 +653,76 @@ fn confirm(app: &AppHandle, choice: &Choice, nodes: &[NodeInfo]) -> bool {
 }
 
 fn act(app: &AppHandle, choice: Choice, nodes: &[NodeInfo], report: &Report) -> Outcome {
-    let result = match choice {
-        Choice::Use(index) => {
-            let Some(node) = nodes.get(index) else {
-                return Outcome::Failed(t!("找不到所选的 Node。", "The chosen Node is gone.").into());
-            };
-            report(t!("正在切换到所选的 Node…", "Switching to the chosen Node…"), -1.0);
-            crate::dsh::run(
-                app,
-                &[
-                    OsStr::new("-Mode"),
-                    OsStr::new("switch"),
-                    OsStr::new("-NodeExe"),
-                    node.path.as_os_str(),
-                ],
-                report,
-            )
-        }
-        Choice::InstallDsh(index) => {
-            let Some(node) = nodes.get(index) else {
-                return Outcome::Failed(t!("找不到所选的 Node。", "The chosen Node is gone.").into());
-            };
-            // Said here rather than left to the script's first `::status`.
-            // Between the confirm dialog closing and that line there is a
-            // PowerShell to start, a 1500-line script to parse and an
-            // `npm prefix -g` to run for the Node's global directory — seconds
-            // in which the card has greyed itself out and said nothing about
-            // why. Every other action below announces itself the same way.
-            report(t!("正在准备安装 dsh…", "Getting ready to install dsh…"), -1.0);
-            crate::dsh::run(
-                app,
-                &[
-                    OsStr::new("-Mode"),
-                    OsStr::new("install-dsh"),
-                    OsStr::new("-NodeExe"),
-                    node.path.as_os_str(),
-                ],
-                report,
-            )
-        }
-        Choice::InstallNode => {
-            // Same gap as `InstallDsh` above: the script's own first line comes
-            // after the mirror speed test has been set up.
-            report(t!("正在准备安装 Node…", "Getting ready to install Node…"), -1.0);
-            crate::dsh::run(app, &[OsStr::new("-Mode"), OsStr::new("install-node")], report)
-        }
-        Choice::UninstallDsh(index) => {
-            let Some(node) = nodes.get(index) else {
-                return Outcome::Failed(t!("找不到所选的 Node。", "The chosen Node is gone.").into());
-            };
-            report(t!("正在卸载 dsh…", "Uninstalling dsh…"), -1.0);
-            crate::dsh::run(
-                app,
-                &[
-                    OsStr::new("-Mode"),
-                    OsStr::new("uninstall-dsh"),
-                    OsStr::new("-NodeExe"),
-                    node.path.as_os_str(),
-                ],
-                report,
-            )
-        }
-        Choice::DeleteNode(index) => {
-            let Some(node) = nodes.get(index) else {
-                return Outcome::Failed(t!("找不到所选的 Node。", "The chosen Node is gone.").into());
-            };
-            report(t!("正在删除这个 Node…", "Deleting that Node…"), -1.0);
-            crate::dsh::run(
-                app,
-                &[
-                    OsStr::new("-Mode"),
-                    OsStr::new("delete-node"),
-                    OsStr::new("-NodeExe"),
-                    node.path.as_os_str(),
-                ],
-                report,
-            )
-        }
-        Choice::RemoveNode => {
-            report(
-                t!("正在删除应用安装的 Node…", "Deleting the app's Node…"),
-                -1.0,
-            );
-            crate::dsh::run(app, &[OsStr::new("-Mode"), OsStr::new("remove-node")], report)
-        }
+    // Every action is a script mode, a line to say while it runs, and — for the
+    // four that work on one Node in the list — which Node. The modes stay
+    // written as `OsStr::new("…")` literals here because
+    // `every_mode_this_module_runs_is_one_the_scripts_take` reads this file
+    // looking for them.
+    let (mode, saying, index) = match choice {
+        Choice::Use(index) => (
+            OsStr::new("switch"),
+            t!("正在切换到所选的 Node…", "Switching to the chosen Node…"),
+            Some(index),
+        ),
+        Choice::InstallDsh(index) => (
+            OsStr::new("install-dsh"),
+            t!("正在准备安装 dsh…", "Getting ready to install dsh…"),
+            Some(index),
+        ),
+        Choice::UninstallDsh(index) => (
+            OsStr::new("uninstall-dsh"),
+            t!("正在卸载 dsh…", "Uninstalling dsh…"),
+            Some(index),
+        ),
+        Choice::DeleteNode(index) => (
+            OsStr::new("delete-node"),
+            t!("正在删除这个 Node…", "Deleting that Node…"),
+            Some(index),
+        ),
+        Choice::InstallNode => (
+            OsStr::new("install-node"),
+            t!("正在准备安装 Node…", "Getting ready to install Node…"),
+            None,
+        ),
+        Choice::RemoveNode => (
+            OsStr::new("remove-node"),
+            t!("正在删除应用安装的 Node…", "Deleting the app's Node…"),
+            None,
+        ),
         // All handled in [`show`] before the action runs.
         Choice::Quit | Choice::Close | Choice::Rescan => return Outcome::Aborted,
     };
 
-    match result {
+    // Resolved before anything is said, the way it was when each arm did this
+    // for itself: an index that no longer names a Node is a list that moved
+    // under the click, and there is nothing to announce or run.
+    let node = match index {
+        Some(index) => match nodes.get(index) {
+            Some(node) => Some(node),
+            None => {
+                return Outcome::Failed(
+                    t!("找不到所选的 Node。", "The chosen Node is gone.").into(),
+                )
+            }
+        },
+        None => None,
+    };
+
+    // Said here rather than left to the script's first `::status`. Between the
+    // confirm dialog closing and that line there is a PowerShell to start and a
+    // 1500-line script to parse, and then more: `install-dsh` runs an
+    // `npm prefix -g` for the Node's global directory, and `install-node` sets
+    // up the mirror speed test. Seconds in which the card has greyed itself out
+    // and said nothing about why.
+    report(saying, -1.0);
+
+    let mut args = vec![OsStr::new("-Mode"), mode];
+    if let Some(node) = node {
+        args.push(OsStr::new("-NodeExe"));
+        args.push(node.path.as_os_str());
+    }
+
+    match crate::dsh::run(app, &args, report) {
         Ok(true) => Outcome::Done,
         Ok(false) => Outcome::Aborted,
         Err(message) => Outcome::Failed(message),
