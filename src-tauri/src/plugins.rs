@@ -789,7 +789,18 @@ fn spec_name(spec: &str) -> Option<String> {
     if spec.is_empty() || spec.contains(['/', '\\', ':']) && !spec.starts_with('@') {
         return None;
     }
-    // A scoped name keeps its leading `@`; the range separator is a later one.
+    without_range(spec)
+}
+
+/// A `name@version` with the version range cut off, or `None` when what is
+/// left is not usable as a name.
+///
+/// A scoped name keeps its leading `@`, so the separator is the *last* one and
+/// only when something precedes it. Shared by [`spec_name`] and
+/// [`pnpm_blamed`]: one reads a spec the user typed and the other a spec pnpm
+/// printed, but `@scope/pkg@1.2.3` has to come apart the same way in both, and
+/// it came apart in two places here before it came apart in one.
+fn without_range(spec: &str) -> Option<String> {
     let name = match spec.rfind('@') {
         Some(at) if at > 0 => &spec[..at],
         _ => spec,
@@ -1079,15 +1090,7 @@ fn pnpm_blamed(line: &str) -> Option<String> {
         return None;
     }
 
-    // A scoped name keeps its leading `@`, so the version separator is the
-    // *last* `@`, and only when something follows the first character.
-    let name = match spec.rfind('@') {
-        Some(at) if at > 0 => &spec[..at],
-        _ => spec,
-    };
-
-    let name = name.trim();
-    (!name.is_empty() && !name.contains(' ')).then(|| name.to_string())
+    without_range(spec)
 }
 
 /// Whether this line is pnpm failing to delete or replace a path.
