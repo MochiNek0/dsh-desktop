@@ -134,7 +134,9 @@ mod tests {
     use serde_json::{json, Map, Value};
 
     /// The read half of `read`, without the `AppHandle` a test cannot build.
-    /// Kept in step with it by `parses_like_the_reader`, below.
+    /// A copy of it, and nothing pins the two together: a change to how the
+    /// reader treats a document has to be made here as well or these tests go
+    /// on passing against the old behaviour.
     fn parse(text: &str) -> Map<String, Value> {
         match serde_json::from_str::<Value>(text) {
             Ok(Value::Object(map)) => map,

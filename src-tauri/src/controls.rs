@@ -95,7 +95,9 @@ pub enum Action {
     UpdateDsh,
     CheckApp,
     Autostart,
-    /// Turn the finished-turn notification on or off; see [`crate::settings`].
+    /// Turn this app's notifications on or off — every one of them, not just
+    /// the finished-turn toast this verb is named after. The gate is in
+    /// `notify::show`, which they all pass through; see [`crate::settings`].
     NotifyTurns,
     Quit,
     /// dsh switched language under a document that is not going to load

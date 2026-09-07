@@ -137,7 +137,7 @@ pub fn script() -> String {
   }}
 
   function row(preset) {{
-    var line = make('label', 'dsh-pp-row dsh-pp-card-row');
+    var line = make('label', 'dsh-pp-row');
 
     var box = make('input', '', line);
     box.type = 'checkbox';
@@ -188,7 +188,7 @@ pub fn script() -> String {
 
   /** One plugin that is already in the profile, and so can be taken out. */
   function holding(item) {{
-    var line = make('label', 'dsh-pp-row dsh-pp-card-row');
+    var line = make('label', 'dsh-pp-row');
 
     var box = make('input', '', line);
     box.type = 'checkbox';

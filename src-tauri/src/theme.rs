@@ -59,8 +59,11 @@ pub fn preference() -> Preference {
     read().unwrap_or_default()
 }
 
-/// `None` when the file could not be read at all, which the poll below tells
-/// apart from a file that simply says nothing about the theme.
+/// `None` when the file could not be read at all, which is a different thing
+/// from a file that is readable and says nothing about the theme — that one
+/// answers `Some(default)`. [`preference`] collapses the two, since the default
+/// is the answer either way; the distinction is kept here because this is where
+/// it is still knowable.
 fn read() -> Option<Preference> {
     let text = std::fs::read_to_string(settings_file()?).ok()?;
     Some(parse(&text).unwrap_or_default())
