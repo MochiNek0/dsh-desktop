@@ -100,36 +100,14 @@ fn dsh_locale() -> Option<String> {
 
 /// Read `locale.preference` out of the settings document.
 ///
-/// The same scan [`crate::theme`] reads `ui-theme.preference` with, for the
-/// same reason: every namespace is a top-level key with its section indented
-/// under it, and one string out of a file whose other sections belong to
-/// plugins is not worth pulling in a YAML parser for. Anything the scan does
-/// not recognise leaves the answer `None`, which is the system locale — what
-/// this did before there was a preference to read.
+/// The same scan [`crate::theme`] reads `ui-theme.preference` with, and now
+/// literally the same one — see [`crate::theme::field`]. A key that is present
+/// but empty is nothing said, which leaves the answer `None`: the system
+/// locale, what this did before there was a preference to read.
 fn parse(text: &str) -> Option<String> {
-    let mut section = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        if !line.starts_with([' ', '\t']) {
-            section = trimmed == "locale:";
-            continue;
-        }
-        if !section {
-            continue;
-        }
-
-        if let Some(value) = trimmed.strip_prefix("preference:") {
-            let value = value.trim().trim_matches(['"', '\'']);
-            return (!value.is_empty()).then(|| value.to_string());
-        }
-    }
-
-    None
+    crate::theme::field(text, "locale", "preference")
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// One string in both languages, Chinese first.
