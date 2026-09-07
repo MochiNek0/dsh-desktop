@@ -23,6 +23,8 @@
 pub fn script() -> String {
     let scheme = crate::controls::SCHEME;
     let font = crate::controls::FONT;
+    let maker = crate::controls::dom_make();
+    let watcher = crate::controls::theme_watcher("dsh-pp-dark");
 
     // One object rather than a literal per string: they are pasted into
     // JavaScript, and a label is one apostrophe away from being a syntax error
@@ -97,12 +99,7 @@ pub fn script() -> String {
     window.location.href = '{scheme}://' + verb;
   }}
 
-  function make(tag, className, parent) {{
-    var node = document.createElement(tag);
-    if (className) node.className = className;
-    if (parent) parent.appendChild(node);
-    return node;
-  }}
+{maker}
 
   function button(parent, text, onclick) {{
     var node = make('button', '', parent);
@@ -309,34 +306,7 @@ pub fn script() -> String {
     signal('plugins-remove?names=' + encodeURIComponent(names.join(',')));
   }}
 
-  // dsh's theme is the page's, not the window's, and the panel is drawn over
-  // the page. Read exactly the way the titlebar reads it -- see controls.rs,
-  // which explains why the media query is only the fallback.
-  function paint(card) {{
-    var media = window.matchMedia('(prefers-color-scheme:dark)');
-
-    function dark() {{
-      if (document.body.hasAttribute('data-ds-dark-theme')) return true;
-      var declared = getComputedStyle(document.documentElement).colorScheme || '';
-      var light = declared.indexOf('light') !== -1;
-      var night = declared.indexOf('dark') !== -1;
-      return night !== light ? night : media.matches;
-    }}
-
-    function repaint() {{
-      card.classList.toggle('dsh-pp-dark', dark());
-    }}
-
-    repaint();
-    var watch = new MutationObserver(repaint);
-    watch.observe(document.documentElement, {{
-      attributes: true, attributeFilter: ['style', 'class', 'data-theme']
-    }});
-    watch.observe(document.body, {{
-      attributes: true, attributeFilter: ['style', 'class', 'data-ds-dark-theme']
-    }});
-    media.addEventListener('change', repaint);
-  }}
+{watcher}
 
   function build() {{
     var style = document.createElement('style');

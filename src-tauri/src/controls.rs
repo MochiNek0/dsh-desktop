@@ -451,16 +451,79 @@ pub fn relabel(app: &AppHandle) {
     );
 }
 
+/// `function make(tag, className, parent)`, for the injected scripts that build
+/// a card out of elements: the titlebar's siblings in [`crate::dialog`],
+/// [`crate::panel`] and [`crate::setup`].
+///
+/// Five lines, and it was five lines written out three times. Not because
+/// anything about it is subtle, but because three copies of a helper is three
+/// places a fourth card would be tempted to copy it from again.
+pub(crate) fn dom_make() -> &'static str {
+    r#"  function make(tag, className, parent) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (parent) parent.appendChild(node);
+    return node;
+  }"#
+}
+
+/// `function paint(node)`, which puts `dark_class` on `node` for as long as
+/// dsh's page is dark and takes it off again when it is not.
+///
+/// dsh's theme is the *page's*, not the window's: it writes `color-scheme` on
+/// the root element and `data-ds-dark-theme` on the body, and switching it
+/// inside the UI changes both without anything reaching the webview's own
+/// `prefers-color-scheme` — which is settled when the window is built (see
+/// [`crate::theme`]) and has nothing to move it afterwards. So every card this
+/// app draws reads the page, and falls back to the media query only where the
+/// page says nothing either way: the loading page, whose `color-scheme` is the
+/// bare `light dark`.
+///
+/// One function because there is one answer. This was written out four times —
+/// once per card — and each copy carried a comment telling the next reader to
+/// keep it in step with the others by hand. Nothing checked that they were, so
+/// a correction to how dsh's theme is read would have been a correction to one
+/// card and a silent divergence in three. `every_card_reads_the_theme_the_same_way`
+/// now pins that they all come from here.
+pub(crate) fn theme_watcher(dark_class: &str) -> String {
+    format!(
+        r#"  function paint(node) {{
+    var media = window.matchMedia('(prefers-color-scheme:dark)');
+
+    function dark() {{
+      if (document.body.hasAttribute('data-ds-dark-theme')) return true;
+      var declared = getComputedStyle(document.documentElement).colorScheme || '';
+      var light = declared.indexOf('light') !== -1;
+      var night = declared.indexOf('dark') !== -1;
+      return night !== light ? night : media.matches;
+    }}
+
+    function repaint() {{
+      node.classList.toggle({dark_class:?}, dark());
+    }}
+
+    repaint();
+    var watch = new MutationObserver(repaint);
+    watch.observe(document.documentElement, {{
+      attributes: true, attributeFilter: ['style', 'class', 'data-theme']
+    }});
+    watch.observe(document.body, {{
+      attributes: true, attributeFilter: ['style', 'class', 'data-ds-dark-theme']
+    }});
+    media.addEventListener('change', repaint);
+  }}"#
+    )
+}
+
 /// The script that draws all of it, injected into every document the window
 /// loads.
 ///
 /// The dots carry their own colour, the same three macOS uses, so there is
 /// nothing about them that has to follow dsh's theme — they read the same
 /// against a light page and a dark one. The menu does not have that luxury: it
-/// is text on a panel, so it follows the theme of the page it is drawn over,
-/// watching the two things dsh's own theme writes onto the document rather than
-/// the webview's `prefers-color-scheme` — which is settled when the window is
-/// built (see `theme`) and does not move when the theme is switched inside dsh.
+/// is text on a panel, so it follows the theme of the page it is drawn over;
+/// see [`theme_watcher`], which is where that reading lives for every card in
+/// the app.
 pub fn script() -> String {
     let titlebar_height = TITLEBAR_HEIGHT;
     let dot = DOT;
@@ -468,6 +531,7 @@ pub fn script() -> String {
     let pad = ROW_PAD;
 
     let labels = labels();
+    let watcher = theme_watcher("dsh-wc-dark");
 
     format!(
         r#"(function () {{
@@ -540,6 +604,11 @@ pub fn script() -> String {
   function signal(verb) {{
     window.location.href = '{SCHEME}://' + verb;
   }}
+
+  // ----------------------------------------------------------- the theme --
+  // Pasted in from `controls::theme_watcher`, which every card in this app
+  // draws its dark mode from; the rationale is there.
+{watcher}
 
   // ------------------------------------------------------------- links --
   function isExternal(url) {{
@@ -875,40 +944,10 @@ pub fn script() -> String {
       attributeFilter: ['lang']
     }});
 
-    // ----------------------------------------------------------- the theme --
-
-    // dsh's theme is the page's, not the window's: it writes `color-scheme` on
-    // the root element and `data-ds-dark-theme` on the body, and switching it
-    // inside the UI changes both without anything reaching the webview's own
-    // `prefers-color-scheme` -- which is fixed when the window is built and has
-    // nothing to move it afterwards. So the menu reads the page, and falls back
-    // to the media query only where the page says nothing either way: the
-    // loading page, whose `color-scheme` is the bare `light dark`.
-    var media = window.matchMedia('(prefers-color-scheme:dark)');
-
-    function dark() {{
-      if (document.body.hasAttribute('data-ds-dark-theme')) return true;
-      var declared = getComputedStyle(document.documentElement).colorScheme || '';
-      var light = declared.indexOf('light') !== -1;
-      var night = declared.indexOf('dark') !== -1;
-      return night !== light ? night : media.matches;
-    }}
-
-    function repaint() {{
-      bar.classList.toggle('dsh-wc-dark', dark());
-    }}
-
     // Before the bar is in the document, so it is never painted the wrong
-    // colour first.
-    repaint();
-    var watch = new MutationObserver(repaint);
-    watch.observe(document.documentElement, {{
-      attributes: true, attributeFilter: ['style', 'class', 'data-theme']
-    }});
-    watch.observe(document.body, {{
-      attributes: true, attributeFilter: ['style', 'class', 'data-ds-dark-theme']
-    }});
-    media.addEventListener('change', repaint);
+    // colour first. `paint` starts watching as well as painting; see
+    // `controls::theme_watcher`.
+    paint(bar);
 
     document.body.appendChild(drag);
     document.body.appendChild(bar);
@@ -1130,6 +1169,54 @@ mod tests {
             action(&Url::parse("dsh-window://close").unwrap()),
             Some(Action::Close)
         ));
+    }
+
+    /// Every card this app draws over dsh's page reads dsh's theme from
+    /// [`theme_watcher`], and none of them from a copy of it.
+    ///
+    /// Written across the four modules on purpose, the way
+    /// `turn::never_reads_this_app_s_own_buttons` is. This was four
+    /// hand-maintained copies of the same twenty lines, each with a comment
+    /// asking the next reader to keep it in step with the others; nothing
+    /// checked that anyone had. A correction to how dsh's theme is read would
+    /// have landed in one card and quietly missed three — the titlebar
+    /// following a theme switch while the dialog over it stayed light.
+    ///
+    /// The assertion is deliberately the whole generated block rather than a
+    /// phrase out of it: a copy that drifts by one line is exactly the failure
+    /// this is here to catch, and matching on a fragment would let it through.
+    #[test]
+    fn every_card_reads_the_theme_the_same_way() {
+        for (what, script, class) in [
+            ("the titlebar", script(), "dsh-wc-dark"),
+            ("a dialog", crate::dialog::script(), "dsh-ask-dark"),
+            ("the plugin panel", crate::panel::script(), "dsh-pp-dark"),
+            ("the runtime chooser", crate::setup::script(), "dsh-su-dark"),
+        ] {
+            assert!(
+                script.contains(&theme_watcher(class)),
+                "{what} must paint itself from `theme_watcher`, not a copy of it"
+            );
+        }
+    }
+
+    /// The three cards built out of elements share one `make`, for the same
+    /// reason: three copies is three places a fourth card copies from.
+    ///
+    /// The titlebar is not in the list. It builds its row by hand and has no
+    /// `make` to share — if it ever grows one, it belongs here too.
+    #[test]
+    fn the_cards_share_one_element_helper() {
+        for (what, script) in [
+            ("a dialog", crate::dialog::script()),
+            ("the plugin panel", crate::panel::script()),
+            ("the runtime chooser", crate::setup::script()),
+        ] {
+            assert!(
+                script.contains(dom_make()),
+                "{what} must build elements with `dom_make`, not a copy of it"
+            );
+        }
     }
 }
 
