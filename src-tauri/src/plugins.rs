@@ -56,7 +56,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::channel;
 use std::sync::Mutex;
@@ -406,6 +406,7 @@ pub fn install(
     })?;
 
     ensure_pnpm(app, log)?;
+    repair(app, log);
 
     log(&t!("正在安装：{}", "Installing: {}", specs.join(" ")));
 
@@ -425,6 +426,11 @@ pub fn install(
     command.args(&specs);
     crate::dsh::apply_path(app, &mut command);
 
+    // Marked for as long as pnpm is in the profile. The `?` on this run and on
+    // the retry below are deliberately not places that clear it: an install the
+    // app killed on its way out is exactly what the next run needs to know
+    // about, and it is the only thing that gets to leave the file behind.
+    mark(app);
     let mut outcome = run(command, log)?;
 
     // A release-age refusal that names only packages this install did not ask
@@ -462,6 +468,10 @@ pub fn install(
         }
     }
 
+    // pnpm exited on its own, whatever it exited with, so the directory is in a
+    // state it chose rather than one it was interrupted in.
+    unmark(app);
+
     match outcome.code {
         0 => {
             log(t!("插件安装完成。", "Plugins installed."));
@@ -490,6 +500,177 @@ pub fn install(
 /// The pnpm error code for a package younger than the `minimumReleaseAge`
 /// cooldown the machine is configured with.
 const RELEASE_AGE: &str = "ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION";
+
+/// Clear what a plugin run that did not finish left behind, before pnpm walks
+/// back into it.
+///
+/// The profile links its plugins into `node_modules` as junctions — dsh sets
+/// `nodeLinker: hoisted`, under which pnpm wants a real directory at that path
+/// and a junction is what it has to replace. Kill pnpm while it is working and
+/// those junctions outlive the virtual store entries they point at, and a
+/// dangling one is a wall pnpm cannot get past on its own: with its target gone
+/// it is no longer a directory, so pnpm clears it the way it clears a file, and
+/// the way to clear a file is `DeleteFileW` — which refuses a *directory* link
+/// with `ERROR_ACCESS_DENIED` however free of locks the path is. Every later
+/// install then fails on that entry, reporting a permission problem that no
+/// amount of closing things fixes.
+///
+/// Reproduced from nothing but a dangling junction, with no dsh running and
+/// nothing holding the path: `pnpm add` under a hoisted linker answers
+/// `failed to clear non-directory dirent at "…": (os error 5)`, and answers it
+/// again forever. See [`unlink`] for the call that does work, and
+/// [`pnpm_stuck`] for the failure as it arrives.
+///
+/// Announced when it finds something, and when the run before this one is known
+/// not to have finished — see [`UNFINISHED`] — because a repair nobody is told
+/// about is indistinguishable from an install that inexplicably worked this
+/// time.
+fn repair(app: &AppHandle, log: &Log) {
+    let unfinished = unfinished(app);
+    if unfinished {
+        log(t!(
+            "上次的插件操作没有正常收尾，先看看 node_modules 里留下了什么…",
+            "The last plugin run did not finish; checking what it left in node_modules…"
+        ));
+    }
+
+    let cleared = sweep(&profile_dir(app).join("node_modules"));
+    if !cleared.is_empty() {
+        log(&t!(
+            "清掉了装到一半留下的断链：{}",
+            "Cleared dangling links from an unfinished install: {}",
+            cleared.join(" ")
+        ));
+    } else if unfinished {
+        log(t!("没有残留需要清理。", "Nothing was left behind."));
+    }
+}
+
+/// Delete every link under `root` whose target is gone, and answer with what
+/// was deleted.
+///
+/// The top level, and one level into each `@scope` directory: that is where a
+/// package is linked in. `.pnpm` — the virtual store below it, thousands of
+/// entries deep — is deliberately not walked. The failure this clears is at the
+/// level pnpm is adding a package to, and a sweep of the store would be a long
+/// walk for a problem nothing has reported.
+fn sweep(root: &Path) -> Vec<String> {
+    let mut cleared = Vec::new();
+
+    for entry in read(root) {
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // A scope is a real directory with the links inside it.
+        if name.starts_with('@') && entry.path().is_dir() {
+            for scoped in read(&entry.path()) {
+                if clear(&scoped.path()) {
+                    cleared.push(format!("{name}/{}", scoped.file_name().to_string_lossy()));
+                }
+            }
+            continue;
+        }
+
+        if clear(&entry.path()) {
+            cleared.push(name);
+        }
+    }
+
+    cleared
+}
+
+/// One entry: deleted if it is a link with nothing at the other end, left alone
+/// otherwise. Answers whether it went.
+fn clear(path: &Path) -> bool {
+    let Ok(link) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+
+    // `exists` follows the link, so one that still resolves answers `true` here
+    // and is none of this function's business: pnpm replaces those itself, and
+    // deleting a working one would take a plugin out from under the user.
+    if !link.file_type().is_symlink() || path.exists() {
+        return false;
+    }
+
+    match unlink(path) {
+        Ok(()) => true,
+        // Reported and not raised: pnpm is about to hit the same path and say
+        // so in its own words, and [`diagnose`] is what turns that into
+        // something the user can act on.
+        Err(error) => {
+            eprintln!(
+                "dsh-desktop: could not clear the dangling link {}: {error}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+/// Remove a link of either kind.
+///
+/// A directory link has to go through `RemoveDirectoryW`, which is
+/// `remove_dir`; `remove_file` is `DeleteFileW` and refuses one. A file link is
+/// the other way round. Both are tried rather than asked about, because asking
+/// needs a platform-specific answer — `FileTypeExt::is_symlink_dir` — and the
+/// fallback does not.
+fn unlink(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path))
+}
+
+/// The entries of a directory that may not be there at all. A `node_modules`
+/// that cannot be read is a profile nothing has installed into yet, which is
+/// not a failure of the sweep.
+fn read(dir: &Path) -> Vec<std::fs::DirEntry> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect()
+}
+
+/// The file that says a pnpm run in this profile did not get to finish.
+///
+/// Written before pnpm starts and removed once it has exited on its own.
+/// What leaves it behind is the one path nothing can clean up from: [`stop`]
+/// kills pnpm because the app is quitting, and the thread that would remove
+/// this is racing the process exit. A file still here on the next run is that
+/// having happened, and the next run's [`repair`] is what it is for.
+///
+/// A spawn that never got pnpm started leaves it too, which is why neither the
+/// file nor the line the panel prints about it claims more than it knows: the
+/// last run did not finish, and the directory is worth a look.
+const UNFINISHED: &str = ".dsh-desktop-unfinished";
+
+fn unfinished(app: &AppHandle) -> bool {
+    profile_dir(app).join(UNFINISHED).is_file()
+}
+
+/// Best effort, and in both directions: a marker that could not be written
+/// costs the next run its announcement, and one that could not be removed costs
+/// it a sweep that finds nothing. Neither is worth failing a plugin run over.
+fn mark(app: &AppHandle) {
+    let dir = profile_dir(app);
+    // No profile yet — dsh creates it on the run that is about to start, and
+    // there is nothing in it for a killed pnpm to leave half-written.
+    if !dir.is_dir() {
+        return;
+    }
+
+    let path = dir.join(UNFINISHED);
+    if let Err(error) = std::fs::write(&path, b"") {
+        eprintln!("dsh-desktop: could not write {}: {error}", path.display());
+    }
+}
+
+fn unmark(app: &AppHandle) {
+    let path = profile_dir(app).join(UNFINISHED);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!("dsh-desktop: could not remove {}: {error}", path.display()),
+    }
+}
 
 /// Whether a hand-typed spec is something this app is willing to install.
 ///
@@ -655,6 +836,17 @@ fn diagnose(app: &AppHandle, outcome: &Outcome, removing: bool) -> String {
                 path
             )
         };
+    }
+
+    // Not split by `removing`, unlike the refusal above: what this says is
+    // about the state of a directory, and that is the same state whichever verb
+    // walked into it.
+    if outcome.stuck {
+        return t!(
+            "pnpm 清不掉 {} 里的一个路径——装到一半留下的断链会这样，这次已经替你清过一遍了。如果还是失败：完全退出 dsh（含托盘图标）后删掉整个 node_modules 再装一次，里面的插件都能从 package.json 装回来。",
+            "pnpm could not clear a path in {} — dangling links from an install that did not finish do this, and this run already swept them once. If it keeps failing: quit dsh completely, tray icon included, then delete the whole node_modules and install again. Everything in it comes back from package.json.",
+            profile_dir(app).join("node_modules").display()
+        );
     }
 
     t!(
@@ -841,6 +1033,11 @@ struct Outcome {
     code: i32,
     codes: HashSet<String>,
     blamed: HashSet<String>,
+    /// Whether the run died on a path it could not delete or replace. Not an
+    /// `ERR_PNPM_*` code, which is why it is a field of its own rather than one
+    /// more entry in `codes`: this failure comes out of pnpm's Rust half, which
+    /// reports an OS error and no code at all. See [`pnpm_stuck`].
+    stuck: bool,
 }
 
 impl Outcome {
@@ -891,6 +1088,37 @@ fn pnpm_blamed(line: &str) -> Option<String> {
 
     let name = name.trim();
     (!name.is_empty() && !name.contains(' ')).then(|| name.to_string())
+}
+
+/// Whether this line is pnpm failing to delete or replace a path.
+///
+/// The one failure in this module that pnpm reports with no error code to
+/// switch on, and the one the panel used to hand over as a bare exit code — a
+/// user who clicked a button being shown `os error 5` and left to work out that
+/// the fix is a directory this app put there.
+///
+/// The first mark is the exact wording of the Windows failure [`repair`]
+/// exists for, and it is the one that carries the case: pnpm wraps the failing
+/// path across several lines, so `os error 5` can arrive split down the middle
+/// — `(os error` on one line and `5)` on the next — while the phrase itself
+/// stays whole. The rest are the same event in the words other parts of pnpm
+/// use: a path that will not go away, whether because it is a directory link on
+/// Windows, because something holds it open, or because the account cannot
+/// write there. All four end at the same advice, which is what makes them one
+/// case rather than four.
+///
+/// `EACCES` is deliberately not among them. It is the store or the npm prefix
+/// being unwritable — a different directory, with a different fix, and
+/// [`crate::dsh::unwritable_prefix`] already names it where it happens.
+fn pnpm_stuck(line: &str) -> bool {
+    const MARKS: [&str; 4] = [
+        "failed to clear non-directory dirent",
+        "os error 5",
+        "EPERM",
+        "EBUSY",
+    ];
+
+    MARKS.iter().any(|mark| line.contains(mark))
 }
 
 /// Run a child to completion, putting every line either stream produces through
@@ -951,10 +1179,12 @@ fn run(mut command: Command, log: &Log) -> Result<Outcome, String> {
 
     let mut codes = HashSet::new();
     let mut blamed = HashSet::new();
+    let mut stuck = false;
     for line in rx {
         eprintln!("[plugin] {line}");
         codes.extend(pnpm_codes(&line));
         blamed.extend(pnpm_blamed(&line));
+        stuck |= pnpm_stuck(&line);
         log(&line);
     }
 
@@ -972,6 +1202,7 @@ fn run(mut command: Command, log: &Log) -> Result<Outcome, String> {
         code: status?.code().unwrap_or(-1),
         codes,
         blamed,
+        stuck,
     })
 }
 
@@ -1112,6 +1343,9 @@ pub fn remove(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String
     })?;
 
     ensure_pnpm(app, log)?;
+    // A removal rewrites `node_modules` exactly as an install does, so it walks
+    // into the same residue and is stopped by it the same way.
+    repair(app, log);
 
     log(&t!("正在卸载：{}", "Removing: {}", names.join(" ")));
 
@@ -1125,6 +1359,8 @@ pub fn remove(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String
         command
     };
 
+    // See `install`: held across both runs, cleared only once pnpm has exited.
+    mark(app);
     let mut outcome = run(removal(), log)?;
 
     // A removal stopped by the release-age cooldown is retried once with the
@@ -1147,6 +1383,8 @@ pub fn remove(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String
         retry.env("PNPM_CONFIG_MINIMUM_RELEASE_AGE", "0");
         outcome = run(retry, log)?;
     }
+
+    unmark(app);
 
     match outcome.code {
         0 => {
@@ -1189,9 +1427,10 @@ pub fn open_directory(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dependencies_of, is_package_spec, parse, pnpm_blamed, pnpm_codes, requested, spec_name,
-        wanted_gone, Outcome, PRESETS, RELEASE_AGE,
+        dependencies_of, is_package_spec, parse, pnpm_blamed, pnpm_codes, pnpm_stuck, requested,
+        spec_name, sweep, wanted_gone, Outcome, PRESETS, RELEASE_AGE,
     };
+    use std::path::{Path, PathBuf};
     use tauri::Url;
 
     fn codes(line: &str) -> Vec<String> {
@@ -1264,6 +1503,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             blamed: Default::default(),
+            stuck: false,
         };
 
         assert!(outcome.flagged(RELEASE_AGE));
@@ -1311,6 +1551,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             blamed: Default::default(),
+            stuck: false,
         };
 
         assert!(!outcome.flagged(RELEASE_AGE));
@@ -1500,6 +1741,129 @@ mod tests {
             "name@file:../payload",
         ] {
             assert!(!is_package_spec(spec), "{spec} is not a package name");
+        }
+    }
+
+    /// The failure this module could not previously say anything about, in the
+    /// words it arrived in — from a Windows machine whose profile still held
+    /// the links of an install that had been killed partway through.
+    #[test]
+    fn a_path_that_will_not_go_away_is_recognised() {
+        assert!(pnpm_stuck(
+            "  ╰─▶ failed to clear non-directory dirent at \"C:\\Users\\me\\.dsh\\profiles\\web\\node_modules\\dsh-web-search-free\": 拒绝访问。 (os error 5)"
+        ));
+        assert!(pnpm_stuck("EPERM: operation not permitted, unlink"));
+        assert!(pnpm_stuck("EBUSY: resource busy or locked, rmdir"));
+
+        // The ordinary output of a run that is going fine, and the one failure
+        // that is explicitly somebody else's: see the note on `pnpm_stuck`.
+        assert!(!pnpm_stuck("Progress: resolved 8, reused 1, downloaded 0, added 0"));
+        assert!(!pnpm_stuck(
+            "Packages are hard linked from the content-addressable store to the virtual store."
+        ));
+        assert!(!pnpm_stuck("EACCES: permission denied, mkdir '/usr/lib/node_modules'"));
+    }
+
+    /// What the sweep is allowed to touch. The dangling link is the residue an
+    /// interrupted install leaves; everything else in a `node_modules` is
+    /// either working or none of its business, and deleting a working link
+    /// would take a plugin out from under the user.
+    #[test]
+    fn clears_only_the_links_whose_target_is_gone() {
+        let scratch = Scratch::new("sweep");
+        let modules = scratch.dir("node_modules");
+
+        // A package linked in the way pnpm links one, with its store entry
+        // still where the link says it is.
+        link_dir(&scratch.dir("store/live"), &modules.join("live"));
+
+        // The same, with the store entry gone: what a killed pnpm leaves.
+        let gone = scratch.dir("store/gone");
+        link_dir(&gone, &modules.join("dangling"));
+        std::fs::remove_dir_all(&gone).expect("the store entry goes");
+
+        // And the scoped shape, which is one level further down.
+        let scoped = scratch.dir("store/scoped");
+        scratch.dir("node_modules/@scope");
+        link_dir(&scoped, &modules.join("@scope").join("dangling"));
+        std::fs::remove_dir_all(&scoped).expect("the store entry goes");
+
+        // Real directories and files, which are not links at all.
+        scratch.dir("node_modules/.pnpm");
+        std::fs::write(modules.join(".modules.yaml"), b"").expect("the state file");
+
+        let mut cleared = sweep(&modules);
+        cleared.sort();
+        assert_eq!(cleared, vec!["@scope/dangling", "dangling"]);
+
+        assert!(std::fs::symlink_metadata(modules.join("dangling")).is_err());
+        assert!(
+            std::fs::symlink_metadata(modules.join("@scope").join("dangling")).is_err(),
+            "the scoped link is still there"
+        );
+        assert!(modules.join("live").is_dir(), "a working link was deleted");
+        assert!(modules.join(".pnpm").is_dir());
+        assert!(modules.join(".modules.yaml").is_file());
+    }
+
+    /// Link a directory the way pnpm links a package into `node_modules`.
+    ///
+    /// A junction on Windows, and not by preference: `symlink_dir` there needs
+    /// a privilege a test runner does not have, `mklink /J` needs none — and a
+    /// junction is what pnpm actually creates, so it is also the case worth
+    /// testing. It is the one `remove_file` cannot delete.
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("the link");
+
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .expect("mklink runs");
+            assert!(
+                made.status.success(),
+                "mklink /J {} {}: {}{}",
+                link.display(),
+                target.display(),
+                String::from_utf8_lossy(&made.stdout),
+                String::from_utf8_lossy(&made.stderr)
+            );
+        }
+    }
+
+    /// A directory of this test's own, gone again when it ends. Built on disk,
+    /// because what [`sweep`] answers is a question about links, and a link
+    /// only exists on one.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let unique = format!("dsh-plugins-{name}-{}", std::process::id());
+            let dir = std::env::temp_dir().join(unique);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch directory under the temp dir");
+            Self(dir)
+        }
+
+        /// One component at a time, because these paths are handed to `mklink`
+        /// below and cmd refuses a forward slash in one — which `join` would
+        /// otherwise leave in the middle of the path on Windows.
+        fn dir(&self, path: &str) -> PathBuf {
+            let dir = path
+                .split('/')
+                .fold(self.0.clone(), |dir, part| dir.join(part));
+            std::fs::create_dir_all(&dir).expect("the directory");
+            dir
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 }
