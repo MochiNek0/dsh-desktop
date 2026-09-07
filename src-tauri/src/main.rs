@@ -1122,22 +1122,26 @@ fn show_plugins(app: &tauri::AppHandle, session: &Session, first: bool) {
     session.splash.plugins(&window, &plugins::listing(app), first);
 }
 
-/// Install what the panel asked for, with `dsh web` down for the duration.
+/// Run one pnpm job against the profile with `dsh web` down for the duration,
+/// reporting onto the panel.
 ///
-/// It has to come down: pnpm is about to rewrite the profile directory the
-/// running server read its plugins out of. It also has to come back up
-/// afterwards, which is what leaving the panel does — the new plugins are only
-/// in the window once dsh has been started again to load them.
-fn install_plugins(app: &tauri::AppHandle, ids: Vec<String>, spec: Option<String>) {
+/// The server has to come down: pnpm is about to rewrite the profile directory
+/// the running server read its plugins out of. It also has to come back up
+/// afterwards, which is what leaving the panel does — a change to the profile
+/// is only in the window once dsh has been started again to load it.
+///
+/// Installing and removing were two copies of this, differing in three strings
+/// and the one line that does the work. The copies are the reason it is worth
+/// naming what they shared: the [`BUSY`] claim has to be taken on this thread
+/// and released by the [`Busy`] guard on the spawned one, and a second job
+/// slipping between those two would be a pnpm rewriting the directory the
+/// first one is reading.
+fn change_plugins<F>(app: &tauri::AppHandle, busy: &str, done: &'static str, work: F)
+where
+    F: FnOnce(&tauri::AppHandle, &plugins::Log<'_>) -> Result<(), String> + Send + 'static,
+{
     if BUSY.swap(true, Ordering::SeqCst) {
-        dsh::note(
-            app,
-            t!("请稍等", "One moment"),
-            t!(
-                "dsh 正在启动或更新中，等它忙完再装插件。",
-                "dsh is starting or updating; wait for that to finish before installing plugins."
-            ),
-        );
+        dsh::note(app, t!("请稍等", "One moment"), busy);
         return;
     }
 
@@ -1153,66 +1157,47 @@ fn install_plugins(app: &tauri::AppHandle, ids: Vec<String>, spec: Option<String
         stop_server(&session);
 
         let log = |line: &str| session.splash.plugin_log(&window, line);
-        match plugins::install(&app, &ids, spec.as_deref(), &log) {
+        match work(&app, &log) {
             Ok(()) => {
                 session.splash.plugin_lists(&window, &plugins::listing(&app));
-                session.splash.plugin_done(
-                    &window,
-                    true,
-                    t!(
-                        "装好了。回到 dsh 时会重新启动它，插件在那之后生效。",
-                        "Done. dsh restarts on the way back, and the plugins take effect then."
-                    ),
-                );
+                session.splash.plugin_done(&window, true, done);
             }
             Err(error) => session.splash.plugin_done(&window, false, &error),
         }
     });
 }
 
-/// Take the ticked plugins out again, with `dsh web` down for the duration and
-/// for the same reason the install takes it down: pnpm is about to rewrite the
-/// directory the running server read them out of.
+/// Install what the panel asked for: the ticked presets, and whatever was
+/// typed into its box.
+fn install_plugins(app: &tauri::AppHandle, ids: Vec<String>, spec: Option<String>) {
+    change_plugins(
+        app,
+        t!(
+            "dsh 正在启动或更新中，等它忙完再装插件。",
+            "dsh is starting or updating; wait for that to finish before installing plugins."
+        ),
+        t!(
+            "装好了。回到 dsh 时会重新启动它，插件在那之后生效。",
+            "Done. dsh restarts on the way back, and the plugins take effect then."
+        ),
+        move |app, log| plugins::install(app, &ids, spec.as_deref(), log),
+    );
+}
+
+/// Take the ticked plugins out again.
 fn remove_plugins(app: &tauri::AppHandle, names: Vec<String>) {
-    if BUSY.swap(true, Ordering::SeqCst) {
-        dsh::note(
-            app,
-            t!("请稍等", "One moment"),
-            t!(
-                "dsh 正在启动或更新中，等它忙完再动插件。",
-                "dsh is starting or updating; wait for that to finish before changing plugins."
-            ),
-        );
-        return;
-    }
-
-    let session = app.state::<Session>().inner().clone();
-    let app = app.clone();
-
-    std::thread::spawn(move || {
-        let _busy = Busy;
-        let Some(window) = app.get_webview_window("main") else {
-            return;
-        };
-
-        stop_server(&session);
-
-        let log = |line: &str| session.splash.plugin_log(&window, line);
-        match plugins::remove(&app, &names, &log) {
-            Ok(()) => {
-                session.splash.plugin_lists(&window, &plugins::listing(&app));
-                session.splash.plugin_done(
-                    &window,
-                    true,
-                    t!(
-                        "卸载完成。回到 dsh 时会重新启动它。",
-                        "Removed. dsh restarts on the way back."
-                    ),
-                );
-            }
-            Err(error) => session.splash.plugin_done(&window, false, &error),
-        }
-    });
+    change_plugins(
+        app,
+        t!(
+            "dsh 正在启动或更新中，等它忙完再动插件。",
+            "dsh is starting or updating; wait for that to finish before changing plugins."
+        ),
+        t!(
+            "卸载完成。回到 dsh 时会重新启动它。",
+            "Removed. dsh restarts on the way back."
+        ),
+        move |app, log| plugins::remove(app, &names, log),
+    );
 }
 
 /// Leave the panel: back to dsh, starting it if it is not running.
