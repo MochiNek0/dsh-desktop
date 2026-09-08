@@ -215,7 +215,13 @@ fn preset_file(app: &AppHandle) -> Option<PathBuf> {
 /// See `dist/index.html`.
 pub fn listing(app: &AppHandle) -> String {
     let presets = presets(app);
-    let installed = installed(app);
+    // One read and one parse for both questions below. They used to be a call
+    // apiece, each opening the profile manifest for itself — and pnpm is free
+    // to rewrite that directory between two reads of it, which would build the
+    // list of what can go in and the list of what is in out of two different
+    // files.
+    let manifest = profile_manifest(app);
+    let installed = installed_in(&manifest);
 
     // A preset already on the machine is not something to offer again; it is
     // listed below instead, where it can be taken off.
@@ -238,7 +244,7 @@ pub fn listing(app: &AppHandle) -> String {
     // What pnpm put there, which is the whole of what it can take away again.
     // Carrying the preset's own label where the list knows one, so a plugin
     // reads the same on the way out as it did on the way in.
-    let held: Vec<serde_json::Value> = dependencies(app)
+    let held: Vec<serde_json::Value> = dependencies_in(&manifest)
         .into_iter()
         .map(|(name, version)| {
             let label = presets
@@ -258,24 +264,30 @@ pub fn listing(app: &AppHandle) -> String {
     .to_string()
 }
 
+/// The profile manifest, read and parsed once.
+///
+/// `Value::Null` for a profile that is not there yet, or a manifest that is not
+/// JSON — which both readers below answer as an empty profile, the same as the
+/// separate reads they replaced did.
+fn profile_manifest(app: &AppHandle) -> serde_json::Value {
+    std::fs::read_to_string(profile_dir(app).join("package.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 /// What pnpm was asked to install: every dependency, with the range recorded.
 ///
-/// `dsh.profile.bundles` is deliberately not read here, though [`installed`]
+/// `dsh.profile.bundles` is deliberately not read here, though [`installed_in`]
 /// reads both: `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` are on
 /// that list and are not plugins. Offering to remove the profile's own
 /// foundation would be offering to break it.
 fn dependencies(app: &AppHandle) -> Vec<(String, String)> {
-    std::fs::read_to_string(profile_dir(app).join("package.json"))
-        .map(|raw| dependencies_of(&raw))
-        .unwrap_or_default()
+    dependencies_in(&profile_manifest(app))
 }
 
-fn dependencies_of(manifest: &str) -> Vec<(String, String)> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(manifest) else {
-        return Vec::new();
-    };
-
-    value
+fn dependencies_in(manifest: &serde_json::Value) -> Vec<(String, String)> {
+    manifest
         .get("dependencies")
         .and_then(serde_json::Value::as_object)
         .map(|deps| {
@@ -294,14 +306,7 @@ fn dependencies_of(manifest: &str) -> Vec<(String, String)> {
 /// `dsh.profile.bundles` is the layer stack dsh reconciled out of that — a
 /// plugin is in the first and, once dsh has seen it declare `dsh.bundle`, the
 /// second. Reading both means an entry matches whichever name it went in under.
-fn installed(app: &AppHandle) -> HashSet<String> {
-    let Ok(raw) = std::fs::read_to_string(profile_dir(app).join("package.json")) else {
-        return HashSet::new();
-    };
-    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return HashSet::new();
-    };
-
+fn installed_in(manifest: &serde_json::Value) -> HashSet<String> {
     let dependencies = manifest
         .get("dependencies")
         .and_then(serde_json::Value::as_object)
@@ -1430,11 +1435,19 @@ pub fn open_directory(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dependencies_of, is_package_spec, parse, pnpm_blamed, pnpm_codes, pnpm_stuck, requested,
+        dependencies_in, is_package_spec, parse, pnpm_blamed, pnpm_codes, pnpm_stuck, requested,
         spec_name, sweep, wanted_gone, Outcome, PRESETS, RELEASE_AGE,
     };
     use std::path::{Path, PathBuf};
     use tauri::Url;
+
+    /// `dependencies_in` reads a parsed manifest now, because `listing` parses
+    /// the file once and asks it two questions. What a manifest that will not
+    /// parse at all comes out as is `profile_manifest`'s answer — `Value::Null`
+    /// — which is what this hands over for the unparseable cases below.
+    fn dependencies_of(manifest: &str) -> Vec<(String, String)> {
+        dependencies_in(&serde_json::from_str(manifest).unwrap_or(serde_json::Value::Null))
+    }
 
     fn codes(line: &str) -> Vec<String> {
         pnpm_codes(line).collect()
