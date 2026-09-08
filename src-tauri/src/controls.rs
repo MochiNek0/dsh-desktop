@@ -57,11 +57,12 @@
 //! that hands a target to the system, and [`crate::plugins::is_package_spec`]
 //! for the one that installs a package.
 //!
-//! Four things travel the other way, each pushed rather than asked for, because
+//! Five things travel the other way, each pushed rather than asked for, because
 //! the page has no way to see any of them: whether the window is maximised
-//! ([`sync`]), whether the login item is on ([`sync_autostart`]), the menu's own
-//! labels when dsh changes language under it ([`relabel`]), and whatever
-//! slow thing is running right now ([`busy`]).
+//! ([`sync`]), whether the login item is on ([`sync_autostart`]), whether
+//! notifications are ([`sync_notify`]), the menu's own labels when dsh changes
+//! language under it ([`relabel`]), and whatever slow thing is running right
+//! now ([`busy`]).
 
 use tauri::{AppHandle, Manager, Url, WebviewWindow};
 use tauri_plugin_autostart::ManagerExt;

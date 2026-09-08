@@ -332,15 +332,21 @@ fn installed_in(manifest: &serde_json::Value) -> HashSet<String> {
 /// the answer has to be worked out the way dsh works it out — not read off
 /// anything of ours.
 pub fn profile_dir(app: &AppHandle) -> PathBuf {
-    dsh_home(app).join("profiles").join(PROFILE)
+    // Taken and not used, and the one place in this module that is true. The
+    // answer is `$DSH_HOME`, which is dsh's and is read straight off the
+    // environment — nothing about it comes from this app's own state. The
+    // handle stays in the signature because every other path here is asked
+    // for one and a dozen call sites would otherwise split into two shapes for
+    // no gain; `dsh_home` below, which has one caller, does without it.
+    let _ = app;
+    dsh_home().join("profiles").join(PROFILE)
 }
 
-fn dsh_home(app: &AppHandle) -> PathBuf {
+fn dsh_home() -> PathBuf {
     if let Some(home) = std::env::var_os("DSH_HOME") {
         return PathBuf::from(home);
     }
 
-    let _ = app;
     #[allow(deprecated)]
     std::env::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
