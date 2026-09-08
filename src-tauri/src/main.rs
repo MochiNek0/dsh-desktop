@@ -572,6 +572,25 @@ fn is_ours(url: &Url, origin: &Origin) -> bool {
 /// joining in.
 static BUSY: AtomicBool = AtomicBool::new(false);
 
+/// Whether the plugin panel is on screen.
+///
+/// The two verbs it sends are the only ones in [`controls::Action`] that stop
+/// dsh and run a package manager, and they were the only ones a panel had never
+/// had to be open for. Their neighbours all have this door: `setup::answered`
+/// does nothing unless the chooser has a thread waiting on it, and
+/// `dialog::answered` checks the token it handed the dialog it drew. So any
+/// script on dsh's page — a plugin's included — could take the server down and
+/// put a package into the profile with the panel never having been opened, and
+/// all the user would see is dsh disappearing.
+///
+/// Not a token, which `controls` explains cannot work here: the scripts that
+/// draw the panel share a JavaScript context with dsh's own code, so anything
+/// handed to them is readable by the page. Whether the panel is up is the one
+/// part of the question this side knows on its own, and it is the part that
+/// narrows the verbs from "any script, any time" to "while the user is looking
+/// at the panel".
+static PANEL: AtomicBool = AtomicBool::new(false);
+
 /// Clears [`BUSY`] however the thread holding it ends, including the early
 /// returns for an app that is quitting.
 struct Busy;
@@ -1119,6 +1138,7 @@ fn show_plugins(app: &tauri::AppHandle, session: &Session, first: bool) {
         return;
     };
 
+    PANEL.store(true, Ordering::SeqCst);
     session.splash.plugins(&window, &plugins::listing(app), first);
 }
 
@@ -1140,6 +1160,14 @@ fn change_plugins<F>(app: &tauri::AppHandle, busy: &str, done: &'static str, wor
 where
     F: FnOnce(&tauri::AppHandle, &plugins::Log<'_>) -> Result<(), String> + Send + 'static,
 {
+    // No panel, nobody asked. Silently, the way `setup::answered` drops an
+    // answer nothing is waiting for: a note here would be a dialog any script
+    // could raise at will. See [`PANEL`].
+    if !PANEL.load(Ordering::SeqCst) {
+        eprintln!("dsh-desktop: a plugin change arrived with no panel open; ignored");
+        return;
+    }
+
     if BUSY.swap(true, Ordering::SeqCst) {
         dsh::note(app, t!("请稍等", "One moment"), busy);
         return;
@@ -1223,6 +1251,7 @@ fn leave_plugins(app: &tauri::AppHandle) {
         // note is a dialog, drawn *under* this panel, so what the user saw was a
         // button that did nothing. Closing the panel conflicts with nothing; it
         // is only the dsh underneath that one thread at a time may drive.
+        PANEL.store(false, Ordering::SeqCst);
         session.splash.plugin_hide(&window);
 
         // Which leaves the question this was really guarding: is there a dsh to
