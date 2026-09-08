@@ -35,10 +35,10 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 
 - **Out of the Box**: Detects the Node.js installations on your machine and installs `dsh` where needed — no administrator privileges required.
 - **Port Conflict-Free**: `dsh web` listens on an auto-assigned loopback port, coexisting seamlessly with manual instances started from a terminal.
-- **Native Experience**: Frameless window with the controls drawn inside the page; theme and interface language follow the settings dsh itself keeps in `$DSH_HOME/settings.yaml`, and switching the language inside dsh takes effect without a restart. Tray-resident, with optional start at login.
+- **Native Experience**: Frameless window with the controls drawn inside the page; theme and interface language follow the settings dsh itself keeps in `$DSH_HOME/settings.yaml`, and switching either inside dsh takes effect without a restart — `system` included, which then follows the desktop. Tray-resident, with optional start at login.
 - **Smart Notifications**: No plugin required — a native notification is raised when a turn finishes, or when dsh is waiting on you (a tool approval, a plan review, a question). Suppressed while the window is in front.
-- **Runtime Management**: A built-in **Runtime** panel enumerates every Node on the machine and lets you switch between them, install dsh into one, or install a fresh Node. Also handles dsh version checks and one-click upgrades.
-- **Plugin Management**: Built-in visual panel to install and remove dsh plugins effortlessly — [DSH Market](https://github.com/dsh-market/dsh-market) sits first in the recommended list, so the whole community catalogue is one click away. Alternatively, use the integrated terminal pre-configured with the correct `PATH`.
+- **Runtime Management**: A built-in **Runtime** panel enumerates every Node on the machine and lets you switch between them, install or uninstall dsh in one, install a fresh Node, or delete a Node you no longer need. Also handles dsh version checks and one-click upgrades.
+- **Plugin Management**: Built-in visual panel to install and remove dsh plugins without a terminal; [DSH Market](#dsh-market) sits first in the recommended list.
 - **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit. Returns to the loading page and offers a restart if `dsh web` crashes unexpectedly.
 
 ## Installation
@@ -60,7 +60,7 @@ Download the latest release package for your operating system from the **[offici
 
 ## Menu
 
-The titlebar menu (and the tray menu) offers:
+The titlebar menu offers the following (the tray menu has only **Show window** and **Quit dsh**):
 
 | Item | Description |
 | :--- | :--- |
@@ -71,7 +71,7 @@ The titlebar menu (and the tray menu) offers:
 | **Runtime…** | Manage Node.js: list, switch, install, or remove |
 | **Check for app updates…** | Check for a newer version of the desktop app itself |
 | **Start at login** / **Notifications** | Toggles |
-| **Quit dsh** | Quit for real (closing the window only parks it in the tray) |
+| **Quit dsh** | Quit the app for real |
 
 ### Plugins
 
@@ -127,9 +127,10 @@ dsh-desktop/
 │   ├── tauri.conf.json           # Base configuration (Windows: NSIS)
 │   ├── tauri.{linux,macos}.conf.json  # Platform-specific bundle targets
 │   ├── installer-hooks.nsh       # NSIS install / uninstall hooks
+│   ├── resources/                # Bundled resources (preset-plugins.json is the panel's preset list)
 │   └── src/                      # Rust core (window, process supervisor, tray, plugins, runtime, updater)
 ├── updater-proxy/                # Cloudflare Worker proxying the update endpoint
-└── .github/workflows/release.yml # Tag-triggered multi-platform build, signing, and draft release
+└── .github/workflows/            # release.yml (tag-triggered build, signing, draft release) and notify-site.yml
 ```
 
 ## Notes
@@ -137,13 +138,13 @@ dsh-desktop/
 - **Node.js Requirement**: `dsh` needs Node.js **22.19.0** or newer. If no suitable Node is found, the app opens the **Runtime** panel on launch so you can pick an existing one or install a fresh Node 24.
 - **Network on First Launch**: Neither Node nor `dsh` is bundled in the installer, so the first launch needs an internet connection if the local components are missing.
 - **Closing Parks in the Tray**: Closing the window leaves the app running in the tray (so an in-flight task is not torn down). Use **Quit dsh** in the menu to exit for real.
-- **Auto Update**: Integrated auto-updater support (Linux supports AppImage format only).
+- **Auto Update**: The app checks for a new version silently on launch and speaks up only when there is one; nothing is downloaded without asking. A manual check lives in the menu.
 
 ## Friends
 
 ### DSH Market
 
-[dsh-market](https://github.com/dsh-market/dsh-market) — the visual plugin market inside dsh: browse, search and install community plugins (2300+, growing daily) in one click. It is the first entry in this app's recommended plugin list — install it, restart `dsh web`, then open **Settings → Plugin Market**. [dshmarket.com](https://dshmarket.com)
+[dsh-market](https://github.com/dsh-market/dsh-market) — the visual plugin market inside dsh: browse, search and install community plugins in one click. Install it, restart `dsh web`, then open **Settings → Plugin Market**. [dshmarket.com](https://dshmarket.com)
 
 ## Links
 

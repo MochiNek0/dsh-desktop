@@ -35,10 +35,10 @@ DeepSeek Harness (`dsh web`) 的跨平台 Tauri 桌面客户端
 
 - **开箱即用**：自动检测机器上的 Node.js 并按需安装 `dsh`，全程无需管理员权限。
 - **无感共存**：`dsh web` 监听动态分配的回环端口，与终端里手动运行的实例互不干扰。
-- **轻量原生**：无边框窗口、窗口控件内嵌于页面；主题与界面语言跟随 dsh 自身设置（`$DSH_HOME/settings.yaml`），在 dsh 里切换语言无需重启。支持托盘常驻与开机自启。
+- **轻量原生**：无边框窗口、窗口控件内嵌于页面；主题与界面语言跟随 dsh 自身设置（`$DSH_HOME/settings.yaml`），在 dsh 里切换语言或主题（含 `system` 跟随系统）都无需重启。支持托盘常驻与开机自启。
 - **智能通知**：无需安装任何插件，回合结束、或 dsh 在等待你确认（工具授权、计划评审、提问）时自动发出系统通知；窗口在前台时自动静默。
-- **环境管理**：内置「运行环境」面板，可枚举机器上的所有 Node、切换所用版本、就地安装 dsh 或安装一份全新 Node；并提供 dsh 版本检查与一键升级。
-- **插件管理**：可视化插件面板，无需终端即可一键安装/卸载插件，推荐位首条即 [DSH Market](https://github.com/dsh-market/dsh-market) 插件市场，装上后在 dsh 里浏览搜索社区插件；同时提供自带正确环境的终端入口，不污染系统全局 PATH。
+- **环境管理**：内置「运行环境」面板，可枚举机器上的所有 Node，在其间切换、就地安装或卸载 dsh、安装一份全新 Node，也可删除不再需要的 Node；并提供 dsh 版本检查与一键升级。
+- **插件管理**：可视化插件面板，无需终端即可一键安装/卸载插件；推荐位首条是 [DSH Market](#dsh-market) 插件市场。
 - **稳定守护**：单实例运行，应用退出时自动回收所有关联子进程；`dsh web` 意外退出时返回加载页并提供重启。
 
 ## 安装与下载
@@ -60,7 +60,7 @@ DeepSeek Harness (`dsh web`) 的跨平台 Tauri 桌面客户端
 
 ## 菜单功能
 
-窗口标题栏的菜单（以及托盘菜单）提供以下入口：
+窗口标题栏的菜单提供以下入口（托盘菜单只有「显示窗口」与「退出 dsh」）：
 
 | 菜单项 | 说明 |
 | :--- | :--- |
@@ -71,7 +71,7 @@ DeepSeek Harness (`dsh web`) 的跨平台 Tauri 桌面客户端
 | **运行环境…** | 管理 Node.js：查看、切换、安装或删除 |
 | **检查应用更新…** | 检查桌面端自身的新版本 |
 | **开机自启动** / **通知** | 开关项 |
-| **退出 dsh** | 真正退出（直接关闭窗口只会收进托盘） |
+| **退出 dsh** | 真正退出应用 |
 
 ### 插件
 
@@ -127,9 +127,10 @@ dsh-desktop/
 │   ├── tauri.conf.json           # 基础配置（Windows: NSIS）
 │   ├── tauri.{linux,macos}.conf.json  # 平台专属打包目标
 │   ├── installer-hooks.nsh       # NSIS 安装 / 卸载钩子
+│   ├── resources/                # 随包资源（preset-plugins.json 是插件面板的预设列表）
 │   └── src/                      # Rust 后端源码（窗口、进程托管、托盘、插件、运行环境、更新）
 ├── updater-proxy/                # Cloudflare Worker：更新检查端点代理
-└── .github/workflows/release.yml # 打 tag 后的多平台构建、签名与草稿发布
+└── .github/workflows/            # release.yml：打 tag 后的多平台构建、签名与草稿发布；notify-site.yml：通知下载站
 ```
 
 ## 注意事项
@@ -137,13 +138,13 @@ dsh-desktop/
 - **Node.js 版本要求**：`dsh` 需要 Node.js **22.19.0** 或更高版本。若机器上没有满足要求的 Node，应用会在启动时弹出「运行环境」面板，可从中选择一个已有的 Node，或安装一份全新的 Node 24。
 - **首次启动联网**：安装包不内置 Node 与 `dsh`，首次启动时若未检测到本地环境，需联网拉取，请保持网络连通。
 - **关闭即最小化**：关闭窗口只会将应用收进托盘（避免中断进行中的任务），真正退出请使用菜单中的「退出 dsh」。
-- **自动更新**：支持桌面端应用自动检查并安装更新（Linux 环境仅支持 AppImage 格式）。
+- **自动更新**：启动时静默检查桌面端新版本，只在有更新时提示，下载前会先征求同意；也可从菜单手动检查。
 
 ## 友情链接
 
 ### DSH Market
 
-[dsh-market](https://github.com/dsh-market/dsh-market)——dsh 里的可视化插件市场：浏览、搜索、一键安装社区插件（2300+ 且每天在涨）。本应用插件面板推荐位的第一条就是它，装完重启 `dsh web`，在「设置 → 插件市场」里打开。[dshmarket.com](https://dshmarket.com)
+[dsh-market](https://github.com/dsh-market/dsh-market)——dsh 里的可视化插件市场：社区插件在这里浏览、搜索、一键安装。装完重启 `dsh web`，在「设置 → 插件市场」里打开。[dshmarket.com](https://dshmarket.com)
 
 ## 相关链接
 
