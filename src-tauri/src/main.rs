@@ -165,8 +165,6 @@ fn main() {
 
             build_tray(app.handle())?;
 
-            theme::paint(&window, preference);
-
             boot(app.handle().clone(), window, session);
 
             Ok(())
@@ -211,14 +209,27 @@ fn build_window(
         // the screen in front of the user — and the only thing it bought was
         // not having to move a window that opens where it can be seen anyway.
         .center()
-        .visible(visible)
+        // Never at build time, even when this launch wants a window. WebView2
+        // takes its default background from the options the controller is
+        // created with, and Tauri only reaches that through the builder — which
+        // cannot be told the answer for `system`, since resolving that needs a
+        // window to ask. So the window is built hidden, painted below once it
+        // exists and can be asked, and shown after. Built visible, it opened on
+        // the controller's own white and turned dark a frame or two later,
+        // which is the flash this avoids.
+        .visible(false)
         // No frame: minimise, maximise and close are drawn into the page by
         // `controls`, which carries its own colours and so needs nothing out
         // here to repaint it when dsh changes theme.
         .decorations(false)
-        // Still set, even without a frame to paint: it is what the webview
-        // resolves `prefers-color-scheme` against, so the loading page opens in
-        // the theme dsh is about to show.
+        // Not a frame colour — there is no frame — but the answer every media
+        // query in the webview gets, dsh's own included: tauri-runtime-wry
+        // creates the webview with `with_theme(window.theme())`, so this is the
+        // earliest hook there is, and every later change goes through
+        // `set_theme`. `None` is `system`, which leaves it with the desktop.
+        // See the module docs in [`theme`] for why it is dsh's preference and
+        // not the desktop that answers, and `theme::watch` for what keeps it
+        // true after the launch.
         .theme(preference.window())
         // Tauri replaces WebView2's drag-drop handler by default and routes the
         // events to its own `DragDropEvent` — which has the side effect of
@@ -229,7 +240,6 @@ fn build_window(
         // OS-level file drops — nothing listens for them — so turn the
         // interception off and let the HTML5 events through.
         .disable_drag_drop_handler()
-        .initialization_script(theme::script(preference))
         .initialization_script(controls::script())
         // Turns the page's own `Notification` calls into real ones.
         .initialization_script(notify::script())
@@ -308,6 +318,18 @@ fn build_window(
         })
         .build()?;
 
+    // Before it is on screen: this is the call that reaches WebView2's default
+    // background, and the window that would show the wrong one is not up yet.
+    theme::background(&window, preference);
+    if visible {
+        let _ = window.show();
+    }
+
+    // From here the preference is the file's to change and this app's to
+    // follow; see [`theme::watch`].
+    theme::watch(window.clone(), preference);
+
+    let repaint = window.clone();
     window.on_window_event(move |event| match event {
         // Closing the window parks the app in the tray instead of tearing the
         // agent down mid-task. Quitting for real goes through the tray menu.
@@ -323,6 +345,14 @@ fn build_window(
             if let Some(window) = closer.get_webview_window("main") {
                 controls::sync(&window);
             }
+        }
+        // The window's theme has settled somewhere new: the desktop moved under
+        // a `system` preference, or `theme::watch` has just changed it. Either
+        // way the colour behind the webview is the one thing that does not
+        // follow on its own — the pages in the window are already repainting off
+        // the media query this event is the tail of.
+        tauri::WindowEvent::ThemeChanged(_) => {
+            theme::background(&repaint, theme::preference());
         }
         _ => {}
     });

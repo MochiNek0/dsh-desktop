@@ -472,12 +472,11 @@ pub(crate) fn dom_make() -> &'static str {
 ///
 /// dsh's theme is the *page's*, not the window's: it writes `color-scheme` on
 /// the root element and `data-ds-dark-theme` on the body, and switching it
-/// inside the UI changes both without anything reaching the webview's own
-/// `prefers-color-scheme` — which is settled when the window is built (see
-/// [`crate::theme`]) and has nothing to move it afterwards. So every card this
-/// app draws reads the page, and falls back to the media query only where the
-/// page says nothing either way: the loading page, whose `color-scheme` is the
-/// bare `light dark`.
+/// inside the UI changes both, and the page is the first thing to know. So
+/// every card this app draws reads the page, and falls back to the media query
+/// only where the page says nothing either way — which is dsh's boot, and is
+/// the right answer there because the window answers that query with dsh's own
+/// preference; see [`crate::theme`].
 ///
 /// One function because there is one answer. This was written out four times —
 /// once per card — and each copy carried a comment telling the next reader to
@@ -500,6 +499,12 @@ pub(crate) fn theme_watcher(dark_class: &str) -> String {
 
     function repaint() {{
       node.classList.toggle({dark_class:?}, dark());
+      // One hook, for the piece of this that is not a class on a card: the
+      // strip the titlebar takes off the top of the page, whose colour has to
+      // be worked out from what the page underneath has painted rather than
+      // from a stylesheet. See `band` in [`script`]. Called from every card's
+      // repaint, so it follows whichever of them notices a change first.
+      if (window.__dshThemePainted) window.__dshThemePainted();
     }}
 
     repaint();
@@ -529,6 +534,7 @@ pub fn script() -> String {
     let dot = DOT;
     let gap = DOT_GAP;
     let pad = ROW_PAD;
+    let night = crate::theme::dark_css();
 
     let labels = labels();
     let watcher = theme_watcher("dsh-wc-dark");
@@ -947,6 +953,32 @@ pub fn script() -> String {
     // Before the bar is in the document, so it is never painted the wrong
     // colour first. `paint` starts watching as well as painting; see
     // `controls::theme_watcher`.
+    // The strip is carved out of the page by pushing its content down, so what
+    // shows through it is the page's own canvas -- and dsh leaves that at the
+    // UA's white for the whole of its boot. A dark session therefore opens on
+    // a white band across the top until "Loading plugins..." is done, measured
+    // at exactly the 36px this app reserves.
+    //
+    // Covered only while the page has painted nothing of its own, and only
+    // where that blank is the wrong colour. The moment dsh paints, the strip
+    // goes back to transparent and the band is the page's own background
+    // again -- which is the only way there is nothing to see at the 36px line,
+    // since dsh's dark is its own colour (`#151517` in the build this was
+    // measured against) and not one this app can hold a copy of.
+    function band() {{
+      var painted = getComputedStyle(document.body).backgroundColor || '';
+      var parts = /^rgba?\(([^)]+)\)/.exec(painted);
+      // Split on whatever separator the engine used: `rgb(21, 21, 23)` is the
+      // comma form every current one returns, and the space form is legal.
+      var channels = parts ? parts[1].split(/[\s,\/]+/).map(parseFloat) : [];
+      var opaque = channels.length > 3 ? channels[3] !== 0 : channels.length === 3;
+      var white = channels[0] === 255 && channels[1] === 255 && channels[2] === 255;
+      var blank = !opaque || white;
+      drag.style.backgroundColor =
+        blank && bar.classList.contains('dsh-wc-dark') ? {night:?} : '';
+    }}
+    window.__dshThemePainted = band;
+
     paint(bar);
 
     document.body.appendChild(drag);
