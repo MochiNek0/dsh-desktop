@@ -141,6 +141,17 @@
           animation-duration: 2.4s;
         }
       }
+      /* The app draws its cards over whatever page the window shows, this one
+         included: the runtime chooser opens on it before dsh exists, the
+         plugin guide on the first launch, and a dialog can be raised over
+         either. All three are a full-viewport `backdrop-filter: blur()`, so a
+         spinner still turning underneath one makes the compositor re-blur the
+         whole window every frame for something nobody can see. Same mistake
+         `controls` measured at 1.6% of a core; see the note at its own
+         spinner. */
+      html:has(.dsh-su-shown, .dsh-pp-shown, .dsh-ask-shown) .spinner {
+        animation: none;
+      }
       #status {
         color: var(--muted);
       }
