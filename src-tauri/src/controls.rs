@@ -1072,6 +1072,15 @@ pub fn script() -> String {
     }}
     document.addEventListener('mousemove', function (event) {{
       queued = event;
+      // Almost every move is somewhere else on dsh's page entirely. `pull` is
+      // zero for every dot once the pointer is further than LIFT from the
+      // row's centre line -- the distance is two-dimensional, so it is at
+      // least the vertical part -- and `place` would compute three square
+      // roots to arrive at the early return below. Recorded either way, so a
+      // frame already asked for still lands on the latest position; only the
+      // asking is skipped. `near` is what keeps the pass that puts a raised
+      // row back down.
+      if (event.clientY > mid + LIFT && !near) return;
       if (!frame) frame = requestAnimationFrame(flush);
     }}, {{ capture: true, passive: true }});
     // The pointer can leave the window without ever passing the row.
