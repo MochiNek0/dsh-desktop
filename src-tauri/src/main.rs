@@ -16,6 +16,7 @@ mod plugins;
 mod server;
 mod settings;
 mod setup;
+mod signal;
 mod theme;
 mod turn;
 mod update;

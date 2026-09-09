@@ -141,6 +141,8 @@ pub enum Action {
     RestartDsh,
     /// A notification the page raised; see [`crate::notify`].
     Notify(crate::notify::Notice),
+    /// A session transition the client plugin reported; see [`crate::signal`].
+    Signal(crate::signal::Signal),
     /// A button in one of this app's own dialogs; see [`crate::dialog`]. Carries
     /// the whole URL because the token and the button id are read there.
     Answered(Url),
@@ -205,6 +207,10 @@ pub fn action(url: &Url) -> Option<Action> {
         // and the only one that can decline: an empty notification is dropped
         // here rather than raised as a blank toast.
         "notify" => crate::notify::received(url).map(Action::Notify),
+        // Also a payload rather than a request: dsh's own view of what each
+        // session is doing, from the client plugin in `plugin/`. See
+        // `crate::signal`, which owns the parsing.
+        "signal" => crate::signal::received(url).map(Action::Signal),
         // An answer to a question this app asked; see `crate::dialog`, which
         // owns the parsing because it owns the callback the answer runs.
         "ask" => Some(Action::Answered(url.clone())),
@@ -290,6 +296,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::Runtime => return crate::open_runtime(app),
         Action::RestartDsh => return crate::restart_dsh(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),
+        Action::Signal(signal) => return crate::signal::note(signal),
         Action::Answered(url) => return crate::dialog::answered(app, &url),
         Action::OpenUrl(target) => {
             let _ = app.opener().open_url(target, None::<&str>);
