@@ -121,6 +121,37 @@ Windows: WinRT Toast   macOS: mac-notification-sys   Linux: D-Bus
   失败。所以插件启动第一件事是认宿主 —— `main.rs` 已经注入了 `__DSH_VERSION__`，拿它当
   标记 —— 认不出就整体不接线，退化成一个 no-op 插件。
 
+**随包发货欠下的一笔账，卸载时要还。** `bundled:` 装出来的是
+`"dsh-desktop-signal": "link:<安装目录>\resources\plugin"`，profile 的 `node_modules` 下是
+一条指向应用安装目录的 junction。而 NSIS 的卸载 hook **明确不动 `$DSH_HOME`**
+（`installer-hooks.nsh`：「这是用户自己的东西」，那个框默认选「否」）。于是卸载应用之后，
+那条 junction 的另一头没了，用户要付两笔：
+
+- `dsh.profile.bundles` 还列着它，之后每次 `dsh web` 都会去激活一个文件已经不在的 layer，
+  按 [A.4](#a4-客户端插件的加载契约) 的记录是 fails loudly。
+- 断掉的 junction 在 `nodeLinker: hoisted` 下是 **pnpm 自己过不去的墙** —— 原因见
+  `repair()` 的注释（目标没了它就不再是目录，pnpm 按文件清，而清文件是 `DeleteFileW`，
+  它拒绝目录链接并回 `ERROR_ACCESS_DENIED`）。之后**每一次** `dsh plugin add` 都会栽在这个
+  条目上。而 `repair()` 只在这个应用自己的安装路径里跑 —— 应用都卸了，没人再跑它。
+
+改成首次启动自动装之后，这笔账从「主动装过插件的少数人」变成了**所有启动过这个应用的人**，
+所以必须还。实装：`install-deps.ps1` 新增 `-Mode unlink-plugin`，卸载 hook 在确认这不是
+更新/重装之后**无条件**调一次（不管用户对 Node / dsh 那两个问题怎么答，静默安装也调）。
+
+它只做两件事，且只在断链时做：删掉那条 junction，再从 `package.json` 的 `dependencies` 和
+`dsh.profile.bundles` 里摘掉这一项。三个决定：
+
+- **不走 `dsh plugin remove`。** 那条路要一个能跑的 Node + dsh + pnpm，而且要让 pnpm 去动一个
+  junction 已经断掉的 profile —— 正好是上面那堵墙；还可能联网。卸载器给不了这些保证，也等不起。
+  PowerShell 直接动文件系统，什么都不需要。
+- **判据是「链接在、目标没了」，不比对路径。** 这既精确覆盖了要修的那种情况，又天然放过了
+  开发者：`dsh plugin add -w ./plugin` 装出来的链接指向他自己的 checkout，应用卸了 checkout 还在。
+- **不能用 `Test-Path` 判断断链。** 实测（Windows 11，junction 目标刚被删）`Test-Path` 和
+  `[IO.Directory]::Exists` **都答 True** —— 两者都终结在 `GetFileAttributesW`，它报的是链接自己的
+  属性，从不跟进去。要问就得问目标：`(Get-Item -Force).Target`（5.1 里是 `String[]`）拿到目标路径
+  再 `Test-Path`。注意 Rust 那边不是这样：`Path::exists` 会跟进去，所以 `clear()` 里的写法是对的，
+  但不能照抄到 PowerShell。
+
 一处校验缺口，记录在案：`plugins.rs` 用 `spec_name()` 组装 release-age 重试要比对的集合，而
 `spec_name` 对含 `/` 或 `:` 的 spec 返回 `None`，本地路径会被丢出那个集合。`github:` 现在就是
 这个待遇 —— 是既有的、已接受的缺口，不是本次新增的（对随包资源也无害：本地路径不过 registry，

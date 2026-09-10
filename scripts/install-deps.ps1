@@ -34,6 +34,9 @@
 param(
     # `update` moves an existing dsh to the newest release. `uninstall` removes
     # what the switches below name, and only what this script installed.
+    # `unlink-plugin` takes the app's own dsh plugin back out of the user's
+    # profile, and is the one mode the uninstaller runs whatever the user
+    # answers to the questions below — see `Remove-BundledPlugin`.
     #
     # The four after them are the interactive setup the app's loading page drives
     # when a launch finds no dsh to run — see `setup.rs`. `list` enumerates every
@@ -60,8 +63,8 @@ param(
     # Node itself and installed dsh into it — and a bare run of this script is
     # not a thing that should still be able to change the machine.
     [Parameter(Mandatory)]
-    [ValidateSet('update', 'uninstall', 'list', 'switch', 'install-dsh', 'install-node',
-        'uninstall-dsh', 'remove-node', 'delete-node')]
+    [ValidateSet('update', 'uninstall', 'unlink-plugin', 'list', 'switch', 'install-dsh',
+        'install-node', 'uninstall-dsh', 'remove-node', 'delete-node')]
     [string] $Mode,
 
     # `update` only: the npm global prefix holding the dsh to replace. The app
@@ -108,6 +111,11 @@ $Package = '@deepseek-ai/dsh'
 # beside its install and nothing else ever writes one, so a pnpm without it is
 # the user's and is never touched from here.
 $Pnpm = 'pnpm'
+
+# The app's own dsh plugin, by the name it installs under. Written down here
+# because by the time `unlink-plugin` runs, the manifest that would have said it
+# has been deleted along with the rest of the installation directory.
+$SignalPlugin = 'dsh-desktop-signal'
 $PnpmMark = '.dsh-owns-pnpm'
 
 # The same directory Tauri resolves as `app_local_data_dir()` and
@@ -1490,9 +1498,129 @@ function Remove-Node {
     Step '已删除。' 100
 }
 
+# Take the app's own plugin back out of the user's dsh profile.
+#
+# The app ships a dsh plugin inside itself and installs it from the directory it
+# ships in — `bundled:plugin` in `src-tauri/src/plugins.rs`, which resolves to an
+# absolute path under the installation directory. pnpm records that as
+# `"dsh-desktop-signal": "link:C:\Program Files\..."` and puts a junction at
+# that name in the profile's `node_modules`.
+#
+# Uninstalling the app deletes the other end of that junction. What it must not
+# do is leave the near end behind, because the profile is the user's own and
+# they keep it — the uninstaller says so, and its prompt defaults to keeping it.
+# Left behind, it costs them two things:
+#
+#   * dsh still lists the plugin in `dsh.profile.bundles`, so every later `dsh
+#     web` tries to activate a layer whose files are gone, and says so loudly.
+#   * A dangling junction under `nodeLinker: hoisted` is a wall pnpm cannot get
+#     past: with its target gone it is no longer a directory, so pnpm clears it
+#     the way it clears a file, and that call refuses a directory link with
+#     ERROR_ACCESS_DENIED. Every later `dsh plugin add` then fails on that entry
+#     forever. See `repair` in `src-tauri/src/plugins.rs`, where the same
+#     failure is documented from the other side.
+#
+# So: the junction, then the two registrations that name it.
+#
+# Done here rather than by handing the job to `dsh plugin remove`, which is what
+# does it while the app is installed. That path needs a working Node, dsh and
+# pnpm, runs pnpm against a profile whose junction is already dangling — the
+# wall above — and can reach the network. An uninstaller gets none of those
+# guarantees and cannot afford the wait. This needs nothing but the filesystem.
+#
+# **Only ever a link with nothing at the other end.** That is exactly the harm
+# and it is a complete test for it: a developer working on the plugin installs
+# it as a link to their own checkout (`dsh plugin add -w ./plugin`), and their
+# checkout is still there when the app goes, so this leaves them alone without
+# having to compare any paths.
+function Remove-BundledPlugin {
+    # `$DSH_HOME` is dsh's own variable. Worked out the way dsh works it out,
+    # which is the way `profile_dir` in `src-tauri/src/plugins.rs` does.
+    $dshHome = $env:DSH_HOME
+    if (-not $dshHome) { $dshHome = Join-Path $env:USERPROFILE '.dsh' }
+    $profileDir = Join-Path (Join-Path $dshHome 'profiles') 'web'
+
+    $manifestPath = Join-Path $profileDir 'package.json'
+    $linkPath = Join-Path (Join-Path $profileDir 'node_modules') $SignalPlugin
+
+    # Nothing was ever installed here. Not worth a word: this runs on every
+    # uninstall, including the many that never had a dsh profile at all.
+    if (-not (Test-Path -LiteralPath $manifestPath)) {
+        return
+    }
+
+    $link = Get-Item -LiteralPath $linkPath -Force -ErrorAction SilentlyContinue
+    if (-not $link) {
+        return
+    }
+
+    # A reparse point whose target still resolves is somebody else's — the
+    # developer case above — and so is a real directory that is not a link at
+    # all.
+    #
+    # The question has to be put to the target rather than to the link.
+    # `Test-Path` on a junction answers True however dead the far end is, and so
+    # does `[IO.Directory]::Exists`: both end at `GetFileAttributesW`, which
+    # reports the link's own attributes and never follows it. Measured on
+    # Windows 11 against a junction whose target had just been deleted — both
+    # said True, and only enumerating the directory threw. (Rust's
+    # `Path::exists` does not share this: it follows, so the check in `clear` in
+    # `plugins.rs` is right as written and is not the model for this one.)
+    $isLink = ($link.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    # `Target` is a `String[]` in Windows PowerShell 5.1, not a string.
+    $target = if ($isLink) { @($link.Target)[0] } else { $null }
+    if (-not ($isLink -and $target -and -not (Test-Path -LiteralPath $target))) {
+        return
+    }
+
+    Say '正在从 dsh 配置中移除本应用的「会话信号」插件…'
+
+    # A directory link goes through RemoveDirectoryW and a file link through
+    # DeleteFileW, and each refuses the other. Both are tried rather than asked
+    # about, for the reason `unlink` in `plugins.rs` tries both.
+    try {
+        [IO.Directory]::Delete($linkPath, $false)
+    } catch {
+        try {
+            [IO.File]::Delete($linkPath)
+        } catch {
+            Say "无法删除 $linkPath，dsh 的插件安装可能会因此失败。手动删掉这个目录即可。"
+            return
+        }
+    }
+
+    # The two registrations, both of which have to go: `dependencies` is what
+    # pnpm re-resolves on the next install, and `dsh.profile.bundles` is what
+    # dsh tries to activate on the next launch. See the appendix on the loading
+    # contract in `docs/notifications.md`.
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+
+        if ($manifest.dependencies) {
+            $manifest.dependencies.PSObject.Properties.Remove($SignalPlugin)
+        }
+
+        $bundles = $manifest.dsh.profile.bundles
+        if ($bundles) {
+            $manifest.dsh.profile.bundles = @($bundles | Where-Object { $_ -ne $SignalPlugin })
+        }
+
+        # `-Depth` because the default of 2 would flatten everything below
+        # `dsh.profile` into type names. No BOM: this file is dsh's and every
+        # other writer of it is a JSON tool.
+        $json = $manifest | ConvertTo-Json -Depth 100
+        [IO.File]::WriteAllText($manifestPath, $json, (New-Object Text.UTF8Encoding $false))
+        Say '已移除。'
+    } catch {
+        Say "无法改写 $manifestPath：$($_.Exception.Message)"
+        Say "dsh 里可以自己移除：dsh plugin --profile web remove $SignalPlugin"
+    }
+}
+
 switch ($Mode) {
     'update' { Update-All }
     'uninstall' { Uninstall-All }
+    'unlink-plugin' { Remove-BundledPlugin }
     'list' { List-Nodes }
     'switch' { Switch-Node }
     'install-dsh' { Install-DshInto }
