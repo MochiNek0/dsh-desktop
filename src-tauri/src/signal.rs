@@ -83,6 +83,12 @@ pub enum Signal {
         /// all for the two kinds whose buttons say the same thing every time.
         /// See [`buttons`].
         options: Vec<String>,
+        /// What the wait is about, when the carrier said. Both are empty for a
+        /// wait that carries neither, which is every wait a `question` raises
+        /// and every one a dsh older than this reports. See [`waiting_on`],
+        /// which turns them into the notification's body.
+        tool: String,
+        reason: String,
     },
     /// The request went away — answered, cancelled, or its session pruned.
     WaitOver { session: String },
@@ -100,6 +106,8 @@ pub fn received(url: &Url) -> Option<Signal> {
     let mut key = String::new();
     let mut done = false;
     let mut options = Vec::new();
+    let mut tool = String::new();
+    let mut reason = String::new();
 
     for (name, value) in url.query_pairs() {
         match name.as_ref() {
@@ -108,6 +116,14 @@ pub fn received(url: &Url) -> Option<Signal> {
             "kind" => kind = clamp(&value),
             "key" => key = clamp(&value),
             "done" => done = value == "1",
+            // Prose rather than an identifier, and so the one field here whose
+            // clamp is visible: cut at [`LIMIT`] it loses its last words and
+            // says nothing about having lost them. Left that way because the
+            // alternative is a second clamp with different manners for one
+            // field, and because what is cut is the tail of a sentence whose
+            // first 200 characters have already said which tool and why.
+            "reason" => reason = clamp(&value),
+            "tool" => tool = clamp(&value),
             // Repeated, one per label, and taken in order: the id a press
             // sends back is the label's position. Bounded like the rest, and
             // by count as well — a toast has room for two, and the rest would
@@ -132,6 +148,8 @@ pub fn received(url: &Url) -> Option<Signal> {
             kind,
             key,
             options,
+            tool,
+            reason,
         }),
         "wait-over" => Some(Signal::WaitOver { session }),
         "stale" => Some(Signal::Stale { session }),
@@ -169,12 +187,14 @@ pub fn act(app: &AppHandle, signal: Signal) {
             kind,
             key,
             options,
+            tool,
+            reason,
         } => {
             eprintln!("dsh-desktop: {session} is waiting on {kind} ({key})");
-            let (title, body) = waiting_on(&kind);
+            let (title, body) = waiting_on(&kind, &tool, &reason);
             crate::notify::show(
                 app,
-                crate::notify::Notice::asking(&session, &key, title, body, buttons(&kind, options)),
+                crate::notify::Notice::asking(&session, &key, title, &body, buttons(&kind, options)),
             );
         }
         // Nothing to say. The toast has already been raised, and withdrawing
@@ -249,7 +269,43 @@ pub fn turn_ended() -> (&'static str, &'static str) {
 /// adds still reads as a session waiting on the user, and the answer to "what do
 /// we say about it" has to keep that promise: the vaguest sentence that is still
 /// true, rather than silence.
-pub fn waiting_on(kind: &str) -> (&'static str, &'static str) {
+///
+/// `tool` and `reason` are what the carrier said this particular wait is about,
+/// and either may be empty. Where they are not, the body says the same thing
+/// dsh's own panel says about the same request: its `ApprovalPanel` renders
+/// `reason ?? "tool <name> requests privileged execution"`, and the two lines
+/// below are that fallback in this app's two languages. Written here rather
+/// than sent ready-made from the plugin for the reason the buttons are — the
+/// user's language is this side's to know.
+///
+/// The generic sentence stays underneath both, and is still what a wait with
+/// nothing to say about itself gets. That is not only the old dsh case: a
+/// `question` carries neither field, because what it is about is the question
+/// text, and a question is answered by reading it rather than by being told a
+/// tool name.
+pub fn waiting_on(kind: &str, tool: &str, reason: &str) -> (&'static str, String) {
+    let (title, generic) = generic_wait(kind);
+
+    // The asker's own sentence wins over anything this could compose, and
+    // naming the tool beats saying "a step". Neither is available for most
+    // kinds, so most waits still get the sentence below.
+    let body = if !reason.is_empty() {
+        reason.to_string()
+    } else if !tool.is_empty() && kind == "approval" {
+        t!(
+            "工具 {} 请求越权执行。",
+            "Tool {} requests privileged execution.",
+            tool
+        )
+    } else {
+        generic.to_string()
+    };
+
+    (title, body)
+}
+
+/// The title, and the body for a wait that says nothing about itself.
+fn generic_wait(kind: &str) -> (&'static str, &'static str) {
     match kind {
         "approval" => (
             t!("dsh 需要你的授权", "dsh needs your approval"),
@@ -389,7 +445,9 @@ mod tests {
                 session: "s1".into(),
                 kind: "approval".into(),
                 key: "k1".into(),
-                options: vec![]
+                options: vec![],
+                tool: String::new(),
+                reason: String::new()
             })
         );
         assert_eq!(
@@ -398,6 +456,28 @@ mod tests {
                 session: "s1".into()
             })
         );
+    }
+
+    /// The two fields that say what a wait is about, off the query.
+    #[test]
+    fn reads_what_an_approval_is_about() {
+        let Some(Signal::Wait { tool, reason, .. }) = read(
+            "event=wait&session=s1&kind=approval&key=k1             &tool=bash&reason=It%20wants%20to%20delete%20build%2F.",
+        ) else {
+            panic!("a wait");
+        };
+        assert_eq!(tool, "bash");
+        assert_eq!(reason, "It wants to delete build/.");
+
+        // Bounded like every other field off this URL, and a wait that sends
+        // neither is every wait a dsh older than this reports.
+        let Some(Signal::Wait { tool, reason, .. }) =
+            read(&format!("event=wait&session=s1&kind=approval&key=k1&reason={}", "r".repeat(LIMIT * 2)))
+        else {
+            panic!("a wait");
+        };
+        assert_eq!(reason.chars().count(), LIMIT);
+        assert!(tool.is_empty());
     }
 
     /// dsh's own discriminator, whatever it is. A kind added by a later dsh is
@@ -410,7 +490,9 @@ mod tests {
                 session: "s1".into(),
                 kind: "something-new".into(),
                 key: "k1".into(),
-                options: vec![]
+                options: vec![],
+                tool: String::new(),
+                reason: String::new()
             })
         );
     }
@@ -467,7 +549,9 @@ mod tests {
                 session: "s-abc".into(),
                 kind: "plan-review".into(),
                 key: "question:42".into(),
-                options: vec![]
+                options: vec![],
+                tool: String::new(),
+                reason: String::new()
             })
         );
         assert_eq!(
@@ -479,7 +563,9 @@ mod tests {
                 session: "s-abc".into(),
                 kind: "question".into(),
                 key: "question:43".into(),
-                options: vec!["Use TypeScript".into(), "Stay on JS".into()]
+                options: vec!["Use TypeScript".into(), "Stay on JS".into()],
+                tool: String::new(),
+                reason: String::new()
             })
         );
         assert_eq!(
@@ -575,7 +661,7 @@ mod tests {
     fn has_words_for_a_kind_it_has_never_heard_of() {
         let known: Vec<_> = ["approval", "question", "plan-review"]
             .iter()
-            .map(|kind| waiting_on(kind))
+            .map(|kind| waiting_on(kind, "", ""))
             .collect();
 
         assert_eq!(
@@ -584,12 +670,38 @@ mod tests {
             "each wait should read as itself"
         );
 
-        let (title, body) = waiting_on("something-dsh-added-later");
+        let (title, body) = waiting_on("something-dsh-added-later", "", "");
         assert!(!title.is_empty() && !body.is_empty());
         assert!(
             !known.contains(&(title, body)),
             "an unknown kind should not borrow another kind's words"
         );
+    }
+
+    /// What the wait is about, when the carrier said.
+    ///
+    /// Three rungs, and the order between them is the point: the asker's own
+    /// sentence beats anything this composes, naming the tool beats saying "a
+    /// step", and a wait that carries neither still gets the sentence every
+    /// wait got before any of this existed.
+    #[test]
+    fn says_what_an_approval_is_about_when_it_can() {
+        let generic = waiting_on("approval", "", "").1;
+
+        let (_, reasoned) = waiting_on("approval", "bash", "It wants to delete build/.");
+        assert_eq!(reasoned, "It wants to delete build/.");
+
+        let (_, named) = waiting_on("approval", "bash", "");
+        assert!(named.contains("bash"), "the tool should be named: {named}");
+        assert_ne!(named, generic);
+
+        // The tool name alone is an approval's fallback and nobody else's: a
+        // question is about its own text, and borrowing this line for one
+        // would describe it wrongly. A reason, if a later dsh ever sends one,
+        // is the asker's own words and reads correctly anywhere.
+        let (_, question) = waiting_on("question", "bash", "");
+        assert_eq!(question, waiting_on("question", "", "").1);
+        assert_eq!(waiting_on("question", "", "Which one?").1, "Which one?");
     }
 
     /// The call a notification click makes: guarded, because the document that

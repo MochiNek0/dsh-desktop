@@ -187,6 +187,41 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   console.log('ok  tracks waits by request key, and their end');
 }
 
+// --- what the wait is about, when the carrier says ---
+{
+  const { exports, sent } = load({ host: true });
+  const s = services();
+  exports.apply(s.ctx);
+
+  // An approval carries both. dsh's own panel renders `reason ?? "tool <name>
+  // requests ..."`, so both travel and the shell composes the same line in the
+  // user's language.
+  s.setPending(new Map([['a', { key: 'k1', kind: 'approval', toolName: 'bash', reason: 'It wants to delete build/.' }]]));
+  await drain();
+  assert.equal(query(sent[0]).tool, 'bash');
+  assert.equal(query(sent[0]).reason, 'It wants to delete build/.');
+
+  // Only the tool: the shell names it rather than saying "a step".
+  s.setPending(new Map([['a', { key: 'k2', kind: 'approval', toolName: 'bash' }]]));
+  await drain();
+  assert.equal(query(sent[1]).tool, 'bash');
+  assert.equal(query(sent[1]).reason, undefined, 'an absent field should not travel as an empty one');
+
+  // Neither, which is every question and every wait an older dsh reports. The
+  // shell falls back to the sentence every wait had before any of this.
+  s.setPending(new Map([['a', { key: 'k3', kind: 'question', questions: asked([{ label: 'Yes' }, { label: 'No' }]) }]]));
+  await drain();
+  assert.equal(query(sent[2]).tool, undefined);
+  assert.equal(query(sent[2]).reason, undefined);
+
+  // Sent by name rather than by kind, so a later dsh that puts either field on
+  // some other wait gets the same treatment without a change here.
+  s.setPending(new Map([['a', { key: 'k4', kind: 'something-new', reason: 'Because.' }]]));
+  await drain();
+  assert.equal(query(sent[3]).reason, 'Because.');
+  console.log('ok  reports what a wait is about when the carrier says');
+}
+
 // --- a burst leaves one at a time, and every URL is distinct ---
 {
   const { exports, sent } = load({ host: true });

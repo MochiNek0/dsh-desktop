@@ -292,13 +292,27 @@ window.__ModuleLoader__.load({
           if (keys[id] === pending.key) continue;
           keys[id] = pending.key;
           if (announce) {
-            send({
+            var params = {
               event: 'wait',
               session: id,
               kind: pending.kind,
               key: pending.key,
               option: oneClick(pending),
-            });
+            };
+            // What the wait is actually about, when the carrier says. An
+            // approval's does: `reason` is the asker's own sentence and
+            // `toolName` is the tool that wants the decision, and dsh's own
+            // panel renders exactly `reason ?? "tool <name> requests …"`. So
+            // both travel and the shell composes the same line, in the user's
+            // language — see `waiting_on` in its signal.rs.
+            //
+            // Sent by name rather than by kind: a later dsh that puts either
+            // field on some other kind of wait gets the same treatment for
+            // free, and one that puts neither is the generic sentence, which
+            // is what every wait said before this.
+            if (pending.reason) params.reason = pending.reason;
+            if (pending.toolName) params.tool = pending.toolName;
+            send(params);
           }
         }
 

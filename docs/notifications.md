@@ -256,6 +256,38 @@ carrier 自带判别与提交面，按钮直接从它上面取（见 [A.1](#a1-d
 - **多题的 request 不逐题走完。** `QuestionAnswer` 是**整批**提交，通知只说「有 N 个问题在
   等」并给「打开」。一题一条 toast 会在 macOS / Linux 的通知中心里堆叠，不如在应用里翻页。
 
+### 4.2.1 通知正文说的是哪件事
+
+**2026-09-10 补。** 原来的正文是按 kind 写死的一句话——授权类永远是「有一步操作在等你允许
+或拒绝」，跟哪个工具、为什么完全无关。测试时发现这不够用：用户看到通知也不知道要授权什么。
+
+carrier 上其实有。`PendingApproval` 带三个字段（`dsh-client-ui-approval/lib/client.js`）：
+
+| 字段 | 说明 |
+| :--- | :--- |
+| `toolName` | 请求决定的工具 |
+| `reason` | 提问方给的人类可读原因 |
+| `callId` | 关联的 tool call |
+
+而 dsh 自己的 `ApprovalPanel` 渲染的就是 `pending.reason ?? t("escalation", { toolName })`，
+其中 `escalation` = 「工具 {toolName} 请求越权执行」。所以插件把 `reason` 和 `tool` 一起发过来，
+shell 用同样的优先级组装，**通知和窗口里说的是同一句话**。三级降级（`waiting_on`）：
+
+1. `reason` 非空 → 用它，那是提问方自己的话；
+2. 否则 `tool` 非空且 kind 是 `approval` → 「工具 X 请求越权执行。」；
+3. 否则 → 原来那句通用的，也是 `question` 和任何旧版 dsh 的待遇。
+
+两个决定：
+
+- **文案在 shell 这边写**，不是插件发成品。理由和按钮文字一样：用户的语言是这一侧知道的事。
+- **插件按字段名发，不按 kind 发。** 哪天 dsh 给别的 wait 也挂上 `reason`，不改代码就能用上；
+  挂不上的就是第 3 级，也就是这件事之前的样子。
+
+**没做具体命令。** 命令不在 approval carrier 上——要拿 `callId` 去 `ctx.chat` 的快照里找对应
+的 tool-call 节点，再 `JSON.parse(argsRaw).command`（dsh 用一个独立子槽
+`conversation.approval.detail` 这么渲染，由 `dsh-client-ui-chat` 填）。能做，但要多 inject 一个
+服务，而 toast 正文本来就只有 200 字符（`clamp`），长命令也放不下。等有人真的需要再说。
+
 ### 4.3 失效与兜底
 
 - **key 校验。** 提交前比对 carrier 的 `key` 与通知发出时记录的是否一致；不一致直接丢弃并
