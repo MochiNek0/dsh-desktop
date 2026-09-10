@@ -426,6 +426,82 @@ pub fn signalling(app: &AppHandle) -> bool {
     installed_in(&profile_manifest(app)).contains(SIGNAL)
 }
 
+/// Put [`SIGNAL`] in, once, on the first launch that finds it missing.
+///
+/// The plugin ships inside this app and used to wait in the panel for someone
+/// to notice it, which made every notification wait on a step the user had no
+/// reason to know about: the menu item said what was missing, and that is a
+/// worse place to learn it than never having to.
+///
+/// One offer and no more. A user who takes the plugin back out has decided
+/// something, and a launch that reinstalled it would be arguing — so this asks
+/// [`remembered`] first and answers to nothing else. That also settles what
+/// happens on the launch after a failed one: nothing. The panel still lists
+/// it, and installing it there is the same install this would have run.
+///
+/// Recorded before the install rather than after, for the reason
+/// [`mark_guided`] is: an install that takes this launch down with it should
+/// not take the next one down too. So what is spent is the attempt, not the
+/// success.
+///
+/// Which is why the one attempt has to be *seen* when it fails, and why this
+/// answers whether it did. Borrowing [`mark_guided`]'s rule without borrowing
+/// a way to say so would not be borrowing the same trade: what a spent marker
+/// costs there is a panel the user can open whenever they like, and what it
+/// costs here is every notification, silently, until somebody notices a menu
+/// item is grey. The caller turns a `true` into the plugin panel — the one
+/// place that lists this plugin, installs it on a click, and prints why if it
+/// fails again. Retrying on the next launch instead would put an npm timeout
+/// in front of every launch a machine spends offline.
+///
+/// Blocking, for as long as an install takes. The caller runs it on the boot
+/// thread with no server up yet — which is the point of running it there
+/// rather than later, since a plugin going in is a reason to stop `dsh web`
+/// and there is nothing yet to stop.
+///
+/// @returns Whether this launch tried to install the plugin and could not.
+/// False covers every other outcome, the three that do nothing included: the
+/// offer was already spent, the plugin was already there, or it went in.
+pub fn adopt(app: &AppHandle, report: &crate::dsh::Report) -> bool {
+    if remembered(app, ADOPTED) {
+        return false;
+    }
+
+    // Already here — put in from the panel by hand, or by a build that shipped
+    // before this did. Nothing to install, and the offer is spent either way,
+    // so that taking it out later stays taken out.
+    if signalling(app) {
+        remember(app, ADOPTED);
+        return false;
+    }
+
+    remember(app, ADOPTED);
+    report(
+        t!(
+            "正在装上「会话信号」插件…",
+            "Installing the session signal plugin…"
+        ),
+        -1.0,
+    );
+
+    // To the terminal and nowhere else. This install is the app's own idea,
+    // running before the window belongs to dsh and with no panel to print
+    // into; a wall of pnpm output on the loading page would be answering a
+    // question nobody asked. What the user sees is the line above.
+    let log = |line: &str| eprintln!("dsh-desktop: {line}");
+    match install(app, &[SIGNAL.to_string()], None, &log) {
+        Ok(()) => false,
+        Err(why) => {
+            // The terminal gets the reason, because the panel the caller is
+            // about to raise cannot hold it: this install ran before the panel
+            // existed and its log started empty. What the panel offers is the
+            // same install again, this time with somewhere to print.
+            eprintln!("dsh-desktop: could not install {SIGNAL} on this launch: {why}");
+            true
+        }
+    }
+}
+
 /// `$DSH_HOME/profiles/web`, where a plugin ends up.
 ///
 /// `DSH_HOME` is dsh's own variable and this app passes it through untouched, so
@@ -1352,23 +1428,43 @@ pub fn stop() {
 /// because a panel nobody knows about is a panel nobody opens, and the whole
 /// point of it is the user who cannot reach these plugins any other way.
 pub fn guided(app: &AppHandle) -> bool {
-    marker(app).is_some_and(|path| path.exists())
+    remembered(app, GUIDED)
 }
 
 pub fn mark_guided(app: &AppHandle) {
-    let Some(path) = marker(app) else { return };
+    remember(app, GUIDED);
+}
+
+/// The panel has been shown. See [`guided`].
+const GUIDED: &str = "plugins-guided";
+
+/// [`SIGNAL`] has had its one offer. See [`adopt`].
+const ADOPTED: &str = "signal-adopted";
+
+/// Whether a launch has already done the thing `name` stands for.
+///
+/// Both markers are empty files. What either one records is that something
+/// happened once, and a file either is there or is not — there is nothing to
+/// put inside it that its own presence does not already say.
+fn remembered(app: &AppHandle, name: &str) -> bool {
+    marker(app, name).is_some_and(|path| path.exists())
+}
+
+/// Record that it happened. Failing to is not worth stopping for: the cost is
+/// the same launch doing the same thing once more next time.
+fn remember(app: &AppHandle, name: &str) {
+    let Some(path) = marker(app, name) else { return };
 
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(error) = std::fs::write(&path, b"") {
-        // The cost is being shown the panel again next launch.
-        eprintln!("dsh-desktop: could not record that the plugin panel was shown: {error}");
+        eprintln!("dsh-desktop: could not record {name}: {error}");
     }
 }
 
-fn marker(app: &AppHandle) -> Option<PathBuf> {
-    Some(crate::dsh::app_dir(app)?.join("plugins-guided"))
+fn marker(app: &AppHandle, name: &str) -> Option<PathBuf> {
+    Some(crate::dsh::app_dir(app)?.join(name))
 }
 
 /// The ids and free-text spec a `dsh-window://plugins-install` navigation
@@ -1715,13 +1811,16 @@ mod tests {
     /// The plugin this app ships inside itself, checked against the plugin
     /// itself.
     ///
-    /// Two things have to line up and neither is checked anywhere else. The
+    /// Three things have to line up and none is checked anywhere else. The
     /// spec has to name a directory that is really there — `bundled:` is
     /// resolved at install time, so a rename shows up as an install that
     /// cannot find itself. And the preset's `package` has to be the name that
     /// directory installs under, because that name is what "already
     /// installed" is decided against: get it wrong and the panel offers the
-    /// plugin forever, to a user who already has it.
+    /// plugin forever, to a user who already has it. And the preset's `id` has
+    /// to be that name too, because `adopt` asks for this one preset by id and
+    /// `install` looks ids up in the list — a drift there breaks only the
+    /// automatic install, which is the one nobody is watching.
     #[test]
     fn the_plugin_that_ships_inside_the_app_is_the_one_the_list_names() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1752,6 +1851,15 @@ mod tests {
             assert_eq!(
                 preset.package, SIGNAL,
                 "the gate in `signalling` names a different plugin than the list ships"
+            );
+            // And the id, because `adopt` installs this preset by naming it —
+            // `install` looks its `ids` up in the list, so an id that drifted
+            // off the package name would leave the first-launch install
+            // failing with "no preset called dsh-desktop-signal" while
+            // everything a user can reach by hand kept working.
+            assert_eq!(
+                preset.id, SIGNAL,
+                "`adopt` asks for this preset by id and would not find it"
             );
         }
 

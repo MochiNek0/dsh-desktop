@@ -671,16 +671,39 @@ fn boot(app: tauri::AppHandle, window: WebviewWindow, session: Session) {
             return;
         }
 
+        // The plugin every notification starts at, put in on the first launch
+        // that has a dsh to put it into. See [`plugins::adopt`], which does it
+        // once and then leaves the decision to the user.
+        //
+        // Here rather than a line later because the panel below reads what is
+        // installed to draw itself, and a first launch should find the plugin
+        // already in rather than offered. Here rather than anywhere after,
+        // because everything after this point has a server running and an
+        // install is a reason to stop one.
+        //
+        // Skipped on a login-item launch, for the reason the update check
+        // above is: nobody is looking, and this can reach the network — an
+        // absent pnpm is an `npm install -g` away. The next launch someone
+        // actually asks for does it.
+        let adoption_failed = window_is_visible(&app) && plugins::adopt(&app, &report);
+
         // Once, on the launch that first has a dsh to add plugins to — and once
         // more for an install that predates the panel existing. It is shown
         // before the server starts rather than after, because installing a
         // plugin means stopping the server again, and the user has just watched
         // it start.
         //
+        // And once more again for a launch whose own attempt at the signal
+        // plugin failed. That attempt is not repeated — see [`plugins::adopt`]
+        // — so this is where it gets said: the panel lists the plugin, installs
+        // it on a click, and this time has somewhere to print the reason if it
+        // fails again. The alternative is notifications that never work and a
+        // grey menu item to find out from.
+        //
         // Marked as shown before it is shown: a panel that crashes the launch it
         // appears on should not appear on the next one too. What happens next is
         // the panel's — see [`leave_plugins`].
-        if window_is_visible(&app) && !plugins::guided(&app) {
+        if window_is_visible(&app) && (adoption_failed || !plugins::guided(&app)) {
             plugins::mark_guided(&app);
             show_plugins(&app, &session, true);
             return;
