@@ -417,7 +417,11 @@ pub fn busy(app: &AppHandle, text: &str) {
 /// `__dsh*` on it yet — hence the guard in each. Every one of them repaints
 /// something the next page load pushes again, so a call that lands nowhere
 /// costs nothing.
-fn eval(app: &AppHandle, call: &str) {
+///
+/// Shared with the two cards that carry labels of their own — see
+/// [`crate::panel::relabel`] and [`crate::setup::relabel`] — because what they
+/// push is the same kind of call under the same conditions.
+pub(crate) fn eval(app: &AppHandle, call: &str) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.eval(call);
     }
@@ -1324,6 +1328,36 @@ mod tests {
             assert!(
                 script.contains(&theme_watcher(class)),
                 "{what} must paint itself from `theme_watcher`, not a copy of it"
+            );
+        }
+    }
+
+    /// Two of the cards carry their own labels, pasted into the injected
+    /// script when the window is built rather than asked for when they draw —
+    /// so a language switch has to send them again, and each has to answer.
+    ///
+    /// The call is guarded by `&&`, because a document that has not finished
+    /// loading has no `__dsh*` on it. That guard is also what would swallow a
+    /// hook this script no longer defines: the relabel would land nowhere and
+    /// the card would stay in the language the app started in, which is the
+    /// bug the two hooks were added for.
+    #[test]
+    fn every_card_with_labels_of_its_own_answers_a_relabel() {
+        for (what, script, hook) in [
+            (
+                "the plugin panel",
+                crate::panel::script(),
+                crate::panel::RELABEL,
+            ),
+            (
+                "the runtime chooser",
+                crate::setup::script(),
+                crate::setup::RELABEL,
+            ),
+        ] {
+            assert!(
+                script.contains(&format!("window.{hook} = function")),
+                "{what} must answer on `{hook}`, which is what its `relabel` calls"
             );
         }
     }

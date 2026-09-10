@@ -59,6 +59,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use crate::dsh::Report;
 
+/// The call [`relabel`] makes, and the one the script answers on; see
+/// [`crate::panel::RELABEL`].
+pub(crate) const RELABEL: &str = "__dshSetupText";
+
 /// How long [`present`] waits for a choice before giving up. A backstop for a
 /// panel that went away without being able to say so — a renderer crash, a
 /// document navigated out from under it — rather than a policy, the way the same
@@ -821,15 +825,14 @@ pub fn answered(choice: Choice) {
     }
 }
 
-/// The script that draws the chooser, injected into every document the window
-/// loads. Built on first use, like the plugin panel's and the dialog's.
-pub fn script() -> String {
-    let scheme = crate::controls::SCHEME;
-    let font = crate::controls::FONT;
-    let maker = crate::controls::dom_make();
-    let watcher = crate::controls::theme_watcher("dsh-su-dark");
-
-    let labels = json!({
+/// Every string the chooser draws, as the object the script indexes.
+///
+/// A function rather than a literal inside [`script`], for the reason
+/// [`crate::panel::labels`] is one: the chooser is written twice, here and
+/// again by [`relabel`], and two copies of these strings would be the drift
+/// [`crate::i18n`] is arranged to prevent.
+fn labels() -> String {
+    json!({
         "title": t!("选择运行环境", "Choose a runtime"),
         "ledeNodes": t!(
             "这台机器上有不止一个 Node。选一个来运行 dsh —— 已经装好 dsh 的可以直接用，没装的也能在这里装上。",
@@ -892,7 +895,31 @@ pub fn script() -> String {
             "": t!("Node", "Node")
         }
     })
-    .to_string();
+    .to_string()
+}
+
+/// Put the chooser into the language dsh has just switched to; see
+/// [`crate::panel::relabel`] for why an injected card needs telling at all.
+///
+/// The boot's chooser is up before dsh is, so nothing can switch the language
+/// under it. The menu's can be opened at any point in a session, which is the
+/// one this is for.
+pub fn relabel(app: &AppHandle) {
+    crate::controls::eval(
+        app,
+        &format!("window.{RELABEL} && window.{RELABEL}({})", labels()),
+    );
+}
+
+/// The script that draws the chooser, injected into every document the window
+/// loads. Built on first use, like the plugin panel's and the dialog's.
+pub fn script() -> String {
+    let scheme = crate::controls::SCHEME;
+    let font = crate::controls::FONT;
+    let maker = crate::controls::dom_make();
+    let watcher = crate::controls::theme_watcher("dsh-su-dark");
+    let labels = labels();
+    let relabel = RELABEL;
 
     format!(
         r#"(function () {{
@@ -903,10 +930,13 @@ pub fn script() -> String {
 
   var TEXT = {labels};
 
-  var root = null, card, lede, list, errBox, errText;
+  var root = null, sheet, card, lede, list, errBox, errText;
   var statusBox, statusText, statusFill;
   var installNode, removeNode, rescan, quit;
   var sent = false;
+  // Set when the language moved under a card that was already built; see
+  // `__dshSetupText`.
+  var stale = false;
   // Set from every payload; see the `manage` field in `payload`.
   var managing = false;
   // And the `followsPath` field beside it: the app is running the PATH's dsh,
@@ -1147,7 +1177,9 @@ pub fn script() -> String {
       // there is to do while an install runs.
       '.dsh-su.dsh-su-busy .dsh-su-card{{pointer-events:none}}' +
       '.dsh-su.dsh-su-busy .dsh-su-list{{opacity:.45}}';
-    document.head.appendChild(style);
+    // Kept, because `discard` takes it away again.
+    sheet = style;
+    document.head.appendChild(sheet);
 
     root = make('div', 'dsh-su');
     card = make('div', 'dsh-su-card', root);
@@ -1181,19 +1213,34 @@ pub fn script() -> String {
       signal('setup-install-node');
     }}, true);
 
-    // Escape closes the panel opened from the menu, and does nothing on the
-    // one the boot is waiting on: there the app has not decided whether it
-    // starts at all, and the key people press to dismiss things should not be
-    // the one that quits.
-    document.addEventListener('keydown', function (event) {{
-      if (event.key === 'Escape' && managing && root.classList.contains('dsh-su-shown')) {{
-        signal('setup-close');
-      }}
-    }});
-
     paint(root);
     document.body.appendChild(root);
   }}
+
+  /** Take the built card down, stylesheet and all, so the next opening builds
+   *  it again. What a language switch leaves behind; see `__dshSetupText`. */
+  function discard() {{
+    if (sheet && sheet.parentNode) sheet.parentNode.removeChild(sheet);
+    if (root && root.parentNode) root.parentNode.removeChild(root);
+    sheet = null;
+    root = null;
+    stale = false;
+  }}
+
+  // Escape closes the panel opened from the menu, and does nothing on the one
+  // the boot is waiting on: there the app has not decided whether it starts at
+  // all, and the key people press to dismiss things should not be the one that
+  // quits.
+  //
+  // Registered once, out here rather than in `build`: the card is built again
+  // after a language switch, and a listener per build is a second handler
+  // holding a card the user cannot see.
+  document.addEventListener('keydown', function (event) {{
+    if (event.key === 'Escape' && managing && root &&
+        root.classList.contains('dsh-su-shown')) {{
+      signal('setup-close');
+    }}
+  }});
 
   function ready(then) {{
     if (document.body) then();
@@ -1209,6 +1256,7 @@ pub fn script() -> String {
     }}
 
     ready(function () {{
+      if (stale) discard();
       if (!root) build();
 
       sent = false;
@@ -1342,6 +1390,14 @@ pub fn script() -> String {
 
   window.__dshSetupHide = function () {{
     if (root) root.classList.remove('dsh-su-shown');
+  }};
+
+  /** The labels again, after dsh changed language; see `relabel` in setup.rs.
+   *  The card built in the old language is thrown away at the next opening
+   *  rather than here, for the reason `__dshPluginText` gives. */
+  window.{relabel} = function (next) {{
+    TEXT = next;
+    stale = !!root;
   }};
 }})();"#
     )

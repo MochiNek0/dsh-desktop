@@ -377,13 +377,20 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 /// dsh writes it through to `<html lang>` without loading the document again,
 /// and [`controls`] watches for that. Everything drawn from here on reads the
 /// new language on its own — what needs saying out loud is the two menus that
-/// were drawn before it.
+/// were drawn before it, and the two injected cards that carry their labels
+/// inside the script rather than asking for them when they draw.
 fn switch_language(app: &tauri::AppHandle, tag: &str) {
     if !i18n::switch(tag) {
         return;
     }
 
     controls::relabel(app);
+    // Not only what is on screen. An initialization script is composed once,
+    // when the window is built, so without these two the plugin panel and the
+    // runtime chooser would stay in the language the app started in for the
+    // rest of the run — a reload included. See [`panel::relabel`].
+    panel::relabel(app);
+    setup::relabel(app);
 
     let Some(tray) = app.tray_by_id(TRAY) else {
         return;

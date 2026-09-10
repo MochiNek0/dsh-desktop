@@ -15,22 +15,30 @@
 //! the same cancelled-navigation channel everything else in this window uses.
 //! Rust pushes into it with `window.eval`; see `Splash` in main.rs.
 
-/// The script that draws it, injected into every document the window loads.
-///
-/// Nothing is built until the panel is first shown: on most launches it never
-/// is, and a document this app does not own is not somewhere to leave a card
-/// and a stylesheet lying around unasked.
-pub fn script() -> String {
-    let scheme = crate::controls::SCHEME;
-    let font = crate::controls::FONT;
-    let maker = crate::controls::dom_make();
-    let watcher = crate::controls::theme_watcher("dsh-pp-dark");
+use tauri::AppHandle;
 
-    // One object rather than a literal per string: they are pasted into
-    // JavaScript, and a label is one apostrophe away from being a syntax error
-    // that takes the panel with it. The two languages live inline here the way
-    // they do everywhere else; see `i18n`.
-    let labels = serde_json::json!({
+/// The call [`relabel`] makes, and the one the script answers on.
+///
+/// A constant because the name is written in both places and the call is
+/// guarded by `&&` — the guard is there because a document that has not
+/// finished loading has no `__dsh*` on it, and it would swallow a typo just as
+/// quietly.
+pub(crate) const RELABEL: &str = "__dshPluginText";
+
+/// Every string the panel draws, as the object the script indexes.
+///
+/// One object rather than a literal per string: they are pasted into
+/// JavaScript, and a label is one apostrophe away from being a syntax error
+/// that takes the panel with it. The two languages live inline here the way
+/// they do everywhere else; see [`crate::i18n`].
+///
+/// A function rather than a literal inside [`script`], because the panel is
+/// written twice: into the script when the window is built, and again by
+/// [`relabel`] when dsh changes language under a window that is not going to
+/// be built a second time. Two copies of these strings would be the drift
+/// [`crate::i18n`] is arranged to prevent.
+fn labels() -> String {
+    serde_json::json!({
         "title": t!("插件", "Plugins"),
         "ledeFirst": t!(
             "这几个是推荐的插件。现在装，或者以后从标题栏菜单里再回来都行。安装时 dsh 会先停下，装完再自动启动它。",
@@ -77,7 +85,40 @@ pub fn script() -> String {
         "more": t!("继续装别的", "Install more"),
         "retry": t!("重试", "Try again"),
     })
-    .to_string();
+    .to_string()
+}
+
+/// Put the panel into the language dsh has just switched to.
+///
+/// The dialogs in [`crate::dialog`] need nothing like this: their words come
+/// from Rust at the moment they are asked, so they are already in whatever
+/// language is current. This card's do not. The script below is an
+/// initialization script — evaluated at every document load, but composed once,
+/// when the window is built — so the labels pasted into it are the language the
+/// app started in, and would stay it for as long as the app runs. Not just
+/// while a document lasts: a reload runs the same string again.
+///
+/// So they are sent again, and the panel throws away whatever it has already
+/// built. See `__dshPluginText`.
+pub fn relabel(app: &AppHandle) {
+    crate::controls::eval(
+        app,
+        &format!("window.{RELABEL} && window.{RELABEL}({})", labels()),
+    );
+}
+
+/// The script that draws it, injected into every document the window loads.
+///
+/// Nothing is built until the panel is first shown: on most launches it never
+/// is, and a document this app does not own is not somewhere to leave a card
+/// and a stylesheet lying around unasked.
+pub fn script() -> String {
+    let scheme = crate::controls::SCHEME;
+    let font = crate::controls::FONT;
+    let maker = crate::controls::dom_make();
+    let watcher = crate::controls::theme_watcher("dsh-pp-dark");
+    let labels = labels();
+    let relabel = RELABEL;
 
     format!(
         r#"(function () {{
@@ -90,8 +131,11 @@ pub fn script() -> String {
 
   var TEXT = {labels};
 
-  var root = null, lede, list, held, heldList, heldCount, hint, spec, log, note;
+  var root = null, sheet, lede, list, held, heldList, heldCount, hint, spec, log, note;
   var dir, drop, leave, install;
+  // Set when the language moved under a card that was already built; see
+  // `__dshPluginText`.
+  var stale = false;
 
   // The whole channel back to Rust; see controls.rs. The navigation is
   // cancelled there, so the page under the panel stays exactly where it is.
@@ -461,7 +505,9 @@ pub fn script() -> String {
       '.dsh-pp button.dsh-pp-danger:hover{{background:var(--pp-danger);color:#fff}}' +
       '.dsh-pp button[disabled]{{opacity:.45;cursor:default;pointer-events:none}}' +
       '.dsh-pp button[hidden]{{display:none}}';
-    document.head.appendChild(style);
+    // Kept, because `discard` takes it away again.
+    sheet = style;
+    document.head.appendChild(sheet);
 
     root = make('div', 'dsh-pp');
     var card = make('div', 'dsh-pp-card', root);
@@ -497,18 +543,33 @@ pub fn script() -> String {
     install = button(foot, TEXT.install, start);
     install.className = 'dsh-pp-primary';
 
-    // The way out that is not at the far end of the card. Ignored while an
-    // install runs, which is exactly when the button it stands in for is
-    // disabled: pnpm is mid-write, and there is nothing to go back to yet.
-    document.addEventListener('keydown', function (event) {{
-      if (event.key === 'Escape' && shown() && !leave.disabled) done();
-    }});
-
     // Painted before it is in the document, so it is never the wrong colour
     // for a frame.
     paint(root);
     document.body.appendChild(root);
   }}
+
+  /** Take the built card down, stylesheet and all, so the next opening builds
+   *  it again. What a language switch leaves behind; see `__dshPluginText`. */
+  function discard() {{
+    if (sheet && sheet.parentNode) sheet.parentNode.removeChild(sheet);
+    if (root && root.parentNode) root.parentNode.removeChild(root);
+    sheet = null;
+    root = null;
+    stale = false;
+  }}
+
+  // The way out that is not at the far end of the card. Ignored while an
+  // install runs, which is exactly when the button it stands in for is
+  // disabled: pnpm is mid-write, and there is nothing to go back to yet.
+  //
+  // Registered once, out here rather than in `build`: the card is built again
+  // after a language switch, and a listener per build is a second handler
+  // holding a card the user cannot see. `shown()` is false while there is no
+  // card, which is what keeps the rest of the line from being read then.
+  document.addEventListener('keydown', function (event) {{
+    if (event.key === 'Escape' && shown() && !leave.disabled) done();
+  }});
 
   function ready(then) {{
     if (document.body) then();
@@ -520,6 +581,7 @@ pub fn script() -> String {
   /** The listing, and which of the two ways this was opened. */
   window.__dshPlugins = function (listing, how) {{
     ready(function () {{
+      if (stale) discard();
       if (!root) build();
 
       var data;
@@ -589,6 +651,20 @@ pub fn script() -> String {
    *  that is still running or starting one that is not. */
   window.__dshPluginHide = function () {{
     if (root) root.classList.remove('dsh-pp-shown');
+  }};
+
+  /** The labels again, after dsh changed language; see `relabel` in panel.rs.
+   *
+   *  The card is built once and kept, so the words in one already built are the
+   *  language it was built in. Rewriting them node by node would be a second
+   *  list of which element holds which label, to keep in step with the first;
+   *  the card is thrown away instead and the next opening builds it out of the
+   *  new TEXT. Not thrown away here: this can land while the panel is on
+   *  screen, and a card that vanishes under the user is worse than a card in
+   *  the language they just left. */
+  window.{relabel} = function (next) {{
+    TEXT = next;
+    stale = !!root;
   }};
 }})();"#
     )
