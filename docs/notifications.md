@@ -256,6 +256,34 @@ carrier 自带判别与提交面，按钮直接从它上面取（见 [A.1](#a1-d
 - **多题的 request 不逐题走完。** `QuestionAnswer` 是**整批**提交，通知只说「有 N 个问题在
   等」并给「打开」。一题一条 toast 会在 macOS / Linux 的通知中心里堆叠，不如在应用里翻页。
 
+**⚠️ 按钮 label 必须转义（Windows）。** `tauri-winrt-notification` 拼 toast XML 时，标题和
+两行正文都过了 `xml_escape::escape`，**唯独按钮没有**——它把 label 原样写进一个单引号属性：
+
+```rust
+write!(actions, "<action content='{}' arguments='{}'/>", b.content, b.action)
+```
+
+于是 label 里一个 `'`、`&` 或 `<` 就让文档不合法，`LoadXml` 拒绝，`show()` 返回 Err ——
+而这个 Err 在 `toast.rs` 里只是打一行 stderr，**整条通知就这么静默消失了**。
+
+实测（0.7.3 / Windows 11，一个 case 一条 toast）：`Don't rename it`、`Keep A & B`、
+`Use <default>` 全都发不出来；250 字符的长 label 和带 `"` 的 label 没事（属性的定界符
+正是撇号，所以双引号不特殊）。**长度从来不是问题，特殊字符才是。**
+
+这条路径只有「问题」类通知会碰到，因为只有它的按钮文字是外部来的（`approval` 和
+`plan-review` 的按钮是本应用自己的固定字符串）。而问题的选项 label 是提问方写的，英文里
+带撇号极其常见。
+
+处置见 `toast.rs` 的 `label()`：
+- **自己转义**，因为转义正是那个属性想要的——写进去的 `&amp;` 解析回来就是 `&`。
+- **只在 Windows 转**。XDG 下 label 是走 D-Bus 的裸字符串，转了会让用户看到字面的 `&amp;`。
+- **id 不转**。它们是本应用自己的封闭表，没有一个字符需要转义。
+- **`show()` 失败就去掉按钮重发一次**（`plain()`）。上面那个原因已经处理掉了，这一层是给
+  下一个没想到的原因准备的：正文点击仍然能打开会话，那本来就是每条 toast 的兜底。
+- **上游哪天补了转义**，我们这边会变成双重转义，label 显示成 `&amp;`——是可见的，不是静默的，
+  由 `probes_the_button_label_escaping`（`#[ignore]`，跟另一条真 toast 探针放一起）在升级
+  那个依赖时抓出来。值得给 tauri 提 issue，这不是本项目特有的。
+
 ### 4.2.1 通知正文说的是哪件事
 
 **2026-09-10 补。** 原来的正文是按 kind 写死的一句话——授权类永远是「有一步操作在等你允许

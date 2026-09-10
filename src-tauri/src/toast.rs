@@ -102,6 +102,86 @@ const ANSWERABLE: u32 = 25_000;
 /// — a D-Bus round trip under XDG, COM activation on Windows — and because the
 /// wait that follows is blocking by construction. `click` rides along to the
 /// press; see the module docs.
+/// One button's text, as the platform can be handed it.
+///
+/// A Windows toast is XML, and `tauri-winrt-notification` builds it by
+/// formatting the parts into a template string. It escapes the ones it owns —
+/// title, both body lines, every image path — and does not escape a button's,
+/// which it writes straight into a single-quoted attribute:
+///
+/// ```text
+/// write!(actions, "<action content='{}' arguments='{}'/>", b.content, b.action)
+/// ```
+///
+/// So a label carrying `'`, `&` or `<` makes the document malformed, `LoadXml`
+/// refuses it, and `show()` fails — which cost the **whole notification**,
+/// silently, because the only thing this app did with that error was print it.
+/// Measured on Windows 11 against 0.7.3, one toast per case: `Don't rename it`
+/// and `Keep A & B` and `Use <default>` all failed to appear, while a 250
+/// character label and one containing `"` were fine (the attribute's own
+/// delimiter is the apostrophe, so a double quote is not special).
+///
+/// It reaches here as the asker's own option labels — see
+/// [`crate::signal::buttons`], where a question's buttons are dsh's text and
+/// nothing else is. An apostrophe in an English label is ordinary.
+///
+/// Escaped here rather than worked around, because the escape is exactly what
+/// the attribute wants: `&amp;` written into that template parses back to `&`.
+/// The ids are not escaped — they are this app's own, from one closed table,
+/// and none of them has a character to escape.
+///
+/// **Windows only**, and that is not an optimisation. Under XDG the label
+/// travels over D-Bus as a string with no markup anywhere, so escaping it there
+/// would show the user a literal `&amp;`.
+///
+/// If a later `tauri-winrt-notification` escapes these itself, this becomes a
+/// double escape and labels start reading `&amp;` — visible, not silent, and
+/// caught by `probes_the_button_label_escaping`, which is `#[ignore]`d beside
+/// the other real-toast probe for whoever bumps that dependency.
+#[cfg(windows)]
+fn label(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\'' => escaped.push_str("&apos;"),
+            '"' => escaped.push_str("&quot;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// Everywhere else the label is the label.
+#[cfg(not(windows))]
+fn label(text: &str) -> String {
+    text.to_string()
+}
+
+/// The same notification with nothing to press, for the retry in [`raise`].
+///
+/// Deliberately not the first one with its actions removed: `notify-rust` has
+/// no way to take an action off, and a notification that has already been
+/// through `show()` is not documented to be reusable.
+#[cfg(not(target_os = "macos"))]
+fn plain(title: &str, body: &str) -> notify_rust::Notification {
+    let mut notification = notify_rust::Notification::new();
+    notification.summary(title);
+    if !body.is_empty() {
+        notification.body(body);
+    }
+    notification.auto_icon();
+
+    // The body click, which under XDG is only delivered when it is declared.
+    // The whole point of this retry is to keep that click.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    notification.action("default", t!("打开", "Open"));
+
+    notification
+}
+
 pub fn raise(app: &AppHandle, title: String, body: String, click: Option<crate::notify::Click>) {
     let app = app.clone();
 
@@ -130,7 +210,7 @@ pub fn raise(app: &AppHandle, title: String, body: String, click: Option<crate::
         #[cfg(not(target_os = "macos"))]
         if let Some(click) = &click {
             for button in &click.buttons {
-                notification.action(&button.id, &button.label);
+                notification.action(&button.id, &label(&button.label));
             }
 
             // A toast with something to decide on is given the long life the
@@ -157,6 +237,24 @@ pub fn raise(app: &AppHandle, title: String, body: String, click: Option<crate::
                 // refused or could not be reached. The feature is a courtesy,
                 // so it is written down rather than raised.
                 eprintln!("dsh-desktop: the system would not show a notification: {error}");
+
+                // One retry, without the buttons, when there were any. A
+                // refusal that is really about the buttons costs the whole
+                // notification otherwise, and the notification is the part
+                // that matters: its body still opens the session, which is
+                // every toast's fallback anyway. See [`label`] for the one
+                // cause of this that is known and now handled — this is for
+                // the next one.
+                #[cfg(not(target_os = "macos"))]
+                match plain(&title, &body).show() {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        eprintln!("dsh-desktop: nor would it show one without buttons: {error}");
+                        return;
+                    }
+                }
+
+                #[cfg(target_os = "macos")]
                 return;
             }
         };
@@ -320,6 +418,59 @@ mod tests {
     /// body instead and it should print `Default`; press one of the two
     /// buttons and it should print `Action("allow")` or `Action("reject")`,
     /// which is the pair [`super::press`] tells apart.
+    /// What the platform does with a button label it did not write.
+    ///
+    /// `#[ignore]`d and `--nocapture`, like the probe below: it raises real
+    /// toasts and reads their fate off the return value rather than asserting
+    /// anything, because what it is measuring belongs to a dependency and an
+    /// OS. Run it when bumping `tauri-winrt-notification`.
+    ///
+    /// Every line should print `SHOWN`. Measured against 0.7.3 on Windows 11,
+    /// with [`super::label`] taken out, the middle three printed `FAILED` with
+    /// an XML parse error — that is the bug `label` exists for, and if they
+    /// fail again the escaping stopped reaching the platform.
+    ///
+    /// The other direction is not visible from here: if that crate starts
+    /// escaping these itself, every line still prints `SHOWN` and the toast
+    /// reads `Don&amp;apos;t rename it`. So look at the popups, not only at
+    /// the output.
+    #[test]
+    #[ignore]
+    #[cfg(windows)]
+    fn probes_the_button_label_escaping() {
+        for (name, text) in [
+            ("plain", "Use the shared config"),
+            ("apostrophe", "Don't rename it"),
+            ("ampersand", "Keep A & B"),
+            ("angle", "Use <default>"),
+            ("quote", "Use \"strict\" mode"),
+        ] {
+            let mut notification = notify_rust::Notification::new();
+            notification.summary("dsh-desktop");
+            notification.body(name);
+            notification.action("0", &super::label(text));
+            match notification.show() {
+                Ok(handle) => {
+                    println!("{name:12} SHOWN as {:?}", super::label(text));
+                    drop(handle);
+                }
+                Err(error) => println!("{name:12} FAILED: {error}"),
+            }
+        }
+    }
+
+    /// The escape itself, without a platform in the way.
+    #[test]
+    #[cfg(windows)]
+    fn escapes_what_the_toast_template_would_choke_on() {
+        assert_eq!(super::label("Keep A & B"), "Keep A &amp; B");
+        assert_eq!(super::label("Don't rename it"), "Don&apos;t rename it");
+        assert_eq!(super::label("Use <default>"), "Use &lt;default&gt;");
+        // Nothing to do to a label that has none of them, which is every
+        // button this app writes for itself.
+        assert_eq!(super::label("允许"), "允许");
+    }
+
     #[test]
     #[ignore]
     #[cfg(not(target_os = "macos"))]
