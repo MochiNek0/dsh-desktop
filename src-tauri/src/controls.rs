@@ -296,7 +296,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::Runtime => return crate::open_runtime(app),
         Action::RestartDsh => return crate::restart_dsh(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),
-        Action::Signal(signal) => return crate::signal::note(signal),
+        Action::Signal(signal) => return crate::signal::act(app, signal),
         Action::Answered(url) => return crate::dialog::answered(app, &url),
         Action::OpenUrl(target) => {
             let _ = app.opener().open_url(target, None::<&str>);

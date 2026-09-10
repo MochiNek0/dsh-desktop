@@ -47,10 +47,15 @@
 //!
 //! ## What a click reaches
 //!
-//! The window, and nothing in the page. An activation calls [`crate::reveal`] —
-//! the same function the tray icon and a second launch of the app go through —
-//! and stops there. The page's own `Notification.onclick` is still never fired;
-//! see [`crate::notify`] for why the shim keeps it and leaves it alone.
+//! The window, through [`crate::reveal`] — the same function the tray icon and a
+//! second launch of the app go through. And then, for a notification that named
+//! a session, that session: [`crate::signal::open`] asks the plugin to select
+//! it, so a click on "dsh has a question for you" lands on the session that
+//! asked rather than on whichever one happened to be in front. A notification
+//! the page raised names no session and stops at the window.
+//!
+//! The page's own `Notification.onclick` is still never fired; see
+//! [`crate::notify`] for why the shim keeps it and leaves it alone.
 //!
 //! It is a click on the toast **while it is on screen**. Once the popup has
 //! timed out, Windows and most Linux daemons keep a copy in a notification
@@ -78,8 +83,9 @@ static LISTENING: AtomicUsize = AtomicUsize::new(0);
 ///
 /// On its own thread because two of the three backends do real work in `show()`
 /// — a D-Bus round trip under XDG, COM activation on Windows — and because the
-/// wait that follows is blocking by construction.
-pub fn raise(app: &AppHandle, title: String, body: String) {
+/// wait that follows is blocking by construction. `session` rides along to the
+/// click; see the module docs.
+pub fn raise(app: &AppHandle, title: String, body: String, session: Option<String>) {
     let app = app.clone();
 
     std::thread::spawn(move || {
@@ -112,16 +118,24 @@ pub fn raise(app: &AppHandle, title: String, body: String) {
             }
         };
 
-        // macOS sends on drop; see the module docs. Nothing to wait for.
+        // macOS sends on drop; see the module docs. Nothing to wait for, and
+        // so nothing for the session to be the answer to.
         #[cfg(target_os = "macos")]
-        drop(handle);
+        {
+            let _ = &session;
+            drop(handle);
+        }
 
         #[cfg(not(target_os = "macos"))]
         {
             if LISTENING.fetch_add(1, Ordering::Relaxed) < LISTENERS {
                 let _ = handle.wait_for_response(|response: &notify_rust::NotificationResponse| {
-                    if opens(response) {
-                        crate::reveal(&app);
+                    if !opens(response) {
+                        return;
+                    }
+                    crate::reveal(&app);
+                    if let Some(session) = &session {
+                        crate::signal::open(&app, session);
                     }
                 });
             }

@@ -91,10 +91,28 @@ use tauri::{AppHandle, Manager, Url};
 /// screen wherever it is drawn; the rest would only make the URL longer.
 const LIMIT: usize = 200;
 
-/// One notification, as it arrived from the page.
+/// One notification: what to say, and which session it is about.
+///
+/// The session is `None` for everything the page raises, which is every
+/// notification that comes through the shim -- a plugin calling
+/// `window.Notification` has no session to name and no reason to know the
+/// concept. It is `Some` only for the ones [`crate::signal`] raises from dsh's
+/// own state, and it is what a click on the toast has to go on.
 pub struct Notice {
     title: String,
     body: String,
+    session: Option<String>,
+}
+
+impl Notice {
+    /// One about a session, from [`crate::signal`] rather than from the page.
+    pub fn about(session: &str, title: &str, body: &str) -> Notice {
+        Notice {
+            title: clamp(title),
+            body: clamp(body),
+            session: Some(session.to_string()),
+        }
+    }
 }
 
 /// Read a `dsh-window://notify` navigation. `None` for a query with nothing in
@@ -122,7 +140,11 @@ pub fn received(url: &Url) -> Option<Notice> {
         title = "dsh".to_string();
     }
 
-    Some(Notice { title, body })
+    Some(Notice {
+        title,
+        body,
+        session: None,
+    })
 }
 
 /// Raise it, unless the user turned notifications off or is already looking at
@@ -146,7 +168,7 @@ pub fn show(app: &AppHandle, notice: Notice) {
         return;
     }
 
-    crate::toast::raise(app, notice.title, notice.body);
+    crate::toast::raise(app, notice.title, notice.body, notice.session);
 }
 
 /// Whether the window is on screen and has the user's attention. Anything less —
@@ -301,6 +323,23 @@ mod tests {
     fn refuses_a_notification_with_nothing_in_it() {
         assert!(parse("title=&body=%20").is_none());
         assert!(parse("").is_none());
+    }
+
+    /// A notification from the page is about no session in particular, and one
+    /// from [`crate::signal`] is about exactly one.
+    ///
+    /// Which is the whole difference a click can act on: the shim has no
+    /// session to name — a plugin calling `window.Notification` has no reason
+    /// to know the concept — so a toast it raised stops at the window.
+    #[test]
+    fn only_a_signal_names_a_session() {
+        let from_the_page = parse("title=Turn%20finished&body=all%20done").expect("a notice");
+        assert_eq!(from_the_page.session, None);
+
+        let signalled = super::Notice::about("session-7", "  Turn finished  ", "all done");
+        assert_eq!(signalled.session.as_deref(), Some("session-7"));
+        // Clamped and trimmed like any other.
+        assert_eq!(signalled.title, "Turn finished");
     }
 
     /// The cut lands on a character boundary, which for the scripts this app is

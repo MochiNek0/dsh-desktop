@@ -25,7 +25,7 @@ function load({ host }) {
   assert.ok(registered, 'the bundle should register a factory');
   assert.equal(registered.id, 'dsh-desktop-signal');
   const exports = registered.factory(() => { throw new Error('should require nothing'); });
-  return { exports, sent };
+  return { exports, sent, window };
 }
 
 // Stub services with hand-driven snapshots.
@@ -33,14 +33,21 @@ function services() {
   let list = { ids: [], byId: {} };
   let pending = new Map();
   const listeners = { list: [], pending: [] };
+  const opened = [];
+  let teardown = null;
   return {
+    opened,
+    stop() { if (teardown) teardown(); },
     ctx: {
-      effect: (fn) => { fn(); },
+      // The real one keeps the cleanup to run on disposal; this keeps it so a
+      // test can run it.
+      effect: (fn) => { teardown = fn(); },
       sessions: {
         list: {
           getSnapshot: () => list,
           subscribe: (fn) => { listeners.list.push(fn); return () => {}; },
         },
+        open: (id) => { opened.push(id); },
       },
       uiSession: {
         pendingInteractions: {
@@ -173,6 +180,34 @@ const query = (url) => Object.fromEntries(new URL(url).searchParams);
   assert.equal(sent.length, 3, 'three sessions ending in one tick should all be sent');
   assert.equal(new Set(sent).size, 3, 'identical URLs would not navigate twice');
   console.log('ok  queues a burst instead of clobbering it');
+}
+
+// --- the door back down ---
+{
+  const { exports, window } = load({ host: true });
+  const s = services();
+  exports.apply(s.ctx);
+
+  // Both of the shell's uses of this global: its presence, which is what tells
+  // the shell's DOM watchers to stand down, and the call a notification click
+  // makes.
+  assert.ok(window.__dshSignals, 'the shell reads this to stand its watchers down');
+  window.__dshSignals.open('session-7');
+  assert.deepEqual(s.opened, ['session-7'], 'open should reach ctx.sessions.open');
+
+  s.stop();
+  assert.equal(window.__dshSignals, undefined, 'a torn-down plugin hands the fallback back');
+  console.log('ok  opens a session for the shell, and only while wired up');
+}
+
+// --- no desktop shell: no door either ---
+{
+  const { exports, window } = load({ host: false });
+  const s = services();
+  exports.apply(s.ctx);
+
+  assert.equal(window.__dshSignals, undefined, 'nothing to open outside the shell');
+  console.log('ok  hangs nothing on window outside the desktop shell');
 }
 
 console.log('\nall plugin checks passed');

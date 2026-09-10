@@ -99,37 +99,19 @@ const PERIOD: u32 = 500;
 /// front of, having just navigated or reloaded to get there.
 const GRACE: u32 = 4_000;
 
-/// The waits dsh can raise: the attribute that marks each, and what to say.
+/// The waits dsh can raise: the attribute that marks each card, and dsh's own
+/// name for the same thing.
 ///
-/// A click on a toast brings the window back and no further — see the module
-/// docs in [`crate::notify`] — so each body stands on its own rather than
-/// promising that clicking will take the user to the question itself.
-fn waits() -> [(&'static str, &'static str, &'static str); 3] {
+/// The name is the key to what to say about it — [`crate::signal::waiting_on`]
+/// holds the strings, because the plugin reports these three by that name and
+/// the two paths to one toast must not drift apart. This table is the half that
+/// is only needed while the wait is being spotted in the DOM, and it goes when
+/// this module does.
+fn waits() -> [(&'static str, &'static str); 3] {
     [
-        (
-            "data-approval-key",
-            t!("dsh 需要你的授权", "dsh needs your approval"),
-            t!(
-                "有一步操作在等你允许或拒绝，这一轮暂停在这里。",
-                "A step is waiting for you to allow or refuse it; the turn is paused until you do."
-            ),
-        ),
-        (
-            "data-plan-review-key",
-            t!("dsh 等你审阅方案", "dsh is waiting on your review"),
-            t!(
-                "方案已经写好，等你批准或者说说要改哪里。",
-                "The plan is written and waiting for you to approve it or say what to change."
-            ),
-        ),
-        (
-            "data-question-key",
-            t!("dsh 有问题要问你", "dsh has a question for you"),
-            t!(
-                "这一轮停在一个问题上，等你回答。",
-                "This turn has stopped on a question and is waiting for your answer."
-            ),
-        ),
+        ("data-approval-key", "approval"),
+        ("data-plan-review-key", "plan-review"),
+        ("data-question-key", "question"),
     ]
 }
 
@@ -142,7 +124,8 @@ pub fn script() -> String {
         .iter()
         // Every string goes in through `{:?}`, so a quote or a backslash in a
         // translation arrives escaped rather than ending the literal early.
-        .map(|(attribute, title, body)| {
+        .map(|(attribute, kind)| {
+            let (title, body) = crate::signal::waiting_on(kind);
             format!("{{ attribute: {attribute:?}, title: {title:?}, body: {body:?} }}")
         })
         .collect::<Vec<_>>()
@@ -203,6 +186,17 @@ pub fn script() -> String {
 
   /** Read the composer and act only on a change. */
   function sample() {{
+    // The plugin reports the same three from `uiSession.pendingInteractions`,
+    // where dsh publishes them, with the session and the request's own key --
+    // and a notification raised from that carries the session a click can go
+    // to. So with the plugin wired up this watcher is not a second opinion, it
+    // is a second toast: it stands down whole. See signal.rs. Reading it on the
+    // tick rather than once is what makes an install take effect on the next
+    // dsh page load instead of the next app start -- and the plugin sets it
+    // while its own `apply` runs, inside the {grace}ms this script spends
+    // recording a baseline anyway.
+    if (window.__dshSignals) return;
+
     var now = current();
     var mark = now ? now.mark : '';
 
@@ -242,7 +236,8 @@ mod tests {
 
         assert!(script.contains(&PERIOD.to_string()));
         assert!(script.contains(&GRACE.to_string()));
-        for (attribute, title, body) in waits() {
+        for (attribute, kind) in waits() {
+            let (title, body) = crate::signal::waiting_on(kind);
             assert!(
                 script.contains(attribute),
                 "{attribute} is not in the script"
@@ -263,7 +258,7 @@ mod tests {
     fn looks_every_wait_up_from_one_table() {
         let script = script();
 
-        for (attribute, _, _) in waits() {
+        for (attribute, _) in waits() {
             let quoted = format!("{attribute:?}");
             assert_eq!(
                 script.matches(&quoted).count(),
@@ -271,6 +266,27 @@ mod tests {
                 "{attribute} must reach the script once, from the table"
             );
         }
+    }
+
+    /// It stands down when the plugin is reporting the same thing.
+    ///
+    /// Both would otherwise raise a toast for one event. Asserted against the
+    /// generated script because the check has to be inside the tick — read
+    /// once at install time it would take an app restart to notice a plugin
+    /// added since.
+    #[test]
+    fn stands_down_for_the_plugin() {
+        let script = script();
+
+        assert!(
+            script.contains("if (window.__dshSignals) return;"),
+            "the watcher must stand down while the plugin is wired up"
+        );
+        let guard = script
+            .find("window.__dshSignals")
+            .expect("the guard should be in the script");
+        let sample = script.find("function sample()").expect("no sample()");
+        assert!(guard > sample, "the guard belongs inside the tick");
     }
 
     /// It reads on a clock of its own, not on dsh's mutations.
@@ -293,7 +309,8 @@ mod tests {
     #[test]
     fn quotes_the_strings_it_pastes() {
         let script = script();
-        let (attribute, title, body) = waits()[0];
+        let (attribute, kind) = waits()[0];
+        let (title, body) = crate::signal::waiting_on(kind);
 
         assert!(script.contains(&format!(
             "{{ attribute: {attribute:?}, title: {title:?}, body: {body:?} }}"

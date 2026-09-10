@@ -93,11 +93,10 @@ pub fn script() -> String {
     let settle = SETTLE;
     let period = PERIOD;
     let confirm = CONFIRM;
-    let title = t!("对话已完成", "Turn finished");
-    let body = t!(
-        "dsh 已经处理完这一轮，可以回来看看了。",
-        "dsh has finished this turn and is waiting for you."
-    );
+    // From `signal`, which says the same thing about a turn end the plugin
+    // reported. Two copies of one sentence is the drift `i18n` is written to
+    // avoid, and this module is the copy that goes away.
+    let (title, body) = crate::signal::turn_ended();
 
     format!(
         r#"(function () {{
@@ -200,6 +199,16 @@ pub fn script() -> String {
 
   /** Read the button and act only on a confirmed change. */
   function sample() {{
+    // The plugin reports the same edge from `sessions.list`, where dsh
+    // publishes it, and a notification raised from that carries the session a
+    // click can go to. So with the plugin wired up this watcher is not a
+    // second opinion, it is a second toast: it stands down whole. See
+    // signal.rs. Reading it on the tick rather than once is what makes an
+    // install take effect on the next dsh page load instead of the next app
+    // start -- and the plugin sets it while its own `apply` runs, inside the
+    // window this script spends waiting for a turn to last {settle}ms anyway.
+    if (window.__dshSignals) return;
+
     var now = running();
     if (now === null) return;
 
@@ -257,6 +266,27 @@ mod tests {
         let title = format!("{:?}", t!("对话已完成", "Turn finished"));
 
         assert!(script.contains(&format!("var TITLE = {title};")));
+    }
+
+    /// It stands down when the plugin is reporting the same thing.
+    ///
+    /// Both would otherwise raise a toast for one event. Asserted against the
+    /// generated script because the check has to be inside the tick — read
+    /// once at install time it would take an app restart to notice a plugin
+    /// added since.
+    #[test]
+    fn stands_down_for_the_plugin() {
+        let script = script();
+
+        assert!(
+            script.contains("if (window.__dshSignals) return;"),
+            "the watcher must stand down while the plugin is wired up"
+        );
+        let guard = script
+            .find("window.__dshSignals")
+            .expect("the guard should be in the script");
+        let sample = script.find("function sample()").expect("no sample()");
+        assert!(guard > sample, "the guard belongs inside the tick");
     }
 
     /// A turn has to last a noticeable while before finishing it is news, and

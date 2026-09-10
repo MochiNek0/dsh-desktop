@@ -23,6 +23,18 @@
  * is one module and requires nothing, so there is nothing for a bundler to do
  * and no build step to keep in step with the Rust half.
  *
+ * ## The door the other way
+ *
+ * One global, `window.__dshSignals`, set while the plugin is wired up. The
+ * shell reads it for two things. Its `open(id)` is how a click on a
+ * notification gets back to the session the notification was about —
+ * `ctx.sessions.open` is dsh's own way to switch the current session. And its
+ * mere presence tells the shell's own DOM watchers to stand down: they infer
+ * the same two states by polling dsh's markup, and with this plugin wired up
+ * they would only raise a second toast for every one raised from dsh's own
+ * state. Removed again on teardown, so a disabled plugin hands the fallback
+ * back.
+ *
  * ## Outside the desktop shell
  *
  * Nothing. The channel below is a navigation to a scheme only dsh desktop
@@ -94,7 +106,19 @@ window.__ModuleLoader__.load({
       ctx.effect(() => {
         var stopTurns = watchTurns(ctx);
         var stopWaits = watchWaits(ctx);
+        window.__dshSignals = {
+          /**
+           * Select a session, for a click that arrived on a notification about
+           * it. Called from the shell over `window.eval`; see its signal.rs.
+           *
+           * @param {string} id - session id, as it was reported from here.
+           */
+          open: (id) => {
+            ctx.sessions.open(id);
+          },
+        };
         return () => {
+          delete window.__dshSignals;
           stopTurns();
           stopWaits();
         };
