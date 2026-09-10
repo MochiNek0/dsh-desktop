@@ -338,16 +338,27 @@ pub fn listing(app: &AppHandle) -> String {
 
     // What pnpm put there, which is the whole of what it can take away again.
     // Carrying the preset's own label where the list knows one, so a plugin
-    // reads the same on the way out as it did on the way in.
+    // reads the same on the way out as it did on the way in — and, for the
+    // same reason, everything else its card is drawn out of. The panel draws
+    // one kind of card for both halves of this listing: an installed plugin
+    // keeps the description, the repository and the section it had while it
+    // was still something to install. A plugin the shipped list has never
+    // heard of has none of the three, and gets the card that is left.
     let held: Vec<serde_json::Value> = dependencies_in(&manifest)
         .into_iter()
         .map(|(name, version)| {
-            let label = presets
-                .iter()
-                .find(|preset| preset.package == name)
+            let preset = presets.iter().find(|preset| preset.package == name);
+            let label = preset
                 .map(|preset| preset.name.clone())
                 .unwrap_or_else(|| name.clone());
-            serde_json::json!({ "name": name, "label": label, "version": version })
+            serde_json::json!({
+                "name": name,
+                "label": label,
+                "version": version,
+                "description": preset.map(|preset| preset.description.as_str()),
+                "url": preset.map(|preset| preset.url.as_str()),
+                "section": preset.map(|preset| preset.section.as_str()),
+            })
         })
         .collect();
 
