@@ -138,11 +138,29 @@ Windows: WinRT Toast   macOS: mac-notification-sys   Linux: D-Bus
 
 ### 4.1 通知层三端实现
 
-| 平台 | 用什么 | 按钮 | 激活 | 线程 |
-| :--- | :--- | :--- | :--- | :--- |
-| Windows | `tauri-winrt-notification` | `add_button`，≤5 | `on_activated(Option<String>)` 拿 `arguments` | 回调，不占线程 |
-| macOS | `notify-rust` 的 `.action()` | 1 个 → 主按钮；≥2 → "Options" 下拉 | `send()` 的返回值 | **阻塞**，占一个线程 |
-| Linux | `notify-rust` xdg | XDG actions，实际显示几个由守护进程决定 | `wait_for_action` | **阻塞**，占一个线程 |
+`tauri-plugin-notification` 唯一的依赖就是 `notify-rust`，而 `notify-rust` 三端的
+`show()` 都返回 `Result<NotificationHandle>`，句柄上都有 `wait_for_response`。所以自建
+这一层不是写三份实现，是**一份**加两处平台事实。这一层已实施，见
+`src-tauri/src/toast.rs`；下表「按钮」那一列还是第 4 步的事，第 2 步只有本体点击。
+
+| 平台 | 按钮 | 激活 | 线程 |
+| :--- | :--- | :--- | :--- |
+| Windows | 转成 `tauri-winrt-notification` 的 `add_button`，≤5 | `Default`（点本体）/ `Action(id)` | `show()` 不阻塞；等待占一个线程 |
+| Linux | XDG actions，实际显示几个由守护进程决定 | 同上；点本体要求先声明一个名为 `default` 的 action | 同上 |
+| macOS | 1 个 → 主按钮；≥2 → "Options" 下拉 | **没接**，见下 | 同上 |
+
+- **macOS 的 `show()` 什么都不显示。** 它只把 notification 包进一个句柄；真正发出去发生在
+  `wait_for_response`（同步，走 `NSUserNotificationCenter`，注释要求主 run loop 在转）
+  或者句柄的 `Drop`（异步，`.ok()` 掉错误）。取后者：与插件丢句柄的行为逐位相同，所以
+  macOS 的 toast 与今天一样，代价是三端里只有它听不到点击。为一个便利功能在非主线程里
+  阻塞进 AppKit，且本机无法验证，不值。
+- **要用 `wait_for_response`，不是 `wait_for_action`。** 后者的 Windows 分支把「点了本体」
+  和「toast 自己超时」折成同一个 `"__closed"`（`notify-rust` `src/windows.rs:111`），
+  照它写就是 toast 一超时就把窗口弹到用户面前。
+
+一条能力边界，三端一样：**只接得住弹窗还在屏幕上时的那次点击。** 超时之后 Windows 和多数
+Linux 守护进程会在通知中心留一份，点那一份不送给运行中的进程 —— Windows 要注册一个 COM
+activator，是安装器级别的东西，这个应用别处用不到。所以等待随弹窗结束，线程随等待结束。
 
 按钮上限统一按 **2 个动作 + 本体点击（= 打开）** 设计：正好落在 macOS 下拉的能力内，
 Linux 上守护进程吝啬时也还能露出来。
@@ -183,8 +201,9 @@ carrier 自带判别与提交面，按钮直接从它上面取（见 [A.1](#a1-d
   改造最大的净收益。
 - **版本漂移。** dsh 的客户端包目前是 `0.0.1-rc.*`，契约会动。插件里锁死版本，并接受
   「dsh 升级后插件需要跟版本」这件事。桥断掉时是**加载失败**（响亮），不是误答（安静）。
-- **线程上限。** macOS / Linux 每个待回答通知占一个阻塞线程，需要超时与并发上限，否则挂着
-  不管的会话会堆线程。
+- **线程上限。** 每个还在等点击的通知占一个阻塞线程。第 2 步已经放了并发上限
+  （`toast.rs` 的 `LISTENERS`，超出就照样弹但不听点击）；这条在第 4 步会重新变紧 ——
+  待回答的 toast 想活得比弹窗久，就得配超时。
 
 ## 5. 实施步骤
 
@@ -196,12 +215,13 @@ carrier 自带判别与提交面，按钮直接从它上面取（见 [A.1](#a1-d
    → 验证：切换会话、提问、跑完，Rust 侧收到的事件与侧边栏圆点状态一致；
           `__DSH_VERSION__` 不存在时插件整体不接线；加载日志里没有 inject 解析告警
 
-2. 通知携带 sessionId；点击本体 → reveal() + eval 调插件的 open(id)
-   → 验证：多会话下点通知，回到的是提问的那个会话
-
-3. 自建通知层 toast.rs 替换 tauri-plugin-notification，先只做「打开」按钮
+2. 自建通知层 toast.rs 替换 tauri-plugin-notification，点击本体 → reveal()
    → 验证：Linux 上停掉通知守护进程，日志出现明确失败而非静默；
-          三端 toast 的名称与图标仍为已安装应用自身
+          三端 toast 的名称与图标仍为已安装应用自身；
+          点 toast 本体，窗口从托盘回到前面
+
+3. 通知携带 sessionId；点击本体 → reveal() + eval 调插件的 open(id)
+   → 验证：多会话下点通知，回到的是提问的那个会话
 
 4. 按 4.2 的表加动作按钮，激活 → 插件提交答案
    → 验证：key 不匹配时拒绝提交并降级为「打开」；
@@ -221,7 +241,13 @@ carrier 自带判别与提交面，按钮直接从它上面取（见 [A.1](#a1-d
 开发期的装法见 [A.4](#a4-客户端插件的加载契约)：
 `dsh plugin --profile web add -w ./plugin`，装出来是指向仓库的 `link:`。
 
-第 1、2 步之后就已经可用（点击回到会话），第 3 步是可诊断性，第 4 步才是新能力。
+**2 和 3 调过顺序。** 原来的第 2 步是「点击本体 → reveal()」，但在
+`tauri-plugin-notification` 还拿着 toast 的时候，根本没有激活可接 —— 它 `show()` 之后
+就把句柄丢了。所以「换掉通知层」必须排在「点击有反应」前面，而不是后面。换过来之后
+第 2 步顺带把可诊断性也一起交付了。
+
+第 2 步之后已经可用（收进托盘、点通知回到窗口），第 3 步把「回到窗口」变成「回到提问的
+那个会话」，第 4 步才是新能力。
 
 ## 6. 未决问题
 
@@ -336,7 +362,18 @@ carrier。
 
 - `tauri-plugin-notification@2.3.3` 的 `src/desktop.rs`：`show()` 把通知交给
   `tauri::async_runtime::spawn(async move { let _ = notification.show(); })`，句柄和错误
-  一起丢弃，永远返回 `Ok`。**这是必须绕过它的唯一原因。**
+  一起丢弃，永远返回 `Ok`。**这是必须绕过它的唯一原因。** 而它三端唯一的依赖就是
+  `notify-rust`，`app_id`（Windows）与 `set_application`（macOS）两处身份设置也都在这
+  32 行里 —— 所以「绕过它」等于把这 32 行抄进 `toast.rs`，不是重写一个通知层。
+- **`notify-rust@4.18.0` 的 Windows 后端已经把按钮和激活接好了**（`src/windows.rs`）：
+  `notification.actions` 每两项转成一次 `add_button`，`on_activated` / `on_dismissed`
+  写进一个 mpsc，`show()` 返回持有 `Receiver` 的句柄。所以 `tauri-winrt-notification`
+  不必作为直接依赖 —— 它在下面一层。上一版这张表把 Windows 写成要直接对着它写，是多余的。
+- **`show()` 之后激活还送得到。** 这是自建这层唯一没法靠读代码确认的事：`show()` 里注册
+  `Activated` 的那个 `ToastNotification` 出了函数就析构了。实测送得到 —— `toast.rs` 留了
+  一个 `#[ignore]` 的探针（`cargo test -- --ignored --nocapture raises_one_real_toast`），
+  弹一条真 toast 然后打印回来的是什么；放着不管，6.5 秒后打印 `Closed(Expired)`，说明
+  事件确实从 WinRT 回到了这个进程的线程里。点它则是 `Default`，走的同一条路。
 - `tauri-winrt-notification@0.7.3` 的 `src/lib.rs`：XML 只写
   `<action content='' arguments=''/>`，没有 `<input>`，也没有 raw-XML 逃生口；
   `on_activated` 只读 `args.Arguments()`，**不读 `args.UserInput()`**。Windows 平台本身
@@ -353,13 +390,14 @@ carrier。
   开始菜单快捷方式，NSIS 已经盖过 `${BUNDLEID}`，**不要再盖第二次**；macOS 需要 `.app`
   bundle 且 bundle id 已注册；Linux 需要 `org.freedesktop.Notifications` 守护进程。
 
-### A.3 一处需要更正的既有注释
+### A.3 一处需要更正的既有注释（已改）
 
 `notify.rs` 的模块文档称三个平台对是否投递激活「意见不一」，只有 Windows 可达。按
 `notify-rust@4.18.0` 的实际代码，三端的 `show()` 都返回句柄
 （`xdg::NotificationHandle` / `macos::NotificationHandle` / `windows::NotificationHandle`），
 `tauri-winrt-notification` 也有 `on_activated`。真正的障碍只有插件把句柄扔了这一件，
-与平台无关。**实施第 3 步时同步改掉那段说明。**
+与平台无关。**已随第 2 步改掉**（顺序见 [第 5 节](#5-实施步骤)）：那一节现在讲的是
+点击进 `reveal()`、页面自己的 `onclick` 仍然不触发，以及为什么。
 
 ### A.4 客户端插件的加载契约
 

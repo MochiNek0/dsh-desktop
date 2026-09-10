@@ -17,10 +17,10 @@ serde_json = "1"
 # how you end up shipping rc.10 as older than rc.9.
 semver = "1"
 tauri-plugin-autostart = "2.5.1"
-# Turns the browser Notification API the dsh page calls into a real one; see
-# `notify`. Nothing in the webview is granted it — every notification is raised
-# from Rust, from a payload that arrived over the navigation channel.
-tauri-plugin-notification = "2"
+# The toast itself; see `toast`. This is the one dependency
+# `tauri-plugin-notification` had, called directly because the plugin drops both
+# the error and the handle its `show()` returns and this app needs both.
+notify-rust = "4.18"
 # Which of the two halves of every string to show; see `i18n`. One function and
 # no dependencies of its own — the platform calls it wraps are three different
 # ones, which is the whole reason not to write them here.

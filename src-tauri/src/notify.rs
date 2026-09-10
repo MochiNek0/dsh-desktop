@@ -23,34 +23,34 @@
 //!
 //! ## What a click does
 //!
-//! Nothing. Routing a click on a native toast back into the page is not
-//! portable — the three platforms disagree about whether an activation is even
-//! delivered to a running process — and a handler that fires on one of them is
-//! worse than none, because the plugin author cannot tell which. So the shim
-//! keeps the `Notification` object and its `onclick` intact and simply never
-//! fires it, which is exactly what happens today, and the notification itself is
-//! the part that was missing.
+//! Brings the window back, and nothing else. That is [`crate::toast`]'s half —
+//! it keeps the handle the toast is activated on, which is what this app could
+//! not do while `tauri-plugin-notification` raised the toast and dropped that
+//! handle. The reasoning that used to stand here, that an activation is not
+//! portable enough to be worth wiring, was wrong about the platforms and right
+//! about the plugin: all three backends hand back a handle carrying the
+//! activation, and the plugin threw it away on all three. See the module docs
+//! there for what a click does not reach — a popup that has already moved to the
+//! notification centre.
 //!
-//! This has been asked about, so the state of the ground underneath it: the
-//! Windows half is in fact reachable — `notify-rust` calls `Toast::on_activated`
-//! and hands back a `NotificationHandle` carrying the activation — but
-//! `tauri-plugin-notification`'s desktop `show()` drops that handle on the
-//! floor, so nothing above it can see a click. Wiring one up means going around
-//! the plugin to `notify-rust` directly, on Windows only, and owning a second
-//! notification path for the one platform. That is a real cost for a
-//! convenience, and the decision here is deliberately to leave the toast
-//! inert and put what the user needs into its text instead. Revisit if the
-//! plugin ever surfaces the handle.
+//! What a click still does not do is fire the page's own `onclick`. The shim
+//! below keeps the `Notification` object and its handlers intact and simply
+//! never dispatches to them, because sending an activation back into the page
+//! means naming which notification it belongs to, and the page's own object is
+//! not something Rust has a name for. A plugin author therefore sees the same
+//! thing on every platform: a notification that is raised, and a handler that
+//! does not run.
 //!
-//! Because a click leads nowhere, the body is written to stand on its own: it
+//! Because a click leads to the window rather than to the thing the
+//! notification was about, the body is still written to stand on its own: it
 //! says what finished, not "click to return".
 //!
 //! ## Whose name and icon a toast carries
 //!
 //! The installed app's. This has been reported as a bug more than once, so:
 //! a Windows toast is drawn with the name and icon of the AppUserModelID it was
-//! raised under, and `tauri-plugin-notification` passes the bundle identifier as
-//! that AUMID — but only when the running exe is not under `target\debug` or
+//! raised under, and [`crate::toast`] passes the bundle identifier as that
+//! AUMID — but only when the running exe is not under `target\debug` or
 //! `target\release`. For an uninstalled build it passes nothing, notify-rust
 //! substitutes its `POWERSHELL_APP_ID`, and the toast says *Windows PowerShell*
 //! and wears PowerShell's icon.
@@ -59,7 +59,7 @@
 //! here: the AUMID only resolves to a name and an icon because a Start Menu
 //! shortcut declares it, and an uninstalled build has no shortcut. The NSIS
 //! template already stamps `${BUNDLEID}` onto both shortcuts it creates (its
-//! `SetLnkAppUserModelId`), which is the same string the plugin sends, so an
+//! `SetLnkAppUserModelId`), which is the same string `toast` sends, so an
 //! installed app is correct with nothing added. Do not "fix" this by stamping
 //! the AUMID again from `installer-hooks.nsh` — it is already done, and a second
 //! copy is one more thing to keep in step.
@@ -71,21 +71,21 @@
 //! toast simply does not appear:
 //!
 //! - **macOS** goes through `mac-notification-sys`, which needs a bundle
-//!   identifier registered with LaunchServices. The plugin handles the awkward
-//!   case itself: `set_application(if tauri::is_dev() { "com.apple.Terminal" }
+//!   identifier registered with LaunchServices. `toast::identify` handles the
+//!   awkward case: `set_application(if tauri::is_dev() { "com.apple.Terminal" }
 //!   else { identifier })`, so a `tauri dev` run borrows Terminal's identity and
-//!   an installed `.app` uses its own. Nothing to do here, and in particular do
-//!   not add a `cfg(target_os = "macos")` branch that sets it again.
+//!   an installed `.app` uses its own. It is done in exactly that one place —
+//!   do not add a second `cfg(target_os = "macos")` branch that sets it again.
 //! - **Linux** goes over D-Bus to `org.freedesktop.Notifications`. That is
 //!   present under GNOME, KDE and anything else with a notification daemon, and
 //!   absent under a bare window manager or in a container — where the toast is
 //!   dropped by the session, not by this app.
 //!
-//! In all three cases the failure is silent by design: see the note in [`show`]
-//! on why the `Result` cannot tell you which happened.
+//! Two of those three now say so out loud: [`crate::toast`] logs what `show()`
+//! answered, which is a real answer under XDG and on Windows. macOS is the
+//! exception, and the reason is in that module.
 
 use tauri::{AppHandle, Manager, Url};
-use tauri_plugin_notification::NotificationExt;
 
 /// How much of each string survives the trip. A notification is two lines on
 /// screen wherever it is drawn; the rest would only make the URL longer.
@@ -146,22 +146,7 @@ pub fn show(app: &AppHandle, notice: Notice) {
         return;
     }
 
-    let mut builder = app.notification().builder().title(notice.title);
-    if !notice.body.is_empty() {
-        builder = builder.body(notice.body);
-    }
-
-    // The `Result` is about building the request, not about raising the toast.
-    // `tauri-plugin-notification`'s desktop `show()` hands the notification to
-    // `tauri::async_runtime::spawn` and discards what comes back, so it answers
-    // `Ok` on every platform whether or not anything was ever displayed. This
-    // arm therefore catches almost nothing — kept because it costs a line, but
-    // do not read silence here as a toast that appeared.
-    if let Err(error) = builder.show() {
-        // The whole feature is a courtesy; a platform that will not raise one is
-        // not a reason to interrupt anybody.
-        eprintln!("dsh-desktop: could not raise a notification: {error}");
-    }
+    crate::toast::raise(app, notice.title, notice.body);
 }
 
 /// Whether the window is on screen and has the user's attention. Anything less —

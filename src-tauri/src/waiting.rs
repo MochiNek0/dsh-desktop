@@ -101,9 +101,9 @@ const GRACE: u32 = 4_000;
 
 /// The waits dsh can raise: the attribute that marks each, and what to say.
 ///
-/// A click on a toast leads nowhere — see the module docs in [`crate::notify`]
-/// — so each body stands on its own rather than promising that clicking will
-/// take the user anywhere.
+/// A click on a toast brings the window back and no further — see the module
+/// docs in [`crate::notify`] — so each body stands on its own rather than
+/// promising that clicking will take the user to the question itself.
 fn waits() -> [(&'static str, &'static str, &'static str); 3] {
     [
         (

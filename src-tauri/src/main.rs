@@ -18,6 +18,7 @@ mod settings;
 mod setup;
 mod signal;
 mod theme;
+mod toast;
 mod turn;
 mod update;
 mod waiting;
@@ -125,9 +126,6 @@ fn main() {
             reveal(app);
         }))
         .plugin(tauri_plugin_opener::init())
-        // Raised from Rust only; nothing in the webview is granted it. See
-        // `notify`.
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
