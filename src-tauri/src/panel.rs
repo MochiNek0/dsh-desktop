@@ -194,6 +194,14 @@ pub fn script() -> String {
     var body = make('div', 'dsh-pp-body', line);
     var name = make('div', 'dsh-pp-name', body);
     name.appendChild(document.createTextNode(preset.name));
+    // What is actually going on the machine, where the name does not already
+    // say it. The names are translated, so `插件市场` on its own names nothing
+    // pnpm has heard of; the installed row below carries the package name for
+    // exactly the same reason. Before the chips, so those stay at the end.
+    if (preset.package && preset.package !== preset.name) {{
+      var pkg = make('span', 'dsh-pp-pkg', name);
+      pkg.textContent = preset.package;
+    }}
     if (preset.fix) name.appendChild(chip('fix', TEXT.fix));
     make('div', 'dsh-pp-desc', body).textContent = preset.description || '';
 
@@ -428,6 +436,11 @@ pub fn script() -> String {
       'outline-offset:2px}}' +
       '.dsh-pp-body{{min-width:0;flex:1}}' +
       '.dsh-pp-name{{font-weight:600;display:flex;align-items:center;gap:7px;flex-wrap:wrap}}' +
+      // The package name, said quietly: it is what the row installs, not what
+      // the row is called. Monospace because it is a thing to be typed —
+      // `dsh plugin add` takes this exact string.
+      '.dsh-pp-pkg{{font-weight:400;font-size:11.5px;color:var(--pp-muted);' +
+      'font-family:ui-monospace,Consolas,monospace}}' +
       '.dsh-pp-desc{{color:var(--pp-muted);font-size:13px;margin-top:3px}}' +
       // A badge, not a bare URL. The repository addresses in the list run long
       // enough to wrap twice and say nothing the name has not already said.

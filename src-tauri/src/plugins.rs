@@ -322,6 +322,11 @@ pub fn listing(app: &AppHandle) -> String {
             serde_json::json!({
                 "id": preset.id,
                 "name": preset.name,
+                // Beside the name on the card. The names are translated now,
+                // so the card no longer says anywhere what it is about to put
+                // on the machine — the row on the installed list carries the
+                // package name for the same reason.
+                "package": preset.package,
                 "description": preset.description,
                 "section": preset.section,
                 "url": preset.url,
