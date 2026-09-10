@@ -368,14 +368,36 @@ pub fn sync_autostart(app: &AppHandle) {
     );
 }
 
-/// Put the checkmark on the notification item, or take it off. Pushed on every
-/// page load and after every toggle, like the login item above.
+/// Put the checkmark on the notification item, or take it off — and say
+/// whether the item can be used at all. Pushed on every page load and after
+/// every toggle, like the login item above.
+///
+/// The second answer is [`crate::plugins::signalling`]: without the plugin
+/// that reports what dsh is doing there is nothing to raise a notification
+/// about, so the row is drawn dimmed and inert rather than as a switch that
+/// can be turned on and will do nothing. The third is why, in the user's own
+/// language, because a dimmed row with no explanation is a bug report.
+///
+/// Every page load is enough to keep it current: installing or removing a
+/// plugin restarts dsh and reloads the document, which lands here.
 pub fn sync_notify(app: &AppHandle) {
-    let enabled = crate::settings::notifications(app);
-    eval(
-        app,
-        &format!("window.__dshNotifyTurns && window.__dshNotifyTurns({enabled})"),
+    let call = notify_call(
+        crate::settings::notifications(app),
+        crate::plugins::signalling(app),
+        t!(
+            "需要「会话信号」插件，在菜单的「插件」里安装。",
+            "Needs the Session signals plugin — install it from Plugins in this menu."
+        ),
     );
+    eval(app, &call);
+}
+
+/// The call [`sync_notify`] makes, as a string so both halves of it can be
+/// read in one test: three arguments here, three parameters in the function
+/// the injected script hangs on `window`.
+fn notify_call(enabled: bool, available: bool, hint: &str) -> String {
+    let hint = serde_json::to_string(hint).expect("a string is always serializable");
+    format!("window.__dshNotifyTurns && window.__dshNotifyTurns({enabled}, {available}, {hint})")
 }
 
 /// Say what is running, or `""` when nothing is. Everything the menu starts
@@ -768,6 +790,11 @@ pub fn script() -> String {
       'background:var(--dsh-wc-line)}}' +
       '.dsh-wc-tick{{margin-left:auto;opacity:0;transition:opacity .12s ease}}' +
       '.dsh-wc-pop button.dsh-wc-checked .dsh-wc-tick{{opacity:1}}' +
+      // A switch whose precondition is missing. Dimmed and inert rather than
+      // hidden: a setting that vanishes is one the user cannot find again to
+      // ask why. `title` says what is missing; see `sync_notify`.
+      '.dsh-wc-pop button.dsh-wc-unavailable{{opacity:.4;cursor:default}}' +
+      '.dsh-wc-pop button.dsh-wc-unavailable:hover{{background:none}}' +
       // What is running right now, beside the menu button that started it.
       '.dsh-wc-toast{{display:flex;align-items:center;gap:7px;margin-left:12px;' +
       'color:var(--dsh-wc-fg);font:12px/1 {FONT};white-space:nowrap;' +
@@ -871,6 +898,11 @@ pub fn script() -> String {
         checks[item.verb] = entry;
       }}
       entry.addEventListener('click', function () {{
+        // A row whose precondition is missing is inert. It is not a `disabled`
+        // button, so that it can still be hovered for the reason why; this is
+        // what makes it refuse. Keyboard included: Enter on a button arrives
+        // here as a click.
+        if (entry.getAttribute('aria-disabled') === 'true') return;
         // Closed first: the verb can end in a modal, and a menu still hanging
         // open behind it is a menu that is open again when the modal goes.
         shut();
@@ -922,8 +954,23 @@ pub fn script() -> String {
     window.__dshAutostart = function (on) {{
       mark('autostart', on);
     }};
-    window.__dshNotifyTurns = function (on) {{
-      mark('notify-turns', on);
+    // `on` is the preference, `available` whether anything can act on it, and
+    // `hint` what is missing when it cannot. An unavailable row reads as off
+    // whatever the stored preference says, because that is what it is: see
+    // `notify::show`, which gates on the same answer.
+    window.__dshNotifyTurns = function (on, available, hint) {{
+      var usable = available === undefined || !!available;
+      mark('notify-turns', usable && on);
+      var entry = checks['notify-turns'];
+      if (!entry) return;
+      entry.classList.toggle('dsh-wc-unavailable', !usable);
+      // Marked rather than `disabled`, deliberately. A disabled button takes
+      // no pointer events, and a browser shows no `title` tooltip on one — so
+      // the row would dim with no way left to say why. The class carries the
+      // look, `aria-disabled` the meaning, and the click handler the refusal.
+      entry.setAttribute('aria-disabled', usable ? 'false' : 'true');
+      if (usable) entry.removeAttribute('title');
+      else entry.title = hint || '';
     }};
     window.__dshBusy = function (text) {{
       said.textContent = text || '';
@@ -1220,11 +1267,43 @@ mod tests {
         ));
     }
 
+    /// The notification row is told three things, and the script it is told
+    /// them through reads three.
+    ///
+    /// Two halves that are edited apart: `sync_notify` builds the call in
+    /// Rust and the function it lands on is a string literal in the injected
+    /// script. Adding an argument to one and not the other is silent — the
+    /// extra is dropped, or the missing one reads `undefined` — and what it
+    /// would silence is the row that says why notifications are unavailable.
+    #[test]
+    fn the_notification_row_is_told_whether_it_can_be_used() {
+        let call = super::notify_call(true, false, "install the plugin");
+
+        assert!(
+            call.contains("window.__dshNotifyTurns(true, false, \"install the plugin\")"),
+            "{call}"
+        );
+        assert!(
+            call.starts_with("window.__dshNotifyTurns &&"),
+            "the page may not have the chrome yet: {call}"
+        );
+
+        assert!(
+            script().contains("window.__dshNotifyTurns = function (on, available, hint)"),
+            "the script must read every argument the call sends"
+        );
+        // An older document, injected before availability existed, calls with
+        // one argument. It has to keep reading as usable rather than as off.
+        assert!(
+            script().contains("available === undefined || !!available"),
+            "a one-argument call must not read as unavailable"
+        );
+    }
+
     /// Every card this app draws over dsh's page reads dsh's theme from
     /// [`theme_watcher`], and none of them from a copy of it.
     ///
-    /// Written across the four modules on purpose, the way
-    /// `turn::never_reads_this_app_s_own_buttons` is. This was four
+    /// Written across the four modules on purpose. This was four
     /// hand-maintained copies of the same twenty lines, each with a comment
     /// asking the next reader to keep it in step with the others; nothing
     /// checked that anyone had. A correction to how dsh's theme is read would

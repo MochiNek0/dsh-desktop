@@ -1,16 +1,22 @@
 //! What dsh is doing, as dsh itself reports it.
 //!
-//! [`crate::turn`] and [`crate::waiting`] work this out by polling dsh's DOM:
-//! one sniffs whether the send button's svg child is a `rect` or a `path`, the
-//! other watches three `data-*-key` attributes. Both infer a state dsh has
-//! already computed and published to its own client plugins, and both fail
-//! silently when a dsh release renames a class or reshapes a button.
+//! Two injected scripts used to work this out by polling dsh's DOM: one
+//! sniffed whether the send button's svg child was a `rect` or a `path`, the
+//! other watched three `data-*-key` attributes. Both inferred a state dsh had
+//! already computed and published to its own client plugins, and both failed
+//! silently whenever a dsh release renamed a class or reshaped a button. They
+//! are gone; `git log` has them if the reasoning is ever wanted back.
 //!
-//! So the state is read where it is published. A client plugin — `plugin/` in
-//! this repository — injects dsh's `sessions` and `uiSession` services,
-//! subscribes to `sessions.list` (which carries `running` and `completed` per
-//! session) and to `uiSession.pendingInteractions` (the live map of what each
-//! session is waiting on), and reports each transition here.
+//! The state is read where it is published instead. A client plugin —
+//! `plugin/` in this repository — injects dsh's `sessions` and `uiSession`
+//! services, subscribes to `sessions.list` (which carries `running` and
+//! `completed` per session) and to `uiSession.pendingInteractions` (the live
+//! map of what each session is waiting on), and reports each transition here.
+//!
+//! Which makes the plugin a hard dependency of every notification this app
+//! raises, and that is why the switch that turns notifications on is only
+//! reachable once the plugin is installed. See [`crate::plugins::signalling`]
+//! and [`crate::notify::show`].
 //!
 //! ## Over the same channel as everything else
 //!
@@ -22,22 +28,39 @@
 //!
 //! Which means, as with every other verb on that channel, that anything in the
 //! window can send one. Nothing here acts on the payload — it names a session
-//! and a pending request, and the answer to one will come back out of dsh's own
+//! and a pending request, and the answer to one goes back out through dsh's own
 //! carrier rather than out of this URL — so the strictness that matters is
 //! length, applied below.
 //!
-//! ## What it does not do yet
+//! A forged signal is therefore a toast about a session that is not waiting,
+//! and a press on its buttons submits nothing: [`answer`] hands the choice to
+//! the plugin, which will not find a carrier under that key and says so. What
+//! comes back is [`Signal::Stale`], and what that gets is the window.
 //!
-//! Nothing but report. The notification these signals will raise, and the
-//! answering that follows, are the next steps; see `docs/notifications.md`.
-//! Until then this module is the intake, and the two DOM watchers are still
-//! what raises a toast.
+//! ## What a press answers
+//!
+//! Only what one press can say in full. [`buttons`] draws two at most, and
+//! every one of them maps to a submission dsh's own carrier already allows: an
+//! approval's two decisions, a plan review's approve label or its way back to
+//! the composer, or one option of a single-choice question. Anything else — a
+//! multi-question batch, a plan the user wants to argue with, anything needing
+//! typing — gets no button, and the click on the toast body opens the app at
+//! that session instead.
 
 use tauri::{AppHandle, Manager, Url};
 
 /// How much of each field survives the trip. Session ids and request keys are
 /// short and opaque; this is a bound, not a size.
 const LIMIT: usize = 200;
+
+/// How many buttons a toast may carry.
+///
+/// Two, which is what a toast can be counted on to show: a Linux daemon
+/// decides for itself how many of the actions it was handed to draw, and macOS
+/// would fold anything past the first into an "Options" menu if it drew any at
+/// all (it does not; see [`crate::toast`]). Two plus the body click is the
+/// budget the table in [`buttons`] is written against.
+const BUTTONS: usize = 2;
 
 /// One transition, as the plugin reported it.
 #[derive(Debug, PartialEq, Eq)]
@@ -54,9 +77,18 @@ pub enum Signal {
         session: String,
         kind: String,
         key: String,
+        /// The option labels of a question one press can answer, in the order
+        /// the asker offered them: the plugin sends them only for a batch of
+        /// one single-select question with one or two options, and nothing at
+        /// all for the two kinds whose buttons say the same thing every time.
+        /// See [`buttons`].
+        options: Vec<String>,
     },
     /// The request went away — answered, cancelled, or its session pruned.
     WaitOver { session: String },
+    /// A press on a button reached a request that was no longer there, so
+    /// nothing was submitted. Answered in the window instead; see [`act`].
+    Stale { session: String },
 }
 
 /// Read a `dsh-window://signal` navigation. `None` for a query this build has
@@ -67,6 +99,7 @@ pub fn received(url: &Url) -> Option<Signal> {
     let mut kind = String::new();
     let mut key = String::new();
     let mut done = false;
+    let mut options = Vec::new();
 
     for (name, value) in url.query_pairs() {
         match name.as_ref() {
@@ -75,6 +108,11 @@ pub fn received(url: &Url) -> Option<Signal> {
             "kind" => kind = clamp(&value),
             "key" => key = clamp(&value),
             "done" => done = value == "1",
+            // Repeated, one per label, and taken in order: the id a press
+            // sends back is the label's position. Bounded like the rest, and
+            // by count as well — a toast has room for two, and the rest would
+            // only be buttons nobody drew.
+            "option" if options.len() < BUTTONS => options.push(clamp(&value)),
             _ => {}
         }
     }
@@ -93,8 +131,10 @@ pub fn received(url: &Url) -> Option<Signal> {
             session,
             kind,
             key,
+            options,
         }),
         "wait-over" => Some(Signal::WaitOver { session }),
+        "stale" => Some(Signal::Stale { session }),
         other => {
             eprintln!("dsh-desktop: ignoring unknown session signal {other}");
             None
@@ -102,55 +142,96 @@ pub fn received(url: &Url) -> Option<Signal> {
     }
 }
 
-/// Act on one, which today means raising a notification about it.
+/// Act on one, which for most of them means raising a notification about it.
 ///
 /// Through [`crate::notify::show`], so it passes the same two gates every other
 /// notification does -- the preference, and whether the user is already looking
-/// at the window -- and so the notification carries the session it is about.
-/// That is the whole of what a signal buys over the DOM watchers' toast: a click
-/// on it has somewhere to go.
+/// at the window -- and so the notification carries the session it is about,
+/// and the buttons that answer what that session is waiting on. That is what a
+/// signal buys over the DOM watchers' toast: a press on it has somewhere to go.
 ///
-/// Still written to stderr as well. The two paths to the same toast are meant to
-/// be held against each other for a release before [`crate::turn`] and
-/// [`crate::waiting`] are removed, and a log line is how.
+/// [`Signal::Stale`] is the one that is not a notification. It comes back up
+/// this channel after a press this app already made, and what it asks for is
+/// the window.
+///
+/// Still written to stderr as well: a signal that arrives and raises nothing —
+/// because the window has focus, or the preference is off — is otherwise
+/// indistinguishable from one that never arrived.
 pub fn act(app: &AppHandle, signal: Signal) {
-    match &signal {
+    match signal {
         Signal::TurnEnd { session, done } => {
             eprintln!("dsh-desktop: turn ended in {session} (unopened: {done})");
+            let (title, body) = turn_ended();
+            crate::notify::show(app, crate::notify::Notice::about(&session, title, body));
         }
-        Signal::Wait { session, kind, key } => {
+        Signal::Wait {
+            session,
+            kind,
+            key,
+            options,
+        } => {
             eprintln!("dsh-desktop: {session} is waiting on {kind} ({key})");
+            let (title, body) = waiting_on(&kind);
+            crate::notify::show(
+                app,
+                crate::notify::Notice::asking(&session, &key, title, body, buttons(&kind, options)),
+            );
         }
+        // Nothing to say. The toast has already been raised, and withdrawing
+        // it would mean holding every notification handle open for as long as
+        // the request lives; see `docs/notifications.md`.
         Signal::WaitOver { session } => {
             eprintln!("dsh-desktop: {session} is no longer waiting");
         }
-    }
-
-    if let Some((session, (title, body))) = words(&signal) {
-        crate::notify::show(app, crate::notify::Notice::about(session, title, body));
+        // The press missed. Whatever that session is doing now, the user meant
+        // to answer it, so put them in front of it rather than leaving them
+        // believing a button they pressed did something.
+        Signal::Stale { session } => {
+            eprintln!("dsh-desktop: an answer for {session} arrived too late");
+            crate::reveal(app);
+            open(app, &session);
+        }
     }
 }
 
-/// What to say about a signal, and which session to say it about. `None` for a
-/// signal there is nothing to say about.
+/// What a press can say about one of dsh's waits, in the order the buttons are
+/// drawn. Empty for a wait no press can answer, which leaves the toast with
+/// only its body to click.
 ///
-/// A wait ending is one of those: the toast for it has already been raised, and
-/// withdrawing it would mean holding every notification handle open. What that
-/// costs and buys belongs with the answer buttons, which is where a toast starts
-/// wanting to outlive its popup; see `docs/notifications.md`.
-fn words(signal: &Signal) -> Option<(&str, (&'static str, &'static str))> {
-    match signal {
-        Signal::TurnEnd { session, .. } => Some((session, turn_ended())),
-        Signal::Wait { session, kind, .. } => Some((session, waiting_on(kind))),
-        Signal::WaitOver { .. } => None,
+/// The ids are this app's own, and the plugin turns each back into a call on
+/// dsh's carrier — see `plugin/lib/client.js`, which is the other half of this
+/// table and the only place these strings mean anything.
+///
+/// Two things this deliberately cannot offer. An approval's `允许` is
+/// `allowed-once` and nothing else: `ApprovalDecision` has no standing
+/// permission in it, so the blast radius of a mis-press is one tool call. And
+/// a plan review's second button is `要改` rather than dsh's own `Refuse`:
+/// refusing without saying why is a dead end on a toast, and saying why means
+/// typing, so the button that leads back to the composer is the useful one.
+fn buttons(kind: &str, options: Vec<String>) -> Vec<crate::notify::Button> {
+    use crate::notify::Button;
+
+    match kind {
+        "approval" => vec![
+            Button::new("allow", t!("允许", "Allow")),
+            Button::new("reject", t!("拒绝", "Refuse")),
+        ],
+        "plan-review" => vec![
+            Button::new("approve", t!("批准", "Approve")),
+            Button::new("revise", t!("要改", "Revise")),
+        ],
+        // A question's buttons are the asker's own option labels, and the id
+        // is where the label sat in the list. The plugin sends them only when
+        // one press can answer the whole request.
+        _ => options
+            .into_iter()
+            .enumerate()
+            .map(|(at, label)| Button::new(&at.to_string(), &label))
+            .collect(),
     }
 }
 
 /// A finished turn.
-///
-/// Here rather than in [`crate::turn`], which pastes it into the watcher it
-/// injects, so that the fallback and this cannot drift apart. The table stays
-/// when that module goes.
 pub fn turn_ended() -> (&'static str, &'static str) {
     (
         t!("对话已完成", "Turn finished"),
@@ -162,10 +243,6 @@ pub fn turn_ended() -> (&'static str, &'static str) {
 }
 
 /// One of dsh's waits, by dsh's own name for it.
-///
-/// Read from here by [`crate::waiting`] too, for the same reason as above -- it
-/// spots the same three by their `data-*-key` attributes and has to say the same
-/// thing about them.
 ///
 /// A kind this build has never heard of is not dropped. [`Signal::Wait`] carries
 /// dsh's discriminator through as a string precisely so that a kind a later dsh
@@ -222,6 +299,22 @@ pub fn open(app: &AppHandle, session: &str) {
     let _ = window.eval(call(session));
 }
 
+/// Give dsh the answer a user pressed on a toast.
+///
+/// The same door as [`open`], and guarded the same way for the same reason: a
+/// press can arrive after the document has gone. What the plugin does with it
+/// is check that the request named by `key` is still the one that session is
+/// waiting on — a toast is on screen for seconds, and dsh replays pending
+/// requests on a reconnect — and to send back [`Signal::Stale`] when it is
+/// not. So a press either submits the answer the user gave or shows them the
+/// session; it never submits a different one.
+pub fn answer(app: &AppHandle, session: &str, key: &str, choice: &str) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.eval(reply(session, key, choice));
+}
+
 /// The call [`open`] makes, as a string so it can be read in a test.
 ///
 /// The id goes in through `{:?}`, like every other string this app pastes into
@@ -229,6 +322,12 @@ pub fn open(app: &AppHandle, session: &str) {
 /// that is worth pinning rather than trusting.
 fn call(session: &str) -> String {
     format!("window.__dshSignals && window.__dshSignals.open({session:?});")
+}
+
+/// The call [`answer`] makes. Three strings, each through `{:?}`, and two of
+/// them came off a URL the page itself can have written.
+fn reply(session: &str, key: &str, choice: &str) -> String {
+    format!("window.__dshSignals && window.__dshSignals.answer({session:?}, {key:?}, {choice:?});")
 }
 
 /// One field, trimmed on a character boundary. No ellipsis: these are
@@ -244,7 +343,7 @@ fn clamp(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{call, received, waiting_on, words, Signal, LIMIT};
+    use super::{buttons, call, received, reply, waiting_on, Signal, BUTTONS, LIMIT};
     use tauri::Url;
 
     fn read(query: &str) -> Option<Signal> {
@@ -289,7 +388,8 @@ mod tests {
             Some(Signal::Wait {
                 session: "s1".into(),
                 kind: "approval".into(),
-                key: "k1".into()
+                key: "k1".into(),
+                options: vec![]
             })
         );
         assert_eq!(
@@ -309,7 +409,8 @@ mod tests {
             Some(Signal::Wait {
                 session: "s1".into(),
                 kind: "something-new".into(),
-                key: "k1".into()
+                key: "k1".into(),
+                options: vec![]
             })
         );
     }
@@ -365,45 +466,103 @@ mod tests {
             Some(Signal::Wait {
                 session: "s-abc".into(),
                 kind: "plan-review".into(),
-                key: "question:42".into()
+                key: "question:42".into(),
+                options: vec![]
             })
         );
         assert_eq!(
-            read("dsh-window://signal?event=wait-over&session=s-abc&n=3.1788947724008"),
+            read(
+                "dsh-window://signal?event=wait&session=s-abc&kind=question&key=question%3A43\
+                 &option=Use%20TypeScript&option=Stay%20on%20JS&n=3.1788947724008"
+            ),
+            Some(Signal::Wait {
+                session: "s-abc".into(),
+                kind: "question".into(),
+                key: "question:43".into(),
+                options: vec!["Use TypeScript".into(), "Stay on JS".into()]
+            })
+        );
+        assert_eq!(
+            read("dsh-window://signal?event=wait-over&session=s-abc&n=4.1788947724009"),
             Some(Signal::WaitOver {
+                session: "s-abc".into()
+            })
+        );
+        assert_eq!(
+            read("dsh-window://signal?event=stale&session=s-abc&n=5.1788947724010"),
+            Some(Signal::Stale {
                 session: "s-abc".into()
             })
         );
     }
 
-    /// Every signal the plugin sends either says something or is deliberately
-    /// silent, and the session it says it about is the one it named.
+    /// Every wait either gets buttons a press can honour or gets none, and the
+    /// ids are the ones `plugin/lib/client.js` reads.
+    ///
+    /// The other half of this table is in that file, and neither half can be
+    /// edited without the other going quiet: an id this stops sending leaves a
+    /// dead branch there, and one it starts sending falls through to the
+    /// plugin's stale reply. So the ids are pinned here as strings rather than
+    /// derived from anything.
     #[test]
-    fn says_something_about_each_signal_worth_a_toast() {
-        let turn = Signal::TurnEnd {
-            session: "s1".into(),
-            done: true,
+    fn offers_a_press_only_what_the_plugin_can_submit() {
+        let ids = |kind: &str, options: Vec<String>| {
+            buttons(kind, options)
+                .into_iter()
+                .map(|button| button.id)
+                .collect::<Vec<_>>()
         };
-        let (session, (title, body)) = words(&turn).expect("a finished turn is news");
-        assert_eq!(session, "s1");
-        assert!(!title.is_empty() && !body.is_empty());
 
-        for kind in ["approval", "question", "plan-review"] {
-            let wait = Signal::Wait {
-                session: "s2".into(),
-                kind: kind.into(),
-                key: "k".into(),
-            };
-            let (session, (title, _)) = words(&wait).expect("a wait is news");
-            assert_eq!(session, "s2");
-            assert_eq!(title, waiting_on(kind).0);
+        assert_eq!(ids("approval", vec![]), ["allow", "reject"]);
+        assert_eq!(ids("plan-review", vec![]), ["approve", "revise"]);
+
+        // A question's are positions in the list the asker offered.
+        assert_eq!(ids("question", vec!["Yes".into(), "No".into()]), ["0", "1"]);
+        assert_eq!(ids("question", vec!["Only one".into()]), ["0"]);
+
+        // No options means the plugin found no answer one press could give.
+        assert!(ids("question", vec![]).is_empty());
+        assert!(
+            ids("something-dsh-added-later", vec![]).is_empty(),
+            "a kind this build has never heard of gets a toast, not a guess"
+        );
+    }
+
+    /// The labels are the ones the user reads, so they are not empty and a
+    /// question's are the asker's own.
+    #[test]
+    fn says_what_each_button_does() {
+        for kind in ["approval", "plan-review"] {
+            let labels: Vec<_> = buttons(kind, vec![])
+                .into_iter()
+                .map(|button| button.label)
+                .collect();
+            assert_eq!(labels.len(), BUTTONS);
+            assert!(labels.iter().all(|label| !label.is_empty()));
+            assert_ne!(
+                labels[0], labels[1],
+                "two buttons that read the same are one"
+            );
         }
 
-        // The toast is already up; taking it down again is not this step's.
-        assert!(words(&Signal::WaitOver {
-            session: "s1".into()
-        })
-        .is_none());
+        let asked = buttons(
+            "question",
+            vec!["Use TypeScript".into(), "Stay on JS".into()],
+        );
+        let labels: Vec<_> = asked.into_iter().map(|button| button.label).collect();
+        assert_eq!(labels, ["Use TypeScript", "Stay on JS"]);
+    }
+
+    /// A wait ending says nothing: the toast is already up, and taking it down
+    /// again would mean holding every notification handle open.
+    #[test]
+    fn stays_quiet_when_a_wait_ends() {
+        // `act` needs an `AppHandle`, so this is the readable half of it: the
+        // only signal with no words of its own.
+        assert!(matches!(
+            received(&Url::parse("dsh-window://signal?event=wait-over&session=s1").unwrap()),
+            Some(Signal::WaitOver { .. })
+        ));
     }
 
     /// The three kinds each get their own words, and a fourth kind still gets
@@ -445,6 +604,24 @@ mod tests {
         assert!(call("a\"b").contains("\\\""), "a quote must arrive escaped");
     }
 
+    /// The call a button press makes: the same door as [`super::open`], with
+    /// the request key alongside so the plugin can refuse a press that arrived
+    /// after the request it was raised for had gone.
+    #[test]
+    fn hands_the_press_its_session_key_and_choice() {
+        assert_eq!(
+            reply("session-0b3fcbc5", "question:42", "approve"),
+            concat!(
+                "window.__dshSignals && window.__dshSignals.answer(",
+                "\"session-0b3fcbc5\", \"question:42\", \"approve\");"
+            )
+        );
+        assert!(
+            reply("a\"b", "c\"d", "e\"f").matches("\\\"").count() == 3,
+            "every one of the three arrives escaped"
+        );
+    }
+
     #[test]
     fn bounds_every_field() {
         let long = "k".repeat(LIMIT * 2);
@@ -454,5 +631,17 @@ mod tests {
             panic!("a long key should still read as a wait");
         };
         assert_eq!(key.chars().count(), LIMIT);
+    }
+
+    /// A toast has room for [`BUTTONS`], and a query claiming more is not a
+    /// reason to build buttons nothing will draw.
+    #[test]
+    fn takes_no_more_options_than_a_toast_can_show() {
+        let Some(Signal::Wait { options, .. }) =
+            read("event=wait&session=s1&kind=question&key=k1&option=a&option=b&option=c&option=d")
+        else {
+            panic!("a wait with too many options should still read as a wait");
+        };
+        assert_eq!(options, ["a", "b"]);
     }
 }

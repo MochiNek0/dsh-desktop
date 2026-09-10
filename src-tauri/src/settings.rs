@@ -50,6 +50,14 @@ use tauri::AppHandle;
 /// switch than the one actually wired up. The menu item says the same thing:
 /// "Notifications", not "Notify when a turn finishes".
 ///
+/// What the preference cannot do is turn anything on by itself. Every
+/// notification this app raises starts as a signal from the client plugin in
+/// `plugin/`, so [`crate::notify::show`] asks
+/// [`crate::plugins::signalling`] first and the menu draws the switch
+/// unavailable when the answer is no. The stored value is left alone in that
+/// state rather than forced off: a user who turns notifications on, removes
+/// the plugin and puts it back should find the switch where they left it.
+///
 /// The old name is not read as a fallback. Both the switch and the rename
 /// landed before v0.1.7, so no released build ever wrote `notifyOnTurnEnd` and
 /// there is no file in the wild holding one — the fallback only ever covered a

@@ -196,6 +196,78 @@ fn parse(raw: &str) -> Vec<Preset> {
         .collect()
 }
 
+/// The spec prefix of a plugin that ships inside this app.
+///
+/// Not a scheme pnpm has ever heard of — it is resolved here, before pnpm sees
+/// it, into the absolute path of the staged directory. It has to be resolved
+/// rather than written down because that path is only known at runtime: the
+/// user chose where to install the app. See [`bundled`] and [`local_spec`].
+const BUNDLED: &str = "bundled:";
+
+/// What pnpm is handed for one preset, which for all but [`BUNDLED`] is what
+/// the file already says.
+fn spec_for(app: &AppHandle, spec: &str) -> Result<String, String> {
+    let Some(name) = spec.strip_prefix(BUNDLED) else {
+        return Ok(spec.to_string());
+    };
+
+    let dir = bundled(app, name).ok_or_else(|| {
+        t!(
+            "{} 应该随这个应用一起装上的，但它不在安装目录里。重新安装一次应用能把它带回来。",
+            "{} ships inside this app, and it is not in the installation directory.              Reinstalling the app puts it back.",
+            name
+        )
+    })?;
+
+    Ok(local_spec(&dir))
+}
+
+/// Where a directory that ships with the app is: the staged resource, or the
+/// one in the source tree when this is a `tauri dev` build that has never been
+/// bundled. Same two places and same order as [`preset_file`].
+///
+/// The two names line up on purpose: `scripts/bundle-runtime.mjs` stages the
+/// repository's `plugin/` as `resources/plugin`, so one preset spec addresses
+/// both. A `tauri dev` run has the staged copy too — it is restaged on every
+/// launch — so what a dev build links is that copy rather than the working
+/// tree. Editing the plugin against a running dsh is `dsh plugin add -w
+/// ./plugin`, which is a link to the working tree; see `docs/notifications.md`.
+fn bundled(app: &AppHandle, name: &str) -> Option<PathBuf> {
+    if let Some(staged) = crate::dsh::resources(app).map(|dir| dir.join(name)) {
+        if staged.is_dir() {
+            return Some(staged);
+        }
+    }
+
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()?
+        .join(name);
+    source.is_dir().then_some(source)
+}
+
+/// A local directory as pnpm has to receive it.
+///
+/// The quotes on Windows are load-bearing. `dsh plugin` forwards its arguments
+/// to pnpm through Node's `spawnSync(…, { shell: true })`, and Node does not
+/// quote when it does that — it joins the arguments with spaces and hands the
+/// one string to `cmd.exe`. The app installs to `C:\Program Files\…` by
+/// default, so an unquoted spec arrives at pnpm as *two* arguments, and what
+/// pnpm does with them is not fail: it installs two dependencies named after
+/// the halves (`Program`, `plugin`), warns that neither declares a bundle, and
+/// exits 0. Measured, both halves — and Rust's own escaping on the way out
+/// carries the quotes through intact rather than eating them.
+///
+/// Nothing to quote anywhere else: off Windows there is no shell in the path,
+/// and a quote would become part of the filename.
+fn local_spec(dir: &Path) -> String {
+    let path = dir.display().to_string();
+    if cfg!(windows) {
+        format!("\"{path}\"")
+    } else {
+        path
+    }
+}
+
 /// Where the shipped list is: the bundled resource, or the one in the source
 /// tree when this is a `tauri dev` build that has never been bundled.
 fn preset_file(app: &AppHandle) -> Option<PathBuf> {
@@ -326,6 +398,34 @@ fn installed_in(manifest: &serde_json::Value) -> HashSet<String> {
     dependencies.into_iter().chain(bundles).collect()
 }
 
+/// The plugin that tells this app what dsh is doing, by the name it installs
+/// under. See [`crate::signal`] for what it reports and `plugin/` for the
+/// thing itself.
+///
+/// Written down rather than read out of the preset list, because what depends
+/// on it is one specific plugin and not "whatever the list happens to ship".
+/// Both spellings are checked against the plugin's own manifest by a test, so
+/// this and the list cannot drift apart from it or from each other.
+pub const SIGNAL: &str = "dsh-desktop-signal";
+
+/// Whether dsh has any way to tell this app what it is doing.
+///
+/// Which is the same question as "is [`SIGNAL`] installed", because it is the
+/// only answer left. This app used to sniff dsh's DOM for a finished turn and
+/// for a question waiting to be answered; both of those are gone, and every
+/// notification now starts as a signal from that plugin. So without it there
+/// is nothing to notify about, and the switch that turns notifications on is
+/// drawn unavailable rather than on-and-silent. See [`crate::notify::show`],
+/// which is the gate, and [`crate::controls::sync_notify`], which is the way
+/// the menu is told.
+///
+/// Read from the profile manifest, and read the same way the panel decides
+/// what is "already installed" — those two answers agreeing is the whole
+/// point, since the panel is where a user goes to change this one.
+pub fn signalling(app: &AppHandle) -> bool {
+    installed_in(&profile_manifest(app)).contains(SIGNAL)
+}
+
 /// `$DSH_HOME/profiles/web`, where a plugin ends up.
 ///
 /// `DSH_HOME` is dsh's own variable and this app passes it through untouched, so
@@ -376,7 +476,7 @@ pub fn install(
             .iter()
             .find(|preset| &preset.id == id)
             .ok_or_else(|| t!("清单里没有插件 {}", "no preset called {}", id))?;
-        specs.push(preset.spec.clone());
+        specs.push(spec_for(app, &preset.spec)?);
     }
     if let Some(extra) = extra.map(str::trim).filter(|extra| !extra.is_empty()) {
         if !is_package_spec(extra) {
@@ -1441,8 +1541,8 @@ pub fn open_directory(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dependencies_in, is_package_spec, parse, pnpm_blamed, pnpm_codes, pnpm_stuck, requested,
-        spec_name, sweep, wanted_gone, Outcome, PRESETS, RELEASE_AGE,
+        dependencies_in, is_package_spec, local_spec, parse, pnpm_blamed, pnpm_codes, pnpm_stuck,
+        requested, spec_name, sweep, wanted_gone, Outcome, BUNDLED, PRESETS, RELEASE_AGE, SIGNAL,
     };
     use std::path::{Path, PathBuf};
     use tauri::Url;
@@ -1610,6 +1710,109 @@ mod tests {
                 preset.id
             );
         }
+    }
+
+    /// The plugin this app ships inside itself, checked against the plugin
+    /// itself.
+    ///
+    /// Two things have to line up and neither is checked anywhere else. The
+    /// spec has to name a directory that is really there — `bundled:` is
+    /// resolved at install time, so a rename shows up as an install that
+    /// cannot find itself. And the preset's `package` has to be the name that
+    /// directory installs under, because that name is what "already
+    /// installed" is decided against: get it wrong and the panel offers the
+    /// plugin forever, to a user who already has it.
+    #[test]
+    fn the_plugin_that_ships_inside_the_app_is_the_one_the_list_names() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the repository root");
+        let raw = std::fs::read_to_string(root.join("src-tauri/resources").join(PRESETS))
+            .expect("the shipped preset list");
+
+        let mut found = 0;
+        for preset in parse(&raw) {
+            let Some(name) = preset.spec.strip_prefix(BUNDLED) else {
+                continue;
+            };
+            found += 1;
+
+            let manifest = root.join(name).join("package.json");
+            let manifest = std::fs::read_to_string(&manifest)
+                .unwrap_or_else(|_| panic!("{} names {}, which is not here", preset.id, name));
+            let manifest: serde_json::Value =
+                serde_json::from_str(&manifest).expect("the plugin manifest is JSON");
+
+            assert_eq!(
+                manifest.get("name").and_then(serde_json::Value::as_str),
+                Some(preset.package.as_str()),
+                "{} would install under a different name than the list expects",
+                preset.id
+            );
+            assert_eq!(
+                preset.package, SIGNAL,
+                "the gate in `signalling` names a different plugin than the list ships"
+            );
+        }
+
+        assert_eq!(found, 1, "the signal plugin should be on the shipped list");
+    }
+
+    /// The gate every notification passes: the plugin is there, or it is not.
+    ///
+    /// Read out of the same set the panel calls "already installed", so the
+    /// two cannot disagree — a panel saying the plugin is in while the menu
+    /// says notifications are unavailable would be unanswerable.
+    #[test]
+    fn notifications_wait_on_the_plugin_that_feeds_them() {
+        let holding = |manifest: &str| {
+            let manifest: serde_json::Value = serde_json::from_str(manifest).expect("a manifest");
+            super::installed_in(&manifest).contains(SIGNAL)
+        };
+
+        assert!(holding(
+            r#"{"dependencies":{"dsh-desktop-signal":"link:/somewhere"}}"#
+        ));
+        // Listed as a profile layer but not as a dependency, which is what a
+        // hand-edited profile looks like. Still installed.
+        assert!(holding(
+            r#"{"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","dsh-desktop-signal"]}}}"#
+        ));
+
+        assert!(!holding(r#"{"dependencies":{"dshmarket":"^1.40.0"}}"#));
+        assert!(!holding("{}"), "an empty profile signals nothing");
+        assert!(!holding("null"), "no profile at all signals nothing");
+    }
+
+    /// A path handed to pnpm on Windows arrives quoted, and nowhere else does.
+    ///
+    /// The reasoning is in [`super::local_spec`]; this is the part that would
+    /// silently stop being true. An unquoted path through Program Files does
+    /// not fail the install — it installs two dependencies named after the halves
+    /// of the path and exits 0.
+    #[test]
+    fn a_local_path_survives_the_shell_dsh_forwards_through() {
+        let path = ["C:", "Program Files", "dsh-desktop", "resources", "plugin"]
+            .join(std::path::MAIN_SEPARATOR_STR);
+        let quoted = local_spec(Path::new(&path));
+
+        if cfg!(windows) {
+            assert!(quoted.starts_with('"') && quoted.ends_with('"'), "{quoted}");
+            assert!(quoted.contains("Program Files"));
+        } else {
+            assert!(!quoted.contains('"'), "{quoted}");
+        }
+    }
+
+    /// Everything that is not [`BUNDLED`] is passed through untouched, quotes
+    /// included — a registry spec never goes near a filesystem path.
+    #[test]
+    fn an_ordinary_preset_spec_is_left_alone() {
+        // `spec_for` needs an `AppHandle` for the bundled arm only, so the
+        // pass-through is what is readable here: the prefix is the whole test.
+        assert!(!"dshmarket".starts_with(BUNDLED));
+        assert!("bundled:plugin".starts_with(BUNDLED));
+        assert_eq!("bundled:plugin".strip_prefix(BUNDLED), Some("plugin"));
     }
 
     /// The two groups the panel draws, both actually present in the shipped

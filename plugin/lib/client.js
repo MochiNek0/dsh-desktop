@@ -5,9 +5,10 @@
  * finished, and that dsh has stopped to ask the user something. It used to work
  * both out by polling dsh's DOM — sniffing whether the send button's svg child
  * was a `rect` or a `path`, and watching three `data-*-key` attributes. Both
- * were inferring a state dsh had already computed and published.
+ * were inferring a state dsh had already computed and published, and both are
+ * now gone: this plugin is the only thing that tells the shell either.
  *
- * This reads the published one instead. `ctx.sessions.list` carries `running`
+ * This reads the published state instead. `ctx.sessions.list` carries `running`
  * and `completed` per session, and `ctx.uiSession.pendingInteractions` is the
  * live map of what each session is waiting on — keyed by session id, with the
  * carrier itself as the value, so the same object that says a question is
@@ -26,14 +27,28 @@
  * ## The door the other way
  *
  * One global, `window.__dshSignals`, set while the plugin is wired up. The
- * shell reads it for two things. Its `open(id)` is how a click on a
- * notification gets back to the session the notification was about —
- * `ctx.sessions.open` is dsh's own way to switch the current session. And its
- * mere presence tells the shell's own DOM watchers to stand down: they infer
- * the same two states by polling dsh's markup, and with this plugin wired up
- * they would only raise a second toast for every one raised from dsh's own
- * state. Removed again on teardown, so a disabled plugin hands the fallback
- * back.
+ * shell calls two things on it. `open(id)` is how a click on a notification
+ * gets back to the session the notification was about — `ctx.sessions.open` is
+ * dsh's own way to switch the current session. `answer(id, key, choice)` is
+ * how a press on one of that notification's buttons reaches the request it
+ * answers, which is the same carrier the snapshot above reported: the object
+ * that says a question is pending is the object that answers it.
+ *
+ * Removed again on teardown, so a click that arrives after the plugin was
+ * disabled finds nothing rather than half of something — the shell guards
+ * every call on its presence.
+ *
+ * ## An answer that arrives too late
+ *
+ * A toast outlives nothing: the request it was raised about can be answered in
+ * the window, replaced by a resync, or aborted, all while the popup is still on
+ * screen. So `answer` submits nothing it cannot match — the carrier now in the
+ * snapshot has to be the one the notification named, key and all — and when it
+ * cannot, it says so with a `stale` signal rather than silently doing nothing.
+ * The shell turns that into the fallback every toast has anyway: the window,
+ * on the session in question, where the user can see what is actually pending.
+ * Doing nothing would be the one outcome worse than either, because the user
+ * would believe they had answered.
  *
  * ## Outside the desktop shell
  *
@@ -88,10 +103,18 @@ window.__ModuleLoader__.load({
         return;
       }
       params.n = ++nonce + '.' + Date.now();
-      var query = Object.keys(params)
-        .map((key) => encodeURIComponent(key) + '=' + encodeURIComponent(params[key]))
-        .join('&');
-      window.location.href = SCHEME + '://signal?' + query;
+      // An array value repeats its key, which is how the option labels of a
+      // one-press answer travel: the shell reads the query as pairs, so a
+      // repeated `option` arrives as a list and a label needs no separator
+      // that a label could contain.
+      var pairs = [];
+      for (var key of Object.keys(params)) {
+        var value = params[key];
+        for (var one of Array.isArray(value) ? value : [value]) {
+          pairs.push(encodeURIComponent(key) + '=' + encodeURIComponent(one));
+        }
+      }
+      window.location.href = SCHEME + '://signal?' + pairs.join('&');
       setTimeout(drain, 0);
     }
 
@@ -116,6 +139,29 @@ window.__ModuleLoader__.load({
           open: (id) => {
             ctx.sessions.open(id);
           },
+          /**
+           * Answer what a session is waiting on, for a press on one of a
+           * notification's buttons. Called from the shell over `window.eval`;
+           * see its signal.rs, which owns the choice ids.
+           *
+           * @param {string} id - session id, as it was reported from here.
+           * @param {string} key - request key, as it was reported from here.
+           * @param {string} choice - which button was pressed.
+           */
+          answer: (id, key, choice) => {
+            var stale = () => send({ event: 'stale', session: id });
+            try {
+              var pending = ctx.uiSession.pendingInteractions.getSnapshot().get(id);
+              var sent = pending && pending.key === key ? submit(pending, choice) : null;
+              // Matched and sent, and it can still fail: a request can abort
+              // between the snapshot above and the call below.
+              if (sent) return sent.catch(stale);
+            } catch (error) {
+              // Whatever that was, nothing was submitted, and the one thing
+              // this must not do is fall silent about it.
+            }
+            stale();
+          },
         };
         return () => {
           delete window.__dshSignals;
@@ -123,6 +169,71 @@ window.__ModuleLoader__.load({
           stopWaits();
         };
       }, 'dsh-desktop-signal: session state to the desktop shell');
+    }
+
+    /**
+     * Hand one choice to the carrier that can act on it.
+     *
+     * Every branch is a submission the carrier's own contract allows, and
+     * nothing else: `ApprovalDecision` has exactly two values and neither of
+     * them is a standing permission, a plan review answers with the asker's
+     * own approve label verbatim, and a question answers with one whole batch.
+     * A choice this cannot place returns null rather than guessing, because
+     * the failure mode of a guess is an answer the user did not give.
+     *
+     * @returns {Promise<void> | null} The submission, or null if it is not one.
+     */
+    function submit(pending, choice) {
+      if (pending.kind === 'approval') {
+        if (choice === 'allow') return pending.answer('allowed-once');
+        if (choice === 'reject') return pending.answer('rejected');
+        return null;
+      }
+
+      // A `plan-review` is a request dsh has already narrowed: one question,
+      // single choice, declaring the intent whose `approve` names one of its
+      // own options. So the approve label is readable straight off the
+      // question, and there is no need to reach for `planReviewOf`.
+      if (pending.kind === 'plan-review') {
+        if (choice === 'revise') return pending.cancel();
+        var review = pending.questions[0];
+        if (choice !== 'approve' || !review || !review.intent) return null;
+        return pending.answer(batch(review.id, review.intent.approve));
+      }
+
+      // The generic flow. The shell only offers buttons for a batch of one
+      // single-select question, and numbers them by position in `options`.
+      if (pending.kind === 'question') {
+        var question = pending.questions[0];
+        var option = question && (question.options || [])[Number(choice)];
+        return option ? pending.answer(batch(question.id, option.label)) : null;
+      }
+
+      return null;
+    }
+
+    /** One whole answer batch, for a request of one question. */
+    function batch(id, label) {
+      return { answers: [{ id: id, selected: [label] }] };
+    }
+
+    /**
+     * The labels of an answer a single press can give, or none.
+     *
+     * `approval` and `plan-review` need nothing from here: their buttons say
+     * the same two things every time, and the shell writes them in the user's
+     * own language. A generic question's do not — they are the asker's own
+     * option labels — so they travel. Only a batch of one single-select
+     * question with one or two options fits on a toast; anything more has
+     * answers two buttons cannot express, and the shell offers "open" instead.
+     */
+    function oneClick(pending) {
+      if (pending.kind !== 'question' || pending.questions.length !== 1) return [];
+      var question = pending.questions[0];
+      if (question.multiSelect === true) return [];
+      var options = question.options || [];
+      if (options.length < 1 || options.length > 2) return [];
+      return options.map((option) => option.label);
     }
 
     /**
@@ -181,7 +292,13 @@ window.__ModuleLoader__.load({
           if (keys[id] === pending.key) continue;
           keys[id] = pending.key;
           if (announce) {
-            send({ event: 'wait', session: id, kind: pending.kind, key: pending.key });
+            send({
+              event: 'wait',
+              session: id,
+              kind: pending.kind,
+              key: pending.key,
+              option: oneClick(pending),
+            });
           }
         }
 

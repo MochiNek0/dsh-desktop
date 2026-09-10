@@ -67,6 +67,24 @@ async function drain(ticks = 10) {
   for (let i = 0; i < ticks; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
 }
 const query = (url) => Object.fromEntries(new URL(url).searchParams);
+// Repeated keys, which `query` would collapse: the option labels travel that way.
+const queryAll = (url, key) => new URL(url).searchParams.getAll(key);
+
+// A stand-in for one of dsh's carriers, recording what was submitted to it.
+function carrier(fields) {
+  const calls = [];
+  return Object.assign(
+    {
+      calls,
+      answer(value) { calls.push(['answer', value]); return Promise.resolve(); },
+      cancel() { calls.push(['cancel']); return Promise.resolve(); },
+    },
+    fields,
+  );
+}
+
+// One single-select question, the only shape a press can answer generically.
+const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
 
 // --- exports shape ---
 {
@@ -198,6 +216,179 @@ const query = (url) => Object.fromEntries(new URL(url).searchParams);
   s.stop();
   assert.equal(window.__dshSignals, undefined, 'a torn-down plugin hands the fallback back');
   console.log('ok  opens a session for the shell, and only while wired up');
+}
+
+// --- which waits a press can answer, and with what ---
+{
+  const { exports, sent } = load({ host: true });
+  const s = services();
+  exports.apply(s.ctx);
+
+  const labels = async (pending) => {
+    s.setPending(new Map([['a', pending]]));
+    await drain();
+    return queryAll(sent[sent.length - 1], 'option');
+  };
+
+  // The two kinds whose buttons say the same thing every time send none: the
+  // shell writes those in the user's own language.
+  assert.deepEqual(await labels(carrier({ key: 'k1', kind: 'approval' })), []);
+  assert.deepEqual(
+    await labels(carrier({ key: 'k2', kind: 'plan-review', questions: asked([{ label: 'Go' }]) })),
+    [],
+  );
+
+  // A generic question sends the asker's own labels, in the asker's order.
+  assert.deepEqual(
+    await labels(carrier({
+      key: 'k3',
+      kind: 'question',
+      questions: asked([{ label: 'Use TypeScript' }, { label: 'Stay on JS' }]),
+    })),
+    ['Use TypeScript', 'Stay on JS'],
+  );
+
+  // Everything a press cannot say in full sends none, and the shell offers
+  // "open" instead: too many options, more than one question, multi-select,
+  // and a question with no options at all.
+  assert.deepEqual(
+    await labels(carrier({ key: 'k4', kind: 'question', questions: asked([{ label: 'a' }, { label: 'b' }, { label: 'c' }]) })),
+    [],
+  );
+  assert.deepEqual(
+    await labels(carrier({
+      key: 'k5',
+      kind: 'question',
+      questions: [...asked([{ label: 'a' }]), { id: 'q2', question: 'And?', options: [{ label: 'b' }] }],
+    })),
+    [],
+  );
+  assert.deepEqual(
+    await labels(carrier({ key: 'k6', kind: 'question', questions: [{ id: 'q1', question: 'Which?', multiSelect: true, options: [{ label: 'a' }, { label: 'b' }] }] })),
+    [],
+  );
+  assert.deepEqual(await labels(carrier({ key: 'k7', kind: 'question', questions: asked(undefined) })), []);
+  console.log('ok  offers labels only for a question one press can answer');
+}
+
+// --- a press, on each kind of wait ---
+{
+  const { exports, window } = load({ host: true });
+  const s = services();
+  exports.apply(s.ctx);
+
+  const press = async (pending, choice) => {
+    s.setPending(new Map([['a', pending]]));
+    await drain();
+    window.__dshSignals.answer('a', pending.key, choice);
+    await drain();
+    return pending.calls;
+  };
+  // An answer batch is built inside the vm realm, so compare it by value.
+  const batch = (calls) => [calls[0][0], JSON.stringify(calls[0][1])];
+
+  // An approval's two decisions, and neither of them is a standing permission.
+  assert.deepEqual(
+    await press(carrier({ key: 'k1', kind: 'approval' }), 'allow'),
+    [['answer', 'allowed-once']],
+  );
+  assert.deepEqual(
+    await press(carrier({ key: 'k2', kind: 'approval' }), 'reject'),
+    [['answer', 'rejected']],
+  );
+
+  // A plan review answers with the asker's own approve label, verbatim, and
+  // its second button hands the composer back rather than refusing in silence.
+  const review = {
+    key: 'k3',
+    kind: 'plan-review',
+    questions: [{
+      id: 'plan-1',
+      question: 'Ship it?',
+      detail: '# the plan',
+      options: [{ label: 'Looks right' }, { label: 'No' }],
+      intent: { kind: 'plan-review', approve: 'Looks right' },
+    }],
+  };
+  assert.deepEqual(
+    batch(await press(carrier(review), 'approve')),
+    ['answer', JSON.stringify({ answers: [{ id: 'plan-1', selected: ['Looks right'] }] })],
+  );
+  assert.deepEqual(await press(carrier({ ...review, key: 'k4' }), 'revise'), [['cancel']]);
+
+  // A question answers with the whole batch, and the choice is a position.
+  const question = {
+    key: 'k5',
+    kind: 'question',
+    questions: asked([{ label: 'Use TypeScript' }, { label: 'Stay on JS' }]),
+  };
+  assert.deepEqual(
+    batch(await press(carrier(question), '1')),
+    ['answer', JSON.stringify({ answers: [{ id: 'q1', selected: ['Stay on JS'] }] })],
+  );
+  console.log('ok  submits what each button promised, and nothing else');
+}
+
+// --- a press that arrives too late ---
+{
+  const { exports, window, sent } = load({ host: true });
+  const s = services();
+  exports.apply(s.ctx);
+
+  const pending = carrier({ key: 'k1', kind: 'approval' });
+  s.setPending(new Map([['a', pending]]));
+  await drain();
+  const raised = sent.length;
+
+  const stale = async (...args) => {
+    const before = sent.length;
+    window.__dshSignals.answer(...args);
+    await drain();
+    assert.equal(sent.length, before + 1, 'a press that submits nothing should say so');
+    return query(sent[sent.length - 1]);
+  };
+
+  // The request was replaced while the toast was on screen.
+  let said = await stale('a', 'k0', 'allow');
+  assert.equal(said.event, 'stale');
+  assert.equal(said.session, 'a');
+
+  // The session is not waiting on anything at all.
+  said = await stale('b', 'k1', 'allow');
+  assert.equal(said.event, 'stale');
+  assert.equal(said.session, 'b');
+
+  // A choice this kind has no meaning for, which is what a forged signal
+  // would produce: a toast drawn with buttons the carrier cannot honour.
+  said = await stale('a', 'k1', 'approve');
+  assert.equal(said.event, 'stale');
+
+  assert.deepEqual(pending.calls, [], 'nothing above should have submitted anything');
+
+  // And a submission the carrier itself rejects — a request aborted between
+  // the snapshot and the call.
+  const refuses = carrier({
+    key: 'k2',
+    kind: 'approval',
+    answer() { return Promise.reject(new Error('aborted')); },
+  });
+  s.setPending(new Map([['a', refuses]]));
+  await drain();
+  said = await stale('a', 'k2', 'allow');
+  assert.equal(said.event, 'stale');
+
+  // Or throws outright, which is what a dsh whose carrier has moved on under
+  // us would look like.
+  const throws = carrier({
+    key: 'k3',
+    kind: 'approval',
+    answer() { throw new Error('gone'); },
+  });
+  s.setPending(new Map([['a', throws]]));
+  await drain();
+  said = await stale('a', 'k3', 'allow');
+  assert.equal(said.event, 'stale');
+  console.log('ok  reports a press it could not submit instead of swallowing it');
 }
 
 // --- no desktop shell: no door either ---

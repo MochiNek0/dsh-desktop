@@ -19,9 +19,7 @@ mod setup;
 mod signal;
 mod theme;
 mod toast;
-mod turn;
 mod update;
-mod waiting;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -242,14 +240,6 @@ fn build_window(
         .initialization_script(controls::script())
         // Turns the page's own `Notification` calls into real ones.
         .initialization_script(notify::script())
-        // Raises one of those calls itself when a turn ends, so a finished run
-        // is announced without a plugin having to be installed for it. After
-        // `notify`, because it calls the shim that one installs.
-        .initialization_script(turn::script())
-        // And one when dsh stops to ask the user something, which the turn
-        // watcher cannot see: the run has not ended, it is blocked. Same
-        // shim, so both land in the same suppression check.
-        .initialization_script(waiting::script())
         // The plugin panel, drawn over whatever page is showing when it is
         // asked for — dsh's included, which is the point of it being here.
         .initialization_script(panel::script())
@@ -481,7 +471,17 @@ fn toggle_autostart(app: &tauri::AppHandle) {
 /// pushed from the value [`settings`] returns rather than by reading the file
 /// back. A write that failed leaves the setting on for this session, which the
 /// checkmark then honestly shows.
+/// Flip the notification preference, unless there is nothing to notify about.
+///
+/// The menu draws the row inert without the signal plugin, so an arriving verb
+/// normally means the row was usable. Checked again anyway: the verb is a
+/// navigation, and every verb on that channel is reachable from any script the
+/// window loads (see [`controls`]). Refusing here keeps the stored preference
+/// from being flipped behind a switch the user cannot see the state of.
 fn toggle_notify_turns(app: &tauri::AppHandle) {
+    if !plugins::signalling(app) {
+        return;
+    }
     settings::toggle_notifications(app);
     controls::sync_notify(app);
 }

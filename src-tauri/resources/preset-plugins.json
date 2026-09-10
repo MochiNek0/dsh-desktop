@@ -20,6 +20,16 @@
     "url": "https://github.com/MochiNek0/dsh-web-search-free"
   },
   {
+    "id": "dsh-desktop-signal",
+    "package": "dsh-desktop-signal",
+    "spec": "bundled:plugin",
+    "section": "authored",
+    "name": "会话信号",
+    "description": "让通知知道它在说哪个会话：一轮跑完、或者 dsh 停下来等授权 / 等审方案 / 等你回答时，从 dsh 自己的状态里读，而不是猜页面结构。点通知回到提问的那个会话，能一键回答的直接在通知上答。随应用发货，不联网。",
+    "descriptionEn": "Lets a notification say which session it is about. It reads dsh's own session state rather than guessing at the page, so a finished turn — or a session stopped on an approval, a plan review or a question — names itself. Clicking the notification returns to that session, and what one press can answer is answered on the notification. Ships inside this app; installing it downloads nothing.",
+    "url": "https://github.com/MochiNek0/dsh-desktop"
+  },
+  {
     "id": "dsh-vendor-login",
     "package": "dsh-vendor-login",
     "spec": "dsh-vendor-login",

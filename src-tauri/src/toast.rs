@@ -54,6 +54,19 @@
 //! asked rather than on whichever one happened to be in front. A notification
 //! the page raised names no session and stops at the window.
 //!
+//! ## What a button reaches
+//!
+//! dsh, without the window coming forward at all. [`crate::signal::buttons`]
+//! decides which buttons a wait gets and what each one means; this module only
+//! draws them and hands the id of the one that was pressed back to
+//! [`crate::signal::answer`]. That is the whole point of them — a press that
+//! raised the window would be a click on the body with extra steps.
+//!
+//! The two are kept apart at the response: `Default` is the body and reveals,
+//! `Action(id)` is a button and answers. Under XDG the body click arrives as
+//! the action named `default`, and `notify-rust` folds it into `Default`
+//! before this sees it, so there is no id here that is not a button.
+//!
 //! The page's own `Notification.onclick` is still never fired; see
 //! [`crate::notify`] for why the shim keeps it and leaves it alone.
 //!
@@ -79,13 +92,17 @@ const LISTENERS: usize = 8;
 /// How many of those threads are waiting right now.
 static LISTENING: AtomicUsize = AtomicUsize::new(0);
 
+/// How long a toast that can be answered stays up, in milliseconds. See where
+/// it is applied for why this number and not another.
+const ANSWERABLE: u32 = 25_000;
+
 /// Put one on screen. Returns immediately; the toast outlives the call.
 ///
 /// On its own thread because two of the three backends do real work in `show()`
 /// — a D-Bus round trip under XDG, COM activation on Windows — and because the
-/// wait that follows is blocking by construction. `session` rides along to the
-/// click; see the module docs.
-pub fn raise(app: &AppHandle, title: String, body: String, session: Option<String>) {
+/// wait that follows is blocking by construction. `click` rides along to the
+/// press; see the module docs.
+pub fn raise(app: &AppHandle, title: String, body: String, click: Option<crate::notify::Click>) {
     let app = app.clone();
 
     std::thread::spawn(move || {
@@ -101,9 +118,35 @@ pub fn raise(app: &AppHandle, title: String, body: String, session: Option<Strin
 
         // See the module docs: the body is only clickable under XDG if it is
         // declared, and the label is what a daemon shows if it draws it as a
-        // button anyway.
+        // button anyway. First, so that a daemon drawing all of them puts the
+        // way out where the way out goes.
         #[cfg(all(unix, not(target_os = "macos")))]
         notification.action("default", t!("打开", "Open"));
+
+        // Not on macOS, where nothing is listening: its `show()` sends on
+        // drop and the response never comes back (see the module docs), so a
+        // button there would be one that visibly does nothing. Better no
+        // button and a body click that opens the app.
+        #[cfg(not(target_os = "macos"))]
+        if let Some(click) = &click {
+            for button in &click.buttons {
+                notification.action(&button.id, &button.label);
+            }
+
+            // A toast with something to decide on is given the long life the
+            // platform has, because the short one is not enough to decide in:
+            // Windows shows a toast for about five seconds by default, and a
+            // press after that reaches the notification centre, which reaches
+            // nothing. Twenty-five seconds is the threshold `notify-rust` maps
+            // to `Duration::Long` there, and a plain expiry everywhere else —
+            // as opposed to `Timeout::Never`, which under XDG would leave the
+            // toast, and the thread waiting on it, up until someone swept it
+            // away. A toast with nothing to press keeps the default: it is a
+            // sentence, and the notification centre can hold it.
+            if !click.buttons.is_empty() {
+                notification.timeout(notify_rust::Timeout::Milliseconds(ANSWERABLE));
+            }
+        }
 
         identify(&app, &mut notification);
 
@@ -119,10 +162,10 @@ pub fn raise(app: &AppHandle, title: String, body: String, session: Option<Strin
         };
 
         // macOS sends on drop; see the module docs. Nothing to wait for, and
-        // so nothing for the session to be the answer to.
+        // so nothing for the buttons to be the answer to.
         #[cfg(target_os = "macos")]
         {
-            let _ = &session;
+            let _ = &click;
             drop(handle);
         }
 
@@ -130,12 +173,20 @@ pub fn raise(app: &AppHandle, title: String, body: String, session: Option<Strin
         {
             if LISTENING.fetch_add(1, Ordering::Relaxed) < LISTENERS {
                 let _ = handle.wait_for_response(|response: &notify_rust::NotificationResponse| {
-                    if !opens(response) {
+                    let Some(click) = &click else {
+                        // Raised by the page, which named nothing to go to.
                         return;
-                    }
-                    crate::reveal(&app);
-                    if let Some(session) = &session {
-                        crate::signal::open(&app, session);
+                    };
+
+                    match press(response) {
+                        Some(Press::Open) => {
+                            crate::reveal(&app);
+                            crate::signal::open(&app, &click.session);
+                        }
+                        Some(Press::Answer(id)) => {
+                            crate::signal::answer(&app, &click.session, &click.key, id);
+                        }
+                        None => {}
                     }
                 });
             }
@@ -144,16 +195,36 @@ pub fn raise(app: &AppHandle, title: String, body: String, session: Option<Strin
     });
 }
 
-/// Whether this is the user asking for the app.
-///
-/// `Default` is a click on the toast body, which every backend reports the same
-/// way: Windows sends an activation with no arguments, and the XDG backend
-/// normalises the `default` action key into it. `Action` is a named button,
-/// which nothing here adds yet — when it does, the answer belongs to whatever
-/// asked for the button rather than to this.
+/// What the user did to the toast, out of the things worth doing anything
+/// about. `None` for a toast that expired or was swept away, neither of which
+/// is an answer or a request for the window.
 #[cfg(not(target_os = "macos"))]
-fn opens(response: &notify_rust::NotificationResponse) -> bool {
-    matches!(response, notify_rust::NotificationResponse::Default)
+#[derive(Debug, PartialEq, Eq)]
+enum Press<'a> {
+    /// The body was clicked: the user is asking for the app.
+    Open,
+    /// A button was pressed, by the id [`crate::signal::buttons`] gave it.
+    Answer(&'a str),
+}
+
+/// Read one response.
+///
+/// The one decision in this module that is not a platform call, and worth
+/// naming because the obvious way to write the wait — `notify-rust`'s older
+/// `wait_for_action`, which hands back a bare `&str` — cannot express it. Its
+/// Windows arm folds a body click into the same `"__closed"` it reports a
+/// timeout as, so a toast dismissing itself would have revealed the window.
+///
+/// `Default` is the body on every backend: Windows sends an activation with no
+/// arguments, and the XDG backend normalises the `default` action key into it
+/// before this sees it. So an `Action` is always one of the buttons above.
+#[cfg(not(target_os = "macos"))]
+fn press(response: &notify_rust::NotificationResponse) -> Option<Press<'_>> {
+    match response {
+        notify_rust::NotificationResponse::Default => Some(Press::Open),
+        notify_rust::NotificationResponse::Action(id) => Some(Press::Answer(id)),
+        _ => None,
+    }
 }
 
 /// Whose name and icon the toast wears.
@@ -201,32 +272,37 @@ fn identify(app: &AppHandle, notification: &mut notify_rust::Notification) {
 
 #[cfg(test)]
 mod tests {
-    /// The one decision in this module that is not a platform call: which
-    /// responses mean "the user wants the app".
+    /// The body opens the app, a button answers dsh, and a toast that closed
+    /// on its own does neither.
     ///
-    /// Worth a test because the obvious way to write the wait — `notify-rust`'s
-    /// older `wait_for_action`, which hands back a `&str` — cannot express it.
-    /// Its Windows arm folds a body click into the same `"__closed"` it reports
-    /// a timeout as, so a toast dismissing itself would have revealed the
-    /// window. `wait_for_response` keeps the two apart.
+    /// The last of those is the one worth pinning: `wait_for_action`, the call
+    /// this module does not use, reports a timeout and a body click as the
+    /// same `"__closed"`, so written that way a toast expiring would have
+    /// pulled the window in front of whatever the user had moved on to.
     #[test]
     #[cfg(not(target_os = "macos"))]
-    fn opens_on_a_click_and_on_nothing_else() {
+    fn tells_the_body_the_buttons_and_a_toast_going_away_apart() {
+        use super::Press;
         use notify_rust::{CloseReason, NotificationResponse};
 
-        assert!(super::opens(&NotificationResponse::Default));
+        assert_eq!(
+            super::press(&NotificationResponse::Default),
+            Some(Press::Open)
+        );
+        assert_eq!(
+            super::press(&NotificationResponse::Action("allow".to_string())),
+            Some(Press::Answer("allow")),
+            "a button means what the id says, not \"open\""
+        );
 
-        assert!(!super::opens(&NotificationResponse::Closed(
-            CloseReason::Expired
-        )));
-        assert!(!super::opens(&NotificationResponse::Closed(
-            CloseReason::Dismissed
-        )));
-        // Nothing adds a button yet, and one added later should have to say what
-        // it does rather than inherit "open".
-        assert!(!super::opens(&NotificationResponse::Action(
-            "allow".to_string()
-        )));
+        assert_eq!(
+            super::press(&NotificationResponse::Closed(CloseReason::Expired)),
+            None
+        );
+        assert_eq!(
+            super::press(&NotificationResponse::Closed(CloseReason::Dismissed)),
+            None
+        );
     }
 
     /// Raise one real toast and say what came back. Ignored, because it puts
@@ -239,10 +315,11 @@ mod tests {
     /// is the one the rest of the file has to take on faith: whether an
     /// activation still reaches a process that has already returned from
     /// `show()`, since the object the handler was registered on is gone by
-    /// then. Left alone it should print `Closed(..)` a few seconds later, when
+    /// then. Left alone it should print `Closed(..)` half a minute later, when
     /// the popup times out — same delivery path, no click needed. Click the
-    /// toast instead and it should print `Default`, which is what
-    /// [`super::opens`] acts on.
+    /// body instead and it should print `Default`; press one of the two
+    /// buttons and it should print `Action("allow")` or `Action("reject")`,
+    /// which is the pair [`super::press`] tells apart.
     #[test]
     #[ignore]
     #[cfg(not(target_os = "macos"))]
@@ -250,9 +327,12 @@ mod tests {
         let mut notification = notify_rust::Notification::new();
         notification.summary("dsh-desktop");
         notification.body("a probe, not a turn");
+        notification.timeout(notify_rust::Timeout::Milliseconds(super::ANSWERABLE));
 
         #[cfg(all(unix, not(target_os = "macos")))]
         notification.action("default", "Open");
+        notification.action("allow", "Allow");
+        notification.action("reject", "Refuse");
 
         let handle = notification.show().expect("the system should show a toast");
         handle

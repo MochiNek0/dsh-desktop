@@ -1,12 +1,17 @@
 # 通知与回答：现状、结论与改造方案
 
-> 状态：设计稿，待实施。撰写于 2026-09-09，基于 dsh-desktop 0.1.13 与 dsh 0.1.2-rc.1。
+> 状态：**全部实施完毕**（第 1–5 步 + 随包发货）。撰写于 2026-09-09，基于 dsh-desktop
+> 0.1.13 与 dsh 0.1.2-rc.1。
 >
 > 这份文档记录的是一次调研的结论。中间大量事实是逐条核实过的（见
 > [附录 A](#附录-a已核实的事实与证据)），核实成本远高于阅读成本，所以证据和结论写在一起 ——
 > 改动这份方案之前，先看那一节是否仍然成立。
 
 ## 1. 现状
+
+> **这一节是改造之前的样子**，留着是因为下面每一条结论都是冲它来的。改完之后的样子见
+> [第 4 节](#4-目标架构)：这里说的两个 DOM watcher 已经不存在了，`tauri-plugin-notification`
+> 也换掉了。
 
 一条通知从页面走到操作系统，路径是：
 
@@ -109,9 +114,23 @@ Windows: WinRT Toast   macOS: mac-notification-sys   Linux: D-Bus
   失败。所以插件启动第一件事是认宿主 —— `main.rs` 已经注入了 `__DSH_VERSION__`，拿它当
   标记 —— 认不出就整体不接线，退化成一个 no-op 插件。
 
-一处校验缺口，记录在案：`plugins.rs:457` 用 `spec_name()` 组装安装后的待校验集合，而
-`spec_name` 对含 `/` 或 `:` 的 spec 返回 `None`（`:798`），本地路径会被丢出那个集合，装完
-无法确认。`github:` 现在就是这个待遇 —— 是既有的、已接受的缺口，不是本次新增的。
+一处校验缺口，记录在案：`plugins.rs` 用 `spec_name()` 组装 release-age 重试要比对的集合，而
+`spec_name` 对含 `/` 或 `:` 的 spec 返回 `None`，本地路径会被丢出那个集合。`github:` 现在就是
+这个待遇 —— 是既有的、已接受的缺口，不是本次新增的（对随包资源也无害：本地路径不过 registry，
+碰不到那道冷却检查）。
+
+**实装形态。** preset 的 `spec` 写作 `bundled:plugin`，在 `install()` 里解析成随包目录的绝对
+路径（`spec_for()` / `bundled()`）—— 装到哪里是用户选的，那条路径只有运行时才知道。目录由
+`scripts/bundle-runtime.mjs` 从仓库的 `plugin/` 复制进 `src-tauri/resources/plugin`，走已有
+的 `resources/**/*` 那条 glob，不给 bundler 加第二条规则；进去的正好是插件自己
+`package.json` 的 `files`（`lib/` + `cordis.patch.yml`）加清单，不含 `test/`。
+
+**一个必须记住的坑：Windows 上这条 spec 要自己加引号。** `dsh plugin` 用 Node 的
+`spawnSync(…, { shell: true })` 转发给 pnpm，而 Node 在那个模式下**不加引号** —— 它把参数用
+空格拼成一行交给 `cmd.exe`。默认安装目录是 `C:\Program Files\…`，所以不加引号的 spec 到
+pnpm 手里是**两个**参数，而 pnpm 不会失败：它按两半各装一个依赖（`Program`、`plugin`），
+warn 一句「declares no dsh.bundle」，然后 exit 0。三层都实测过（Rust `Command` 的转义 → Node
+的 shell 拼接 → cmd 拆词），加引号能原样穿过去。见 `plugins.rs` 的 `local_spec()`。
 
 ## 4. 目标架构
 
@@ -141,14 +160,18 @@ Windows: WinRT Toast   macOS: mac-notification-sys   Linux: D-Bus
 `tauri-plugin-notification` 唯一的依赖就是 `notify-rust`，而 `notify-rust` 三端的
 `show()` 都返回 `Result<NotificationHandle>`，句柄上都有 `wait_for_response`。所以自建
 这一层不是写三份实现，是**一份**加两处平台事实。这一层已实施，见
-`src-tauri/src/toast.rs`；下表「按钮」那一列还是第 4 步的事，第 2 步只有本体点击。
+`src-tauri/src/toast.rs`，下表整张都已落地（macOS 那格仍然是「没接」）。
 
 | 平台 | 按钮 | 激活 | 线程 |
 | :--- | :--- | :--- | :--- |
 | Windows | 转成 `tauri-winrt-notification` 的 `add_button`，≤5 | `Default`（点本体）/ `Action(id)` | `show()` 不阻塞；等待占一个线程 |
 | Linux | XDG actions，实际显示几个由守护进程决定 | 同上；点本体要求先声明一个名为 `default` 的 action | 同上 |
-| macOS | 1 个 → 主按钮；≥2 → "Options" 下拉 | **没接**，见下 | 同上 |
+| macOS | **一个都不画**，见下 | **没接**，见下 | 同上 |
 
+- **macOS 上不画按钮。** 不是画不出（`notify-rust` 会把 `.action()` 映射成主按钮或
+  "Options" 下拉），是按了没人接 —— 见下一条，那台机器上响应根本回不来。一个按下去可见地
+  什么都不发生的按钮，比没有这个按钮更糟，所以那两句 `.action()` 在 macOS 上整体 cfg 掉，
+  只留本体点击开应用。
 - **macOS 的 `show()` 什么都不显示。** 它只把 notification 包进一个句柄；真正发出去发生在
   `wait_for_response`（同步，走 `NSUserNotificationCenter`，注释要求主 run loop 在转）
   或者句柄的 `Drop`（异步，`.ok()` 掉错误）。取后者：与插件丢句柄的行为逐位相同，所以
@@ -157,6 +180,13 @@ Windows: WinRT Toast   macOS: mac-notification-sys   Linux: D-Bus
 - **要用 `wait_for_response`，不是 `wait_for_action`。** 后者的 Windows 分支把「点了本体」
   和「toast 自己超时」折成同一个 `"__closed"`（`notify-rust` `src/windows.rs:111`），
   照它写就是 toast 一超时就把窗口弹到用户面前。
+
+**带按钮的 toast 要给它平台上限的寿命。** Windows 默认只显示约 5 秒，而「读两个选项再决定」
+装不进 5 秒；超时之后按钮就只在通知中心里，而那里按不动（见下）。所以有按钮的通知带
+`Timeout::Milliseconds(25_000)` —— 25000 正好是 `notify-rust` 映射到 Windows
+`Duration::Long` 的门槛，在 XDG 下则是一次普通的 25 秒过期。**不要改用 `Timeout::Never`**：
+XDG 下那是「挂到有人扫掉为止」，连带那个等待线程一起。没有按钮的通知维持默认寿命 ——
+它只是一句话，进通知中心照样能读。
 
 一条能力边界，三端一样：**只接得住弹窗还在屏幕上时的那次点击。** 超时之后 Windows 和多数
 Linux 守护进程会在通知中心留一份，点那一份不送给运行中的进程 —— Windows 要注册一个 COM
@@ -194,10 +224,10 @@ carrier 自带判别与提交面，按钮直接从它上面取（见 [A.1](#a1-d
   降级为「打开」。`key` 的声明是「Opaque request identity; a replacement request must use a
   new key」，正好是这个用途。dsh 会在重连和 resync 时重放待处理请求，用户点到的可能已经
   是过去的那一个。
-- **插件缺失。** 插件没装则没有信号。`resources/preset-plugins.json` 加一行指向随包的
-  `plugin/`，先只做面板里可选（自动安装另见 [未决问题 2](#6-未决问题)）；并保留现有
-  `turn.rs` / `waiting.rs` 一个版本做兜底；稳定后删除那两个模块（约 700 行含测试）是本次
-  改造最大的净收益。
+- **插件缺失。** 插件没装则没有信号，而且现在**没有兜底**：`turn.rs` / `waiting.rs` 已经删了。
+  插件保持**面板里可选**、不自动装（`resources/preset-plugins.json` 里的
+  `dsh-desktop-signal`，装的是随包那份，不联网）。所以「没装」这件事必须看得见，
+  见下面 [4.4](#44-开关与它的前提)。
 - **两条路同时在，但不会响两次。** 第 3 步之后信号自己会弹通知，DOM 那两个 watcher 也还
   会弹 —— 所以插件接线时挂一个 `window.__dshSignals`，两个 watcher 的每一 tick 开头看见它
   就整个停手（不是「让一让」，是不干了）。放在页面里而不是 Rust 里，是因为这样刷新一次
@@ -205,14 +235,53 @@ carrier 自带判别与提交面，按钮直接从它上面取（见 [A.1](#a1-d
   「页面重载了但标记还在」。竞态窗口是零而不是小：两个 watcher 本来就有 4 秒的基线期
   （`turn.rs` 的 `SETTLE`、`waiting.rs` 的 `GRACE`），插件的 `apply` 在文档加载时就跑完，
   正好落在那 4 秒里面。
+- **答案怎么回来。** 按钮 id 由 Rust 定（`signal.rs` 的 `buttons()`），插件按 id 翻成
+  carrier 上的调用（`client.js` 的 `submit()`）—— 这张表两半都要改，改一半的失效模式是
+  「按了没反应」，而下面那条把它变成响亮的。
+- **key 不匹配走一次回程。** 原计划写的是「直接丢弃并降级为「打开」」，但 Rust 侧
+  `window.eval` 没有返回值，谁校验谁就得说话。所以插件校验不过（key 变了、会话不在等、
+  choice 这个 kind 认不出、或者 `answer()` 自己 reject 了）时回一条
+  `dsh-window://signal?event=stale`，Rust 收到就唤起窗口并切到那个会话。**静默什么都不做
+  是最坏的一种**：用户会以为自己已经答了。
 - **通知文案只有一份。** 信号弹的和 watcher 弹的是同一句话，字符串收在 `signal.rs`
   （`turn_ended()` / `waiting_on(kind)`），`turn.rs` 与 `waiting.rs` 从那里取。两份中英文
   对照散在两个地方就是 `i18n` 那套写法专门要避免的漂移，而且要删的是取用的那一半。
 - **版本漂移。** dsh 的客户端包目前是 `0.0.1-rc.*`，契约会动。插件里锁死版本，并接受
   「dsh 升级后插件需要跟版本」这件事。桥断掉时是**加载失败**（响亮），不是误答（安静）。
-- **线程上限。** 每个还在等点击的通知占一个阻塞线程。第 2 步已经放了并发上限
-  （`toast.rs` 的 `LISTENERS`，超出就照样弹但不听点击）；这条在第 4 步会重新变紧 ——
-  待回答的 toast 想活得比弹窗久，就得配超时。
+- **线程上限。** 每个还在等点击的通知占一个阻塞线程，上限在 `toast.rs` 的 `LISTENERS`
+  （8，超出就照样弹但不听点击）。第 4 步没有把它改紧：待回答的 toast 最终**没有**活得比
+  弹窗久，只是拿了平台的长寿命（见 [4.1](#41-通知层三端实现)），等待照样随弹窗结束。
+- **`wait-over` 撤不掉已经弹出的通知，这条到此为止。** 原计划说和第 4 步一起做，做不了：
+  `notify-rust` 的 Windows `NotificationHandle` **根本没有 `close()`**，而 XDG 那个的
+  `close(self)` 与 `wait_for_response(self)` 都按值拿走句柄 —— 二选一，撤销就听不见点击。
+  真要撤销得绕过 crate 直接对 `windows::UI::Notifications` 写，成本与收益不成比例（收益
+  是「已经答过的问题的 toast 早消失 20 秒」）。答过之后按旧 toast 的按钮不会误答，那条路
+  由上面的 key 校验兜住。
+
+### 4.4 开关与它的前提
+
+通知总开关（`settings::notifications`，菜单里的「通知」）本来就有。第 5 步把兜底删掉之后
+它多了一个前提：**没装插件，就没有任何东西可通知**。
+
+所以那一项现在有三种状态而不是两种：
+
+| 插件 | 偏好 | 菜单里的样子 | `notify::show` |
+| :--- | :--- | :--- | :--- |
+| 没装 | 任意 | 变灰、不可点，hover 说明缺什么 | 直接返回 |
+| 装了 | 开 | 打勾 | 照常两道闸 |
+| 装了 | 关 | 不打勾 | 直接返回 |
+
+三处要注意的：
+
+- **闸门在 `notify::show`，也就是所有通知的唯一出口。** 于是「关」只有一个意思。代价是
+  第三方 dsh 插件调 `window.Notification` 也一并静音——本机 dsh `0.1.2-rc.1` 的 222 个包
+  里没有任何一个调它（查过），所以今天这个代价是零；哪天不是零了，加第二道闸，而不是把
+  这道闸放宽。
+- **变灰而不是隐藏。** 一个消失的设置项，用户找不回来问为什么。
+- **不用 `disabled` 属性，用 class + `aria-disabled`。** 浏览器不给 `disabled` 的按钮显示
+  `title` 气泡，那一行就会灰着却说不出原因。点击的拒绝由 handler 做，Rust 侧
+  `toggle_notify_turns` 再挡一次——那条 verb 和其它所有 verb 一样，页面里任何脚本都够得着。
+- **偏好本身不被改写。** 拔掉插件不会把存着的 `true` 改成 `false`；装回来开关还在原处。
 
 ## 5. 实施步骤
 
@@ -236,20 +305,34 @@ carrier 自带判别与提交面，按钮直接从它上面取（见 [A.1](#a1-d
 4. 按 4.2 的表加动作按钮，激活 → 插件提交答案
    → 验证：key 不匹配时拒绝提交并降级为「打开」；
           approval / plan-review / 二选一 question 各走通一次
+   ✅ 已完成
 
 5. 删除 turn.rs / waiting.rs 及其注入
    → 验证：全量测试通过；无插件时通知功能整体缺席而非报错
+   ✅ 已完成。「缺席而非报错」按下面 4.4 那条做成了看得见的缺席：菜单里那一项变灰并说明
+     为什么
+
+X. 随包发货 + preset 一行（原属第 1 步，见下）
+   → 验证：`bundle-runtime` 把 plugin/ 摆进 resources/；面板里能装上且不联网；
+          装出来的 link: 指向安装目录，且 `dsh.profile.bundles` 里有它
+   ✅ 已完成
 ```
 
-**第 1 步的交付形态与原计划有一处不同。** 原来括号里写的是「随包资源 + preset 一行」，
-实装后拆开了：信号链路（`plugin/` + `src-tauri/src/signal.rs` + `controls.rs` 一条路由）
-已经完成并验证，而**随包发货与 preset 那一行没做**。原因是 preset 的 `spec` 是
-`resources/preset-plugins.json` 里的静态字符串，随包资源的路径只有运行时才知道
-（`resource_dir()`），所以要么在 `install` 里做一次占位符替换，要么走非 preset 的安装路径 ——
-不是「一行」。它不影响第 1 步的任何验证条件，所以单独作为一步排在后面。
+**第 1 步的交付形态与原计划有一处不同，现已补齐。** 原来括号里写的是「随包资源 + preset
+一行」，实装时拆开了：信号链路（`plugin/` + `src-tauri/src/signal.rs` + `controls.rs` 一条
+路由）先完成，随包发货与 preset 那一行留到后面单独做——因为 preset 的 `spec` 是
+`resources/preset-plugins.json` 里的静态字符串，而随包资源的路径只有运行时才知道
+（`resource_dir()`），确实不是「一行」。它现在做完了，形态与踩到的坑见
+[3.2](#32-交付形态)。
 
 开发期的装法见 [A.4](#a4-客户端插件的加载契约)：
 `dsh plugin --profile web add -w ./plugin`，装出来是指向仓库的 `link:`。
+
+**第 4 步比原计划多了一条上行字段和一个上行事件。** 通用问题的按钮文字是提问方自己的
+option label，Rust 画按钮就得拿到它，所以 `wait` 信号多了可重复的 `option=`（只在
+「单题、单选、选项 1–2 个」时由插件发，最多两个）；`approval` 和 `plan-review` 的两个按钮
+每次都说同一句话，由 Rust 用 `t!` 写，不走这条。回程的 `stale` 见
+[4.3](#43-失效与兜底)。第 4 步的能力边界与 `wait-over` 的结论也记在那一节。
 
 **第 3 步比原计划多做了一件事，因为绕不开。** 「通知携带 sessionId」等于通知必须由信号
 来发 —— watcher 从 DOM 里看不出 sessionId，靠时间把两边对起来是猜，正是这次改造要去掉的
@@ -263,19 +346,23 @@ carrier 自带判别与提交面，按钮直接从它上面取（见 [A.1](#a1-d
 第 2 步顺带把可诊断性也一起交付了。
 
 第 2 步之后已经可用（收进托盘、点通知回到窗口），第 3 步把「回到窗口」变成「回到提问的
-那个会话」，第 4 步才是新能力。
+那个会话」，第 4 步才是新能力，第 5 步把旧路拆掉。**到这里整条链路只剩一条路：dsh 的状态
+→ 插件 → `signal.rs` → `toast.rs`。**
 
 ## 6. 未决问题
 
-1. **`approval` 是否允许在通知上直接点「允许」。** 倾向给，而且核实完更倾向给：
-   `ApprovalDecision` 只有 `'allowed-once' | 'rejected'`，这个面根本给不出「一直允许」，
-   误答的代价是一次工具调用而不是一项长期授权。保守方案仍是只留「拒绝」和「打开」。
-2. **插件是否自动安装。** 自动安装会把这个应用从「能配任何 dsh」变成「需要我们的插件」。
-   现有 `notify.rs` 的设计哲学是「没有桥可说，也就没有桥会断」，这一步是明确地立一座桥 ——
-   但是一座会响亮地断的桥。随包发货（见 [3.2](#32-交付形态)）把代价压低了不少：不联网，
-   装不上的失败面小得多。但「默认装上」和「面板里可选」仍是两种产品姿态，这个问题不因
-   交付形态而消失。第 1 步先按可选做。
+三个都结了，结论记在下面。
 
+> ~~1. 插件是否自动安装。~~ 已结：**不装**，保持面板里可选 —— 插件后续可能单独发到 npm，
+> 自动装会把这个应用从「能配任何 dsh」变成「需要我们的插件」。当初记下的顾虑
+> （`notify.rs` 的「没有桥可说，也就没有桥会断」）就是这一条，随包发货只是把装不上的
+> 失败面压小，没有让这个问题消失。代价是通知功能从此有一个用户可见的前提，怎么呈现见
+> [4.4](#44-开关与它的前提)。
+>
+> ~~2. `approval` 是否允许在通知上直接点「允许」。~~ 已结，第 4 步按「给」实施：
+> `ApprovalDecision` 只有 `'allowed-once' | 'rejected'`，这个呈现面根本给不出「一直允许」，
+> 误答的代价是一次工具调用而不是一项长期授权。
+>
 > ~~3. 拿 carrier 的路径待定。~~ 已结，见 [A.1](#a1-dsh-侧的官方-api)：carrier 就在
 > `ctx.uiSession.pendingInteractions` 这个公开 observable 里，与 composer 座位无关。
 
