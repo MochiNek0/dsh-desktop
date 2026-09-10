@@ -26,6 +26,13 @@
 //! release. Anything not on it goes in the panel's own text box, which passes
 //! whatever is typed straight through to pnpm.
 //!
+//! Both strings the panel draws are written twice in that file: `name` and
+//! `description` in Chinese, `nameEn` and `descriptionEn` beside them. The
+//! English half is optional so that a new entry is offered before it has been
+//! translated, and [`parse`] falls back to the Chinese one — which is why a
+//! test refuses to let an entry whose Chinese half is actually Chinese ship
+//! without the other.
+//!
 //! ## What is not automated
 //!
 //! pnpm 10 and later refuse to run a dependency's build scripts until the
@@ -107,7 +114,12 @@ struct Preset {
     /// repository's manifest declares, and nothing here can work that out
     /// without fetching it.
     package: String,
+    /// What the panel calls it, in the language of the moment: `nameEn` where
+    /// the file has one, `name` otherwise. A name that reads the same in both
+    /// languages needs only the one field; anything written in Chinese needs
+    /// both, or it stays Chinese in an English panel.
     name: String,
+    /// The same two halves, `description` and `descriptionEn`.
     description: String,
     /// Which group of the panel it is drawn under. Free-form, because the panel
     /// decides what a group is called and in what order the groups come; an
@@ -169,20 +181,26 @@ fn parse(raw: &str) -> Vec<Preset> {
             let text = |key: &str| entry.get(key)?.as_str().map(str::to_string);
             let flag = |key: &str| entry.get(key).and_then(serde_json::Value::as_bool) == Some(true);
 
+            // One of a field's two halves, in the language of the moment. The
+            // English one is optional: a preset that has not been translated
+            // yet reads in Chinese rather than not at all. Nothing here is
+            // settled at startup — `listing` builds this again every time the
+            // panel opens, so a language switch reaches it on the next
+            // opening, the way it reaches the panel's own labels.
+            let half = |zh: &str, en: &str| {
+                if crate::i18n::chinese() {
+                    text(zh)
+                } else {
+                    text(en).or_else(|| text(zh))
+                }
+            };
+
             Some(Preset {
                 package: text("package").or_else(|| text("id"))?,
                 id: text("id")?,
                 spec: text("spec")?,
-                name: text("name")?,
-                // The English half is optional: a preset that has not been
-                // translated yet reads in Chinese rather than not at all.
-                description: if crate::i18n::chinese() {
-                    text("description").unwrap_or_default()
-                } else {
-                    text("descriptionEn")
-                        .or_else(|| text("description"))
-                        .unwrap_or_default()
-                },
+                name: half("name", "nameEn")?,
+                description: half("description", "descriptionEn").unwrap_or_default(),
                 section: text("section")
                     .map(|section| section.trim().to_string())
                     .filter(|section| !section.is_empty())
@@ -1805,6 +1823,93 @@ mod tests {
                 "{} has an empty section",
                 preset.id
             );
+        }
+    }
+
+    /// A preset is drawn in the language the app is in.
+    ///
+    /// Reads the language rather than setting it, the way [`crate::i18n`]'s own
+    /// test does: the switch is one atomic for the whole process, and a test
+    /// that moved it would move it under every other test running beside it.
+    #[test]
+    fn a_preset_reads_in_the_language_the_app_is_in() {
+        let raw = r#"[{
+            "id": "x", "spec": "x",
+            "name": "中文名", "nameEn": "English name",
+            "description": "中文说明", "descriptionEn": "English description"
+        }]"#;
+
+        let mut parsed = parse(raw);
+        let preset = parsed.pop().expect("the entry survives parse");
+
+        let (name, description) = if crate::i18n::chinese() {
+            ("中文名", "中文说明")
+        } else {
+            ("English name", "English description")
+        };
+        assert_eq!(preset.name, name);
+        assert_eq!(preset.description, description);
+    }
+
+    /// And one with no English half is still offered, in Chinese. That is the
+    /// point of the fallback: a plugin worth suggesting should not wait on a
+    /// translation to appear in the panel at all.
+    #[test]
+    fn an_untranslated_preset_is_still_offered() {
+        let raw = r#"[{"id": "x", "spec": "x", "name": "中文名", "description": "中文说明"}]"#;
+
+        let mut parsed = parse(raw);
+        let preset = parsed.pop().expect("the entry survives parse");
+
+        assert_eq!(preset.name, "中文名");
+        assert_eq!(preset.description, "中文说明");
+    }
+
+    /// A shipped string that is really Chinese has an English half.
+    ///
+    /// [`parse`] falls back to the Chinese one where there is no other, so
+    /// that an entry can be offered before it has been translated. That
+    /// fallback is also how Chinese text gets into an English panel: nothing
+    /// fails, the row simply reads in the wrong language, and the only person
+    /// who would notice is running the app in English. Which is what shipped
+    /// — the bundled plugin was `会话信号` in both.
+    ///
+    /// Keyed off the Chinese half rather than a list of fields that must be
+    /// translated: a name that is the same in both languages — a bare product
+    /// name — would otherwise need a second field that only ever repeats its
+    /// neighbour. Every entry shipping today happens to be translated; the
+    /// rule is what lets one that does not need to be skip it.
+    #[test]
+    fn a_preset_string_written_in_chinese_has_an_english_half() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(PRESETS);
+        let raw = std::fs::read_to_string(&path).expect("the shipped preset list");
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_str(&raw).expect("the preset list is a JSON array");
+
+        for entry in &entries {
+            let id = entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("an entry with no id");
+
+            for (zh, en) in [("name", "nameEn"), ("description", "descriptionEn")] {
+                let chinese = entry
+                    .get(zh)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if chinese.is_ascii() {
+                    continue;
+                }
+
+                let english = entry.get(en).and_then(serde_json::Value::as_str);
+                assert!(
+                    english.is_some_and(|value| !value.trim().is_empty()),
+                    "{id} has a Chinese `{zh}` and no `{en}`, so it reads in Chinese \
+                     in an English panel"
+                );
+            }
         }
     }
 

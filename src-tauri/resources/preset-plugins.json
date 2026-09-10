@@ -4,7 +4,8 @@
     "package": "dshmarket",
     "spec": "dshmarket",
     "section": "recommended",
-    "name": "DSH Market",
+    "name": "插件市场",
+    "nameEn": "DSH Market",
     "description": "dsh 里的可视化插件市场：浏览、搜索、一键安装社区插件。装了它之后，后续找插件就不用再回到这个面板。",
     "descriptionEn": "A visual plugin market inside dsh: browse, search, and install community plugins in one click. With it installed, finding the next plugin no longer means coming back to this panel.",
     "url": "https://github.com/dsh-market/dsh-market"
@@ -14,7 +15,8 @@
     "package": "dsh-web-search-free",
     "spec": "dsh-web-search-free",
     "section": "authored",
-    "name": "Web Search Free",
+    "name": "免费网络搜索",
+    "nameEn": "Web Search Free",
     "description": "免费的联网搜索与网页抓取通道：Tavily / Exa / Jina / Firecrawl / Brave 多引擎按序 fallback，可拖动排序、每个引擎填多个 Key。走各家专用检索接口，不经过任何模型，因此一次搜索 0 模型 token，也不需要 DEEPSEEK_API_KEY。",
     "descriptionEn": "A free web search and fetch channel: Tavily, Exa, Jina, Firecrawl and Brave chained with automatic fallback, reorderable by drag, several keys per engine. It calls each engine's own search endpoint rather than a model, so a search costs zero model tokens and needs no DEEPSEEK_API_KEY.",
     "url": "https://github.com/MochiNek0/dsh-web-search-free"
@@ -25,6 +27,7 @@
     "spec": "bundled:plugin",
     "section": "authored",
     "name": "会话信号",
+    "nameEn": "Session Signals",
     "description": "让通知知道它在说哪个会话：一轮跑完、或者 dsh 停下来等授权 / 等审方案 / 等你回答时，从 dsh 自己的状态里读，而不是猜页面结构。点通知回到提问的那个会话，能一键回答的直接在通知上答。随应用发货，不联网。",
     "descriptionEn": "Lets a notification say which session it is about. It reads dsh's own session state rather than guessing at the page, so a finished turn — or a session stopped on an approval, a plan review or a question — names itself. Clicking the notification returns to that session, and what one press can answer is answered on the notification. Ships inside this app; installing it downloads nothing.",
     "url": "https://github.com/MochiNek0/dsh-desktop"
@@ -34,7 +37,8 @@
     "package": "dsh-vendor-login",
     "spec": "dsh-vendor-login",
     "section": "authored",
-    "name": "Vendor Login",
+    "name": "厂商账号登录",
+    "nameEn": "Vendor Login",
     "description": "用你自己的订阅账号登录那些根本不发 API Key 的 AI 编程套餐：Claude Pro/Max/Team、ChatGPT Plus/Pro、GitHub Copilot、SuperGrok。在 dsh 设置界面里直接走各家官方的 OAuth / 设备码流程，令牌只留在本机。",
     "descriptionEn": "Sign in to AI coding plans that hand out no API key at all — Claude Pro/Max/Team, ChatGPT Plus/Pro, GitHub Copilot, SuperGrok — with your own subscription, straight from dsh's settings UI. It drives each vendor's own OAuth or device-code flow and the tokens stay on your machine.",
     "url": "https://github.com/MochiNek0/dsh-vendor-login"
