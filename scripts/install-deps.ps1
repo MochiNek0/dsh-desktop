@@ -1500,16 +1500,18 @@ function Remove-Node {
 
 # Take the app's own plugin back out of the user's dsh profile.
 #
-# The app ships a dsh plugin inside itself and installs it from the directory it
-# ships in — `bundled:plugin` in `src-tauri/src/plugins.rs`, which resolves to an
-# absolute path under the installation directory. pnpm records that as
-# `"dsh-desktop-signal": "link:C:\Program Files\..."` and puts a junction at
-# that name in the profile's `node_modules`.
+# The app ships a dsh plugin inside itself. Current builds copy it to
+# `$DSH_HOME\.dsh-desktop\bundled\plugin` first and install from there — see
+# `stage_bundled` in `src-tauri/src/plugins.rs` — so the profile records
+# `"dsh-desktop-signal": "link:…\.dsh-desktop\bundled\plugin"` and that target
+# survives the app being uninstalled or moved. Uninstalling the app therefore
+# leaves a still-valid local package behind, which this mode does not touch.
 #
-# Uninstalling the app deletes the other end of that junction. What it must not
-# do is leave the near end behind, because the profile is the user's own and
-# they keep it — the uninstaller says so, and its prompt defaults to keeping it.
-# Left behind, it costs them two things:
+# What it *does* clean up is the older scheme: installs that linked straight
+# into `$INSTDIR\resources\plugin`. Uninstalling those deletes the far end of
+# the junction. The near end is the user's own profile and they keep it — the
+# uninstaller says so, and its prompt defaults to keeping it. Left behind, it
+# costs them two things:
 #
 #   * dsh still lists the plugin in `dsh.profile.bundles`, so every later `dsh
 #     web` tries to activate a layer whose files are gone, and says so loudly.
@@ -1520,7 +1522,8 @@ function Remove-Node {
 #     forever. See `repair` in `src-tauri/src/plugins.rs`, where the same
 #     failure is documented from the other side.
 #
-# So: the junction, then the two registrations that name it.
+# So: the junction, then the two registrations that name it — but only when
+# the far end is already gone.
 #
 # Done here rather than by handing the job to `dsh plugin remove`, which is what
 # does it while the app is installed. That path needs a working Node, dsh and
@@ -1532,7 +1535,8 @@ function Remove-Node {
 # and it is a complete test for it: a developer working on the plugin installs
 # it as a link to their own checkout (`dsh plugin add -w ./plugin`), and their
 # checkout is still there when the app goes, so this leaves them alone without
-# having to compare any paths.
+# having to compare any paths. The same rule now also protects a current
+# install's link into `$DSH_HOME`, whose target is still there.
 function Remove-BundledPlugin {
     # `$DSH_HOME` is dsh's own variable. Worked out the way dsh works it out,
     # which is the way `profile_dir` in `src-tauri/src/plugins.rs` does.

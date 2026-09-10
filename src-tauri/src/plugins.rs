@@ -217,10 +217,21 @@ fn parse(raw: &str) -> Vec<Preset> {
 /// The spec prefix of a plugin that ships inside this app.
 ///
 /// Not a scheme pnpm has ever heard of — it is resolved here, before pnpm sees
-/// it, into the absolute path of the staged directory. It has to be resolved
-/// rather than written down because that path is only known at runtime: the
-/// user chose where to install the app. See [`bundled`] and [`local_spec`].
+/// it, into the absolute path of a *persistent* copy under `$DSH_HOME`, not the
+/// directory inside the application resources. pnpm records a local directory
+/// as `link:`, and a link into `$INSTDIR` (or an AppImage's temporary mount)
+/// outlives the files it points at the moment the app is uninstalled, moved, or
+/// simply next launched from a new mount. See [`stage_bundled`].
 const BUNDLED: &str = "bundled:";
+
+/// Where a bundled plugin is copied before pnpm is allowed to see it.
+///
+/// Under `$DSH_HOME` rather than this app's own data directory: the profile
+/// that links the copy lives there too, and a Windows uninstall that deletes
+/// app data must not take the far end of that link with it.
+fn staged_root() -> PathBuf {
+    dsh_home().join(".dsh-desktop").join("bundled")
+}
 
 /// What pnpm is handed for one preset, which for all but [`BUNDLED`] is what
 /// the file already says.
@@ -229,7 +240,35 @@ fn spec_for(app: &AppHandle, spec: &str) -> Result<String, String> {
         return Ok(spec.to_string());
     };
 
-    let dir = bundled(app, name).ok_or_else(|| {
+    let dir = stage_bundled(app, name)?;
+    Ok(local_spec(&dir))
+}
+
+/// Copy a directory that ships inside the app out to [`staged_root`], and
+/// answer with the copy's path.
+///
+/// This is the whole of the reason `bundled:` is not just "the path under
+/// `resources/`". pnpm turns a local directory into a `link:`, and that link is
+/// recorded in the user's profile — which is theirs and outlives this app.
+/// Linking straight at the installation directory leaves:
+///
+/// - a dangling link after uninstall, on every platform that has no
+///   `unlink-plugin` hook (macOS and Linux have none — see `install-deps.sh`);
+/// - a dangling link after the user moves the install;
+/// - a *permanently* dangling link under AppImage, whose mount path changes
+///   every launch while `package.json` keeps recording the previous one.
+///
+/// The copy is under `$DSH_HOME`, beside the profile that uses it, so all three
+/// go away. An app update that changes the plugin's files is handled by
+/// re-running this on every launch that finds the plugin already installed —
+/// see [`adopt`] — so the linked directory is refreshed from the new build.
+///
+/// Written into a sibling first and only then swapped in, so a failed copy
+/// leaves yesterday's copy — and the link pointing at it — alone. A file
+/// deleted from the plugin does not live on in the new copy, because the
+/// destination is replaced rather than merged over.
+fn stage_bundled(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    let source = bundled(app, name).ok_or_else(|| {
         t!(
             "{} 应该随这个应用一起装上的，但它不在安装目录里。重新安装一次应用能把它带回来。",
             "{} ships inside this app, and it is not in the installation directory.              Reinstalling the app puts it back.",
@@ -237,7 +276,98 @@ fn spec_for(app: &AppHandle, spec: &str) -> Result<String, String> {
         )
     })?;
 
-    Ok(local_spec(&dir))
+    let dest = staged_root().join(name);
+    let tmp = dest.with_file_name(format!("{name}.new"));
+
+    if tmp.exists() {
+        if let Err(error) = std::fs::remove_dir_all(&tmp) {
+            return Err(t!(
+                "无法清掉 {}：{error}",
+                "could not clear {}: {error}",
+                tmp.display()
+            ));
+        }
+    }
+
+    copy_tree(&source, &tmp).map_err(|error| {
+        t!(
+            "无法把 {} 拷到 {}：{error}",
+            "could not copy {} to {}: {error}",
+            source.display(),
+            tmp.display()
+        )
+    })?;
+
+    if dest.exists() {
+        if let Err(error) = std::fs::remove_dir_all(&dest) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(t!(
+                "无法更新 {} 里已有的插件副本：{error}",
+                "could not replace the existing plugin copy in {}: {error}",
+                dest.display()
+            ));
+        }
+    }
+
+    if let Err(rename_error) = std::fs::rename(&tmp, &dest) {
+        // Same volume under `$DSH_HOME`, so rename should not be the one that
+        // fails — but a leftover from a previous run that is not ours, or a
+        // virus scanner holding the path, would. Copy the finished tree across
+        // rather than leaving nothing at `dest`.
+        copy_tree(&tmp, &dest).map_err(|error| {
+            t!(
+                "无法把 {} 挪到 {}：{error}（rename 也失败：{rename_error}）",
+                "could not move {} into place at {}: {error} (rename failed too: {rename_error})",
+                tmp.display(),
+                dest.display()
+            )
+        })?;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    Ok(dest)
+}
+
+/// Recursive file copy, for the handful of files one bundled plugin is.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// The path a `link:` range names, or `None` when the range is not one.
+fn link_target(range: &str) -> Option<PathBuf> {
+    range.strip_prefix("link:").map(PathBuf::from)
+}
+
+/// Where the profile's dependency on [`SIGNAL`] points, if it is a local link
+/// at all.
+fn signal_link(app: &AppHandle) -> Option<PathBuf> {
+    let range = dependencies_in(&profile_manifest(app))
+        .into_iter()
+        .find(|(name, _)| name == SIGNAL)?
+        .1;
+    link_target(&range)
+}
+
+/// Whether the profile's copy of [`SIGNAL`] has lost the files it points at.
+///
+/// True after an AppImage unmounts — the recorded mount is gone — and after an
+/// older install that linked into this app was uninstalled or moved. False for
+/// a healthy link, wherever it points: a developer's `dsh plugin add -w
+/// ./plugin` is a valid link to their own checkout and is none of this
+/// function's business. Same rule `Remove-BundledPlugin` in the bootstrap
+/// script applies.
+fn signal_link_is_gone(app: &AppHandle) -> bool {
+    signal_link(app).is_some_and(|path| !path.exists())
 }
 
 /// Where a directory that ships with the app is: the staged resource, or the
@@ -246,10 +376,9 @@ fn spec_for(app: &AppHandle, spec: &str) -> Result<String, String> {
 ///
 /// The two names line up on purpose: `scripts/bundle-runtime.mjs` stages the
 /// repository's `plugin/` as `resources/plugin`, so one preset spec addresses
-/// both. A `tauri dev` run has the staged copy too — it is restaged on every
-/// launch — so what a dev build links is that copy rather than the working
-/// tree. Editing the plugin against a running dsh is `dsh plugin add -w
-/// ./plugin`, which is a link to the working tree; see `docs/notifications.md`.
+/// both. What pnpm is given is never this path — [`stage_bundled`] copies it
+/// out first. Editing the plugin against a running dsh is `dsh plugin add -w
+/// ./plugin`, which is a link to the working tree.
 fn bundled(app: &AppHandle, name: &str) -> Option<PathBuf> {
     if let Some(staged) = crate::dsh::resources(app).map(|dir| dir.join(name)) {
         if staged.is_dir() {
@@ -460,7 +589,8 @@ pub fn signalling(app: &AppHandle) -> bool {
     installed_in(&profile_manifest(app)).contains(SIGNAL)
 }
 
-/// Put [`SIGNAL`] in, once, on the first launch that finds it missing.
+/// Put [`SIGNAL`] in, once, on the first launch that finds it missing — and
+/// keep the staged copy of it current on every launch after that.
 ///
 /// The plugin ships inside this app and used to wait in the panel for someone
 /// to notice it, which made every notification wait on a step the user had no
@@ -468,10 +598,19 @@ pub fn signalling(app: &AppHandle) -> bool {
 /// worse place to learn it than never having to.
 ///
 /// One offer and no more. A user who takes the plugin back out has decided
-/// something, and a launch that reinstalled it would be arguing — so this asks
-/// [`remembered`] first and answers to nothing else. That also settles what
-/// happens on the launch after a failed one: nothing. The panel still lists
-/// it, and installing it there is the same install this would have run.
+/// something, and a launch that reinstalled it would be arguing — so once the
+/// offer is spent, a launch that finds the plugin missing answers to nothing.
+/// That also settles what happens on the launch after a failed one: nothing.
+/// The panel still lists it, and installing it there is the same install this
+/// would have run.
+///
+/// The one exception to "do nothing when it is already here" is keeping the
+/// staged copy under `$DSH_HOME` current — see [`stage_bundled`] — and
+/// re-linking onto it when the profile's link has lost its target. The profile
+/// links that copy rather than this app's own resources, so an app update that
+/// changes the plugin's files is this function's job to walk over; an AppImage
+/// that unmounted between launches, or an older install that linked into this
+/// app and was then moved, is this function's job to notice and repair.
 ///
 /// Recorded before the install rather than after, for the reason
 /// [`mark_guided`] is: an install that takes this launch down with it should
@@ -497,15 +636,41 @@ pub fn signalling(app: &AppHandle) -> bool {
 /// False covers every other outcome, the three that do nothing included: the
 /// offer was already spent, the plugin was already there, or it went in.
 pub fn adopt(app: &AppHandle, report: &crate::dsh::Report) -> bool {
-    if remembered(app, ADOPTED) {
+    // Already here — put in from the panel by hand, by an earlier launch, or by
+    // a build that shipped before this did. Nothing to install, and the offer is
+    // spent either way, so that taking it out later stays taken out.
+    //
+    // Two things still happen. The staged copy is refreshed, because the
+    // profile links that copy rather than the directory inside this app and an
+    // app update is what changes its files. And a link whose target is gone —
+    // an AppImage's previous mount, or an older install that pointed into
+    // `$INSTDIR` — is put back onto the staged copy. `install` runs `repair`
+    // first, which clears the dangling junction that would otherwise stop
+    // pnpm. A healthy link anywhere else is left alone: a developer's `dsh
+    // plugin add -w ./plugin` is not ours to re-point. Both are best effort —
+    // a failed refresh leaves yesterday's copy in place, which still works.
+    if signalling(app) {
+        if let Some(name) = bundled_name(app) {
+            match stage_bundled(app, &name) {
+                Ok(_staged) if signal_link_is_gone(app) => {
+                    let log = |line: &str| eprintln!("dsh-desktop: {line}");
+                    if let Err(why) = install(app, &[SIGNAL.to_string()], None, &log) {
+                        eprintln!(
+                            "dsh-desktop: could not re-link {SIGNAL} after its target went away: {why}"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(why) => {
+                    eprintln!("dsh-desktop: could not refresh the staged {SIGNAL} plugin: {why}");
+                }
+            }
+        }
+        remember(app, ADOPTED);
         return false;
     }
 
-    // Already here — put in from the panel by hand, or by a build that shipped
-    // before this did. Nothing to install, and the offer is spent either way,
-    // so that taking it out later stays taken out.
-    if signalling(app) {
-        remember(app, ADOPTED);
+    if remembered(app, ADOPTED) {
         return false;
     }
 
@@ -534,6 +699,21 @@ pub fn adopt(app: &AppHandle, report: &crate::dsh::Report) -> bool {
             true
         }
     }
+}
+
+/// The directory name under `resources/` for the [`SIGNAL`] preset, if it is
+/// still a [`BUNDLED`] entry.
+///
+/// Read out of the shipped list rather than written down again, so renaming the
+/// staged directory does not leave [`adopt`] refreshing a path nothing
+/// installs from.
+fn bundled_name(app: &AppHandle) -> Option<String> {
+    presets(app)
+        .into_iter()
+        .find(|preset| preset.id == SIGNAL)?
+        .spec
+        .strip_prefix(BUNDLED)
+        .map(str::to_string)
 }
 
 /// `$DSH_HOME/profiles/web`, where a plugin ends up.
@@ -2031,6 +2211,60 @@ mod tests {
         } else {
             assert!(!quoted.contains('"'), "{quoted}");
         }
+    }
+
+    /// [`super::copy_tree`] is what `stage_bundled` walks a plugin directory
+    /// out with. Nested files have to come along, and a name that is already
+    /// at the destination is replaced rather than skipped.
+    #[test]
+    fn copy_tree_takes_nested_files_and_replaces_what_is_there() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-desktop-copy-tree-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let from = root.join("from");
+        let to = root.join("to");
+        std::fs::create_dir_all(from.join("lib")).unwrap();
+        std::fs::write(from.join("package.json"), b"{\"name\":\"x\"}").unwrap();
+        std::fs::write(from.join("lib").join("index.js"), b"export default 1").unwrap();
+
+        std::fs::create_dir_all(to.join("lib")).unwrap();
+        std::fs::write(to.join("lib").join("index.js"), b"stale").unwrap();
+        std::fs::write(to.join("gone.txt"), b"should not survive stage_bundled").unwrap();
+
+        super::copy_tree(&from, &to).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(to.join("lib").join("index.js")).unwrap(),
+            "export default 1"
+        );
+        assert!(to.join("package.json").is_file());
+        // `copy_tree` itself merges; `stage_bundled` is what removes the old
+        // directory first, which is why a stale sibling is still here.
+        assert!(to.join("gone.txt").is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only a `link:` range names a path. A registry range, which is what
+    /// every non-bundled plugin records, is not one — and must not be read as
+    /// a path, or a version like `1.2.3` would look like a relative directory.
+    #[test]
+    fn only_a_link_range_names_a_path() {
+        assert_eq!(
+            super::link_target("link:C:\\somewhere\\plugin"),
+            Some(PathBuf::from("C:\\somewhere\\plugin"))
+        );
+        assert_eq!(
+            super::link_target("link:/home/user/.dsh/.dsh-desktop/bundled/plugin"),
+            Some(PathBuf::from("/home/user/.dsh/.dsh-desktop/bundled/plugin"))
+        );
+        assert_eq!(super::link_target("^1.0.0"), None);
+        assert_eq!(super::link_target("1.2.3"), None);
+        assert_eq!(super::link_target("github:owner/repo"), None);
+        assert_eq!(super::link_target(""), None);
     }
 
     /// Everything that is not [`BUNDLED`] is passed through untouched, quotes

@@ -416,14 +416,15 @@ FunctionEnd
   ; The app's own dsh plugin, out of the user's profile, before anything below
   ; asks the user anything.
   ;
-  ; The plugin is installed from the directory it ships in, so pnpm records it
-  ; as a `link:` into `$INSTDIR` and junctions it into the profile's
-  ; `node_modules`. `$INSTDIR` is gone by the time this hook runs; the near end
-  ; of that junction is not, and the profile it sits in is the user's own — kept
-  ; by default, as the prompt further down says. A dangling junction there stops
-  ; every later `dsh plugin add` for good, and the bundle entry beside it makes
-  ; every later `dsh web` try to activate files that are not there. See
-  ; `Remove-BundledPlugin` in the script, which documents both.
+  ; Current builds stage the plugin under `$DSH_HOME\.dsh-desktop\bundled` and
+  ; link that, so the target survives this uninstall and the cleanup below is a
+  ; no-op for them. Older builds linked straight into `$INSTDIR`, which is gone
+  ; by the time this hook runs; the near end of that junction is not, and the
+  ; profile it sits in is the user's own — kept by default, as the prompt
+  ; further down says. A dangling junction there stops every later `dsh plugin
+  ; add` for good, and the bundle entry beside it makes every later `dsh web`
+  ; try to activate files that are not there. See `Remove-BundledPlugin` in the
+  ; script, which documents both.
   ;
   ; Unconditional on this path, which is the point of it being here rather than
   ; further down with the others: it runs whatever the user answers about Node
