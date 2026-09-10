@@ -26,6 +26,13 @@
 //! release. Anything not on it goes in the panel's own text box, which passes
 //! whatever is typed straight through to pnpm.
 //!
+//! Both strings the panel draws are written twice in that file: `name` and
+//! `description` in Chinese, `nameEn` and `descriptionEn` beside them. The
+//! English half is optional so that a new entry is offered before it has been
+//! translated, and [`parse`] falls back to the Chinese one — which is why a
+//! test refuses to let an entry whose Chinese half is actually Chinese ship
+//! without the other.
+//!
 //! ## What is not automated
 //!
 //! pnpm 10 and later refuse to run a dependency's build scripts until the
@@ -107,7 +114,12 @@ struct Preset {
     /// repository's manifest declares, and nothing here can work that out
     /// without fetching it.
     package: String,
+    /// What the panel calls it, in the language of the moment: `nameEn` where
+    /// the file has one, `name` otherwise. A name that reads the same in both
+    /// languages needs only the one field; anything written in Chinese needs
+    /// both, or it stays Chinese in an English panel.
     name: String,
+    /// The same two halves, `description` and `descriptionEn`.
     description: String,
     /// Which group of the panel it is drawn under. Free-form, because the panel
     /// decides what a group is called and in what order the groups come; an
@@ -169,20 +181,26 @@ fn parse(raw: &str) -> Vec<Preset> {
             let text = |key: &str| entry.get(key)?.as_str().map(str::to_string);
             let flag = |key: &str| entry.get(key).and_then(serde_json::Value::as_bool) == Some(true);
 
+            // One of a field's two halves, in the language of the moment. The
+            // English one is optional: a preset that has not been translated
+            // yet reads in Chinese rather than not at all. Nothing here is
+            // settled at startup — `listing` builds this again every time the
+            // panel opens, so a language switch reaches it on the next
+            // opening, the way it reaches the panel's own labels.
+            let half = |zh: &str, en: &str| {
+                if crate::i18n::chinese() {
+                    text(zh)
+                } else {
+                    text(en).or_else(|| text(zh))
+                }
+            };
+
             Some(Preset {
                 package: text("package").or_else(|| text("id"))?,
                 id: text("id")?,
                 spec: text("spec")?,
-                name: text("name")?,
-                // The English half is optional: a preset that has not been
-                // translated yet reads in Chinese rather than not at all.
-                description: if crate::i18n::chinese() {
-                    text("description").unwrap_or_default()
-                } else {
-                    text("descriptionEn")
-                        .or_else(|| text("description"))
-                        .unwrap_or_default()
-                },
+                name: half("name", "nameEn")?,
+                description: half("description", "descriptionEn").unwrap_or_default(),
                 section: text("section")
                     .map(|section| section.trim().to_string())
                     .filter(|section| !section.is_empty())
@@ -194,6 +212,207 @@ fn parse(raw: &str) -> Vec<Preset> {
             })
         })
         .collect()
+}
+
+/// The spec prefix of a plugin that ships inside this app.
+///
+/// Not a scheme pnpm has ever heard of — it is resolved here, before pnpm sees
+/// it, into the absolute path of a *persistent* copy under `$DSH_HOME`, not the
+/// directory inside the application resources. pnpm records a local directory
+/// as `link:`, and a link into `$INSTDIR` (or an AppImage's temporary mount)
+/// outlives the files it points at the moment the app is uninstalled, moved, or
+/// simply next launched from a new mount. See [`stage_bundled`].
+const BUNDLED: &str = "bundled:";
+
+/// Where a bundled plugin is copied before pnpm is allowed to see it.
+///
+/// Under `$DSH_HOME` rather than this app's own data directory: the profile
+/// that links the copy lives there too, and a Windows uninstall that deletes
+/// app data must not take the far end of that link with it.
+fn staged_root() -> PathBuf {
+    dsh_home().join(".dsh-desktop").join("bundled")
+}
+
+/// What pnpm is handed for one preset, which for all but [`BUNDLED`] is what
+/// the file already says.
+fn spec_for(app: &AppHandle, spec: &str) -> Result<String, String> {
+    let Some(name) = spec.strip_prefix(BUNDLED) else {
+        return Ok(spec.to_string());
+    };
+
+    let dir = stage_bundled(app, name)?;
+    Ok(local_spec(&dir))
+}
+
+/// Copy a directory that ships inside the app out to [`staged_root`], and
+/// answer with the copy's path.
+///
+/// This is the whole of the reason `bundled:` is not just "the path under
+/// `resources/`". pnpm turns a local directory into a `link:`, and that link is
+/// recorded in the user's profile — which is theirs and outlives this app.
+/// Linking straight at the installation directory leaves:
+///
+/// - a dangling link after uninstall, on every platform that has no
+///   `unlink-plugin` hook (macOS and Linux have none — see `install-deps.sh`);
+/// - a dangling link after the user moves the install;
+/// - a *permanently* dangling link under AppImage, whose mount path changes
+///   every launch while `package.json` keeps recording the previous one.
+///
+/// The copy is under `$DSH_HOME`, beside the profile that uses it, so all three
+/// go away. An app update that changes the plugin's files is handled by
+/// re-running this on every launch that finds the plugin already installed —
+/// see [`adopt`] — so the linked directory is refreshed from the new build.
+///
+/// Written into a sibling first and only then swapped in, so a failed copy
+/// leaves yesterday's copy — and the link pointing at it — alone. A file
+/// deleted from the plugin does not live on in the new copy, because the
+/// destination is replaced rather than merged over.
+fn stage_bundled(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    let source = bundled(app, name).ok_or_else(|| {
+        t!(
+            "{} 应该随这个应用一起装上的，但它不在安装目录里。重新安装一次应用能把它带回来。",
+            "{} ships inside this app, and it is not in the installation directory.              Reinstalling the app puts it back.",
+            name
+        )
+    })?;
+
+    let dest = staged_root().join(name);
+    let tmp = dest.with_file_name(format!("{name}.new"));
+
+    if tmp.exists() {
+        if let Err(error) = std::fs::remove_dir_all(&tmp) {
+            return Err(t!(
+                "无法清掉 {}：{error}",
+                "could not clear {}: {error}",
+                tmp.display()
+            ));
+        }
+    }
+
+    copy_tree(&source, &tmp).map_err(|error| {
+        t!(
+            "无法把 {} 拷到 {}：{error}",
+            "could not copy {} to {}: {error}",
+            source.display(),
+            tmp.display()
+        )
+    })?;
+
+    if dest.exists() {
+        if let Err(error) = std::fs::remove_dir_all(&dest) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(t!(
+                "无法更新 {} 里已有的插件副本：{error}",
+                "could not replace the existing plugin copy in {}: {error}",
+                dest.display()
+            ));
+        }
+    }
+
+    if let Err(rename_error) = std::fs::rename(&tmp, &dest) {
+        // Same volume under `$DSH_HOME`, so rename should not be the one that
+        // fails — but a leftover from a previous run that is not ours, or a
+        // virus scanner holding the path, would. Copy the finished tree across
+        // rather than leaving nothing at `dest`.
+        copy_tree(&tmp, &dest).map_err(|error| {
+            t!(
+                "无法把 {} 挪到 {}：{error}（rename 也失败：{rename_error}）",
+                "could not move {} into place at {}: {error} (rename failed too: {rename_error})",
+                tmp.display(),
+                dest.display()
+            )
+        })?;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    Ok(dest)
+}
+
+/// Recursive file copy, for the handful of files one bundled plugin is.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// The path a `link:` range names, or `None` when the range is not one.
+fn link_target(range: &str) -> Option<PathBuf> {
+    range.strip_prefix("link:").map(PathBuf::from)
+}
+
+/// Where the profile's dependency on [`SIGNAL`] points, if it is a local link
+/// at all.
+fn signal_link(app: &AppHandle) -> Option<PathBuf> {
+    let range = dependencies_in(&profile_manifest(app))
+        .into_iter()
+        .find(|(name, _)| name == SIGNAL)?
+        .1;
+    link_target(&range)
+}
+
+/// Whether the profile's copy of [`SIGNAL`] has lost the files it points at.
+///
+/// True after an AppImage unmounts — the recorded mount is gone — and after an
+/// older install that linked into this app was uninstalled or moved. False for
+/// a healthy link, wherever it points: a developer's `dsh plugin add -w
+/// ./plugin` is a valid link to their own checkout and is none of this
+/// function's business. Same rule `Remove-BundledPlugin` in the bootstrap
+/// script applies.
+fn signal_link_is_gone(app: &AppHandle) -> bool {
+    signal_link(app).is_some_and(|path| !path.exists())
+}
+
+/// Where a directory that ships with the app is: the staged resource, or the
+/// one in the source tree when this is a `tauri dev` build that has never been
+/// bundled. Same two places and same order as [`preset_file`].
+///
+/// The two names line up on purpose: `scripts/bundle-runtime.mjs` stages the
+/// repository's `plugin/` as `resources/plugin`, so one preset spec addresses
+/// both. What pnpm is given is never this path — [`stage_bundled`] copies it
+/// out first. Editing the plugin against a running dsh is `dsh plugin add -w
+/// ./plugin`, which is a link to the working tree.
+fn bundled(app: &AppHandle, name: &str) -> Option<PathBuf> {
+    if let Some(staged) = crate::dsh::resources(app).map(|dir| dir.join(name)) {
+        if staged.is_dir() {
+            return Some(staged);
+        }
+    }
+
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()?
+        .join(name);
+    source.is_dir().then_some(source)
+}
+
+/// A local directory as pnpm has to receive it.
+///
+/// The quotes on Windows are load-bearing. `dsh plugin` forwards its arguments
+/// to pnpm through Node's `spawnSync(…, { shell: true })`, and Node does not
+/// quote when it does that — it joins the arguments with spaces and hands the
+/// one string to `cmd.exe`. The app installs to `C:\Program Files\…` by
+/// default, so an unquoted spec arrives at pnpm as *two* arguments, and what
+/// pnpm does with them is not fail: it installs two dependencies named after
+/// the halves (`Program`, `plugin`), warns that neither declares a bundle, and
+/// exits 0. Measured, both halves — and Rust's own escaping on the way out
+/// carries the quotes through intact rather than eating them.
+///
+/// Nothing to quote anywhere else: off Windows there is no shell in the path,
+/// and a quote would become part of the filename.
+fn local_spec(dir: &Path) -> String {
+    let path = dir.display().to_string();
+    if cfg!(windows) {
+        format!("\"{path}\"")
+    } else {
+        path
+    }
 }
 
 /// Where the shipped list is: the bundled resource, or the one in the source
@@ -232,6 +451,11 @@ pub fn listing(app: &AppHandle) -> String {
             serde_json::json!({
                 "id": preset.id,
                 "name": preset.name,
+                // Beside the name on the card. The names are translated now,
+                // so the card no longer says anywhere what it is about to put
+                // on the machine — the row on the installed list carries the
+                // package name for the same reason.
+                "package": preset.package,
                 "description": preset.description,
                 "section": preset.section,
                 "url": preset.url,
@@ -243,16 +467,27 @@ pub fn listing(app: &AppHandle) -> String {
 
     // What pnpm put there, which is the whole of what it can take away again.
     // Carrying the preset's own label where the list knows one, so a plugin
-    // reads the same on the way out as it did on the way in.
+    // reads the same on the way out as it did on the way in — and, for the
+    // same reason, everything else its card is drawn out of. The panel draws
+    // one kind of card for both halves of this listing: an installed plugin
+    // keeps the description, the repository and the section it had while it
+    // was still something to install. A plugin the shipped list has never
+    // heard of has none of the three, and gets the card that is left.
     let held: Vec<serde_json::Value> = dependencies_in(&manifest)
         .into_iter()
         .map(|(name, version)| {
-            let label = presets
-                .iter()
-                .find(|preset| preset.package == name)
+            let preset = presets.iter().find(|preset| preset.package == name);
+            let label = preset
                 .map(|preset| preset.name.clone())
                 .unwrap_or_else(|| name.clone());
-            serde_json::json!({ "name": name, "label": label, "version": version })
+            serde_json::json!({
+                "name": name,
+                "label": label,
+                "version": version,
+                "description": preset.map(|preset| preset.description.as_str()),
+                "url": preset.map(|preset| preset.url.as_str()),
+                "section": preset.map(|preset| preset.section.as_str()),
+            })
         })
         .collect();
 
@@ -326,6 +561,161 @@ fn installed_in(manifest: &serde_json::Value) -> HashSet<String> {
     dependencies.into_iter().chain(bundles).collect()
 }
 
+/// The plugin that tells this app what dsh is doing, by the name it installs
+/// under. See [`crate::signal`] for what it reports and `plugin/` for the
+/// thing itself.
+///
+/// Written down rather than read out of the preset list, because what depends
+/// on it is one specific plugin and not "whatever the list happens to ship".
+/// Both spellings are checked against the plugin's own manifest by a test, so
+/// this and the list cannot drift apart from it or from each other.
+pub const SIGNAL: &str = "dsh-desktop-signal";
+
+/// Whether dsh has any way to tell this app what it is doing.
+///
+/// Which is the same question as "is [`SIGNAL`] installed", because it is the
+/// only answer left. This app used to sniff dsh's DOM for a finished turn and
+/// for a question waiting to be answered; both of those are gone, and every
+/// notification now starts as a signal from that plugin. So without it there
+/// is nothing to notify about, and the switch that turns notifications on is
+/// drawn unavailable rather than on-and-silent. See [`crate::notify::show`],
+/// which is the gate, and [`crate::controls::sync_notify`], which is the way
+/// the menu is told.
+///
+/// Read from the profile manifest, and read the same way the panel decides
+/// what is "already installed" — those two answers agreeing is the whole
+/// point, since the panel is where a user goes to change this one.
+pub fn signalling(app: &AppHandle) -> bool {
+    installed_in(&profile_manifest(app)).contains(SIGNAL)
+}
+
+/// Put [`SIGNAL`] in, once, on the first launch that finds it missing — and
+/// keep the staged copy of it current on every launch after that.
+///
+/// The plugin ships inside this app and used to wait in the panel for someone
+/// to notice it, which made every notification wait on a step the user had no
+/// reason to know about: the menu item said what was missing, and that is a
+/// worse place to learn it than never having to.
+///
+/// One offer and no more. A user who takes the plugin back out has decided
+/// something, and a launch that reinstalled it would be arguing — so once the
+/// offer is spent, a launch that finds the plugin missing answers to nothing.
+/// That also settles what happens on the launch after a failed one: nothing.
+/// The panel still lists it, and installing it there is the same install this
+/// would have run.
+///
+/// The one exception to "do nothing when it is already here" is keeping the
+/// staged copy under `$DSH_HOME` current — see [`stage_bundled`] — and
+/// re-linking onto it when the profile's link has lost its target. The profile
+/// links that copy rather than this app's own resources, so an app update that
+/// changes the plugin's files is this function's job to walk over; an AppImage
+/// that unmounted between launches, or an older install that linked into this
+/// app and was then moved, is this function's job to notice and repair.
+///
+/// Recorded before the install rather than after, for the reason
+/// [`mark_guided`] is: an install that takes this launch down with it should
+/// not take the next one down too. So what is spent is the attempt, not the
+/// success.
+///
+/// Which is why the one attempt has to be *seen* when it fails, and why this
+/// answers whether it did. Borrowing [`mark_guided`]'s rule without borrowing
+/// a way to say so would not be borrowing the same trade: what a spent marker
+/// costs there is a panel the user can open whenever they like, and what it
+/// costs here is every notification, silently, until somebody notices a menu
+/// item is grey. The caller turns a `true` into the plugin panel — the one
+/// place that lists this plugin, installs it on a click, and prints why if it
+/// fails again. Retrying on the next launch instead would put an npm timeout
+/// in front of every launch a machine spends offline.
+///
+/// Blocking, for as long as an install takes. The caller runs it on the boot
+/// thread with no server up yet — which is the point of running it there
+/// rather than later, since a plugin going in is a reason to stop `dsh web`
+/// and there is nothing yet to stop.
+///
+/// @returns Whether this launch tried to install the plugin and could not.
+/// False covers every other outcome, the three that do nothing included: the
+/// offer was already spent, the plugin was already there, or it went in.
+pub fn adopt(app: &AppHandle, report: &crate::dsh::Report) -> bool {
+    // Already here — put in from the panel by hand, by an earlier launch, or by
+    // a build that shipped before this did. Nothing to install, and the offer is
+    // spent either way, so that taking it out later stays taken out.
+    //
+    // Two things still happen. The staged copy is refreshed, because the
+    // profile links that copy rather than the directory inside this app and an
+    // app update is what changes its files. And a link whose target is gone —
+    // an AppImage's previous mount, or an older install that pointed into
+    // `$INSTDIR` — is put back onto the staged copy. `install` runs `repair`
+    // first, which clears the dangling junction that would otherwise stop
+    // pnpm. A healthy link anywhere else is left alone: a developer's `dsh
+    // plugin add -w ./plugin` is not ours to re-point. Both are best effort —
+    // a failed refresh leaves yesterday's copy in place, which still works.
+    if signalling(app) {
+        if let Some(name) = bundled_name(app) {
+            match stage_bundled(app, &name) {
+                Ok(_staged) if signal_link_is_gone(app) => {
+                    let log = |line: &str| eprintln!("dsh-desktop: {line}");
+                    if let Err(why) = install(app, &[SIGNAL.to_string()], None, &log) {
+                        eprintln!(
+                            "dsh-desktop: could not re-link {SIGNAL} after its target went away: {why}"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(why) => {
+                    eprintln!("dsh-desktop: could not refresh the staged {SIGNAL} plugin: {why}");
+                }
+            }
+        }
+        remember(app, ADOPTED);
+        return false;
+    }
+
+    if remembered(app, ADOPTED) {
+        return false;
+    }
+
+    remember(app, ADOPTED);
+    report(
+        t!(
+            "正在装上「会话信号」插件…",
+            "Installing the session signal plugin…"
+        ),
+        -1.0,
+    );
+
+    // To the terminal and nowhere else. This install is the app's own idea,
+    // running before the window belongs to dsh and with no panel to print
+    // into; a wall of pnpm output on the loading page would be answering a
+    // question nobody asked. What the user sees is the line above.
+    let log = |line: &str| eprintln!("dsh-desktop: {line}");
+    match install(app, &[SIGNAL.to_string()], None, &log) {
+        Ok(()) => false,
+        Err(why) => {
+            // The terminal gets the reason, because the panel the caller is
+            // about to raise cannot hold it: this install ran before the panel
+            // existed and its log started empty. What the panel offers is the
+            // same install again, this time with somewhere to print.
+            eprintln!("dsh-desktop: could not install {SIGNAL} on this launch: {why}");
+            true
+        }
+    }
+}
+
+/// The directory name under `resources/` for the [`SIGNAL`] preset, if it is
+/// still a [`BUNDLED`] entry.
+///
+/// Read out of the shipped list rather than written down again, so renaming the
+/// staged directory does not leave [`adopt`] refreshing a path nothing
+/// installs from.
+fn bundled_name(app: &AppHandle) -> Option<String> {
+    presets(app)
+        .into_iter()
+        .find(|preset| preset.id == SIGNAL)?
+        .spec
+        .strip_prefix(BUNDLED)
+        .map(str::to_string)
+}
+
 /// `$DSH_HOME/profiles/web`, where a plugin ends up.
 ///
 /// `DSH_HOME` is dsh's own variable and this app passes it through untouched, so
@@ -376,7 +766,7 @@ pub fn install(
             .iter()
             .find(|preset| &preset.id == id)
             .ok_or_else(|| t!("清单里没有插件 {}", "no preset called {}", id))?;
-        specs.push(preset.spec.clone());
+        specs.push(spec_for(app, &preset.spec)?);
     }
     if let Some(extra) = extra.map(str::trim).filter(|extra| !extra.is_empty()) {
         if !is_package_spec(extra) {
@@ -1252,23 +1642,43 @@ pub fn stop() {
 /// because a panel nobody knows about is a panel nobody opens, and the whole
 /// point of it is the user who cannot reach these plugins any other way.
 pub fn guided(app: &AppHandle) -> bool {
-    marker(app).is_some_and(|path| path.exists())
+    remembered(app, GUIDED)
 }
 
 pub fn mark_guided(app: &AppHandle) {
-    let Some(path) = marker(app) else { return };
+    remember(app, GUIDED);
+}
+
+/// The panel has been shown. See [`guided`].
+const GUIDED: &str = "plugins-guided";
+
+/// [`SIGNAL`] has had its one offer. See [`adopt`].
+const ADOPTED: &str = "signal-adopted";
+
+/// Whether a launch has already done the thing `name` stands for.
+///
+/// Both markers are empty files. What either one records is that something
+/// happened once, and a file either is there or is not — there is nothing to
+/// put inside it that its own presence does not already say.
+fn remembered(app: &AppHandle, name: &str) -> bool {
+    marker(app, name).is_some_and(|path| path.exists())
+}
+
+/// Record that it happened. Failing to is not worth stopping for: the cost is
+/// the same launch doing the same thing once more next time.
+fn remember(app: &AppHandle, name: &str) {
+    let Some(path) = marker(app, name) else { return };
 
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(error) = std::fs::write(&path, b"") {
-        // The cost is being shown the panel again next launch.
-        eprintln!("dsh-desktop: could not record that the plugin panel was shown: {error}");
+        eprintln!("dsh-desktop: could not record {name}: {error}");
     }
 }
 
-fn marker(app: &AppHandle) -> Option<PathBuf> {
-    Some(crate::dsh::app_dir(app)?.join("plugins-guided"))
+fn marker(app: &AppHandle, name: &str) -> Option<PathBuf> {
+    Some(crate::dsh::app_dir(app)?.join(name))
 }
 
 /// The ids and free-text spec a `dsh-window://plugins-install` navigation
@@ -1441,8 +1851,8 @@ pub fn open_directory(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dependencies_in, is_package_spec, parse, pnpm_blamed, pnpm_codes, pnpm_stuck, requested,
-        spec_name, sweep, wanted_gone, Outcome, PRESETS, RELEASE_AGE,
+        dependencies_in, is_package_spec, local_spec, parse, pnpm_blamed, pnpm_codes, pnpm_stuck,
+        requested, spec_name, sweep, wanted_gone, Outcome, BUNDLED, PRESETS, RELEASE_AGE, SIGNAL,
     };
     use std::path::{Path, PathBuf};
     use tauri::Url;
@@ -1610,6 +2020,262 @@ mod tests {
                 preset.id
             );
         }
+    }
+
+    /// A preset is drawn in the language the app is in.
+    ///
+    /// Reads the language rather than setting it, the way [`crate::i18n`]'s own
+    /// test does: the switch is one atomic for the whole process, and a test
+    /// that moved it would move it under every other test running beside it.
+    #[test]
+    fn a_preset_reads_in_the_language_the_app_is_in() {
+        let raw = r#"[{
+            "id": "x", "spec": "x",
+            "name": "中文名", "nameEn": "English name",
+            "description": "中文说明", "descriptionEn": "English description"
+        }]"#;
+
+        let mut parsed = parse(raw);
+        let preset = parsed.pop().expect("the entry survives parse");
+
+        let (name, description) = if crate::i18n::chinese() {
+            ("中文名", "中文说明")
+        } else {
+            ("English name", "English description")
+        };
+        assert_eq!(preset.name, name);
+        assert_eq!(preset.description, description);
+    }
+
+    /// And one with no English half is still offered, in Chinese. That is the
+    /// point of the fallback: a plugin worth suggesting should not wait on a
+    /// translation to appear in the panel at all.
+    #[test]
+    fn an_untranslated_preset_is_still_offered() {
+        let raw = r#"[{"id": "x", "spec": "x", "name": "中文名", "description": "中文说明"}]"#;
+
+        let mut parsed = parse(raw);
+        let preset = parsed.pop().expect("the entry survives parse");
+
+        assert_eq!(preset.name, "中文名");
+        assert_eq!(preset.description, "中文说明");
+    }
+
+    /// A shipped string that is really Chinese has an English half.
+    ///
+    /// [`parse`] falls back to the Chinese one where there is no other, so
+    /// that an entry can be offered before it has been translated. That
+    /// fallback is also how Chinese text gets into an English panel: nothing
+    /// fails, the row simply reads in the wrong language, and the only person
+    /// who would notice is running the app in English. Which is what shipped
+    /// — the bundled plugin was `会话信号` in both.
+    ///
+    /// Keyed off the Chinese half rather than a list of fields that must be
+    /// translated: a name that is the same in both languages — a bare product
+    /// name — would otherwise need a second field that only ever repeats its
+    /// neighbour. Every entry shipping today happens to be translated; the
+    /// rule is what lets one that does not need to be skip it.
+    #[test]
+    fn a_preset_string_written_in_chinese_has_an_english_half() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(PRESETS);
+        let raw = std::fs::read_to_string(&path).expect("the shipped preset list");
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_str(&raw).expect("the preset list is a JSON array");
+
+        for entry in &entries {
+            let id = entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("an entry with no id");
+
+            for (zh, en) in [("name", "nameEn"), ("description", "descriptionEn")] {
+                let chinese = entry
+                    .get(zh)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if chinese.is_ascii() {
+                    continue;
+                }
+
+                let english = entry.get(en).and_then(serde_json::Value::as_str);
+                assert!(
+                    english.is_some_and(|value| !value.trim().is_empty()),
+                    "{id} has a Chinese `{zh}` and no `{en}`, so it reads in Chinese \
+                     in an English panel"
+                );
+            }
+        }
+    }
+
+    /// The plugin this app ships inside itself, checked against the plugin
+    /// itself.
+    ///
+    /// Three things have to line up and none is checked anywhere else. The
+    /// spec has to name a directory that is really there — `bundled:` is
+    /// resolved at install time, so a rename shows up as an install that
+    /// cannot find itself. And the preset's `package` has to be the name that
+    /// directory installs under, because that name is what "already
+    /// installed" is decided against: get it wrong and the panel offers the
+    /// plugin forever, to a user who already has it. And the preset's `id` has
+    /// to be that name too, because `adopt` asks for this one preset by id and
+    /// `install` looks ids up in the list — a drift there breaks only the
+    /// automatic install, which is the one nobody is watching.
+    #[test]
+    fn the_plugin_that_ships_inside_the_app_is_the_one_the_list_names() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the repository root");
+        let raw = std::fs::read_to_string(root.join("src-tauri/resources").join(PRESETS))
+            .expect("the shipped preset list");
+
+        let mut found = 0;
+        for preset in parse(&raw) {
+            let Some(name) = preset.spec.strip_prefix(BUNDLED) else {
+                continue;
+            };
+            found += 1;
+
+            let manifest = root.join(name).join("package.json");
+            let manifest = std::fs::read_to_string(&manifest)
+                .unwrap_or_else(|_| panic!("{} names {}, which is not here", preset.id, name));
+            let manifest: serde_json::Value =
+                serde_json::from_str(&manifest).expect("the plugin manifest is JSON");
+
+            assert_eq!(
+                manifest.get("name").and_then(serde_json::Value::as_str),
+                Some(preset.package.as_str()),
+                "{} would install under a different name than the list expects",
+                preset.id
+            );
+            assert_eq!(
+                preset.package, SIGNAL,
+                "the gate in `signalling` names a different plugin than the list ships"
+            );
+            // And the id, because `adopt` installs this preset by naming it —
+            // `install` looks its `ids` up in the list, so an id that drifted
+            // off the package name would leave the first-launch install
+            // failing with "no preset called dsh-desktop-signal" while
+            // everything a user can reach by hand kept working.
+            assert_eq!(
+                preset.id, SIGNAL,
+                "`adopt` asks for this preset by id and would not find it"
+            );
+        }
+
+        assert_eq!(found, 1, "the signal plugin should be on the shipped list");
+    }
+
+    /// The gate every notification passes: the plugin is there, or it is not.
+    ///
+    /// Read out of the same set the panel calls "already installed", so the
+    /// two cannot disagree — a panel saying the plugin is in while the menu
+    /// says notifications are unavailable would be unanswerable.
+    #[test]
+    fn notifications_wait_on_the_plugin_that_feeds_them() {
+        let holding = |manifest: &str| {
+            let manifest: serde_json::Value = serde_json::from_str(manifest).expect("a manifest");
+            super::installed_in(&manifest).contains(SIGNAL)
+        };
+
+        assert!(holding(
+            r#"{"dependencies":{"dsh-desktop-signal":"link:/somewhere"}}"#
+        ));
+        // Listed as a profile layer but not as a dependency, which is what a
+        // hand-edited profile looks like. Still installed.
+        assert!(holding(
+            r#"{"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","dsh-desktop-signal"]}}}"#
+        ));
+
+        assert!(!holding(r#"{"dependencies":{"dshmarket":"^1.40.0"}}"#));
+        assert!(!holding("{}"), "an empty profile signals nothing");
+        assert!(!holding("null"), "no profile at all signals nothing");
+    }
+
+    /// A path handed to pnpm on Windows arrives quoted, and nowhere else does.
+    ///
+    /// The reasoning is in [`super::local_spec`]; this is the part that would
+    /// silently stop being true. An unquoted path through Program Files does
+    /// not fail the install — it installs two dependencies named after the halves
+    /// of the path and exits 0.
+    #[test]
+    fn a_local_path_survives_the_shell_dsh_forwards_through() {
+        let path = ["C:", "Program Files", "dsh-desktop", "resources", "plugin"]
+            .join(std::path::MAIN_SEPARATOR_STR);
+        let quoted = local_spec(Path::new(&path));
+
+        if cfg!(windows) {
+            assert!(quoted.starts_with('"') && quoted.ends_with('"'), "{quoted}");
+            assert!(quoted.contains("Program Files"));
+        } else {
+            assert!(!quoted.contains('"'), "{quoted}");
+        }
+    }
+
+    /// [`super::copy_tree`] is what `stage_bundled` walks a plugin directory
+    /// out with. Nested files have to come along, and a name that is already
+    /// at the destination is replaced rather than skipped.
+    #[test]
+    fn copy_tree_takes_nested_files_and_replaces_what_is_there() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-desktop-copy-tree-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let from = root.join("from");
+        let to = root.join("to");
+        std::fs::create_dir_all(from.join("lib")).unwrap();
+        std::fs::write(from.join("package.json"), b"{\"name\":\"x\"}").unwrap();
+        std::fs::write(from.join("lib").join("index.js"), b"export default 1").unwrap();
+
+        std::fs::create_dir_all(to.join("lib")).unwrap();
+        std::fs::write(to.join("lib").join("index.js"), b"stale").unwrap();
+        std::fs::write(to.join("gone.txt"), b"should not survive stage_bundled").unwrap();
+
+        super::copy_tree(&from, &to).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(to.join("lib").join("index.js")).unwrap(),
+            "export default 1"
+        );
+        assert!(to.join("package.json").is_file());
+        // `copy_tree` itself merges; `stage_bundled` is what removes the old
+        // directory first, which is why a stale sibling is still here.
+        assert!(to.join("gone.txt").is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only a `link:` range names a path. A registry range, which is what
+    /// every non-bundled plugin records, is not one — and must not be read as
+    /// a path, or a version like `1.2.3` would look like a relative directory.
+    #[test]
+    fn only_a_link_range_names_a_path() {
+        assert_eq!(
+            super::link_target("link:C:\\somewhere\\plugin"),
+            Some(PathBuf::from("C:\\somewhere\\plugin"))
+        );
+        assert_eq!(
+            super::link_target("link:/home/user/.dsh/.dsh-desktop/bundled/plugin"),
+            Some(PathBuf::from("/home/user/.dsh/.dsh-desktop/bundled/plugin"))
+        );
+        assert_eq!(super::link_target("^1.0.0"), None);
+        assert_eq!(super::link_target("1.2.3"), None);
+        assert_eq!(super::link_target("github:owner/repo"), None);
+        assert_eq!(super::link_target(""), None);
+    }
+
+    /// Everything that is not [`BUNDLED`] is passed through untouched, quotes
+    /// included — a registry spec never goes near a filesystem path.
+    #[test]
+    fn an_ordinary_preset_spec_is_left_alone() {
+        // `spec_for` needs an `AppHandle` for the bundled arm only, so the
+        // pass-through is what is readable here: the prefix is the whole test.
+        assert!(!"dshmarket".starts_with(BUNDLED));
+        assert!("bundled:plugin".starts_with(BUNDLED));
+        assert_eq!("bundled:plugin".strip_prefix(BUNDLED), Some("plugin"));
     }
 
     /// The two groups the panel draws, both actually present in the shipped

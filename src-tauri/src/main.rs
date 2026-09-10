@@ -16,10 +16,10 @@ mod plugins;
 mod server;
 mod settings;
 mod setup;
+mod signal;
 mod theme;
-mod turn;
+mod toast;
 mod update;
-mod waiting;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -124,9 +124,6 @@ fn main() {
             reveal(app);
         }))
         .plugin(tauri_plugin_opener::init())
-        // Raised from Rust only; nothing in the webview is granted it. See
-        // `notify`.
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -243,14 +240,6 @@ fn build_window(
         .initialization_script(controls::script())
         // Turns the page's own `Notification` calls into real ones.
         .initialization_script(notify::script())
-        // Raises one of those calls itself when a turn ends, so a finished run
-        // is announced without a plugin having to be installed for it. After
-        // `notify`, because it calls the shim that one installs.
-        .initialization_script(turn::script())
-        // And one when dsh stops to ask the user something, which the turn
-        // watcher cannot see: the run has not ended, it is blocked. Same
-        // shim, so both land in the same suppression check.
-        .initialization_script(waiting::script())
         // The plugin panel, drawn over whatever page is showing when it is
         // asked for — dsh's included, which is the point of it being here.
         .initialization_script(panel::script())
@@ -388,13 +377,20 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 /// dsh writes it through to `<html lang>` without loading the document again,
 /// and [`controls`] watches for that. Everything drawn from here on reads the
 /// new language on its own — what needs saying out loud is the two menus that
-/// were drawn before it.
+/// were drawn before it, and the two injected cards that carry their labels
+/// inside the script rather than asking for them when they draw.
 fn switch_language(app: &tauri::AppHandle, tag: &str) {
     if !i18n::switch(tag) {
         return;
     }
 
     controls::relabel(app);
+    // Not only what is on screen. An initialization script is composed once,
+    // when the window is built, so without these two the plugin panel and the
+    // runtime chooser would stay in the language the app started in for the
+    // rest of the run — a reload included. See [`panel::relabel`].
+    panel::relabel(app);
+    setup::relabel(app);
 
     let Some(tray) = app.tray_by_id(TRAY) else {
         return;
@@ -482,7 +478,17 @@ fn toggle_autostart(app: &tauri::AppHandle) {
 /// pushed from the value [`settings`] returns rather than by reading the file
 /// back. A write that failed leaves the setting on for this session, which the
 /// checkmark then honestly shows.
+/// Flip the notification preference, unless there is nothing to notify about.
+///
+/// The menu draws the row inert without the signal plugin, so an arriving verb
+/// normally means the row was usable. Checked again anyway: the verb is a
+/// navigation, and every verb on that channel is reachable from any script the
+/// window loads (see [`controls`]). Refusing here keeps the stored preference
+/// from being flipped behind a switch the user cannot see the state of.
 fn toggle_notify_turns(app: &tauri::AppHandle) {
+    if !plugins::signalling(app) {
+        return;
+    }
     settings::toggle_notifications(app);
     controls::sync_notify(app);
 }
@@ -672,16 +678,39 @@ fn boot(app: tauri::AppHandle, window: WebviewWindow, session: Session) {
             return;
         }
 
+        // The plugin every notification starts at, put in on the first launch
+        // that has a dsh to put it into. See [`plugins::adopt`], which does it
+        // once and then leaves the decision to the user.
+        //
+        // Here rather than a line later because the panel below reads what is
+        // installed to draw itself, and a first launch should find the plugin
+        // already in rather than offered. Here rather than anywhere after,
+        // because everything after this point has a server running and an
+        // install is a reason to stop one.
+        //
+        // Skipped on a login-item launch, for the reason the update check
+        // above is: nobody is looking, and this can reach the network — an
+        // absent pnpm is an `npm install -g` away. The next launch someone
+        // actually asks for does it.
+        let adoption_failed = window_is_visible(&app) && plugins::adopt(&app, &report);
+
         // Once, on the launch that first has a dsh to add plugins to — and once
         // more for an install that predates the panel existing. It is shown
         // before the server starts rather than after, because installing a
         // plugin means stopping the server again, and the user has just watched
         // it start.
         //
+        // And once more again for a launch whose own attempt at the signal
+        // plugin failed. That attempt is not repeated — see [`plugins::adopt`]
+        // — so this is where it gets said: the panel lists the plugin, installs
+        // it on a click, and this time has somewhere to print the reason if it
+        // fails again. The alternative is notifications that never work and a
+        // grey menu item to find out from.
+        //
         // Marked as shown before it is shown: a panel that crashes the launch it
         // appears on should not appear on the next one too. What happens next is
         // the panel's — see [`leave_plugins`].
-        if window_is_visible(&app) && !plugins::guided(&app) {
+        if window_is_visible(&app) && (adoption_failed || !plugins::guided(&app)) {
             plugins::mark_guided(&app);
             show_plugins(&app, &session, true);
             return;

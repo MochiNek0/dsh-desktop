@@ -1,0 +1,16 @@
+# dsh bundle patch for dsh-desktop-signal.
+#
+# One insert and nothing else. This plugin overrides no seam and repoints
+# nothing: its host half is empty, and its client half only reads services
+# dsh-base already provides (`sessions`, `uiSession`) and reports what it sees
+# to the desktop shell. Installing it adds a listener; removing it drops the
+# layer and dsh is exactly as it was.
+#
+# The insert is what makes it a profile layer at all. `dsh plugin add`
+# reconciles `dsh.profile.bundles` by installed state, and a dependency joins
+# the layer stack only when its manifest declares `dsh.bundle.patch` — without
+# this file the package installs as a plain dependency, warns once, and never
+# loads.
+- insert:
+    - id: desktop-signal
+      name: 'dsh-desktop-signal'

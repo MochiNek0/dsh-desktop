@@ -1,4 +1,5 @@
-// Stage what ships beside the app: the two bootstrap scripts, and nothing else.
+// Stage what ships beside the app: the two bootstrap scripts and the dsh client
+// plugin, and nothing else.
 //
 // Neither Node nor dsh is shipped. The machine's Nodes are listed, the user
 // picks one, and then comes `npm install -g @deepseek-ai/dsh` — all of it in
@@ -19,11 +20,11 @@
 // it; the deletions are all by name.
 //
 // Runs from `beforeBuildCommand`, and by hand as `npm run bundle:runtime`. It
-// copies two files and never touches the network.
+// copies a handful of small files and never touches the network.
 //
 // Everything it writes lives under `src-tauri/resources/`, which is gitignored.
 
-import { copyFileSync, mkdirSync, rmSync } from 'node:fs';
+import { cpSync, copyFileSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -53,6 +54,28 @@ for (const script of ['install-deps.ps1', 'install-deps.sh']) {
   copyFileSync(join(root, 'scripts', script), join(resources, script));
 }
 console.log('[bundle] staged install-deps.ps1 and install-deps.sh');
+
+// The dsh client plugin, which ships inside the app and is installed into the
+// user's profile from here — see `plugin/` for what it does and
+// `src-tauri/src/plugins.rs` for the `bundled:` preset that points at this copy.
+//
+// A copy rather than a resource glob reaching out of `src-tauri/`, because the
+// bundler's `resources/**/*` already sweeps this directory and one staging
+// rule is easier to keep true than two. What goes in is what the plugin's own
+// `package.json` lists under `files`, plus the manifest: no tests, and nothing
+// a publish would leave out either. The whole thing is a few kilobytes of
+// hand-written JavaScript with no build step — that is the point of it.
+//
+// Cleared first, so a file deleted from `plugin/` does not live on in an
+// installer built afterwards.
+const staged = join(resources, 'plugin');
+rmSync(staged, { recursive: true, force: true });
+mkdirSync(staged, { recursive: true });
+cpSync(join(root, 'plugin', 'lib'), join(staged, 'lib'), { recursive: true });
+for (const file of ['package.json', 'cordis.patch.yml']) {
+  copyFileSync(join(root, 'plugin', file), join(staged, file));
+}
+console.log('[bundle] staged plugin/');
 
 // The installer's two bitmaps, drawn from the app icon. They go into
 // `src-tauri/installer/` rather than here, because everything in `resources/`

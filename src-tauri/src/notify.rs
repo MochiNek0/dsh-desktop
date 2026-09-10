@@ -23,34 +23,37 @@
 //!
 //! ## What a click does
 //!
-//! Nothing. Routing a click on a native toast back into the page is not
-//! portable — the three platforms disagree about whether an activation is even
-//! delivered to a running process — and a handler that fires on one of them is
-//! worse than none, because the plugin author cannot tell which. So the shim
-//! keeps the `Notification` object and its `onclick` intact and simply never
-//! fires it, which is exactly what happens today, and the notification itself is
-//! the part that was missing.
+//! Brings the window back — and, for a toast [`crate::signal`] raised about a
+//! session dsh has stopped in, answers it where one press can. That is
+//! [`crate::toast`]'s half: it keeps the handle the toast is activated on,
+//! which is what this app could not do while `tauri-plugin-notification` raised
+//! the toast and dropped that handle. The reasoning that used to stand here, that an activation is not
+//! portable enough to be worth wiring, was wrong about the platforms and right
+//! about the plugin: all three backends hand back a handle carrying the
+//! activation, and the plugin threw it away on all three. See the module docs
+//! there for what a click does not reach — a popup that has already moved to the
+//! notification centre.
 //!
-//! This has been asked about, so the state of the ground underneath it: the
-//! Windows half is in fact reachable — `notify-rust` calls `Toast::on_activated`
-//! and hands back a `NotificationHandle` carrying the activation — but
-//! `tauri-plugin-notification`'s desktop `show()` drops that handle on the
-//! floor, so nothing above it can see a click. Wiring one up means going around
-//! the plugin to `notify-rust` directly, on Windows only, and owning a second
-//! notification path for the one platform. That is a real cost for a
-//! convenience, and the decision here is deliberately to leave the toast
-//! inert and put what the user needs into its text instead. Revisit if the
-//! plugin ever surfaces the handle.
+//! What a click still does not do is fire the page's own `onclick`. The shim
+//! below keeps the `Notification` object and its handlers intact and simply
+//! never dispatches to them, because sending an activation back into the page
+//! means naming which notification it belongs to, and the page's own object is
+//! not something Rust has a name for. A plugin author therefore sees the same
+//! thing on every platform: a notification that is raised, and a handler that
+//! does not run.
 //!
-//! Because a click leads nowhere, the body is written to stand on its own: it
-//! says what finished, not "click to return".
+//! The body is still written to stand on its own — it says what finished, not
+//! "click to return" — because a click is a courtesy rather than the point.
+//! What a notification from the page has to go on is only its own two lines,
+//! and a toast that says what happened is readable in the notification centre
+//! days later, where nothing is clickable at all.
 //!
 //! ## Whose name and icon a toast carries
 //!
 //! The installed app's. This has been reported as a bug more than once, so:
 //! a Windows toast is drawn with the name and icon of the AppUserModelID it was
-//! raised under, and `tauri-plugin-notification` passes the bundle identifier as
-//! that AUMID — but only when the running exe is not under `target\debug` or
+//! raised under, and [`crate::toast`] passes the bundle identifier as that
+//! AUMID — but only when the running exe is not under `target\debug` or
 //! `target\release`. For an uninstalled build it passes nothing, notify-rust
 //! substitutes its `POWERSHELL_APP_ID`, and the toast says *Windows PowerShell*
 //! and wears PowerShell's icon.
@@ -59,7 +62,7 @@
 //! here: the AUMID only resolves to a name and an icon because a Start Menu
 //! shortcut declares it, and an uninstalled build has no shortcut. The NSIS
 //! template already stamps `${BUNDLEID}` onto both shortcuts it creates (its
-//! `SetLnkAppUserModelId`), which is the same string the plugin sends, so an
+//! `SetLnkAppUserModelId`), which is the same string `toast` sends, so an
 //! installed app is correct with nothing added. Do not "fix" this by stamping
 //! the AUMID again from `installer-hooks.nsh` — it is already done, and a second
 //! copy is one more thing to keep in step.
@@ -71,30 +74,106 @@
 //! toast simply does not appear:
 //!
 //! - **macOS** goes through `mac-notification-sys`, which needs a bundle
-//!   identifier registered with LaunchServices. The plugin handles the awkward
-//!   case itself: `set_application(if tauri::is_dev() { "com.apple.Terminal" }
+//!   identifier registered with LaunchServices. `toast::identify` handles the
+//!   awkward case: `set_application(if tauri::is_dev() { "com.apple.Terminal" }
 //!   else { identifier })`, so a `tauri dev` run borrows Terminal's identity and
-//!   an installed `.app` uses its own. Nothing to do here, and in particular do
-//!   not add a `cfg(target_os = "macos")` branch that sets it again.
+//!   an installed `.app` uses its own. It is done in exactly that one place —
+//!   do not add a second `cfg(target_os = "macos")` branch that sets it again.
 //! - **Linux** goes over D-Bus to `org.freedesktop.Notifications`. That is
 //!   present under GNOME, KDE and anything else with a notification daemon, and
 //!   absent under a bare window manager or in a container — where the toast is
 //!   dropped by the session, not by this app.
 //!
-//! In all three cases the failure is silent by design: see the note in [`show`]
-//! on why the `Result` cannot tell you which happened.
+//! Two of those three now say so out loud: [`crate::toast`] logs what `show()`
+//! answered, which is a real answer under XDG and on Windows. macOS is the
+//! exception, and the reason is in that module.
 
 use tauri::{AppHandle, Manager, Url};
-use tauri_plugin_notification::NotificationExt;
 
 /// How much of each string survives the trip. A notification is two lines on
 /// screen wherever it is drawn; the rest would only make the URL longer.
 const LIMIT: usize = 200;
 
-/// One notification, as it arrived from the page.
+/// One notification: what to say, and what pressing it reaches.
+///
+/// [`Notice::click`] is `None` for everything the page raises, which is every
+/// notification that comes through the shim -- a plugin calling
+/// `window.Notification` has no session to name and no reason to know the
+/// concept, so its toast is a sentence and nothing more. It is `Some` only for
+/// the ones [`crate::signal`] raises from dsh's own state.
 pub struct Notice {
     title: String,
     body: String,
+    click: Option<Click>,
+}
+
+/// What a press on a toast reaches.
+pub struct Click {
+    /// The session it is about, which a click on the body goes to.
+    pub session: String,
+    /// The pending request the buttons answer. Empty when there are none.
+    pub key: String,
+    /// At most two, and none unless `key` names a request.
+    pub buttons: Vec<Button>,
+}
+
+/// One button: the id that comes back when it is pressed, and what it says.
+///
+/// The id means nothing to the platform and everything to the two halves of
+/// [`crate::signal`] -- it is written in its table and read in the plugin's.
+pub struct Button {
+    pub id: String,
+    pub label: String,
+}
+
+impl Button {
+    pub fn new(id: &str, label: &str) -> Button {
+        Button {
+            id: id.to_string(),
+            label: label.to_string(),
+        }
+    }
+}
+
+impl Notice {
+    /// One about a session, from [`crate::signal`] rather than from the page.
+    /// A click on it opens that session; there is nothing on it to press.
+    pub fn about(session: &str, title: &str, body: &str) -> Notice {
+        Notice {
+            title: clamp(title),
+            body: clamp(body),
+            click: Some(Click {
+                session: session.to_string(),
+                key: String::new(),
+                buttons: Vec::new(),
+            }),
+        }
+    }
+
+    /// One a press can answer. Falls back to [`Notice::about`] when the wait
+    /// turns out to have no one-press answer, so a caller can build the
+    /// buttons without first asking whether there will be any.
+    pub fn asking(
+        session: &str,
+        key: &str,
+        title: &str,
+        body: &str,
+        buttons: Vec<Button>,
+    ) -> Notice {
+        if buttons.is_empty() {
+            return Notice::about(session, title, body);
+        }
+
+        Notice {
+            title: clamp(title),
+            body: clamp(body),
+            click: Some(Click {
+                session: session.to_string(),
+                key: key.to_string(),
+                buttons,
+            }),
+        }
+    }
 }
 
 /// Read a `dsh-window://notify` navigation. `None` for a query with nothing in
@@ -122,7 +201,11 @@ pub fn received(url: &Url) -> Option<Notice> {
         title = "dsh".to_string();
     }
 
-    Some(Notice { title, body })
+    Some(Notice {
+        title,
+        body,
+        click: None,
+    })
 }
 
 /// Raise it, unless the user turned notifications off or is already looking at
@@ -141,27 +224,26 @@ pub fn received(url: &Url) -> Option<Notice> {
 /// "Notifications" rather than naming the finished-turn toast. It was named for
 /// the toast once, and a switch whose label promises less than it does is a
 /// switch that surprises the person who used it. See [`crate::settings`].
+///
+/// And before either of those, whether the signal plugin is installed at all —
+/// see [`crate::plugins::signalling`]. It gates this whole function rather
+/// than only [`crate::signal`]'s notifications, so that "notifications are
+/// off" means one thing rather than two: the switch above is drawn unavailable
+/// without the plugin, and a switch that reads unavailable while something
+/// still raises toasts would be a lie. The cost is that a third-party dsh
+/// plugin calling `window.Notification` is silent too until this app's own
+/// plugin is installed. Nothing shipped in dsh calls it — checked across all
+/// 222 packages of `0.1.2-rc.1` — so today that costs nothing; the day it
+/// costs something, the fix is a second gate, not a wider one.
 pub fn show(app: &AppHandle, notice: Notice) {
+    if !crate::plugins::signalling(app) {
+        return;
+    }
     if !crate::settings::notifications(app) || watching(app) {
         return;
     }
 
-    let mut builder = app.notification().builder().title(notice.title);
-    if !notice.body.is_empty() {
-        builder = builder.body(notice.body);
-    }
-
-    // The `Result` is about building the request, not about raising the toast.
-    // `tauri-plugin-notification`'s desktop `show()` hands the notification to
-    // `tauri::async_runtime::spawn` and discards what comes back, so it answers
-    // `Ok` on every platform whether or not anything was ever displayed. This
-    // arm therefore catches almost nothing — kept because it costs a line, but
-    // do not read silence here as a toast that appeared.
-    if let Err(error) = builder.show() {
-        // The whole feature is a courtesy; a platform that will not raise one is
-        // not a reason to interrupt anybody.
-        eprintln!("dsh-desktop: could not raise a notification: {error}");
-    }
+    crate::toast::raise(app, notice.title, notice.body, notice.click);
 }
 
 /// Whether the window is on screen and has the user's attention. Anything less —
@@ -316,6 +398,53 @@ mod tests {
     fn refuses_a_notification_with_nothing_in_it() {
         assert!(parse("title=&body=%20").is_none());
         assert!(parse("").is_none());
+    }
+
+    /// A notification from the page is about no session in particular, and one
+    /// from [`crate::signal`] is about exactly one.
+    ///
+    /// Which is the whole difference a click can act on: the shim has no
+    /// session to name — a plugin calling `window.Notification` has no reason
+    /// to know the concept — so a toast it raised stops at the window.
+    #[test]
+    fn only_a_signal_names_a_session() {
+        let from_the_page = parse("title=Turn%20finished&body=all%20done").expect("a notice");
+        assert!(from_the_page.click.is_none());
+
+        let signalled = super::Notice::about("session-7", "  Turn finished  ", "all done");
+        let click = signalled.click.as_ref().expect("a signal names a session");
+        assert_eq!(click.session, "session-7");
+        assert!(click.buttons.is_empty(), "there is nothing on it to press");
+        // Clamped and trimmed like any other.
+        assert_eq!(signalled.title, "Turn finished");
+    }
+
+    /// A wait with no one-press answer is a notice like any other, rather than
+    /// one carrying a request key nothing can be done with.
+    ///
+    /// The caller builds its buttons before it knows whether there are any —
+    /// which kinds have them is [`crate::signal`]'s table, not a question to
+    /// ask twice — so the empty case has to land somewhere, and it lands here.
+    #[test]
+    fn drops_the_request_when_no_button_can_answer_it() {
+        let none = super::Notice::asking("session-7", "question:42", "Asked", "…", vec![]);
+        let click = none.click.as_ref().expect("it is still about a session");
+        assert_eq!(click.session, "session-7");
+        assert!(
+            click.key.is_empty(),
+            "a key no press can send is not carried"
+        );
+
+        let asked = super::Notice::asking(
+            "session-7",
+            "question:42",
+            "Asked",
+            "…",
+            vec![super::Button::new("allow", "Allow")],
+        );
+        let click = asked.click.as_ref().expect("it is about a session");
+        assert_eq!(click.key, "question:42");
+        assert_eq!(click.buttons[0].id, "allow");
     }
 
     /// The cut lands on a character boundary, which for the scripts this app is

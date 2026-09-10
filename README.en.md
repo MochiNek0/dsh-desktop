@@ -36,7 +36,7 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 - **Out of the Box**: Detects the Node.js installations on your machine and installs `dsh` where needed — no administrator privileges required.
 - **Port Conflict-Free**: `dsh web` listens on an auto-assigned loopback port, coexisting seamlessly with manual instances started from a terminal.
 - **Native Experience**: Frameless window with the controls drawn inside the page; theme and interface language follow the settings dsh itself keeps in `$DSH_HOME/settings.yaml`, and switching either inside dsh takes effect without a restart — `system` included, which then follows the desktop. Tray-resident, with optional start at login.
-- **Smart Notifications**: No plugin required — a native notification is raised when a turn finishes, or when dsh is waiting on you (a tool approval, a plan review, a question). Suppressed while the window is in front.
+- **Smart Notifications**: A native notification when a turn finishes, or when dsh is waiting on you (a tool approval, a plan review, a question). It knows which session it is about, so clicking it returns to that one; what a single press can answer — allow/refuse, approve/revise, a two-way choice — is answered on the notification itself. Suppressed while the window is in front. Fed by the Session signals plugin, which ships inside the app and goes in by itself on the first launch, with nothing downloaded. Remove it and it stays removed; the **Notifications** menu item is then dimmed and says so.
 - **Runtime Management**: A built-in **Runtime** panel enumerates every Node on the machine and lets you switch between them, install or uninstall dsh in one, install a fresh Node, or delete a Node you no longer need. Also handles dsh version checks and one-click upgrades.
 - **Plugin Management**: Built-in visual panel to install and remove dsh plugins without a terminal; [DSH Market](#dsh-market) sits first in the recommended list.
 - **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit. Returns to the loading page and offers a restart if `dsh web` crashes unexpectedly.
@@ -70,7 +70,7 @@ The titlebar menu offers the following (the tray menu has only **Show window** a
 | **Update dsh…** | Check for and install a newer `dsh` |
 | **Runtime…** | Manage Node.js: list, switch, install, or remove |
 | **Check for app updates…** | Check for a newer version of the desktop app itself |
-| **Start at login** / **Notifications** | Toggles |
+| **Start at login** / **Notifications** | Toggles (**Notifications** is fed by the Session signals plugin, and is dimmed if you remove it) |
 | **Quit dsh** | Quit the app for real |
 
 ### Plugins
@@ -121,6 +121,7 @@ Platform-specific bundle targets are merged in automatically from `tauri.linux.c
 dsh-desktop/
 ├── dist/index.html               # Frontend loading and error feedback page
 ├── docs/                         # README images
+├── plugin/                       # dsh client plugin: reports session state to the shell, ships with the installer
 ├── scripts/                      # Bootstrap scripts (install-deps.ps1 / .sh) and build helpers
 ├── src-tauri/
 │   ├── Cargo.toml                # Rust dependencies and build configuration

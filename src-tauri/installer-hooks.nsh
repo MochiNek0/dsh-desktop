@@ -413,6 +413,32 @@ FunctionEnd
     Goto uninstall_done
   ${EndIf}
 
+  ; The app's own dsh plugin, out of the user's profile, before anything below
+  ; asks the user anything.
+  ;
+  ; Current builds stage the plugin under `$DSH_HOME\.dsh-desktop\bundled` and
+  ; link that, so the target survives this uninstall and the cleanup below is a
+  ; no-op for them. Older builds linked straight into `$INSTDIR`, which is gone
+  ; by the time this hook runs; the near end of that junction is not, and the
+  ; profile it sits in is the user's own — kept by default, as the prompt
+  ; further down says. A dangling junction there stops every later `dsh plugin
+  ; add` for good, and the bundle entry beside it makes every later `dsh web`
+  ; try to activate files that are not there. See `Remove-BundledPlugin` in the
+  ; script, which documents both.
+  ;
+  ; Unconditional on this path, which is the point of it being here rather than
+  ; further down with the others: it runs whatever the user answers about Node
+  ; and dsh, and in silent mode too. It asks nothing, touches only a link this
+  ; app made and only while the far end is missing, and needs neither
+  ; `bootstrap.json` nor a working Node.
+  ${If} ${FileExists} "$PLUGINSDIR\install-deps.ps1"
+    nsExec::ExecToLog '${DSH_POWERSHELL} "$PLUGINSDIR\install-deps.ps1" -Mode unlink-plugin'
+    Pop $0
+    ${If} $0 != "0"
+      DetailPrint "移除「会话信号」插件时出错（退出码 $0）。可以在 dsh 里手动移除：dsh plugin --profile web remove dsh-desktop-signal"
+    ${EndIf}
+  ${EndIf}
+
   ; The old private tree, if an install from before this scheme left one and the
   ; upgrade path above never ran.
   StrCpy $R5 "$INSTDIR\bin"
