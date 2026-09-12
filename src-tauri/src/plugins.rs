@@ -1784,7 +1784,7 @@ fn run(mut command: Command, log: &Log) -> Result<Outcome, String> {
         .to_string());
     }
 
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut child = crate::server::tethered(command).map_err(|error| error.to_string())?;
     let stdout = child.stdout.take().ok_or("stdout is piped")?;
     let stderr = child.stderr.take().ok_or("stderr is piped")?;
 

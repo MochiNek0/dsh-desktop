@@ -36,8 +36,9 @@ tauri-plugin-single-instance = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Process groups: `setpgid` before the exec and a signal to the whole group on
-# the way out, which is what stands in for the job object below. See
-# `server::group_leader`.
+# the way out, which is the ordinary shutdown path — see `server::group_leader`.
+# And on Linux `prctl(PR_SET_PDEATHSIG)`, which stands in for the job object
+# below when that path never runs. See `server::tethered`.
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

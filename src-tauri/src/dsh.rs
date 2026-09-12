@@ -1083,7 +1083,7 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
         .to_string());
     }
 
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut child = crate::server::tethered(command).map_err(|error| error.to_string())?;
     let stdout = child
         .stdout
         .take()
