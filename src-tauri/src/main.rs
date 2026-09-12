@@ -19,6 +19,7 @@ mod setup;
 mod signal;
 mod theme;
 mod toast;
+mod transport;
 mod update;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -260,6 +261,11 @@ fn build_window(
             "window.__DSH_VERSION__ = {:?};",
             env!("CARGO_PKG_VERSION")
         ))
+        // One reload for a page holding a plugin-bundle address the server has
+        // moved on from — which is what installing or removing a plugin does to
+        // every document loaded before it. See [`transport`], which is mostly an
+        // explanation of why the failure is otherwise permanent.
+        .initialization_script(transport::script())
         .on_page_load(move |webview, payload| {
             // The first page this window ever loads is the bundled loading page,
             // and this is the one place its address is stated by something that
