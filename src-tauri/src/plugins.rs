@@ -536,7 +536,7 @@ fn profile_manifest(app: &AppHandle) -> serde_json::Value {
 /// reads both: `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` are on
 /// that list and are not plugins. Offering to remove the profile's own
 /// foundation would be offering to break it — which is what [`holdings`],
-/// which does read both, has [`FOUNDATION`] for.
+/// which does read both, has [`IN_BOX`] for.
 fn dependencies_in(manifest: &serde_json::Value) -> Vec<(String, String)> {
     manifest
         .get("dependencies")
@@ -573,7 +573,7 @@ fn holdings(manifest: &serde_json::Value) -> Vec<(String, String, bool)> {
         .collect();
 
     for name in bundles_in(manifest) {
-        if FOUNDATION.contains(&name.as_str()) {
+        if name.starts_with(IN_BOX) {
             continue;
         }
         if held.iter().any(|(held, _, _)| held == &name) {
@@ -614,18 +614,35 @@ fn bundles_in(manifest: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The names a fresh `web` profile is born with on the layer stack without ever
-/// having been dependencies.
+/// The scope dsh's own in-box bundles are named in.
 ///
-/// dsh's own reconcile protects these by never taking out a name that has not
-/// been a dependency — it has the manifest as it was before pnpm ran, so it can
-/// tell an in-box bundle from one a user installed. [`audit`] has only the
-/// manifest as it stands, so the same protection has to be written down. It is
-/// the second of two guards and not the only one: a name has to be missing from
-/// `dependencies` *and* have nothing under the profile's `node_modules` before
-/// anything touches it, so a future dsh that ships another in-box bundle costs
-/// this list an entry rather than costing the user their profile.
-const FOUNDATION: [&str; 2] = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
+/// A profile's layer stack is born with names that were never dependencies —
+/// `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` for the `web`
+/// template dsh ships today. dsh's own reconcile protects them by never taking
+/// out a name that has not been a dependency: it has the manifest as it was
+/// before pnpm ran, so it can tell an in-box bundle from one a user installed.
+/// [`audit`] has only the manifest as it stands, so the same protection has to
+/// be written down here.
+///
+/// Written as the scope rather than as a copy of that pair, because the pair is
+/// not a constant this app can hold. dsh's `PROFILE_TEMPLATES` is what a
+/// profile is born from and dsh normalizes an existing profile's tuple to it
+/// across its own versions, so a dsh update is free to put a third in-box name
+/// on a stack this app is about to read.
+///
+/// And the other two guards would not catch that name. It is not a dependency,
+/// and it is not under the profile's `node_modules` either: dsh's
+/// `resolveBundleDir` tries the dsh installation's anchor first and the
+/// profile's second, so every in-box bundle resolves out of dsh's own tree —
+/// which is exactly where this scope is, and where nothing pnpm installs into a
+/// profile on a user's behalf ever is.
+///
+/// What it costs is residue whose package happens to be in this scope, which
+/// [`audit`] leaves alone rather than guess about. That is a repair not done,
+/// on a state that is already rare; the other way round is this app deleting a
+/// layer the user's dsh needs, on every launch, over a dsh update it has never
+/// heard of.
+const IN_BOX: &str = "@deepseek-ai/";
 
 /// Take out of `dsh.profile.bundles` every name the profile can no longer load,
 /// and answer with what went.
@@ -690,7 +707,7 @@ pub fn audit(app: &AppHandle) -> Vec<String> {
 
 /// The names on the layer stack that nothing in the profile can load.
 ///
-/// Both guards, in order: [`FOUNDATION`], then `dependencies`, then whether the
+/// All three guards, in order: [`IN_BOX`], then `dependencies`, then whether the
 /// package is actually under `modules`. All three have to say no. Split out of
 /// [`audit`] so the rule can be read — and tested — without an app handle, since
 /// what it decides is which entries get deleted out of a file the user owns.
@@ -702,7 +719,7 @@ fn stale_bundles(manifest: &serde_json::Value, modules: &Path) -> Vec<String> {
 
     bundles_in(manifest)
         .into_iter()
-        .filter(|name| !FOUNDATION.contains(&name.as_str()))
+        .filter(|name| !name.starts_with(IN_BOX))
         .filter(|name| !held.contains(name))
         // A scoped name carries its own separator, which `join` takes on every
         // platform this builds for.
@@ -2092,7 +2109,7 @@ mod tests {
     use super::{
         dependencies_in, holdings, is_package_spec, local_spec, parse, pnpm_blamed, pnpm_codes,
         pnpm_stuck, requested, spec_name, stale_bundles, sweep, wanted_gone, without_bundles,
-        Outcome, BUNDLED, FOUNDATION, PRESETS, RELEASE_AGE, SIGNAL,
+        Outcome, BUNDLED, IN_BOX, PRESETS, RELEASE_AGE, SIGNAL,
     };
     use std::path::{Path, PathBuf};
     use tauri::Url;
@@ -2787,10 +2804,10 @@ mod tests {
                 ("dsh-antigravity".to_string(), String::new(), true),
             ],
         );
-        for name in FOUNDATION {
+        for (name, _, _) in &held {
             assert!(
-                !held.iter().any(|(held, _, _)| held == name),
-                "{name} is the profile's own foundation and is not removable"
+                !name.starts_with(IN_BOX),
+                "{name} is dsh's own and is not this panel's to offer"
             );
         }
     }
@@ -2813,10 +2830,13 @@ mod tests {
         let manifest = serde_json::json!({
             "dependencies": { "dshmarket": "^1.41.0" },
             "dsh": { "profile": { "bundles": [
-                // Foundation: not a dependency and not under node_modules,
-                // and still not ours to touch.
+                // In-box: not dependencies and not under this node_modules,
+                // because dsh resolves them out of its own installation. The
+                // third is the one no list of names would have had in it — a
+                // bundle a later dsh puts on the stack by itself.
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
+                "@deepseek-ai/dsh-not-shipped-yet",
                 // A dependency, so pnpm owns it.
                 "dshmarket",
                 "still-here",
