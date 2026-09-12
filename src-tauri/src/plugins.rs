@@ -473,9 +473,9 @@ pub fn listing(app: &AppHandle) -> String {
     // keeps the description, the repository and the section it had while it
     // was still something to install. A plugin the shipped list has never
     // heard of has none of the three, and gets the card that is left.
-    let held: Vec<serde_json::Value> = dependencies_in(&manifest)
+    let held: Vec<serde_json::Value> = holdings(&manifest)
         .into_iter()
-        .map(|(name, version)| {
+        .map(|(name, version, stale)| {
             let preset = presets.iter().find(|preset| preset.package == name);
             let label = preset
                 .map(|preset| preset.name.clone())
@@ -484,9 +484,28 @@ pub fn listing(app: &AppHandle) -> String {
                 "name": name,
                 "label": label,
                 "version": version,
-                "description": preset.map(|preset| preset.description.as_str()),
+                // What residue is, in place of whatever the shipped list says
+                // the package does. A card reading "插件市场" with a red chip on
+                // it and the description it has always had explains nothing;
+                // the fact worth having is why it is on the list twice.
+                "description": if stale {
+                    t!(
+                        "这一条还挂在 profile 的层列表上，但它已经不是依赖了 —— \
+                         上次装或卸插件没收尾留下的。勾上卸载就能清掉，不会动到别的插件。",
+                        "This is still on the profile's layer stack but is no longer a \
+                         dependency — residue from a plugin change that did not finish. \
+                         Tick it and remove to clear it; nothing else is touched."
+                    )
+                    .to_string()
+                } else {
+                    preset.map(|preset| preset.description.clone()).unwrap_or_default()
+                },
                 "url": preset.map(|preset| preset.url.as_str()),
                 "section": preset.map(|preset| preset.section.as_str()),
+                // Drawn with a chip of its own, and worth the extra field: a
+                // card the user is told is residue reads differently from one
+                // that says a plugin is working.
+                "stale": stale,
             })
         })
         .collect();
@@ -516,11 +535,8 @@ fn profile_manifest(app: &AppHandle) -> serde_json::Value {
 /// `dsh.profile.bundles` is deliberately not read here, though [`installed_in`]
 /// reads both: `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` are on
 /// that list and are not plugins. Offering to remove the profile's own
-/// foundation would be offering to break it.
-fn dependencies(app: &AppHandle) -> Vec<(String, String)> {
-    dependencies_in(&profile_manifest(app))
-}
-
+/// foundation would be offering to break it — which is what [`holdings`],
+/// which does read both, has [`FOUNDATION`] for.
 fn dependencies_in(manifest: &serde_json::Value) -> Vec<(String, String)> {
     manifest
         .get("dependencies")
@@ -533,6 +549,40 @@ fn dependencies_in(manifest: &serde_json::Value) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Everything the panel may offer to take out, with the range pnpm recorded and
+/// whether the entry is residue rather than a plugin.
+///
+/// `dependencies` is what pnpm installed and the whole of what `dsh plugin
+/// remove` can act on. The layer stack carries a second, smaller set: a name
+/// dsh still loads on every boot that is no longer a dependency at all. That
+/// state is reachable — see [`audit`] for the line in dsh that leaves it — and
+/// reading `dependencies` alone made it invisible here and unremovable in
+/// [`remove`], while [`installed_in`] went on counting it as installed and so
+/// kept the matching preset off the offered half too. A plugin that is in the
+/// profile twice over and listed nowhere is the shape of a user reinstalling
+/// the app, which is what this is for.
+///
+/// The residue half carries no range because there is no dependency to have
+/// recorded one.
+fn holdings(manifest: &serde_json::Value) -> Vec<(String, String, bool)> {
+    let mut held: Vec<(String, String, bool)> = dependencies_in(manifest)
+        .into_iter()
+        .map(|(name, range)| (name, range, false))
+        .collect();
+
+    for name in bundles_in(manifest) {
+        if FOUNDATION.contains(&name.as_str()) {
+            continue;
+        }
+        if held.iter().any(|(held, _, _)| held == &name) {
+            continue;
+        }
+        held.push((name, String::new(), true));
+    }
+
+    held
 }
 
 /// What the profile manifest says is in it.
@@ -548,17 +598,174 @@ fn installed_in(manifest: &serde_json::Value) -> HashSet<String> {
         .map(|deps| deps.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
 
-    let bundles = manifest
+    dependencies.into_iter().chain(bundles_in(manifest)).collect()
+}
+
+/// The layer stack, in the order dsh composes it.
+fn bundles_in(manifest: &serde_json::Value) -> Vec<String> {
+    manifest
         .pointer("/dsh/profile/bundles")
         .and_then(serde_json::Value::as_array)
         .map(|list| {
             list.iter()
                 .filter_map(|name| name.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
+                .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
-    dependencies.into_iter().chain(bundles).collect()
+/// The names a fresh `web` profile is born with on the layer stack without ever
+/// having been dependencies.
+///
+/// dsh's own reconcile protects these by never taking out a name that has not
+/// been a dependency — it has the manifest as it was before pnpm ran, so it can
+/// tell an in-box bundle from one a user installed. [`audit`] has only the
+/// manifest as it stands, so the same protection has to be written down. It is
+/// the second of two guards and not the only one: a name has to be missing from
+/// `dependencies` *and* have nothing under the profile's `node_modules` before
+/// anything touches it, so a future dsh that ships another in-box bundle costs
+/// this list an entry rather than costing the user their profile.
+const FOUNDATION: [&str; 2] = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
+
+/// Take out of `dsh.profile.bundles` every name the profile can no longer load,
+/// and answer with what went.
+///
+/// This exists because of one line in dsh's plugin command:
+///
+/// ```js
+/// if (exitCode === 0) reconcilePlugins(before, dir);
+/// ```
+///
+/// pnpm writes `package.json` before it has finished rewriting `node_modules`,
+/// and dsh reconciles the layer stack against the manifest only when pnpm came
+/// back clean. So a removal that pnpm starts and then fails — on Windows most
+/// often the `EPERM` a dangling junction answers with, which [`repair`] is the
+/// other half of, or a `minimumReleaseAge` refusal — can leave the dependency
+/// gone from `dependencies` and its name still on the layer stack. Nothing in
+/// dsh ever reconciles that state again, because the reconcile it needs is the
+/// one that was skipped.
+///
+/// What it costs is the whole app: `dsh web` resolves every bundle on the stack
+/// before it binds a port, and a name it cannot resolve is a `throw` rather than
+/// a warning — so dsh does not start at all, and this app's panel could neither
+/// show the name nor remove it (see [`listing`] and [`remove`], which used to
+/// read `dependencies` alone). The way out was reinstalling.
+///
+/// Best effort and loud: a manifest that will not parse, or a write that fails,
+/// leaves the profile exactly as it was and says so on the terminal. Answering
+/// with the names rather than a bool because the caller puts them on screen —
+/// a repair nobody is told about is indistinguishable from a dsh that
+/// inexplicably started this time.
+pub fn audit(app: &AppHandle) -> Vec<String> {
+    let stale = stale_bundles(
+        &profile_manifest(app),
+        &profile_dir(app).join("node_modules"),
+    );
+
+    if stale.is_empty() {
+        return Vec::new();
+    }
+
+    match forget_bundles(app, &stale) {
+        Ok(()) => {
+            // Here rather than at each call site: two of the three reach this
+            // from a path with no status line to draw on, and a repair of the
+            // user's profile is worth a line in the terminal wherever it
+            // happened.
+            eprintln!(
+                "dsh-desktop: took {} off the profile's layer stack — nothing installs them",
+                stale.join(" ")
+            );
+            stale
+        }
+        Err(why) => {
+            eprintln!(
+                "dsh-desktop: could not take {} off the layer stack: {why}",
+                stale.join(" ")
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// The names on the layer stack that nothing in the profile can load.
+///
+/// Both guards, in order: [`FOUNDATION`], then `dependencies`, then whether the
+/// package is actually under `modules`. All three have to say no. Split out of
+/// [`audit`] so the rule can be read — and tested — without an app handle, since
+/// what it decides is which entries get deleted out of a file the user owns.
+fn stale_bundles(manifest: &serde_json::Value, modules: &Path) -> Vec<String> {
+    let held: HashSet<String> = dependencies_in(manifest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+
+    bundles_in(manifest)
+        .into_iter()
+        .filter(|name| !FOUNDATION.contains(&name.as_str()))
+        .filter(|name| !held.contains(name))
+        // A scoped name carries its own separator, which `join` takes on every
+        // platform this builds for.
+        .filter(|name| !modules.join(name).join("package.json").is_file())
+        .collect()
+}
+
+/// Rewrite the profile manifest without `names` on its layer stack.
+///
+/// Through a sibling and a rename, the way [`stage_bundled`] writes: the file
+/// being replaced is the one thing standing between the user and a dsh that
+/// starts, and a half-written one is worse than the state being repaired.
+///
+/// Only `dsh.profile.bundles` is touched. `dependencies` is pnpm's, and a name
+/// that is still listed there is not this function's business — [`audit`] has
+/// already established that these are not.
+fn forget_bundles(app: &AppHandle, names: &[String]) -> Result<(), String> {
+    let path = profile_dir(app).join("package.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let text = without_bundles(&raw, names).map_err(|why| format!("{}: {why}", path.display()))?;
+
+    let tmp = path.with_extension("json.new");
+    std::fs::write(&tmp, text.as_bytes())
+        .map_err(|error| format!("could not write {}: {error}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not move {} into place: {error}", tmp.display())
+    })
+}
+
+/// One profile manifest, as text, without `names` on its layer stack.
+///
+/// The whole of what a repair changes, so that the change can be read against
+/// a file rather than inferred from one. Only `dsh.profile.bundles` is touched:
+/// `dependencies` is pnpm's, and a name still listed there is not this
+/// function's business — [`audit`] has already established that these are not.
+///
+/// dsh writes this file as `JSON.stringify(manifest, undefined, 2) + "\n"`, and
+/// this matches it down to the trailing newline, so a repair does not also
+/// reformat the file under dsh. Key order survives because `serde_json` is
+/// built here with `preserve_order`; see `Cargo.toml`, where that is the only
+/// reason the feature is on.
+fn without_bundles(raw: &str, names: &[String]) -> Result<String, String> {
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| format!("could not parse it: {error}"))?;
+
+    if let Some(list) = manifest
+        .pointer_mut("/dsh/profile/bundles")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        list.retain(|entry| match entry.as_str() {
+            Some(name) => !names.iter().any(|gone| gone == name),
+            // Not a string, so not a name anything here put there and not one
+            // `audit` could have chosen. Left exactly as found.
+            None => true,
+        });
+    }
+
+    let mut text = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("could not serialize it: {error}"))?;
+    text.push('\n');
+    Ok(text)
 }
 
 /// The plugin that tells this app what dsh is doing, by the name it installs
@@ -1727,27 +1934,59 @@ fn commas(value: &str) -> Vec<String> {
 /// No `-w` here. pnpm's refusal to touch a workspace root without one is
 /// `add`'s alone — `remove` at the same root is not questioned.
 pub fn remove(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String> {
-    let held: Vec<String> = dependencies(app)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
+    // Only what the manifest actually lists, and split the way the manifest
+    // lists it. The panel builds its cards out of the same two halves, so a
+    // name on neither did not come from the panel — and `dsh plugin remove` is
+    // not the place to find out what else it would have done with it.
+    let holdings = holdings(&profile_manifest(app));
+    let wanted = |residue: bool| -> Vec<String> {
+        holdings
+            .iter()
+            .filter(|(_, _, stale)| *stale == residue)
+            .filter(|(held, _, _)| names.iter().any(|name| name == held))
+            .map(|(held, _, _)| held.clone())
+            .collect()
+    };
 
-    // Only what the manifest actually lists. The panel builds its list out of
-    // that same manifest, so a name that is not on it did not come from the
-    // panel — and `dsh plugin remove` is not the place to find out what else it
-    // would have done with it.
-    let names: Vec<&str> = names
-        .iter()
-        .filter(|name| held.iter().any(|held| held == *name))
-        .map(String::as_str)
-        .collect();
+    let stale = wanted(true);
+    let names = wanted(false);
 
-    if names.is_empty() {
+    if names.is_empty() && stale.is_empty() {
         return Err(t!(
             "选中的插件不在这个 profile 里，没有可卸载的。",
             "nothing selected is installed in this profile."
         )
         .to_string());
+    }
+
+    // Residue first, and without pnpm anywhere near it. There is no dependency
+    // for pnpm to take out, so `dsh plugin remove` would hand it a name it does
+    // not hold, come back non-zero, and — this being the whole of how the state
+    // arose — skip the reconcile that would have cleared the layer stack. See
+    // [`audit`]. What is left behind is the package directory, which pnpm prunes
+    // on its next successful run and which dsh stops loading the moment its name
+    // is off the stack.
+    if !stale.is_empty() {
+        log(&t!(
+            "正在从 profile 的层列表里摘掉残留：{}",
+            "Taking residue off the profile's layer stack: {}",
+            stale.join(" ")
+        ));
+        forget_bundles(app, &stale).map_err(|why| {
+            t!(
+                "无法改写 profile 清单：{}",
+                "the profile manifest could not be rewritten: {}",
+                why
+            )
+        })?;
+    }
+
+    // Nothing pnpm has to be started for. Which is worth returning early over:
+    // everything below this waits on dsh, on pnpm, and on a `repair` walk of
+    // `node_modules`, for a removal that is already done.
+    if names.is_empty() {
+        log(t!("残留已清掉。", "The residue is gone."));
+        return Ok(());
     }
 
     let dsh = crate::dsh::current(app).ok_or_else(|| {
@@ -1851,8 +2090,9 @@ pub fn open_directory(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dependencies_in, is_package_spec, local_spec, parse, pnpm_blamed, pnpm_codes, pnpm_stuck,
-        requested, spec_name, sweep, wanted_gone, Outcome, BUNDLED, PRESETS, RELEASE_AGE, SIGNAL,
+        dependencies_in, holdings, is_package_spec, local_spec, parse, pnpm_blamed, pnpm_codes,
+        pnpm_stuck, requested, spec_name, stale_bundles, sweep, wanted_gone, without_bundles,
+        Outcome, BUNDLED, FOUNDATION, PRESETS, RELEASE_AGE, SIGNAL,
     };
     use std::path::{Path, PathBuf};
     use tauri::Url;
@@ -2521,6 +2761,119 @@ mod tests {
                 String::from_utf8_lossy(&made.stderr)
             );
         }
+    }
+
+    /// The two halves the panel draws, told apart. A dependency is a plugin; a
+    /// name left on the layer stack without one is residue, and the profile's
+    /// own foundation is neither and must never be offered for removal.
+    #[test]
+    fn holdings_tells_a_plugin_from_what_is_left_on_the_stack() {
+        let manifest = serde_json::json!({
+            "dependencies": { "dshmarket": "^1.41.0" },
+            "dsh": { "profile": { "bundles": [
+                "@deepseek-ai/dsh-base",
+                "@deepseek-ai/dsh-web-app",
+                "dshmarket",
+                "dsh-antigravity",
+            ] } }
+        });
+
+        let held = holdings(&manifest);
+
+        assert_eq!(
+            held,
+            vec![
+                ("dshmarket".to_string(), "^1.41.0".to_string(), false),
+                ("dsh-antigravity".to_string(), String::new(), true),
+            ],
+        );
+        for name in FOUNDATION {
+            assert!(
+                !held.iter().any(|(held, _, _)| held == name),
+                "{name} is the profile's own foundation and is not removable"
+            );
+        }
+    }
+
+    /// What [`super::audit`] deletes out of the user's manifest, and the three
+    /// things that have to be true before it does. Each guard is given an entry
+    /// that only it rejects, so a guard quietly dropped fails this.
+    #[test]
+    fn stale_bundles_needs_every_guard_to_agree() {
+        let scratch = Scratch::new("stale-bundles");
+        let modules = scratch.dir("node_modules");
+        // Not a dependency, but installed — dsh resolves it, so it loads, and
+        // taking it off the stack would be this app removing a working plugin.
+        std::fs::write(
+            scratch.dir("node_modules/still-here").join("package.json"),
+            b"{\"name\":\"still-here\"}",
+        )
+        .expect("the installed package");
+
+        let manifest = serde_json::json!({
+            "dependencies": { "dshmarket": "^1.41.0" },
+            "dsh": { "profile": { "bundles": [
+                // Foundation: not a dependency and not under node_modules,
+                // and still not ours to touch.
+                "@deepseek-ai/dsh-base",
+                "@deepseek-ai/dsh-web-app",
+                // A dependency, so pnpm owns it.
+                "dshmarket",
+                "still-here",
+                // Nothing holds this one and nothing can load it.
+                "dsh-antigravity",
+            ] } }
+        });
+
+        assert_eq!(
+            stale_bundles(&manifest, &modules),
+            vec!["dsh-antigravity".to_string()]
+        );
+    }
+
+    /// The repair, against the file it repairs. Only the named entry goes, and
+    /// what comes back is byte-for-byte what dsh would have written — same key
+    /// order, same two-space indent, same trailing newline — so a repair does
+    /// not show up as a reformat the next time dsh writes the file.
+    #[test]
+    fn without_bundles_takes_one_line_and_leaves_the_file_alone() {
+        let before = concat!(
+            "{\n",
+            "  \"name\": \"dsh-profile-web\",\n",
+            "  \"private\": true,\n",
+            "  \"dependencies\": {\n",
+            "    \"dshmarket\": \"^1.41.0\"\n",
+            "  },\n",
+            "  \"dependenciesMeta\": {},\n",
+            "  \"dsh\": {\n",
+            "    \"profile\": {\n",
+            "      \"bundles\": [\n",
+            "        \"@deepseek-ai/dsh-base\",\n",
+            "        \"dshmarket\",\n",
+            "        \"dsh-antigravity\"\n",
+            "      ]\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        );
+
+        let after = without_bundles(before, &["dsh-antigravity".to_string()]).expect("a rewrite");
+
+        assert_eq!(after, before.replace(",\n        \"dsh-antigravity\"", ""));
+    }
+
+    /// A manifest with no layer stack at all, and one that will not parse. The
+    /// first is a profile dsh has not written yet and is not an error; the
+    /// second must not be overwritten with a guess at what it meant.
+    #[test]
+    fn without_bundles_leaves_what_it_does_not_understand() {
+        let plain = "{\n  \"name\": \"dsh-profile-web\"\n}\n";
+        assert_eq!(
+            without_bundles(plain, &["anything".to_string()]).expect("a rewrite"),
+            plain
+        );
+
+        assert!(without_bundles("{ not json", &[]).is_err());
     }
 
     /// A directory of this test's own, gone again when it ends. Built on disk,

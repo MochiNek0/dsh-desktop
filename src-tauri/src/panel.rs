@@ -63,6 +63,9 @@ fn labels() -> String {
         // On the card, at the end of its name: what used to be a heading
         // over a list of its own. Both halves are one list now.
         "have": t!("已安装", "Installed"),
+        // The third thing a card can be, and the one nobody wants to see: a
+        // name dsh still loads that nothing installed. See `plugins::holdings`.
+        "residue": t!("残留", "Residue"),
         // The group headings. `recommended` and `authored` are the two the
         // shipped list uses; `other` catches a section name the list invents
         // that this panel has no heading for. See `section` in plugins.rs.
@@ -321,8 +324,11 @@ pub fn script() -> String {
     var name = make('div', 'dsh-pp-name', body);
     name.appendChild(document.createTextNode(item.name));
     if (item.fix) name.appendChild(chip('fix', TEXT.fix));
-    // Last on the line, after any chip a preset came with.
-    if (item.installed) name.appendChild(chip('installed', TEXT.have));
+    // Last on the line, after any chip a preset came with. Residue instead of
+    // "installed", never both: the tick does the same thing to either, but
+    // calling a leftover an installed plugin is the thing that hid it.
+    if (item.stale) name.appendChild(chip('stale', TEXT.residue));
+    else if (item.installed) name.appendChild(chip('installed', TEXT.have));
 
     // What is actually going on the machine, where the name does not already
     // say it. The names are translated, so `插件市场` on its own names nothing
@@ -443,7 +449,8 @@ pub fn script() -> String {
         description: item.description,
         url: item.url,
         section: item.section,
-        installed: true
+        installed: true,
+        stale: !!item.stale
       }};
     }}));
 
@@ -616,6 +623,9 @@ pub fn script() -> String {
       'border-radius:999px;border:1px solid currentColor}}' +
       '.dsh-pp-chip.dsh-pp-fix{{color:var(--pp-fix)}}' +
       '.dsh-pp-chip.dsh-pp-installed{{color:var(--pp-ok)}}' +
+      // The same red the removal button wears, because it is the same verb:
+      // this one is here to be taken away.
+      '.dsh-pp-chip.dsh-pp-stale{{color:var(--pp-danger)}}' +
       '.dsh-pp-hint{{display:block;margin-top:12px;font-size:12px;color:var(--pp-muted)}}' +
       '.dsh-pp-spec{{width:100%;margin-top:4px;padding:8px 11px;' +
       'border:1px solid var(--pp-line);border-radius:8px;background:var(--pp-bg);' +

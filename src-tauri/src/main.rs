@@ -801,7 +801,31 @@ fn update_dsh(app: &tauri::AppHandle) {
 /// Start `dsh web` and hand the window over to it. Blocks until it is serving or
 /// has given up, reporting either onto the loading page.
 fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Session) {
-    session.splash.status(window, t!("正在启动 dsh…", "Starting dsh…"));
+    // Before the spawn, because what it repairs is a `dsh web` that exits on
+    // the way up rather than one that misbehaves once it is serving: a name on
+    // the profile's layer stack that no longer resolves is a `throw` before the
+    // port is bound. See [`plugins::audit`] for how the profile gets into that
+    // state and why nothing in dsh gets it out again.
+    //
+    // Said out loud when it does something. This rewrites a file the user owns,
+    // and the alternative to saying so is a launch that inexplicably worked
+    // after one that inexplicably did not. Folded into the line the start was
+    // going to draw anyway rather than shown first and overwritten a moment
+    // later, which is a message nobody can read.
+    let cleared = plugins::audit(app);
+
+    session.splash.status(
+        window,
+        &if cleared.is_empty() {
+            t!("正在启动 dsh…", "Starting dsh…").to_string()
+        } else {
+            t!(
+                "清掉了上次装卸插件没收尾留下的残留（{}），正在启动 dsh…",
+                "Cleared what an unfinished plugin change left behind ({}); starting dsh…",
+                cleared.join(" ")
+            )
+        },
+    );
     session.splash.progress(window, -1.0);
 
     match server::start(app, None) {
@@ -970,6 +994,14 @@ fn resume(window: &WebviewWindow, session: &Session) -> Result<Receiver<server::
         app,
         t!("dsh 已断开，正在重新启动…", "dsh disconnected; restarting it…"),
     );
+
+    // A dsh that exited on its own may have exited because the profile's layer
+    // stack names something it can no longer resolve — an install or removal
+    // that pnpm did not finish is exactly the kind of thing that stops a server
+    // mid-run. Cheap, and the alternative is restarting into the same refusal
+    // [`RESTARTS`] times over. Its own line goes to the terminal; there is
+    // nothing on screen here but dsh's own connection indicator.
+    plugins::audit(app);
 
     let was = served_port(&session.origin);
     let mut outcome = attempt(window, session, was);
