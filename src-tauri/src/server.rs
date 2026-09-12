@@ -56,6 +56,9 @@ pub struct Server {
     /// Held for the lifetime of the app; see [`Job`].
     #[cfg(windows)]
     _job: Option<Job>,
+    /// The pid file to delete on the way out; see [`leftover`].
+    #[cfg(target_os = "macos")]
+    record: Option<std::path::PathBuf>,
 }
 
 /// Spawn `dsh web` and return the handle plus a channel that yields exactly one
@@ -70,15 +73,25 @@ pub fn start(
     app: &tauri::AppHandle,
     port: Option<u16>,
 ) -> std::io::Result<(Server, Receiver<Event>)> {
-    let mut child = command(app, port)
+    // Before the spawn rather than after it: the point of the sweep is that no
+    // dsh of ours is running yet, so anything that answers to the recorded pid
+    // belongs to a run that is over.
+    #[cfg(target_os = "macos")]
+    leftover::sweep(app);
+
+    let mut prepared = command(app, port);
+    prepared
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .current_dir(working_dir())
-        .spawn()?;
+        .current_dir(working_dir());
+
+    let mut child = tethered(prepared)?;
 
     #[cfg(windows)]
     let job = Job::hold(&child);
+    #[cfg(target_os = "macos")]
+    let record = leftover::remember(app, child.id());
 
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
@@ -93,6 +106,8 @@ pub fn start(
         child,
         #[cfg(windows)]
         _job: job,
+        #[cfg(target_os = "macos")]
+        record,
     };
     Ok((server, rx))
 }
@@ -101,6 +116,16 @@ impl Server {
     /// Stop the server.
     pub fn stop(&mut self) {
         kill_tree(&mut self.child);
+
+        // This ran, so there is nothing for the next launch to clean up after —
+        // and leaving the pid behind is what would have it looked up again long
+        // after it has been handed to something else. See [`leftover`].
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(record) = self.record.take() {
+                let _ = std::fs::remove_file(record);
+            }
+        }
     }
 }
 
@@ -146,12 +171,11 @@ pub fn kill_tree(child: &mut Child) {
 /// Put a child in a process group of its own, so that [`kill_tree`] can take
 /// down everything it goes on to spawn.
 ///
-/// Windows has the job object below for this, which is also a backstop for the app dying
-/// without running any cleanup. There is no equivalent here: `PR_SET_PDEATHSIG`
-/// is Linux-only and fires when the spawning *thread* exits, which is a boot
-/// thread that finishes long before the app does. So on these platforms the
-/// group is the ordinary shutdown path only, and a force-killed app leaves the
-/// server behind — the single-instance lock is what a relaunch runs into.
+/// This is the ordinary shutdown path only, and what covers an app that never
+/// reaches it differs by platform: the job object below on Windows and
+/// [`tethered`] on Linux, both of which have the kernel do it at the moment of
+/// death. macOS has neither, so there it is the next launch that kills what the
+/// last one left behind — see `leftover`.
 #[cfg(unix)]
 pub fn group_leader(command: &mut Command) {
     // SAFETY: `setpgid(0, 0)` is async-signal-safe and touches nothing but the
@@ -163,6 +187,186 @@ pub fn group_leader(command: &mut Command) {
             libc::setpgid(0, 0);
             Ok(())
         });
+    }
+}
+
+/// Spawn a child that the kernel will kill when this process dies, however it
+/// dies. The Linux counterpart of the `Job` below, and used for the same
+/// children.
+///
+/// The backstop matters most for `dsh web`: dsh takes an exclusive `flock` on a
+/// session's `session.lock` for as long as it has that session open, and the
+/// kernel only releases it when the holder dies. So a `dsh web` that outlives
+/// the app it belonged to goes on owning the sessions it had open, and the next
+/// launch — a new `dsh web`, reading the same `~/.dsh` — can list them and
+/// cannot resume them, which dsh reports as `SessionAlreadyOwnedError`. The
+/// sessions of one project sit in one directory, so what the user sees is one
+/// folder that has stopped working while the rest are fine.
+///
+/// `PR_SET_PDEATHSIG` is what asks for it, and it fires when the *thread* that
+/// forked the child exits rather than when the process does — which is why the
+/// fork is handed to `spawner`, a thread that is started once and never
+/// finishes. Setting it on a child forked from a boot thread or from the
+/// restart watcher would have it killed the moment that thread was done, which
+/// is the trap this indirection exists to stay out of.
+///
+/// Two limits, both deliberate. The signal goes to the child alone, not to the
+/// group `group_leader` put it in: for `dsh web` that child is node itself —
+/// npm links a POSIX shim as a symlink, so there is no shell in between — and
+/// node is what holds the locks. And the child sets the flag after the fork, so
+/// a parent that dies in that window leaves it unset; [`kill_tree`] is what
+/// covers every path that runs at all.
+pub fn tethered(mut command: Command) -> std::io::Result<Child> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `prctl(PR_SET_PDEATHSIG, ...)` is async-signal-safe and
+        // touches nothing but the fresh child's own parent-death signal. A
+        // failure would only lose the backstop, and there is nowhere to report
+        // it from between fork and exec, so the result is dropped.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+
+        let (tx, rx) = channel();
+        spawner()
+            .send((command, tx))
+            .expect("the spawner thread runs for the life of the process");
+        return rx
+            .recv()
+            .expect("the spawner thread answers every order it takes");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        command.spawn()
+    }
+}
+
+/// The one thread children whose death should follow ours are forked from.
+///
+/// Started on first use and parked on the queue forever after: it has no exit
+/// of its own, so the only thing that ends it is the process ending, which is
+/// exactly the event [`tethered`] wants the children to hear about. Nothing but
+/// a fork happens on it — the pipes are read by the threads [`pump`] starts,
+/// off this one, so a child that never stops printing cannot hold up the next
+/// spawn.
+#[cfg(target_os = "linux")]
+fn spawner() -> &'static Sender<(Command, Sender<std::io::Result<Child>>)> {
+    static SPAWNER: std::sync::OnceLock<Sender<(Command, Sender<std::io::Result<Child>>)>> =
+        std::sync::OnceLock::new();
+
+    SPAWNER.get_or_init(|| {
+        let (orders, queue) = channel::<(Command, Sender<std::io::Result<Child>>)>();
+        std::thread::spawn(move || {
+            for (mut command, answer) in queue {
+                let _ = answer.send(command.spawn());
+            }
+        });
+        orders
+    })
+}
+
+/// The `dsh web` a previous run left behind.
+///
+/// macOS has neither the job object below nor `PR_SET_PDEATHSIG`, so a
+/// force-killed app there leaves its `dsh web` running and that process goes on
+/// owning every session it had open — see [`tethered`] for what the user sees
+/// when it does. Nothing can be done at the moment of death, so it is done at
+/// the next launch instead, which is exactly when it starts to matter: the pid
+/// of each `dsh web` is written down beside the app's own state, and the next
+/// launch kills whatever is still answering to it.
+///
+/// [`Server::stop`] removes the record, so a file that is still there is itself
+/// the evidence that the app died without running any cleanup. Even then the
+/// pid is not signalled on trust. Pids are recycled, and by the next launch a
+/// stale one could belong to anything — so the process has to still look like a
+/// `dsh web`, and its parent has to be launchd, which is what a child left
+/// behind by a dead app is reparented to. A `dsh web` the user is running in a
+/// terminal is the one thing here that must not be killed, and it has the
+/// shell's pid as its parent, not 1.
+#[cfg(target_os = "macos")]
+mod leftover {
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+
+    /// Where the pid is written. Beside `desktop.json` and the update stamp,
+    /// which is where the rest of this app's small state lives.
+    fn record(app: &tauri::AppHandle) -> Option<PathBuf> {
+        Some(crate::dsh::app_dir(app)?.join("dsh-web.pid"))
+    }
+
+    /// Kill the `dsh web` of a run that never got to clean up after itself.
+    ///
+    /// Once per launch, and before the first spawn: a second call has nothing
+    /// left to read, and every later `dsh web` is one this run is holding.
+    pub fn sweep(app: &tauri::AppHandle) {
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        SWEPT.call_once(|| {
+            let Some(record) = record(app) else { return };
+            let read = std::fs::read_to_string(&record);
+            // Whatever it said has now been acted on, and a record that cannot
+            // be removed is one this would read again on every launch.
+            let _ = std::fs::remove_file(&record);
+
+            let Some(pid) = read.ok().and_then(|pid| pid.trim().parse::<i32>().ok()) else {
+                return;
+            };
+            if !orphaned_dsh(pid) {
+                return;
+            }
+
+            eprintln!("dsh-desktop: killing the dsh web the last run left behind (pid {pid})");
+            // Negative: `group_leader` made it the leader of its own group, so
+            // this takes the workers it spawned with it.
+            //
+            // SAFETY: a signal to a pid that has just been confirmed to be a
+            // `dsh web` whose parent is launchd.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        });
+    }
+
+    /// Whether this pid is still a `dsh web`, and an abandoned one.
+    ///
+    /// `ps` rather than `libproc`, because the answer needs the arguments and
+    /// not just the executable — every `dsh` is some `node`, and `node` on its
+    /// own says nothing about whose process this is.
+    fn orphaned_dsh(pid: i32) -> bool {
+        let Ok(listed) = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "ppid=,command="])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        let listed = listed.trim();
+        let Some((parent, command)) = listed.split_once(char::is_whitespace) else {
+            return false;
+        };
+        parent.trim() == "1" && command.contains("dsh") && command.contains(" web")
+    }
+
+    /// Write down the `dsh web` this run is starting.
+    pub fn remember(app: &tauri::AppHandle, pid: u32) -> Option<PathBuf> {
+        let record = record(app)?;
+
+        // The directory is the app's own, and on a first launch nothing has
+        // needed it yet.
+        if let Some(parent) = record.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::write(&record, pid.to_string()) {
+            eprintln!("dsh-desktop: could not record the dsh web pid: {error}");
+            return None;
+        }
+        Some(record)
     }
 }
 
