@@ -193,10 +193,20 @@ fn install(app: AppHandle, update: Update) {
                         ],
                         answered: Box::new(|app, id| {
                             if id == "now" {
-                                // Skips the ordinary shutdown path, so the dsh
-                                // process tree is left to the job object
-                                // backstop in `server`.
-                                app.restart();
+                                // `request_restart` rather than `restart`: this
+                                // answer is delivered on the main thread, and
+                                // `restart` called there skips `RunEvent::Exit`,
+                                // which is the one place `dsh web` is stopped
+                                // and its process tree waited on. What that
+                                // skipped shutdown left behind was the `dsh web`
+                                // from before the update, still holding the
+                                // `session.lock` of every session it had open,
+                                // beside the one the restarted app starts: two
+                                // servers, and one project whose sessions will
+                                // not resume. Asking the event loop for the exit
+                                // runs the shutdown there, and the restart
+                                // follows it.
+                                app.request_restart();
                             }
                         }),
                     },
