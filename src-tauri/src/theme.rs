@@ -46,7 +46,20 @@ const DARK_BG: Color = Color(0x10, 0x10, 0x14, 0xff);
 /// same colour the window is rather than a white one; after that the cover
 /// comes off and the band is dsh's own colour again.
 pub(crate) fn dark_css() -> String {
-    format!("#{:02x}{:02x}{:02x}", DARK_BG.0, DARK_BG.1, DARK_BG.2)
+    css(DARK_BG)
+}
+
+/// The light one, as CSS.
+///
+/// [`crate::auth`] covers dsh's refusal page with whichever of the two the
+/// window's own theme resolves to, so the one document the user is not meant
+/// to read is the colour of the gap it sits in rather than the UA's white.
+pub(crate) fn light_css() -> String {
+    css(LIGHT_BG)
+}
+
+fn css(colour: Color) -> String {
+    format!("#{:02x}{:02x}{:02x}", colour.0, colour.1, colour.2)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

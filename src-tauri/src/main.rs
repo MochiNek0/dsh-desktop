@@ -266,6 +266,11 @@ fn build_window(
         // every document loaded before it. See [`transport`], which is mostly an
         // explanation of why the failure is otherwise permanent.
         .initialization_script(transport::script())
+        // Over dsh's refusal, for the moment between it loading and `auth`
+        // getting the window past it. Document start is as early as there is,
+        // and the reason the exchange itself cannot run here is that the token
+        // is not in the refusal's address; see [`auth`].
+        .initialization_script(auth::shield())
         .on_page_load(move |webview, payload| {
             // The first page this window ever loads is the bundled loading page,
             // and this is the one place its address is stated by something that
