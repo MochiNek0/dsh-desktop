@@ -2,7 +2,7 @@
 
 # dsh desktop
 
-DeepSeek Harness (`dsh web`) 的跨平台 Tauri 桌面客户端
+DeepSeek Harness (`dsh web`) 的跨平台桌面客户端
 
 **[官方网站 · 下载](https://dsh-desktop.cc.cd/)** · [English](README.en.md) · **简体中文**
 
@@ -23,140 +23,60 @@ DeepSeek Harness (`dsh web`) 的跨平台 Tauri 桌面客户端
 
 <br/>
 
-> **非官方声明**：本项目为基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 开发的第三方桌面客户端，与 DeepSeek 官方无隶属或合作关系。仅供学习与便利使用，欢迎提交 [Issue](https://github.com/MochiNek0/dsh-desktop/issues) 或 Pull Request。
+> 非官方项目：基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的第三方桌面客户端，与 DeepSeek 官方无隶属关系。欢迎 [Issue](https://github.com/MochiNek0/dsh-desktop/issues) 与 PR。
 
----
-
-## 概述
-
-**dsh desktop**（DeepSeek Harness 桌面版）启动时会自动在后台拉起本地 `dsh web` 服务并内嵌至原生桌面窗口。无需手动打开终端或管理端口，会话记录、凭证与配置均与 CLI 全局共享（存储于 `$DSH_HOME`，默认 `~/.dsh`）。
+启动时自动在后台拉起本地 `dsh web` 并嵌入原生窗口，无需开终端、无需管理端口。会话、凭证与配置存放在 `$DSH_HOME`（默认 `~/.dsh`），与命令行里的 `dsh` 是同一份。
 
 ## 特性
 
-- **开箱即用**：自动检测机器上的 Node.js 并按需安装 `dsh`，全程无需管理员权限。
-- **无感共存**：`dsh web` 监听动态分配的回环端口，与终端里手动运行的实例互不干扰。
-- **轻量原生**：无边框窗口、窗口控件内嵌于页面；主题与界面语言跟随 dsh 自身设置（`$DSH_HOME/settings.yaml`），在 dsh 里切换语言或主题（含 `system` 跟随系统）都无需重启。支持托盘常驻与开机自启。
-- **智能通知**：回合结束、或 dsh 在等你确认（工具授权、计划评审、提问）时发出系统通知；通知知道自己说的是哪个会话，点它就回到那个会话，能一键回答的（允许 / 拒绝、批准 / 要改、二选一）直接在通知上答；窗口在前台时自动静默。靠随包发货的「会话信号」插件供给，首次启动自动装上，不联网；把它卸掉就不会再自动装回来，那之后菜单里的「通知」会变灰并说明原因。
-- **环境管理**：内置「运行环境」面板，可枚举机器上的所有 Node，在其间切换、就地安装或卸载 dsh、安装一份全新 Node，也可删除不再需要的 Node；并提供 dsh 版本检查与一键升级。
-- **插件管理**：可视化插件面板，无需终端即可一键安装/卸载插件；推荐位首条是 [DSH Market](#dsh-market) 插件市场。
-- **稳定守护**：单实例运行，应用退出时自动回收所有关联子进程；`dsh web` 意外退出时返回加载页并提供重启。
-- **插件坏了能自救**：插件是在 `dsh web` 绑定端口之前加载的，所以一个会崩的插件会让整个应用停在加载页——而卸插件的面板就在打不开的那个界面后面。此时加载页会多出一个「不加载插件启动」按钮：把你装的插件全部从 profile 的层列表上摘下来（dsh 自带的层不动），只用 dsh 本体启动一次，并直接打开插件面板让你把出问题的那个卸掉。摘掉的插件按原顺序记在应用自己的目录里，标题栏菜单里的「重新加载插件」把它们原样装回去。这个状态会一直持续到你主动退出——关掉应用再打开仍然不加载插件——所以标题栏上会常驻一个「插件未加载」标记，菜单那一行也带悬停说明。
+- **轻量**：Tauri v2 + 系统 WebView，不打包浏览器内核。安装包 Windows 2.3 MB，macOS 5.8 MB，Debian 3.8 MB。
+- **跨平台**：Windows / macOS / Linux 同一套体验。
+- **开箱即用**：自动检测 Node、按需安装 `dsh`、自动选用空闲回环端口，与终端里手动运行的实例互不干扰；全程无需管理员权限。
+- **一切皆插件**：桌面端不改 dsh 一行源码。桌面增强能力（如系统通知）均以随包插件形式供给，卸掉即回到纯净 dsh；内置可视化插件面板并首推 [DSH Market](https://dshmarket.com) 插件市场，安装与卸载插件均不必碰终端。
+- **安全模式（坏了能救回来）**：插件在 `dsh web` 绑定端口之前加载，一个会崩的插件会让应用停在加载页，而卸插件的面板恰好在打不开的界面后面。此时加载页会给出「不加载插件启动」：把你装的插件全部摘出层列表（dsh 自带的不动）启动一次，并直接打开面板让你卸掉出问题的那个，之后用菜单里的「重新加载插件」原样装回。
+- **原生集成**：主题与界面语言跟随 dsh 自身设置，切换无需重启；支持托盘常驻、开机自启；回合结束或 dsh 等待确认时发送系统通知，点击回到对应会话，允许/拒绝一类的选择可直接在通知上作答。
 
-## 安装与下载
+## 安装
 
-前往 **[官方网站 dsh-desktop.cc.cd](https://dsh-desktop.cc.cd/)** 或 [GitHub Releases 页面](https://github.com/MochiNek0/dsh-desktop/releases) 下载适用于您操作系统的最新安装包：
+从 **[官网](https://dsh-desktop.cc.cd/)** 或 [Releases](https://github.com/MochiNek0/dsh-desktop/releases) 下载对应系统的安装包，安装后打开即可。若机器上没有可用的 Node，应用会自动弹出「运行环境」面板，一键装一份 Node 24。
 
-| 操作系统 | 安装包格式 | 说明 |
-| :--- | :--- | :--- |
-| **Windows** | `.exe`（NSIS） | 需系统已安装 WebView2（如缺失将自动引导下载） **[已验证]** |
-| **macOS** | `.dmg` 镜像 | 通用二进制架构，原生支持 Apple Silicon 及 Intel 设备 **[暂未验证，欢迎反馈]** |
-| **Linux** | `.AppImage` / `.deb` | 推荐使用 `.AppImage` 以获得完整的自更新支持 **[Debian 系已验证]** |
-
-> **macOS 首次运行提示**
->
-> 若首次打开时遇到安全拦截提示，可在访达中右键点击应用选择「打开」，或在终端中执行以下命令解除隔离：
-> ```sh
-> xattr -dr com.apple.quarantine /Applications/dsh-desktop.app
-> ```
-
-## 菜单功能
-
-窗口标题栏的菜单提供以下入口（托盘菜单只有「显示窗口」与「退出 dsh」）：
-
-| 菜单项 | 说明 |
-| :--- | :--- |
-| **插件…** | 打开可视化插件面板 |
-| **打开终端** | 启动一个已配置好 `dsh` 环境变量的终端，不修改系统全局 PATH |
-| **重启 dsh** | 重启后台的 `dsh web` 进程 |
-| **重新加载插件** | 只在「不加载插件启动」之后出现：把插件装回层列表并重启 |
-| **更新 dsh…** | 检查并升级 `dsh` 本体 |
-| **运行环境…** | 管理 Node.js：查看、切换、安装或删除 |
-| **检查应用更新…** | 检查桌面端自身的新版本 |
-| **开机自启动** / **通知** | 开关项（「通知」靠「会话信号」插件供给，卸掉它就变灰；不加载插件启动时同样变灰） |
-| **退出 dsh** | 真正退出应用 |
-
-### 插件
-
-插件面板支持从预设列表一键安装，或手动输入 npm 包名 / GitHub 仓库地址（如 `github:owner/repo`）安装。
-
-> **提示**：安装 `github:` 形式的插件时，pnpm 出于安全考虑默认会拦截构建脚本。如遇报错，请根据面板提示打开插件目录，在 `$DSH_HOME/profiles/web/pnpm-workspace.yaml` 的 `allowBuilds` 字段中手动放行该插件。
-
-## 配置与环境变量
-
-应用支持通过环境变量自定义运行行为：
-
-| 环境变量 | 说明 | 默认值 |
-| :--- | :--- | :--- |
-| `DSH_BIN` | 指定 `dsh` 可执行文件的绝对路径（优先级最高，同时跳过 Node 版本检查） | 自动检索系统 PATH |
-| `DSH_HOME` | 指定 `dsh` 数据、凭证与配置的存储目录 | `~/.dsh` |
-
-## 开发与构建
-
-### 前置要求
-
-- **Rust**：稳定版工具链，1.82 或更高版本
-- **Node.js**：22 或更高版本（仅用于构建；CI 使用 Node 22）
-- **Linux 额外依赖**：
-  ```sh
-  sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
-    librsvg2-dev patchelf libxdo-dev libssl-dev build-essential
-  ```
-
-### 常用命令
-
-```sh
-# 安装依赖
-npm install
-
-# 启动开发模式（启用 DevTools）
-npm run dev
-
-# 构建正式发布包（输出至 src-tauri/target/release/bundle/）
-npm run build
-```
-
-平台专属的打包目标由 `tauri.linux.conf.json` / `tauri.macos.conf.json` 自动合并，无需额外参数。
-
-## 项目结构
-
-```text
-dsh-desktop/
-├── dist/index.html               # 前端加载等待与错误提示页面
-├── docs/                         # README 配图
-├── plugin/                       # dsh 客户端插件：把会话状态告诉桌面端，随安装包发货
-├── scripts/                      # 引导脚本（install-deps.ps1 / .sh）与构建辅助脚本
-├── src-tauri/
-│   ├── Cargo.toml                # Rust 依赖项与构建配置
-│   ├── tauri.conf.json           # 基础配置（Windows: NSIS）
-│   ├── tauri.{linux,macos}.conf.json  # 平台专属打包目标
-│   ├── installer-hooks.nsh       # NSIS 安装 / 卸载钩子
-│   ├── resources/                # 随包资源（preset-plugins.json 是插件面板的预设列表）
-│   └── src/                      # Rust 后端源码（窗口、进程托管、托盘、插件、运行环境、更新）
-├── updater-proxy/                # Cloudflare Worker：更新检查端点代理
-└── .github/workflows/            # release.yml：打 tag 后的多平台构建、签名与草稿发布；notify-site.yml：通知下载站
-```
+| 系统 | 格式 | 体积 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **Windows** | `.exe`（NSIS） | 2.3 MB | 需 WebView2，缺失时自动引导安装（已验证） |
+| **macOS** | `.dmg` | 5.8 MB | 通用二进制，支持 Apple Silicon 与 Intel（暂未验证，欢迎反馈） |
+| **Linux** | `.deb` / `.AppImage` | 3.8 MB / 78 MB | `.AppImage` 自带 WebKit 故体积较大，但自更新支持最完整（Debian 系已验证） |
 
 ## 注意事项
 
-- **Node.js 版本要求**：`dsh` 需要 Node.js **22.19.0** 或更高版本。若机器上没有满足要求的 Node，应用会在启动时弹出「运行环境」面板，可从中选择一个已有的 Node，或安装一份全新的 Node 24。
-- **首次启动联网**：安装包不内置 Node 与 `dsh`，首次启动时若未检测到本地环境，需联网拉取，请保持网络连通。
-- **关闭即最小化**：关闭窗口只会将应用收进托盘（避免中断进行中的任务），真正退出请使用菜单中的「退出 dsh」。
-- **自动更新**：启动时静默检查桌面端新版本，只在有更新时提示，下载前会先征求同意；也可从菜单手动检查。
+- **Node 版本**：`dsh` 需要 Node.js 22.19.0 或更高。安装包不内置 Node 与 `dsh`，首次启动缺失时需联网拉取。
+- **关闭即最小化**：关窗口只收进托盘以免中断任务，退出请用菜单里的「退出 dsh」。
+- **自动更新**：启动时静默检查，有更新才提示，下载前先征求同意。
+- **macOS 首次运行被拦截**：在访达中右键点按应用选择「打开」，或执行 `xattr -dr com.apple.quarantine /Applications/dsh-desktop.app`。
+- **安装 `github:` 形式的插件**：pnpm 默认拦截 git 来源的构建脚本，如报错请按面板提示在 `$DSH_HOME/profiles/web/pnpm-workspace.yaml` 的 `allowBuilds` 中放行。
 
-## 友情链接
+## 配置
 
-### DSH Market
+| 环境变量 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| `DSH_BIN` | `dsh` 可执行文件的绝对路径，优先级最高，同时跳过 Node 版本检查 | 自动检索 PATH |
+| `DSH_HOME` | `dsh` 数据、凭证与配置目录 | `~/.dsh` |
 
-[dsh-market](https://github.com/dsh-market/dsh-market)——dsh 里的可视化插件市场：社区插件在这里浏览、搜索、一键安装。装完重启 `dsh web`，在「设置 → 插件市场」里打开。[dshmarket.com](https://dshmarket.com)
+## 开发
+
+需要 Rust 稳定版 1.82+ 与 Node.js 22+。Linux 另需 `libwebkit2gtk-4.1-dev`、`libayatana-appindicator3-dev`、`librsvg2-dev`、`patchelf`、`libxdo-dev`、`libssl-dev`、`build-essential`。
+
+```sh
+npm install     # 安装依赖
+npm run dev     # 开发模式
+npm run build   # 构建发布包，输出至 src-tauri/target/release/bundle/
+```
 
 ## 相关链接
 
 - **官方网站**：[中文](https://dsh-desktop.cc.cd/) · [English](https://dsh-desktop.cc.cd/en/)
-- **GitHub**：[仓库](https://github.com/MochiNek0/dsh-desktop) · [版本下载](https://github.com/MochiNek0/dsh-desktop/releases) · [问题反馈](https://github.com/MochiNek0/dsh-desktop/issues)
 - **上游项目**：[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
-
-<sub>关键词：dsh desktop、DeepSeek Harness 桌面版、dsh web 客户端、DeepSeek 桌面客户端、Tauri、Windows / macOS / Linux AI 编程助手 GUI。</sub>
+- **友情链接**：[DSH Market](https://github.com/dsh-market/dsh-market) —— dsh 里的可视化插件市场，浏览、搜索并一键安装社区插件（[dshmarket.com](https://dshmarket.com)）
 
 ## 许可证
 
-本项目基于 [MIT 许可证](LICENSE) 开源。
+[MIT](LICENSE)

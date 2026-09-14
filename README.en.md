@@ -2,7 +2,7 @@
 
 # dsh desktop
 
-A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
+A cross-platform desktop client for DeepSeek Harness (`dsh web`)
 
 **[Official Website · Download](https://dsh-desktop.cc.cd/en/)** · **English** · [简体中文](README.md)
 
@@ -23,140 +23,60 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 
 <br/>
 
-> **Disclaimer**: This is a third-party desktop client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It is not affiliated with, sponsored, or endorsed by DeepSeek. It is intended for convenience and personal use — please feel free to open an [Issue](https://github.com/MochiNek0/dsh-desktop/issues) or submit a Pull Request.
+> Unofficial: a third-party desktop client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), not affiliated with DeepSeek. [Issues](https://github.com/MochiNek0/dsh-desktop/issues) and PRs welcome.
 
----
-
-## Overview
-
-**dsh desktop** (the DeepSeek Harness desktop app) automatically starts the local `dsh web` service in the background and embeds it into a native window upon launch. There is no need to manually manage terminal sessions or port allocations. Sessions, credentials, and configurations are shared seamlessly with the CLI (`$DSH_HOME`, default `~/.dsh`).
+Starts the local `dsh web` in the background on launch and embeds it in a native window — no terminal, no port juggling. Sessions, credentials and config live in `$DSH_HOME` (default `~/.dsh`), the same ones your command-line `dsh` uses.
 
 ## Features
 
-- **Out of the Box**: Detects the Node.js installations on your machine and installs `dsh` where needed — no administrator privileges required.
-- **Port Conflict-Free**: `dsh web` listens on an auto-assigned loopback port, coexisting seamlessly with manual instances started from a terminal.
-- **Native Experience**: Frameless window with the controls drawn inside the page; theme and interface language follow the settings dsh itself keeps in `$DSH_HOME/settings.yaml`, and switching either inside dsh takes effect without a restart — `system` included, which then follows the desktop. Tray-resident, with optional start at login.
-- **Smart Notifications**: A native notification when a turn finishes, or when dsh is waiting on you (a tool approval, a plan review, a question). It knows which session it is about, so clicking it returns to that one; what a single press can answer — allow/refuse, approve/revise, a two-way choice — is answered on the notification itself. Suppressed while the window is in front. Fed by the Session signals plugin, which ships inside the app and goes in by itself on the first launch, with nothing downloaded. Remove it and it stays removed; the **Notifications** menu item is then dimmed and says so.
-- **Runtime Management**: A built-in **Runtime** panel enumerates every Node on the machine and lets you switch between them, install or uninstall dsh in one, install a fresh Node, or delete a Node you no longer need. Also handles dsh version checks and one-click upgrades.
-- **Plugin Management**: Built-in visual panel to install and remove dsh plugins without a terminal; [DSH Market](#dsh-market) sits first in the recommended list.
-- **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit. Returns to the loading page and offers a restart if `dsh web` crashes unexpectedly.
-- **A Way Back from a Broken Plugin**: Plugins load before `dsh web` binds its port, so one that throws leaves the whole app on the loading page — with the panel that removes a plugin behind the very window that will not open. The loading page then offers **Start without plugins**: every plugin you installed comes off the profile's layer stack (dsh's own bundles stay), dsh starts on those alone, and the plugin panel opens on top so you can take the offender out. What came off is recorded in order under the app's own directory, and **Load plugins again** in the titlebar menu puts it all back exactly as it was. The state lasts until you end it — quitting and reopening comes back into it — so the titlebar carries a standing **No plugins loaded** marker while it does, and the menu row explains itself on hover.
+- **Light**: Tauri v2 on the system WebView, with no bundled browser engine. Installers are 2.3 MB on Windows, 5.8 MB on macOS, 3.8 MB on Debian.
+- **Cross-platform**: the same experience on Windows, macOS and Linux.
+- **Works out of the box**: detects Node, installs `dsh` where needed, and picks a free loopback port so it never collides with an instance you started by hand. No administrator rights at any point.
+- **Everything is a plugin**: Not a single line of dsh source code is modified. Desktop enhancements (like system notifications) are provided as bundled plugins — remove them and dsh returns to a completely pristine state. Features a built-in visual plugin panel highlighting the [DSH Market](https://dshmarket.com) marketplace, requiring no terminal usage.
+- **Safe Mode (recover from broken plugins)**: Plugins load before `dsh web` binds its port, so a crashing plugin leaves the app stuck on the loading page — with the removal panel trapped behind the window that won't open. The loading page provides **Start without plugins**: all user plugins are temporarily unmounted from the layer stack (dsh's built-in layers remain untouched) for a clean launch, opening the panel directly so you can uninstall the culprit, then restore the rest via **Load plugins again** in the menu.
+- **Native integration**: theme and interface language follow dsh's own settings and switch without a restart; tray-resident with optional start at login; a system notification when a turn ends or dsh needs you, which returns to that session on click and takes allow/refuse style answers on the notification itself.
 
 ## Installation
 
-Download the latest release package for your operating system from the **[official website dsh-desktop.cc.cd](https://dsh-desktop.cc.cd/en/)** or the [GitHub Releases page](https://github.com/MochiNek0/dsh-desktop/releases):
+Download the package for your system from the **[website](https://dsh-desktop.cc.cd/en/)** or [Releases](https://github.com/MochiNek0/dsh-desktop/releases), install, and open it. If no usable Node is found, the Runtime panel opens by itself and installs Node 24 in one click.
 
-| Operating System | Package Format | Details |
-| :--- | :--- | :--- |
-| **Windows** | `.exe` (NSIS) | Requires WebView2 (automatically prompted/downloaded if missing) **[Verified]** |
-| **macOS** | `.dmg` image | Universal binary supporting both Apple Silicon and Intel **[Unverified, feedback welcome]** |
-| **Linux** | `.AppImage` / `.deb` | `.AppImage` is recommended for built-in self-updater support **[Verified on Debian]** |
-
-> **macOS First-Launch Note**
->
-> If blocked by macOS Gatekeeper on first launch, right-click the app in Finder and select "Open", or run the following command in terminal:
-> ```sh
-> xattr -dr com.apple.quarantine /Applications/dsh-desktop.app
-> ```
-
-## Menu
-
-The titlebar menu offers the following (the tray menu has only **Show window** and **Quit dsh**):
-
-| Item | Description |
-| :--- | :--- |
-| **Plugins…** | Open the visual plugin panel |
-| **Open a terminal** | A shell pre-configured with `dsh` and its environment, without modifying your global system PATH |
-| **Restart dsh** | Restart the background `dsh web` process |
-| **Load plugins again** | Only after **Start without plugins**: puts them back on the layer stack and restarts |
-| **Update dsh…** | Check for and install a newer `dsh` |
-| **Runtime…** | Manage Node.js: list, switch, install, or remove |
-| **Check for app updates…** | Check for a newer version of the desktop app itself |
-| **Start at login** / **Notifications** | Toggles (**Notifications** is fed by the Session signals plugin, and is dimmed if you remove it — or if this launch started without plugins) |
-| **Quit dsh** | Quit the app for real |
-
-### Plugins
-
-The plugin panel installs from a preset list, or from any valid npm package name / GitHub repository (e.g., `github:owner/repo`).
-
-> **Note on `github:` plugins**: pnpm blocks build scripts from git repositories by default for security. If the installation fails, the panel will show the pnpm output. You will need to open the plugin folder and manually add the package to `allowBuilds` in `$DSH_HOME/profiles/web/pnpm-workspace.yaml`.
-
-## Configuration & Environment Variables
-
-The application behavior can be customized via environment variables:
-
-| Variable | Description | Default |
-| :--- | :--- | :--- |
-| `DSH_BIN` | Absolute path to the `dsh` executable (highest priority; also skips the Node version check) | Auto-detected from `PATH` |
-| `DSH_HOME` | Directory for storing `dsh` data, credentials, and configs | `~/.dsh` |
-
-## Development & Build
-
-### Prerequisites
-
-- **Rust**: Stable toolchain, 1.82 or newer
-- **Node.js**: 22 or newer (build only; CI uses Node 22)
-- **Additional Linux dependencies**:
-  ```sh
-  sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
-    librsvg2-dev patchelf libxdo-dev libssl-dev build-essential
-  ```
-
-### Commands
-
-```sh
-# Install dependencies
-npm install
-
-# Start in development mode (with DevTools)
-npm run dev
-
-# Build production installer (output to src-tauri/target/release/bundle/)
-npm run build
-```
-
-Platform-specific bundle targets are merged in automatically from `tauri.linux.conf.json` / `tauri.macos.conf.json` — no extra flags needed.
-
-## Project Structure
-
-```text
-dsh-desktop/
-├── dist/index.html               # Frontend loading and error feedback page
-├── docs/                         # README images
-├── plugin/                       # dsh client plugin: reports session state to the shell, ships with the installer
-├── scripts/                      # Bootstrap scripts (install-deps.ps1 / .sh) and build helpers
-├── src-tauri/
-│   ├── Cargo.toml                # Rust dependencies and build configuration
-│   ├── tauri.conf.json           # Base configuration (Windows: NSIS)
-│   ├── tauri.{linux,macos}.conf.json  # Platform-specific bundle targets
-│   ├── installer-hooks.nsh       # NSIS install / uninstall hooks
-│   ├── resources/                # Bundled resources (preset-plugins.json is the panel's preset list)
-│   └── src/                      # Rust core (window, process supervisor, tray, plugins, runtime, updater)
-├── updater-proxy/                # Cloudflare Worker proxying the update endpoint
-└── .github/workflows/            # release.yml (tag-triggered build, signing, draft release) and notify-site.yml
-```
+| OS | Format | Size | Details |
+| :--- | :--- | :--- | :--- |
+| **Windows** | `.exe` (NSIS) | 2.3 MB | Needs WebView2; downloaded automatically if missing (verified) |
+| **macOS** | `.dmg` | 5.8 MB | Universal binary for Apple Silicon and Intel (unverified, feedback welcome) |
+| **Linux** | `.deb` / `.AppImage` | 3.8 MB / 78 MB | `.AppImage` carries its own WebKit, hence the size, but has the most complete self-updater support (verified on Debian) |
 
 ## Notes
 
-- **Node.js Requirement**: `dsh` needs Node.js **22.19.0** or newer. If no suitable Node is found, the app opens the **Runtime** panel on launch so you can pick an existing one or install a fresh Node 24.
-- **Network on First Launch**: Neither Node nor `dsh` is bundled in the installer, so the first launch needs an internet connection if the local components are missing.
-- **Closing Parks in the Tray**: Closing the window leaves the app running in the tray (so an in-flight task is not torn down). Use **Quit dsh** in the menu to exit for real.
-- **Auto Update**: The app checks for a new version silently on launch and speaks up only when there is one; nothing is downloaded without asking. A manual check lives in the menu.
+- **Node version**: `dsh` needs Node.js 22.19.0 or newer. Neither Node nor `dsh` is bundled, so the first launch needs a connection if they are missing.
+- **Closing parks in the tray**: closing the window keeps an in-flight task alive. Use **Quit dsh** in the menu to exit for real.
+- **Auto update**: checked silently on launch, raised only when there is one, downloaded only with your consent.
+- **Blocked by Gatekeeper on macOS**: right-click the app in Finder and choose "Open", or run `xattr -dr com.apple.quarantine /Applications/dsh-desktop.app`.
+- **Installing `github:` plugins**: pnpm blocks build scripts from git sources by default. If it fails, allow the package under `allowBuilds` in `$DSH_HOME/profiles/web/pnpm-workspace.yaml` as the panel describes.
 
-## Friends
+## Configuration
 
-### DSH Market
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `DSH_BIN` | Absolute path to the `dsh` executable; highest priority, and skips the Node version check | Auto-detected from `PATH` |
+| `DSH_HOME` | Directory for `dsh` data, credentials and config | `~/.dsh` |
 
-[dsh-market](https://github.com/dsh-market/dsh-market) — the visual plugin market inside dsh: browse, search and install community plugins in one click. Install it, restart `dsh web`, then open **Settings → Plugin Market**. [dshmarket.com](https://dshmarket.com)
+## Development
+
+Requires Rust stable 1.82+ and Node.js 22+. Linux additionally needs `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `patchelf`, `libxdo-dev`, `libssl-dev` and `build-essential`.
+
+```sh
+npm install     # install dependencies
+npm run dev     # development mode
+npm run build   # production bundle, written to src-tauri/target/release/bundle/
+```
 
 ## Links
 
-- **Official Website**: [English](https://dsh-desktop.cc.cd/en/) · [中文](https://dsh-desktop.cc.cd/)
-- **GitHub**: [Repository](https://github.com/MochiNek0/dsh-desktop) · [Releases](https://github.com/MochiNek0/dsh-desktop/releases) · [Issues](https://github.com/MochiNek0/dsh-desktop/issues)
-- **Upstream project**: [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
-
-<sub>Keywords: dsh desktop, DeepSeek Harness desktop app, dsh web GUI client, DeepSeek desktop client, Tauri, AI coding agent GUI for Windows / macOS / Linux.</sub>
+- **Website**: [English](https://dsh-desktop.cc.cd/en/) · [中文](https://dsh-desktop.cc.cd/)
+- **Upstream**: [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+- **Friends**: [DSH Market](https://github.com/dsh-market/dsh-market) — the visual plugin market inside dsh; browse, search and install community plugins in one click ([dshmarket.com](https://dshmarket.com))
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+[MIT](LICENSE)
