@@ -416,6 +416,12 @@ fn switch_language(app: &tauri::AppHandle, tag: &str) {
     }
 
     controls::relabel(app);
+    // `relabel` carries the menu's own labels and nothing else, and safe mode
+    // puts two strings on screen that are not labels: the titlebar's standing
+    // one and the hint on the row. Both would keep the language the window was
+    // built in — which, on a page that never loads again, is the rest of the
+    // run.
+    controls::sync_safe(app);
     // Not only what is on screen. An initialization script is composed once,
     // when the window is built, so without these two the plugin panel and the
     // runtime chooser would stay in the language the app started in for the
