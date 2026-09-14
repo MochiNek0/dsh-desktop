@@ -8,6 +8,7 @@ mod i18n;
 
 mod auth;
 mod controls;
+mod cookies;
 mod dialog;
 mod dsh;
 mod notify;
@@ -1128,6 +1129,9 @@ fn attempt(
             // pointed at a server that is back, and reloading it would throw
             // away the very thing staying put is for.
             if !same {
+                // Before the navigation rather than after it: the header this
+                // clears is on that request. See [`cookies::purge`].
+                cookies::purge(window, &url);
                 session.auth.arm(&url);
 
                 let window = window.clone();
@@ -1591,6 +1595,9 @@ fn serve(
                 *origin.write().unwrap() = Some(url.origin().ascii_serialization());
                 splash.status(window, t!("正在打开界面…", "Opening the interface…"));
 
+                // Before the navigation rather than after it: the header this
+                // clears is on that request. See [`cookies::purge`].
+                cookies::purge(window, &url);
                 auth.arm(&url);
 
                 let handle = window.app_handle().clone();
