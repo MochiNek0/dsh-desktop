@@ -189,6 +189,49 @@ jobs:
             file \
             wget
 
+      # tauri-bundler builds the AppImage with a linuxdeploy it downloads from
+      # `tauri-apps/binary-releases` — a copy pinned on 2024-07-29. linuxdeploy
+      # compiles the AppImage excludelist, the list of libraries too tied to the
+      # host to bundle, into its binary at *build* time, and
+      # `libwayland-client.so.0` was added to that list on 2024-11-03, three
+      # months after the pinned copy was built:
+      #
+      #   https://github.com/AppImageCommunity/pkg2appimage/pull/559
+      #   https://gitlab.freedesktop.org/mesa/mesa/-/issues/11316
+      #
+      # So the pinned copy bundles Ubuntu 22.04's libwayland-client, a current
+      # Mesa on the host refuses to talk to it, and the AppImage dies before it
+      # draws anything with
+      #
+      #   Could not create default EGL display: EGL_BAD_PARAMETER. Aborting...
+      #
+      # which is what issue #7 reported from Arch. A current upstream build has
+      # the entry. The bundler only downloads what is not already in its cache,
+      # so putting one there first is the whole fix — there is no config for it.
+      #
+      # Remove this once tauri-apps/binary-releases carries a copy built after
+      # 2024-11-03; the check after the bundle is what will notice.
+      - name: give tauri a linuxdeploy that knows about libwayland-client
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          tools="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"
+          mkdir -p "$tools"
+          upstream=https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous
+          wget -q -O "$tools/linuxdeploy-x86_64.AppImage" "$upstream/linuxdeploy-x86_64.AppImage"
+          chmod +x "$tools/linuxdeploy-x86_64.AppImage"
+
+          # Proof rather than hope: the excludelist is inside the compressed
+          # payload, so it has to be unpacked to be read. An upstream build that
+          # somehow lacks the entry would produce the same broken AppImage
+          # silently, and this is the only place that can still say so.
+          cd "$tools"
+          ./linuxdeploy-x86_64.AppImage --appimage-extract >/dev/null
+          if ! grep -q libwayland-client.so.0 squashfs-root/usr/bin/linuxdeploy; then
+            echo "this linuxdeploy does not exclude libwayland-client.so.0"
+            exit 1
+          fi
+          rm -rf squashfs-root
+
       - run: npm ci
 
       - name: run cargo test
@@ -207,3 +250,28 @@ jobs:
           # entry for every platform rather than whichever job finished last.
           includeUpdaterJson: true
           args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      # The step above has already uploaded by the time this runs, which is why
+      # the release is a draft: a failure here is a red run beside an unpublished
+      # release rather than a broken AppImage on everyone's updater.
+      #
+      # Checked on the artefact rather than on the tool, because this is the
+      # thing users actually download, and it stays honest whatever the bundler
+      # does next — including on the day the pinned copy is new enough and the
+      # step that seeds one gets deleted.
+      - name: check the AppImage bundles no host-tied libraries
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          appimage=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' -print -quit)
+          [ -n "$appimage" ] || { echo "no AppImage was built"; exit 1; }
+
+          "$appimage" --appimage-extract >/dev/null
+          found=$(find squashfs-root -name 'libwayland-client.so.0*')
+          rm -rf squashfs-root
+
+          if [ -n "$found" ]; then
+            echo "$appimage bundles libwayland-client, which a current Mesa will"
+            echo "refuse to talk to — see issue #7:"
+            echo "$found"
+            exit 1
+          fi
