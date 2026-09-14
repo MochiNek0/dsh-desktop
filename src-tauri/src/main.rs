@@ -285,12 +285,14 @@ fn build_window(
                 splash.flush(&webview);
                 // The chrome was just drawn by a fresh document that has no way
                 // of knowing whether the window is maximised, the login item is
-                // on, or notifications are — nothing resized to tell it, and
-                // nothing was toggled. Every navigation lands here, so every
-                // navigation gets all three.
+                // on, notifications are, or this launch is running on no
+                // plugins — nothing resized to tell it, and nothing was
+                // toggled. Every navigation lands here, so every navigation
+                // gets all four.
                 controls::sync(&webview);
                 controls::sync_autostart(webview.app_handle());
                 controls::sync_notify(webview.app_handle());
+                controls::sync_safe(webview.app_handle());
                 // Last, and only where the page that just loaded is dsh
                 // refusing to serve one: it replaces the page.
                 auth.recover(&webview);
@@ -857,9 +859,30 @@ fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Sessi
     // later, which is a message nobody can read.
     let cleared = plugins::audit(app);
 
+    // And again on every start for as long as safe mode lasts, rather than only
+    // on the way into it: dsh reconciles the layer stack after any plugin change
+    // pnpm completes, which puts back every plugin the user did not remove. See
+    // [`plugins::engage_safe`].
+    let safe = plugins::safe(app);
+    if safe {
+        if let Err(why) = plugins::engage_safe(app) {
+            eprintln!("dsh-desktop: could not keep the plugins off the layer stack: {why}");
+        }
+    }
+
     session.splash.status(
         window,
-        &if cleared.is_empty() {
+        &if safe {
+            // Ahead of the repair line below, and not joined to it: a launch
+            // with no plugins on it is the larger fact about this start, and
+            // residue cleared out of a stack nothing is being loaded off is not
+            // news until the plugins come back.
+            t!(
+                "正在启动 dsh：插件都不加载。",
+                "Starting dsh with no plugins loaded."
+            )
+            .to_string()
+        } else if cleared.is_empty() {
             t!("正在启动 dsh…", "Starting dsh…").to_string()
         } else {
             t!(
@@ -1163,7 +1186,7 @@ fn give_up(window: &WebviewWindow, session: &Session, output: &str) {
     });
 
     // Queued by `rearm` until the loading page above has loaded.
-    session.splash.fail_retry(
+    session.splash.failed(
         window,
         t!("dsh 已退出", "dsh exited"),
         &if output.is_empty() {
@@ -1181,6 +1204,11 @@ fn give_up(window: &WebviewWindow, session: &Session, output: &str) {
                 output
             )
         },
+        true,
+        // A dsh that served and then kept dying is a weaker case against the
+        // plugins than one that never served at all — but it is still a case,
+        // and a plugin is one of the few things here the user can act on.
+        plugins::rescuable(window.app_handle()),
     );
 }
 
@@ -1194,7 +1222,10 @@ fn give_up(window: &WebviewWindow, session: &Session, output: &str) {
 /// only one of ours with a status line a start reports onto. Both are harmless
 /// from the retry button: `stop_server` on nothing is a no-op, and the loading
 /// page is already where it is.
-fn restart_dsh(app: &tauri::AppHandle) {
+///
+/// `into_plugins` opens the panel on the far side of the start; see
+/// [`safe_start`], which is the one caller that wants it.
+fn restart_dsh(app: &tauri::AppHandle, into_plugins: bool) {
     if BUSY.swap(true, Ordering::SeqCst) {
         dsh::note(
             app,
@@ -1242,7 +1273,58 @@ fn restart_dsh(app: &tauri::AppHandle) {
         }
 
         start_serving(&app, &window, &session);
+
+        // Only once dsh is actually serving. A safe start that failed anyway is
+        // a start whose plugins were never the problem, and the error on the
+        // loading page is the thing the user needs to read — drawing the panel
+        // over it would hide the one answer this start produced.
+        if into_plugins && session.origin.read().unwrap().is_some() {
+            show_plugins(&app, &session, false);
+        }
     });
+}
+
+/// Start dsh again with every installed plugin off the profile's layer stack,
+/// and open the panel that can take one out.
+///
+/// The loading page's other button, and the way out of the failure a plugin
+/// causes: `dsh web` composes that stack before it binds a port, so a bundle
+/// that throws on the way up is an app with no page to open the plugin list
+/// from. See [`plugins::engage_safe`] for what is moved and how it comes back.
+fn safe_start(app: &tauri::AppHandle) {
+    match plugins::engage_safe(app) {
+        Ok(_) => restart_dsh(app, true),
+        Err(why) => dsh::note(
+            app,
+            t!("没能停用插件", "Could not set the plugins aside"),
+            &t!(
+                "profile 的插件列表改不动，所以没有启动：{}",
+                "The profile's plugin list could not be changed, so nothing was started: {}",
+                why
+            ),
+        ),
+    }
+}
+
+/// Put the plugins back on the stack and restart into them. The menu item that
+/// only exists while [`safe_start`] is in effect.
+fn safe_off(app: &tauri::AppHandle) {
+    match plugins::release_safe(app) {
+        Ok(_) => restart_dsh(app, false),
+        // Said rather than swallowed, and safe mode stays on: the record of
+        // what to put back is only deleted once the stack has been written, so
+        // the next launch — and the next click on this item — still has it.
+        Err(why) => dsh::note(
+            app,
+            t!("没能装回插件", "Could not load the plugins again"),
+            &t!(
+                "profile 的插件列表改不动，插件仍然没有加载：{}",
+                "The profile's plugin list could not be changed, so the plugins are still not \
+                 loaded: {}",
+                why
+            ),
+        ),
+    }
 }
 
 /// Open the plugin panel, from the menu.
@@ -1520,7 +1602,11 @@ fn serve(
                 return true;
             }
             Ok(server::Event::Failed(output)) => {
-                splash.fail(
+                // The failure a plugin most often causes: dsh composes the
+                // profile's layer stack before it binds a port, so a bundle
+                // that throws is an exit with no URL ever printed — this branch
+                // exactly.
+                splash.failed(
                     window,
                     t!("dsh 已退出", "dsh exited"),
                     &if output.is_empty() {
@@ -1536,6 +1622,8 @@ fn serve(
                             output
                         )
                     },
+                    false,
+                    plugins::rescuable(window.app_handle()),
                 );
                 return false;
             }
@@ -1626,22 +1714,34 @@ impl Splash {
 
     /// Replace the spinner with an error the user can read and copy.
     fn fail(&self, window: &WebviewWindow, title: &str, detail: &str) {
-        self.failed(window, title, detail, false);
+        self.failed(window, title, detail, false, false);
     }
 
-    /// The same, for the one failure the user can do something about from here:
-    /// a dsh that was serving and stopped. The page draws a button that starts
-    /// it again.
-    fn fail_retry(&self, window: &WebviewWindow, title: &str, detail: &str) {
-        self.failed(window, title, detail, true);
-    }
-
-    fn failed(&self, window: &WebviewWindow, title: &str, detail: &str, retry: bool) {
+    /// The same, with the buttons the user can do something with from here.
+    ///
+    /// `retry` draws the button that starts dsh again; `rescue` the one that
+    /// starts it with the installed plugins off the layer stack. The second is
+    /// only offered where a plugin is a candidate for the cause — a dsh that
+    /// would not come up — and only where there is a plugin to set aside; see
+    /// [`plugins::rescuable`].
+    fn failed(
+        &self,
+        window: &WebviewWindow,
+        title: &str,
+        detail: &str,
+        retry: bool,
+        rescue: bool,
+    ) {
         eprintln!("dsh-desktop: {title}: {detail}");
         self.call(
             window,
             "dshError",
-            &[title, detail, if retry { "retry" } else { "" }],
+            &[
+                title,
+                detail,
+                if retry { "retry" } else { "" },
+                if rescue { "rescue" } else { "" },
+            ],
         );
 
         // A login-item launch leaves the window hidden in the tray, where an

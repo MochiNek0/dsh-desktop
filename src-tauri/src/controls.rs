@@ -139,6 +139,13 @@ pub enum Action {
     Terminal,
     /// Start `dsh web` again after it exited on its own.
     RestartDsh,
+    /// Start it with every installed plugin off the profile's layer stack. The
+    /// loading page's second button, offered on a dsh that would not come up;
+    /// see [`crate::plugins::engage_safe`].
+    SafeStart,
+    /// Put them back and restart into them. The menu row that exists only while
+    /// [`Action::SafeStart`] is in effect.
+    SafeOff,
     /// A notification the page raised; see [`crate::notify`].
     Notify(crate::notify::Notice),
     /// A session transition the client plugin reported; see [`crate::signal`].
@@ -190,6 +197,8 @@ pub fn action(url: &Url) -> Option<Action> {
         "runtime" => Some(Action::Runtime),
         "terminal" => Some(Action::Terminal),
         "restart-dsh" => Some(Action::RestartDsh),
+        "safe-start" => Some(Action::SafeStart),
+        "safe-off" => Some(Action::SafeOff),
         // Not a request for anything: the page saying what it has already
         // done, so the chrome around it can catch up. See [`relabel`].
         "locale" => url
@@ -294,7 +303,9 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::SetupClose => return crate::setup::answered(crate::setup::Choice::Close),
         Action::SetupQuit => return crate::setup::answered(crate::setup::Choice::Quit),
         Action::Runtime => return crate::open_runtime(app),
-        Action::RestartDsh => return crate::restart_dsh(app),
+        Action::RestartDsh => return crate::restart_dsh(app, false),
+        Action::SafeStart => return crate::safe_start(app),
+        Action::SafeOff => return crate::safe_off(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),
         Action::Signal(signal) => return crate::signal::act(app, signal),
         Action::Answered(url) => return crate::dialog::answered(app, &url),
@@ -381,15 +392,37 @@ pub fn sync_autostart(app: &AppHandle) {
 /// Every page load is enough to keep it current: installing or removing a
 /// plugin restarts dsh and reloads the document, which lands here.
 pub fn sync_notify(app: &AppHandle) {
+    // Two ways for the row to be unavailable, and they want different
+    // sentences. Without the plugin the fix is to install it; on a safe launch
+    // it is installed and deliberately not loaded, and telling that user to go
+    // and install it would send them looking for something already on the list.
     let call = notify_call(
         crate::settings::notifications(app),
         crate::plugins::signalling(app),
-        t!(
-            "需要「会话信号」插件，在菜单的「插件」里安装。",
-            "Needs the Session signals plugin — install it from Plugins in this menu."
-        ),
+        if crate::plugins::safe(app) {
+            t!(
+                "这次启动没有加载任何插件，「会话信号」也在内。用上面的「重新加载插件」装回来。",
+                "This launch loaded no plugins, Session signals included. Use “Load plugins again” above to bring them back."
+            )
+        } else {
+            t!(
+                "需要「会话信号」插件，在菜单的「插件」里安装。",
+                "Needs the Session signals plugin — install it from Plugins in this menu."
+            )
+        },
     );
     eval(app, &call);
+}
+
+/// Show the row that leaves safe mode, or hide it. Pushed on every page load
+/// beside the two above, and for the same reason: a fresh document has no way
+/// of knowing which kind of launch it is part of.
+pub fn sync_safe(app: &AppHandle) {
+    let on = crate::plugins::safe(app);
+    eval(
+        app,
+        &format!("window.__dshSafeMode && window.__dshSafeMode({on})"),
+    );
 }
 
 /// The call [`sync_notify`] makes, as a string so both halves of it can be
@@ -444,6 +477,10 @@ fn labels() -> String {
         ("plugins", t!("插件…", "Plugins…")),
         ("terminal", t!("打开终端", "Open a terminal")),
         ("restart-dsh", t!("重启 dsh", "Restart dsh")),
+        // Plain words rather than "safe mode": the row exists for a user whose
+        // app would not start, and what they need to read off it is what
+        // clicking it does.
+        ("safe-off", t!("重新加载插件", "Load plugins again")),
         ("update-dsh", t!("更新 dsh…", "Update dsh…")),
         ("runtime", t!("运行环境…", "Runtime…")),
         (
@@ -613,6 +650,8 @@ pub fn script() -> String {
     {{ verb: 'terminal' }},
     {{ separator: true }},
     {{ verb: 'restart-dsh' }},
+    // Hidden until there is something to undo. See `__dshSafeMode`.
+    {{ verb: 'safe-off', hidden: true }},
     {{ verb: 'update-dsh' }},
     // One item for the whole of which Node and which dsh, rather than one per
     // verb: the panel behind it can switch, install and uninstall, and this
@@ -789,6 +828,13 @@ pub fn script() -> String {
       'display:flex;align-items:center;gap:10px;width:100%;height:30px;' +
       'padding:0 10px;border-radius:7px;cursor:pointer;white-space:nowrap;' +
       'color:var(--dsh-wc-fg-hi);font:13px/1 {FONT}}}' +
+      // The row above sets `display`, and an author rule outranks the UA's
+      // `[hidden]{{display:none}}` however the attribute is spelled — `all:unset`
+      // would have taken that rule out even without the `display:flex`. So the
+      // one row that comes and goes needs its own way to go; see
+      // `__dshSafeMode`. More specific than the rule it is correcting, which is
+      // what lets it win without `!important`.
+      '.dsh-wc-pop button[hidden]{{display:none}}' +
       '.dsh-wc-pop button:hover{{background:var(--dsh-wc-hover)}}' +
       '.dsh-wc-pop hr{{border:0;height:1px;margin:5px 8px;' +
       'background:var(--dsh-wc-line)}}' +
@@ -884,6 +930,8 @@ pub fn script() -> String {
     // Kept for the same reason `checks` is: something out here changes them
     // after they are drawn. See `__dshRelabel`.
     var spans = {{}};
+    // And the rows themselves, for the one that comes and goes.
+    var entries = {{}};
 
     ITEMS.forEach(function (item) {{
       if (item.separator) {{
@@ -893,6 +941,8 @@ pub fn script() -> String {
 
       var entry = document.createElement('button');
       entry.type = 'button';
+      entries[item.verb] = entry;
+      if (item.hidden) entry.hidden = true;
       var label = document.createElement('span');
       label.textContent = LABELS[item.verb];
       spans[item.verb] = label;
@@ -975,6 +1025,13 @@ pub fn script() -> String {
       entry.setAttribute('aria-disabled', usable ? 'false' : 'true');
       if (usable) entry.removeAttribute('title');
       else entry.title = hint || '';
+    }};
+    // Called from Rust; see `sync_safe`. The row is the only standing sign
+    // that this launch is running on no plugins, so it is drawn from the same
+    // answer every page load asks for rather than remembered from the click
+    // that caused it.
+    window.__dshSafeMode = function (on) {{
+      if (entries['safe-off']) entries['safe-off'].hidden = !on;
     }};
     window.__dshBusy = function (text) {{
       said.textContent = text || '';
@@ -1196,6 +1253,26 @@ mod tests {
         for verb in verbs {
             assert!(labels.contains_key(verb), "{verb} has no label");
         }
+    }
+
+    /// A menu row that hides itself needs a stylesheet that lets it. The rule
+    /// these rows are drawn by sets `display` — and opens with `all: unset`,
+    /// which takes the UA's own `[hidden]` rule out on its own — so the
+    /// attribute alone does nothing and the row that leaves safe mode was
+    /// visible on every launch. Pinned here because nothing about the markup
+    /// looks wrong when this is missing.
+    #[test]
+    fn a_hidden_menu_row_is_actually_hidden() {
+        let script = super::script();
+
+        assert!(
+            script.contains("'.dsh-wc-pop button[hidden]{display:none}'"),
+            "the rows set their own display, so [hidden] needs a rule that outranks it"
+        );
+        assert!(
+            script.contains("verb: 'safe-off', hidden: true"),
+            "the row that leaves safe mode is the one that starts hidden"
+        );
     }
 
     /// The page reporting what dsh just did to it; see `relabel`.
