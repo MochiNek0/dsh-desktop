@@ -40,7 +40,7 @@
 //! too, which is what [`BUDGET`] is for: a stale address costs one reload, and
 //! a dsh that is gone stops reloading and lets dsh say so.
 
-/// How many reloads one document may spend, and how long apart.
+/// How many reloads one spell of failures may spend, and how long apart.
 ///
 /// The recovery this is for costs exactly one: the reload re-reads the manifest
 /// and the second attempt is against addresses that exist. More than one is
@@ -49,11 +49,34 @@
 /// `sessionStorage` outlives a reload and is only cleared when the window is —
 /// and a user who changes plugins twice in an afternoon should get the repair
 /// both times.
+///
+/// A spell rather than a window, which is what [`SETTLED`] is for: three is a
+/// generous allowance for one occasion and a miserly one for a day of them.
 const BUDGET: u32 = 3;
 
 /// Seconds between reloads, so a failure that answers instantly cannot spend
 /// the whole budget before the user sees anything.
 const APART: u32 = 10;
+
+/// Seconds without a reload after which the count starts again.
+///
+/// Without it the budget is a window's rather than an occasion's, and a window
+/// that has spent three on one bad afternoon cannot repair a stale address
+/// again for as long as it stays open — which, since nothing here closes it, is
+/// until the user quits the app. That is the opposite of what [`BUDGET`] is
+/// written to do.
+///
+/// What it must not become is the loop the budget exists to stop, so it is
+/// counted from the last reload rather than from the last success: a page that
+/// fails, reloads and fails again keeps pushing the mark forward and still stops
+/// at three. Only a spell that actually ended is forgiven.
+///
+/// A success would be the more direct signal and is the wrong one to take.
+/// `loadBundle` is asked for each batch separately, and the failure this module
+/// was written for takes one batch while the others load — so clearing on a
+/// bundle that worked would clear on every pass of exactly the failure that must
+/// not loop.
+const SETTLED: u32 = 300;
 
 /// The script, for the window's `initialization_script`.
 ///
@@ -79,6 +102,9 @@ pub fn script() -> String {
     var now = Date.now();
     try {{
       var seen = JSON.parse(sessionStorage.getItem(KEY) || '{{"n":0,"at":0}}');
+      // A spell that ended is not one the next spell inherits. Measured from
+      // the last reload, so a page that keeps failing keeps the count.
+      if (now - seen.at >= {settled} * 1000) seen = {{ n: 0, at: 0 }};
       if (seen.n >= {budget}) return false;
       if (now - seen.at < {apart} * 1000) return false;
       sessionStorage.setItem(KEY, JSON.stringify({{ n: seen.n + 1, at: now }}));
@@ -120,14 +146,15 @@ pub fn script() -> String {
 }})();"#,
         budget = BUDGET,
         apart = APART,
+        settled = SETTLED,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{script, APART, BUDGET};
+    use super::{script, APART, BUDGET, SETTLED};
 
-    /// The two numbers are the whole of the loop protection, and they are
+    /// The three numbers are the whole of the loop protection, and they are
     /// written into the script by `format!` rather than read from it. A
     /// placeholder that stopped being substituted would leave a script that
     /// parses and never stops reloading.
@@ -142,6 +169,37 @@ mod tests {
             script.contains(&format!("< {APART} * 1000")),
             "the interval must be substituted: {script}"
         );
+        assert!(
+            script.contains(&format!(">= {SETTLED} * 1000")),
+            "the settling time must be substituted: {script}"
+        );
+    }
+
+    /// The count starts again from the last *reload*, not the last success.
+    /// Read off the record's own field, because a version of this that cleared
+    /// on a bundle that loaded would clear on every pass of the one failure the
+    /// budget is written to stop — the batch that fails while the others load.
+    #[test]
+    fn the_count_starts_again_from_the_last_reload() {
+        let script = script();
+        assert!(
+            script.contains(&format!("if (now - seen.at >= {SETTLED} * 1000)")),
+            "settling is measured from the last reload: {script}"
+        );
+        assert!(
+            script.contains("seen = { n: 0, at: 0 };"),
+            "a settled spell is forgotten rather than decayed: {script}"
+        );
+    }
+
+    /// The reset has to be read before the budget is, or a spell that ended
+    /// still refuses the reload it has just earned back.
+    #[test]
+    fn settling_is_read_before_the_budget() {
+        let script = script();
+        let settled = script.find("now - seen.at >=").expect("the settling check");
+        let budget = script.find("seen.n >=").expect("the budget check");
+        assert!(settled < budget, "settling must come first: {script}");
     }
 
     /// Every brace in the script body is doubled for `format!`, and one that is
@@ -175,3 +233,4 @@ mod tests {
         );
     }
 }
+
