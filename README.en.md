@@ -40,6 +40,7 @@ A cross-platform Tauri desktop client for DeepSeek Harness (`dsh web`)
 - **Runtime Management**: A built-in **Runtime** panel enumerates every Node on the machine and lets you switch between them, install or uninstall dsh in one, install a fresh Node, or delete a Node you no longer need. Also handles dsh version checks and one-click upgrades.
 - **Plugin Management**: Built-in visual panel to install and remove dsh plugins without a terminal; [DSH Market](#dsh-market) sits first in the recommended list.
 - **Clean Lifecycle**: Single-instance enforcement with complete child process cleanup upon exit. Returns to the loading page and offers a restart if `dsh web` crashes unexpectedly.
+- **A Way Back from a Broken Plugin**: Plugins load before `dsh web` binds its port, so one that throws leaves the whole app on the loading page — with the panel that removes a plugin behind the very window that will not open. The loading page then offers **Start without plugins**: every plugin you installed comes off the profile's layer stack (dsh's own bundles stay), dsh starts on those alone, and the plugin panel opens on top so you can take the offender out. What came off is recorded in order under the app's own directory, and **Load plugins again** in the titlebar menu puts it all back exactly as it was. The state lasts until you end it — quitting and reopening comes back into it — so the titlebar carries a standing **No plugins loaded** marker while it does, and the menu row explains itself on hover.
 
 ## Installation
 
@@ -67,10 +68,11 @@ The titlebar menu offers the following (the tray menu has only **Show window** a
 | **Plugins…** | Open the visual plugin panel |
 | **Open a terminal** | A shell pre-configured with `dsh` and its environment, without modifying your global system PATH |
 | **Restart dsh** | Restart the background `dsh web` process |
+| **Load plugins again** | Only after **Start without plugins**: puts them back on the layer stack and restarts |
 | **Update dsh…** | Check for and install a newer `dsh` |
 | **Runtime…** | Manage Node.js: list, switch, install, or remove |
 | **Check for app updates…** | Check for a newer version of the desktop app itself |
-| **Start at login** / **Notifications** | Toggles (**Notifications** is fed by the Session signals plugin, and is dimmed if you remove it) |
+| **Start at login** / **Notifications** | Toggles (**Notifications** is fed by the Session signals plugin, and is dimmed if you remove it — or if this launch started without plugins) |
 | **Quit dsh** | Quit the app for real |
 
 ### Plugins

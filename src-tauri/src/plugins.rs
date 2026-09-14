@@ -729,18 +729,33 @@ fn stale_bundles(manifest: &serde_json::Value, modules: &Path) -> Vec<String> {
 
 /// Rewrite the profile manifest without `names` on its layer stack.
 ///
-/// Through a sibling and a rename, the way [`stage_bundled`] writes: the file
-/// being replaced is the one thing standing between the user and a dsh that
-/// starts, and a half-written one is worse than the state being repaired.
-///
 /// Only `dsh.profile.bundles` is touched. `dependencies` is pnpm's, and a name
 /// that is still listed there is not this function's business — [`audit`] has
 /// already established that these are not.
 fn forget_bundles(app: &AppHandle, names: &[String]) -> Result<(), String> {
+    rewrite_manifest(app, |raw| without_bundles(raw, names))
+}
+
+/// Rewrite it with `names` back on that stack. The other half of what safe mode
+/// does to a profile; see [`engage_safe`] and [`release_safe`].
+fn restore_bundles(app: &AppHandle, names: &[String]) -> Result<(), String> {
+    rewrite_manifest(app, |raw| with_bundles(raw, names))
+}
+
+/// Read the profile manifest, hand its text to `change`, and put back what
+/// comes out.
+///
+/// Through a sibling and a rename, the way [`stage_bundled`] writes: the file
+/// being replaced is the one thing standing between the user and a dsh that
+/// starts, and a half-written one is worse than the state being repaired.
+fn rewrite_manifest(
+    app: &AppHandle,
+    change: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<(), String> {
     let path = profile_dir(app).join("package.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let text = without_bundles(&raw, names).map_err(|why| format!("{}: {why}", path.display()))?;
+    let text = change(&raw).map_err(|why| format!("{}: {why}", path.display()))?;
 
     let tmp = path.with_extension("json.new");
     std::fs::write(&tmp, text.as_bytes())
@@ -785,6 +800,196 @@ fn without_bundles(raw: &str, names: &[String]) -> Result<String, String> {
     Ok(text)
 }
 
+/// One profile manifest, as text, with `names` back on its layer stack.
+///
+/// The inverse of [`without_bundles`], written the same way and for the same
+/// reason — same key order, same indent, same trailing newline, so that putting
+/// a plugin back does not also show up as a reformat.
+///
+/// Appended rather than put back where each name was. What a stack carries is
+/// an order, and the only part of that order safe mode is entitled to
+/// reconstruct is the order these names had *among themselves*: dsh's own
+/// bundles were never taken off and are still at the front, which is where a
+/// profile puts them, and the rest go back behind them in the order they were
+/// recorded — which is the order they were on the stack in.
+///
+/// A name already there is left alone rather than added twice. dsh's own
+/// reconcile can have put one back while safe mode was on (see [`engage_safe`]),
+/// and the same bundle twice on a stack is its layer applied twice.
+///
+/// A manifest with no layer stack at all is an error rather than one this
+/// invents. Safe mode only ever has names to put back because it took them off
+/// a stack, so a missing one means the file changed underneath it, and writing
+/// a fresh stack over whatever did that is not a repair.
+fn with_bundles(raw: &str, names: &[String]) -> Result<String, String> {
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| format!("could not parse it: {error}"))?;
+
+    let list = manifest
+        .pointer_mut("/dsh/profile/bundles")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "it has no dsh.profile.bundles to put them back on".to_string())?;
+
+    for name in names {
+        if !list.iter().any(|entry| entry.as_str() == Some(name.as_str())) {
+            list.push(name.as_str().into());
+        }
+    }
+
+    let mut text = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("could not serialize it: {error}"))?;
+    text.push('\n');
+    Ok(text)
+}
+
+// ------------------------------------------------------------- safe mode --
+//
+// A plugin that breaks dsh breaks the whole app: `dsh web` composes the layer
+// stack before it binds a port, so a bundle that throws on the way up is a
+// window that never gets past the loading page. In a terminal that is a `dsh
+// plugin remove` away. Here it was not: the panel that removes a plugin is
+// drawn over the page dsh serves, and there is no page. The one way out was
+// reinstalling.
+//
+// So: start once with every installed plugin off the stack, which is enough of
+// a dsh to open the panel with, and take the offender out from there.
+//
+// [`audit`] is the neighbouring repair and not this one. It clears names the
+// profile can no longer *resolve*, which it can decide on its own because a
+// name nothing installs cannot be anything but residue. A plugin that resolves
+// and then misbehaves is indistinguishable from one that works until the user
+// says which, and that is what this is: a thing the user asks for, and one that
+// says so and can be undone.
+
+/// What safe mode took off the layer stack, in the order it was on it.
+///
+/// The file *is* safe mode — there is no flag beside it, because a flag and a
+/// list that disagreed would be a profile with plugins nobody could put back.
+/// It lives under the app's own directory rather than in the profile, so that
+/// whatever is wrong with the profile cannot also be wrong with the way out of
+/// it. The markers next to it are empty files ([`remembered`]); this one has
+/// something to say and says it as a JSON array of names.
+const SAFE: &str = "safe-mode.json";
+
+/// Whether this launch runs on dsh's own bundles alone.
+pub fn safe(app: &AppHandle) -> bool {
+    marker(app, SAFE).is_some_and(|path| path.exists())
+}
+
+/// Whether safe mode has anything to offer, which is the question the loading
+/// page's rescue button is drawn on. Not offered on a profile with no plugins
+/// in it, where it would promise a repair it cannot make.
+pub fn rescuable(app: &AppHandle) -> bool {
+    !safe(app) && !installed_bundles(&profile_manifest(app)).is_empty()
+}
+
+/// The layer stack minus dsh's own; see [`IN_BOX`]. Everything left got there
+/// because somebody installed it, and it is the whole of what safe mode takes
+/// off.
+fn installed_bundles(manifest: &serde_json::Value) -> Vec<String> {
+    bundles_in(manifest)
+        .into_iter()
+        .filter(|name| !name.starts_with(IN_BOX))
+        .collect()
+}
+
+/// Take every installed plugin off the layer stack, and remember what went.
+///
+/// Run on the way into safe mode and again before every start for as long as it
+/// lasts, because it does not stay done. dsh reconciles the stack against the
+/// manifest after any `dsh plugin` command pnpm completes — so removing the
+/// offending plugin from the panel, which is the entire point of being in here,
+/// puts every *other* plugin straight back on. Hence idempotent, and hence what
+/// it answers is what this particular call had to take off.
+///
+/// The record is written first, and that order is the one thing here that is
+/// not arbitrary. A record written over a stack that then fails to be rewritten
+/// is a launch that tries again and gets the same answer. A stack stripped with
+/// no record of what came off it is a set of plugins nothing will ever put
+/// back.
+pub fn engage_safe(app: &AppHandle) -> Result<Vec<String>, String> {
+    let taken = installed_bundles(&profile_manifest(app));
+
+    let mut record = disabled(app);
+    for name in &taken {
+        if !record.contains(name) {
+            record.push(name.clone());
+        }
+    }
+
+    // Always, even when nothing came off: this is also the write that creates
+    // the record on the way in, and a profile can be between `dsh plugin
+    // remove` and the reconcile that follows it, with an empty stack and every
+    // name still to put back.
+    remember_disabled(app, &record)?;
+
+    if !taken.is_empty() {
+        forget_bundles(app, &taken)?;
+    }
+    Ok(taken)
+}
+
+/// Put the plugins back, and leave safe mode.
+///
+/// Only the ones that are still dependencies. The point of a safe launch is to
+/// take a plugin out, and putting the name of one back on the stack after pnpm
+/// has removed the package is precisely the unresolvable layer [`audit`] exists
+/// to clean up after.
+///
+/// The record is deleted last and only once the stack has been written. The
+/// other order fails silently: the app would be out of safe mode with every
+/// plugin still off the stack and nothing left saying which ones.
+pub fn release_safe(app: &AppHandle) -> Result<Vec<String>, String> {
+    let held: HashSet<String> = dependencies_in(&profile_manifest(app))
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let back: Vec<String> = disabled(app)
+        .into_iter()
+        .filter(|name| held.contains(name))
+        .collect();
+
+    if !back.is_empty() {
+        restore_bundles(app, &back)?;
+    }
+
+    let path = marker(app, SAFE).ok_or_else(|| "there is no app data directory".to_string())?;
+    match std::fs::remove_file(&path) {
+        // Already gone is already out of safe mode.
+        Ok(()) => Ok(back),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(back),
+        Err(error) => Err(format!("could not delete {}: {error}", path.display())),
+    }
+}
+
+/// What the record holds — nothing when there is no record, when it cannot be
+/// read, or when it is not the array of names it should be. All three answer
+/// the same because all three mean the same thing to a caller: there is nothing
+/// here to put back.
+fn disabled(app: &AppHandle) -> Vec<String> {
+    let Some(path) = marker(app, SAFE) else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Write it. Unlike [`remember`], a failure here is worth returning: the caller
+/// is about to take these plugins off the stack, and it must not if this is the
+/// only thing that would have known to put them back.
+fn remember_disabled(app: &AppHandle, names: &[String]) -> Result<(), String> {
+    let path = marker(app, SAFE).ok_or_else(|| "there is no app data directory".to_string())?;
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let text = serde_json::to_string(names).expect("a list of strings is always serializable");
+    std::fs::write(&path, text.as_bytes())
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 /// The plugin that tells this app what dsh is doing, by the name it installs
 /// under. See [`crate::signal`] for what it reports and `plugin/` for the
 /// thing itself.
@@ -809,8 +1014,15 @@ pub const SIGNAL: &str = "dsh-desktop-signal";
 /// Read from the profile manifest, and read the same way the panel decides
 /// what is "already installed" — those two answers agreeing is the whole
 /// point, since the panel is where a user goes to change this one.
+///
+/// Safe mode answers no whatever the manifest says, and is asked first because
+/// it outranks the manifest: the plugin is still installed in there, and it is
+/// off the layer stack, so dsh is not running it. This app's own plugin is not
+/// exempt from a safe launch — a rescue that kept one bundle loaded because the
+/// app that offered the rescue wrote it would be a rescue that cannot clear the
+/// app's own plugin of causing the thing it is rescuing from.
 pub fn signalling(app: &AppHandle) -> bool {
-    installed_in(&profile_manifest(app)).contains(SIGNAL)
+    !safe(app) && installed_in(&profile_manifest(app)).contains(SIGNAL)
 }
 
 /// Put [`SIGNAL`] in, once, on the first launch that finds it missing — and
@@ -2107,9 +2319,10 @@ pub fn open_directory(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dependencies_in, holdings, is_package_spec, local_spec, parse, pnpm_blamed, pnpm_codes,
-        pnpm_stuck, requested, spec_name, stale_bundles, sweep, wanted_gone, without_bundles,
-        Outcome, BUNDLED, IN_BOX, PRESETS, RELEASE_AGE, SIGNAL,
+        dependencies_in, holdings, installed_bundles, is_package_spec, local_spec, parse,
+        pnpm_blamed, pnpm_codes, pnpm_stuck, requested, spec_name, stale_bundles, sweep,
+        wanted_gone, with_bundles, without_bundles, Outcome, BUNDLED, IN_BOX, PRESETS,
+        RELEASE_AGE, SIGNAL,
     };
     use std::path::{Path, PathBuf};
     use tauri::Url;
@@ -2894,6 +3107,100 @@ mod tests {
         );
 
         assert!(without_bundles("{ not json", &[]).is_err());
+    }
+
+    /// What a safe launch takes off, against a stack with all three kinds of
+    /// name on it. dsh's own stay, whether or not this app has heard of them.
+    #[test]
+    fn installed_bundles_leaves_dshs_own_alone() {
+        let manifest = serde_json::json!({
+            "dsh": { "profile": { "bundles": [
+                "@deepseek-ai/dsh-base",
+                "@deepseek-ai/dsh-web-app",
+                "@deepseek-ai/dsh-not-shipped-yet",
+                "dsh-web-search-free",
+                "dshmarket",
+            ] } }
+        });
+
+        assert_eq!(
+            installed_bundles(&manifest),
+            vec!["dsh-web-search-free".to_string(), "dshmarket".to_string()]
+        );
+    }
+
+    /// Out and back again. What the round trip has to preserve is the order the
+    /// plugins had among themselves — the stack is a layer order, and two
+    /// plugins that swapped places are a different composition.
+    #[test]
+    fn safe_mode_puts_the_stack_back_as_it_found_it() {
+        let before = concat!(
+            "{\n",
+            "  \"dsh\": {\n",
+            "    \"profile\": {\n",
+            "      \"bundles\": [\n",
+            "        \"@deepseek-ai/dsh-base\",\n",
+            "        \"dsh-web-search-free\",\n",
+            "        \"dshmarket\",\n",
+            "        \"dsh-desktop-signal\"\n",
+            "      ]\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        );
+
+        let manifest: serde_json::Value = serde_json::from_str(before).expect("a manifest");
+        let taken = installed_bundles(&manifest);
+
+        let safe = without_bundles(before, &taken).expect("a rewrite");
+        assert_eq!(
+            installed_bundles(&serde_json::from_str(&safe).expect("a manifest")),
+            Vec::<String>::new(),
+            "a safe launch composes dsh's own bundles and nothing else"
+        );
+
+        assert_eq!(with_bundles(&safe, &taken).expect("a rewrite"), before);
+    }
+
+    /// The reconcile this has to survive: removing one plugin in safe mode puts
+    /// the others back on the stack, so leaving safe mode must not then list
+    /// them twice. And a plugin pnpm has actually removed never goes back —
+    /// that is the caller's rule, so what is checked here is only that a name
+    /// already present is left alone.
+    #[test]
+    fn with_bundles_adds_nothing_that_is_already_there() {
+        let raw = concat!(
+            "{\n",
+            "  \"dsh\": {\n",
+            "    \"profile\": {\n",
+            "      \"bundles\": [\n",
+            "        \"@deepseek-ai/dsh-base\",\n",
+            "        \"dshmarket\"\n",
+            "      ]\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        );
+
+        let names = ["dshmarket".to_string(), "dsh-web-search-free".to_string()];
+        let after = with_bundles(raw, &names).expect("a rewrite");
+
+        assert_eq!(
+            after,
+            raw.replace(
+                "        \"dshmarket\"\n",
+                "        \"dshmarket\",\n        \"dsh-web-search-free\"\n"
+            )
+        );
+    }
+
+    /// A profile with no layer stack is one safe mode cannot have taken these
+    /// names off, so it is not one to write a stack onto. Same for a manifest
+    /// that will not parse.
+    #[test]
+    fn with_bundles_refuses_a_manifest_it_did_not_come_from() {
+        assert!(with_bundles("{\n  \"name\": \"x\"\n}\n", &["a".to_string()]).is_err());
+        assert!(with_bundles("{ not json", &[]).is_err());
     }
 
     /// A directory of this test's own, gone again when it ends. Built on disk,

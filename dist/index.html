@@ -210,10 +210,12 @@
         gap: 10px;
         margin-top: 14px;
       }
-      #error-retry {
+      #error-retry,
+      #error-safe {
         display: none;
       }
-      body.failed.retryable #error-retry {
+      body.failed.retryable #error-retry,
+      body.failed.rescuable #error-safe {
         display: inline-flex;
       }
       button {
@@ -280,6 +282,7 @@
         <pre id="error-detail"></pre>
         <div class="actions">
           <button id="error-retry" class="primary"></button>
+          <button id="error-safe"></button>
           <button id="error-copy"></button>
         </div>
       </div>
@@ -324,6 +327,18 @@
           document.body.classList.remove('failed', 'retryable');
           id('status').textContent = t('正在启动 dsh…', 'Starting dsh…');
           signal('restart-dsh');
+        });
+
+        // The way out of a plugin that will not let dsh start: the app puts
+        // every installed plugin aside and starts again on dsh's own bundles,
+        // which is enough of a dsh to open the plugin list in. It is offered
+        // only where there is a plugin to put aside -- see `plugins::rescuable`
+        // -- and what it does is undone from the titlebar menu afterwards.
+        id('error-safe').textContent = t('不加载插件启动', 'Start without plugins');
+        id('error-safe').addEventListener('click', function () {
+          document.body.classList.remove('failed', 'retryable', 'rescuable');
+          id('status').textContent = t('正在启动 dsh…', 'Starting dsh…');
+          signal('safe-start');
         });
 
         var copy = id('error-copy');
@@ -391,9 +406,10 @@
           id('progress-fill').style.width =
             Math.min(100, Math.max(0, value)) + '%';
         };
-        window.dshError = function (title, detail, retry) {
+        window.dshError = function (title, detail, retry, rescue) {
           document.body.classList.add('failed');
           document.body.classList.toggle('retryable', retry === 'retry');
+          document.body.classList.toggle('rescuable', rescue === 'rescue');
           id('error-title').textContent = title;
           id('error-detail').textContent = detail || '';
         };
