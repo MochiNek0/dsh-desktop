@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-desktop"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "libc",
  "notify-rust",
