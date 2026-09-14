@@ -305,6 +305,24 @@ fn build_window(
             if is_ours(url, &origin) {
                 return true;
             }
+            // `tauri dev` serves the bundled page off a localhost port instead
+            // of `tauri.localhost`, which is the only spelling of it `is_ours`
+            // knows — so under `npm run dev` the loading page was turned away
+            // and the window sat on `about:blank`.
+            //
+            // That went unnoticed because a launch normally does not *stay* on
+            // that page: dsh starts, and the navigation to its origin is one
+            // `is_ours` does allow, so the blank window lasts as long as the
+            // boot does. It is every launch that has something to say there
+            // that was lost — a dsh that will not start, the runtime chooser,
+            // the first-launch plugin guide.
+            //
+            // Debug builds only, and a release build has no dev URL to match
+            // even if this were compiled into one.
+            #[cfg(debug_assertions)]
+            if is_dev_server(&opener, url) {
+                return true;
+            }
             // A link out of the app belongs in the user's browser, not in place
             // of the session they are working in.
             let _ = opener.opener().open_url(url.to_string(), None::<&str>);
@@ -608,6 +626,20 @@ fn is_ours(url: &Url, origin: &Origin) -> bool {
         .unwrap()
         .as_deref()
         .is_some_and(|ours| url.origin().ascii_serialization() == ours)
+}
+
+/// Whether `url` is the dev server `tauri dev` serves the bundled page from.
+///
+/// The page's address is the CLI's to choose — it picks a port — so it is read
+/// off the config the CLI wrote rather than written down here. Compiled only
+/// into a debug build, where that address exists.
+#[cfg(debug_assertions)]
+fn is_dev_server(app: &tauri::AppHandle, url: &Url) -> bool {
+    app.config()
+        .build
+        .dev_url
+        .as_ref()
+        .is_some_and(|dev| dev.origin() == url.origin())
 }
 
 /// Whether a boot or a dsh update owns the window and the server right now.
