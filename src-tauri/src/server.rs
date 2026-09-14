@@ -336,12 +336,15 @@ mod leftover {
     /// not just the executable — every `dsh` is some `node`, and `node` on its
     /// own says nothing about whose process this is.
     fn orphaned_dsh(pid: i32) -> bool {
-        let Ok(listed) = Command::new("ps")
+        let mut command = Command::new("ps");
+        command
             .args(["-p", &pid.to_string(), "-o", "ppid=,command="])
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-        else {
+            .stderr(Stdio::null());
+        // The host's `ps`, so not one to run against the bundle's libraries.
+        crate::dsh::unbundle(&mut command);
+
+        let Ok(listed) = command.output() else {
             return false;
         };
 
