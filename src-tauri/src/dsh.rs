@@ -46,7 +46,7 @@
 //! be read is an app that reports no dsh at all. See [`marker`], and
 //! [`terminal`] for what the user gets instead of a PATH entry.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -775,6 +775,7 @@ fn manifest_version(root: &Path) -> Option<Version> {
 fn version_of(bin: &OsStr) -> Option<Version> {
     let mut command = Command::new(bin);
     command.arg("--version").stdin(Stdio::null());
+    unbundle(&mut command);
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
@@ -832,6 +833,7 @@ fn node_is_new_enough(app: &AppHandle) -> bool {
 fn meets_floor(node: &Path) -> Option<bool> {
     let mut command = Command::new(node);
     command.arg("--version").stdin(Stdio::null());
+    unbundle(&mut command);
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
@@ -1206,6 +1208,7 @@ pub fn npm(app: &AppHandle) -> Option<Command> {
 
     let mut command = Command::new(node);
     command.arg(cli).stdin(Stdio::null());
+    unbundle(&mut command);
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
@@ -1442,6 +1445,7 @@ pub(crate) fn interpreter(script: &Path) -> Command {
 pub(crate) fn interpreter(script: &Path) -> Command {
     let mut command = Command::new("/bin/sh");
     command.arg(script);
+    unbundle(&mut command);
     command
 }
 
@@ -1467,10 +1471,98 @@ pub fn note(app: &AppHandle, title: &str, detail: &str) {
 /// And dsh shells out to `node` again for workers and plugin tooling, which
 /// should reach the same one the app is running it with, not whichever one a
 /// version manager happens to have active.
+///
+/// Every caller is starting a program off the host rather than out of this
+/// bundle, which is the other half of the same question — so [`unbundle`] runs
+/// here too, and the sites that shape a command without needing dsh's PATH call
+/// it on their own.
 pub fn apply_path(app: &AppHandle, command: &mut Command) {
     if let Ok(path) = std::env::join_paths(search_path(app)) {
         command.env("PATH", path);
     }
+
+    unbundle(command);
+}
+
+/// The variables an AppImage points at its own bundle: [`AppRun`] sets the
+/// first block, and the GTK hook linuxdeploy installs beside it sets the rest.
+///
+/// [`AppRun`]: https://github.com/AppImage/AppImageKit/blob/master/src/AppRun.c
+const BUNDLED: &[&str] = &[
+    "LD_LIBRARY_PATH",
+    "XDG_DATA_DIRS",
+    "GSETTINGS_SCHEMA_DIR",
+    "PYTHONPATH",
+    "PERLLIB",
+    "QT_PLUGIN_PATH",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GTK_PATH",
+    "GTK_EXE_PREFIX",
+    "GTK_DATA_PREFIX",
+    "GTK_IM_MODULE_FILE",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GDK_PIXBUF_MODULEDIR",
+    "GIO_EXTRA_MODULES",
+];
+
+/// Take the AppImage's own library and module directories back out of a child's
+/// environment.
+///
+/// An AppImage's `AppRun` puts `$APPDIR/usr/lib` and its neighbours at the front
+/// of `LD_LIBRARY_PATH` — that is how the bundled webkit and GTK get found — and
+/// every process this one spawns inherits them. None of the children here are
+/// bundled: they are the host's `node`, the host's `dsh` shim, the host's
+/// `/bin/sh`. Aiming the loader at libraries built on Ubuntu 22.04 while it
+/// resolves a binary built against the host's is what issue #7 reported from
+/// Arch, whose libraries are newer than anything the bundle carries:
+///
+/// ```text
+/// version `LIBFFI_CALL_PLAN_8.4' not found
+/// undefined symbol: BrotliDecoderAttachDictionary
+/// undefined symbol: nghttp2_option_set_no_rfc9113_leading_and_trailing_ws_validation
+/// ```
+///
+/// `AppRun` prepends, leaving whatever the user already had at the tail, so
+/// dropping the entries that live under `$APPDIR` hands the child back exactly
+/// the value this process was started with. Outside an AppImage `APPDIR` is
+/// unset and there is nothing to do — which is every Windows and macOS launch,
+/// and a `.deb` install too.
+///
+/// Not done once to this process's own environment, which would save doing it
+/// per child: the bundled webkit spawns `WebKitWebProcess` and dlopens its GIO
+/// and gdk-pixbuf modules out of these same directories long after startup, and
+/// it has to go on finding them.
+pub(crate) fn unbundle(command: &mut Command) {
+    let Some(appdir) = std::env::var_os("APPDIR") else {
+        return;
+    };
+    let appdir = PathBuf::from(appdir);
+
+    for name in BUNDLED {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+
+        match host_entries(&value, &appdir) {
+            Some(kept) => command.env(name, kept),
+            None => command.env_remove(name),
+        };
+    }
+}
+
+/// `value` with every entry under `appdir` dropped, and `None` when that leaves
+/// nothing — the caller's cue to unset the variable rather than hand the child
+/// an empty one, which for `XDG_DATA_DIRS` is not the same thing at all.
+fn host_entries(value: &OsStr, appdir: &Path) -> Option<OsString> {
+    let kept: Vec<PathBuf> = std::env::split_paths(value)
+        .filter(|entry| !entry.starts_with(appdir))
+        .collect();
+
+    if kept.is_empty() {
+        return None;
+    }
+
+    std::env::join_paths(kept).ok()
 }
 
 /// Drop the `\\?\` prefix Tauri's path APIs come back with on Windows. Rust's
@@ -1596,10 +1688,57 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        dsh_on, executable, first_writable_prefix, marker, node_version, package_root, prefix_of,
-        present, resolve, shim_dir, writable, DSH, NODE_MINIMUM, PACKAGE,
+        dsh_on, executable, first_writable_prefix, host_entries, marker, node_version,
+        package_root, prefix_of, present, resolve, shim_dir, writable, DSH, NODE_MINIMUM, PACKAGE,
     };
     use std::path::{Path, PathBuf};
+
+    /// What `AppRun` hands a child, and what has to come back out of it: the
+    /// bundle's own directories go, and the user's own entry stays, in the
+    /// place it was in.
+    #[test]
+    fn the_bundles_libraries_are_dropped_and_the_users_kept() {
+        let appdir = Path::new("/tmp/.mount_dshdesQWERTY");
+        let value = std::env::join_paths([
+            // `AppRun` writes its own entries with a trailing slash.
+            Path::new("/tmp/.mount_dshdesQWERTY/usr/lib/"),
+            Path::new("/tmp/.mount_dshdesQWERTY/usr/lib/x86_64-linux-gnu/"),
+            Path::new("/tmp/.mount_dshdesQWERTY/lib64/"),
+            Path::new("/home/user/.local/lib"),
+        ])
+        .expect("a joinable value");
+
+        let kept = host_entries(&value, appdir).expect("the user's own entry to survive");
+        assert_eq!(kept, std::ffi::OsString::from("/home/user/.local/lib"));
+    }
+
+    /// A wholly bundled value is unset rather than emptied. An empty
+    /// `XDG_DATA_DIRS` is a child that looks for `.desktop` files nowhere at
+    /// all, where an absent one falls back to `/usr/share`.
+    #[test]
+    fn a_wholly_bundled_value_becomes_nothing() {
+        let appdir = Path::new("/tmp/.mount_dshdesQWERTY");
+        let value = std::env::join_paths([
+            Path::new("/tmp/.mount_dshdesQWERTY/usr/lib/"),
+            Path::new("/tmp/.mount_dshdesQWERTY/usr/lib64/"),
+        ])
+        .expect("a joinable value");
+
+        assert_eq!(host_entries(&value, appdir), None);
+    }
+
+    /// A directory whose *name* merely begins with the AppDir's is not inside
+    /// it. `Path::starts_with` compares whole components, and this is here so
+    /// that nobody swaps it for a string prefix and takes
+    /// `/tmp/.mount_dshdesQWERTYnot` out of a value that had nothing to do with
+    /// the bundle.
+    #[test]
+    fn only_whole_path_components_count_as_inside_the_bundle() {
+        let appdir = Path::new("/tmp/.mount_dshdesQWERTY");
+        let value = std::ffi::OsString::from("/tmp/.mount_dshdesQWERTYnot/lib");
+
+        assert_eq!(host_entries(&value, appdir), Some(value.clone()));
+    }
 
     /// The floor lives in three files: this one, and the two scripts. Ours
     /// decides whether a machine that already has a dsh is sent to the chooser;
