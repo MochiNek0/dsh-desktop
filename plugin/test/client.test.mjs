@@ -29,33 +29,44 @@ function load({ host }) {
 }
 
 // Stub services with hand-driven snapshots.
-function services() {
+//
+// `uiSession: false` is the dsh whose web composition does not carry that
+// service — the shape issue #11's follow-up reported from macOS. Cordis never
+// runs a scope whose injected service is missing, and this stub's `inject` does
+// the same rather than pretending the service is there.
+function services({ uiSession = true } = {}) {
   let list = { ids: [], byId: {} };
   let pending = new Map();
   const listeners = { list: [], pending: [] };
   const opened = [];
-  let teardown = null;
+  const teardowns = [];
+  const ctx = {
+    // The real one keeps each cleanup to run on disposal; this keeps them so a
+    // test can run them.
+    effect: (fn) => { const off = fn(); if (off) teardowns.push(off); },
+    inject: (names, callback) => {
+      if (names.every((name) => ctx[name] !== undefined)) callback(ctx);
+    },
+    sessions: {
+      list: {
+        getSnapshot: () => list,
+        subscribe: (fn) => { listeners.list.push(fn); return () => {}; },
+      },
+      open: (id) => { opened.push(id); },
+    },
+  };
+  if (uiSession) {
+    ctx.uiSession = {
+      pendingInteractions: {
+        getSnapshot: () => pending,
+        subscribe: (fn) => { listeners.pending.push(fn); return () => {}; },
+      },
+    };
+  }
   return {
     opened,
-    stop() { if (teardown) teardown(); },
-    ctx: {
-      // The real one keeps the cleanup to run on disposal; this keeps it so a
-      // test can run it.
-      effect: (fn) => { teardown = fn(); },
-      sessions: {
-        list: {
-          getSnapshot: () => list,
-          subscribe: (fn) => { listeners.list.push(fn); return () => {}; },
-        },
-        open: (id) => { opened.push(id); },
-      },
-      uiSession: {
-        pendingInteractions: {
-          getSnapshot: () => pending,
-          subscribe: (fn) => { listeners.pending.push(fn); return () => {}; },
-        },
-      },
-    },
+    stop() { teardowns.splice(0).forEach((fn) => fn()); },
+    ctx,
     setList(next) { list = next; listeners.list.forEach((fn) => fn()); },
     setPending(next) { pending = next; listeners.pending.forEach((fn) => fn()); },
   };
@@ -89,10 +100,39 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
 // --- exports shape ---
 {
   const { exports } = load({ host: true });
+  // Empty, and that is the point: an entry still waiting on a service when
+  // dsh's web boot audits the loader is a boot dsh reports as "Failed to load
+  // plugins". Both services are waited for a scope down; see `client.js`.
   // Crosses the vm realm, so compare by value rather than by prototype.
-  assert.equal(JSON.stringify(exports.inject), '["sessions","uiSession"]');
+  assert.equal(JSON.stringify(exports.inject), '[]');
   assert.equal(typeof exports.apply, 'function');
-  console.log('ok  exports the cordis services and an apply');
+  console.log('ok  requires no service of the entry itself');
+}
+
+// --- a dsh with no `uiSession` at all ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const s = services({ uiSession: false });
+  // Activating is the whole test: this is the shape that took the window down.
+  exports.apply(s.ctx);
+
+  // The half that has what it needs still works.
+  s.setList({ ids: ['a'], byId: { a: { running: true } } });
+  s.setList({ ids: ['a'], byId: { a: { running: false, completed: true } } });
+  await drain();
+  assert.equal(sent.length, 1);
+  assert.equal(query(sent[0]).event, 'turn-end');
+
+  // The door is up, and opens a session.
+  window.__dshSignals.open('session-7');
+  assert.deepEqual(s.opened, ['session-7']);
+
+  // No wait was ever announced, so no toast can carry a press — and one that
+  // somehow arrives says so rather than throwing on a service that is not there.
+  window.__dshSignals.answer('a', 'k1', 'allow');
+  await drain();
+  assert.equal(query(sent[1]).event, 'stale');
+  console.log('ok  runs on a dsh that has no uiSession, minus the waits');
 }
 
 // --- no desktop shell: nothing is wired at all ---

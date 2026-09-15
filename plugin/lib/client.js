@@ -57,6 +57,34 @@
  * offer to open it with something. So the plugin looks for the shell first —
  * `window.__DSH_VERSION__`, which the shell injects into every document — and
  * wires up nothing at all when it is absent.
+ *
+ * ## The entry waits for nothing
+ *
+ * `exports.inject` is empty, and the two services above are waited for one
+ * scope down instead. That is not a style choice: dsh's web boot audits every
+ * loader entry once the loader has settled, and an entry still PENDING on a
+ * service is a *boot failure* — `assertEntriesActive` throws, and the whole
+ * window is the "Failed to load plugins" card with
+ *
+ *   web boot: 1 entry did not activate
+ *   dsh-desktop-signal: pending (waiting for service: uiSession)
+ *
+ * on it. dsh itself is fine; nothing of the user's loads because of us.
+ *
+ * `uiSession` is exactly the service that cannot be counted on. It arrived in
+ * `@deepseek-ai/dsh-client-ui-session` at 0.1.2-alpha.2, which is also where
+ * `sessions` arrived, and whether a given machine's web composition carries it
+ * is not something a plugin installed beside dsh gets to know. An entry that
+ * requires it turns "no toast when dsh asks a question" into "dsh does not
+ * start" — the same lesson as `__DSH_TRANSPORT__`: what varies across dsh
+ * versions is not something to hard-depend on from out here.
+ *
+ * So the entry activates immediately, and each half waits for its own service
+ * in a child fiber. A child fiber is not a loader entry, so the audit never
+ * looks at it and `loader.await()` — which waits on entry tasks, and a PENDING
+ * fiber has none — does not hang on it either. A dsh without `uiSession` gets
+ * turn-end notifications and no wait notifications, which is the degradation
+ * the feature is worth.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-desktop-signal',
@@ -64,8 +92,11 @@ window.__ModuleLoader__.load({
     var module = { exports: {} };
     var exports = module.exports;
 
-    /** Cordis services this plugin waits for before `apply` runs. */
-    exports.inject = ['sessions', 'uiSession'];
+    /**
+     * Nothing. `sessions` and `uiSession` are waited for a scope down; an
+     * entry that waits here is an entry that can fail dsh's boot. See above.
+     */
+    exports.inject = [];
     exports.apply = apply;
 
     /** The desktop shell's channel; see its `controls.rs`. */
@@ -119,16 +150,21 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Install the two watchers, unless this is not the desktop shell.
+     * Put up the shell's door, and each watcher behind the service it needs.
      *
      * @param {import('@deepseek-ai/cordis').Context} ctx - client context.
      */
     function apply(ctx) {
       if (!window.__DSH_VERSION__) return;
 
+      // What each half hands the door, while that half is wired up. Read
+      // through these rather than off `ctx`: a service this entry does not
+      // inject throws on access, and the whole point is that neither of them
+      // is required here.
+      var sessions = null;
+      var waits = null;
+
       ctx.effect(() => {
-        var stopTurns = watchTurns(ctx);
-        var stopWaits = watchWaits(ctx);
         window.__dshSignals = {
           /**
            * Select a session, for a click that arrived on a notification about
@@ -137,7 +173,7 @@ window.__ModuleLoader__.load({
            * @param {string} id - session id, as it was reported from here.
            */
           open: (id) => {
-            ctx.sessions.open(id);
+            if (sessions) sessions.open(id);
           },
           /**
            * Answer what a session is waiting on, for a press on one of a
@@ -151,7 +187,7 @@ window.__ModuleLoader__.load({
           answer: (id, key, choice) => {
             var stale = () => send({ event: 'stale', session: id });
             try {
-              var pending = ctx.uiSession.pendingInteractions.getSnapshot().get(id);
+              var pending = waits && waits.getSnapshot().get(id);
               var sent = pending && pending.key === key ? submit(pending, choice) : null;
               // Matched and sent, and it can still fail: a request can abort
               // between the snapshot above and the call below.
@@ -165,10 +201,34 @@ window.__ModuleLoader__.load({
         };
         return () => {
           delete window.__dshSignals;
-          stopTurns();
-          stopWaits();
         };
-      }, 'dsh-desktop-signal: session state to the desktop shell');
+      }, 'dsh-desktop-signal: the shell\'s way back into dsh');
+
+      // Turn endings, and the session a notification click goes back to.
+      ctx.inject(['sessions'], (scope) => {
+        scope.effect(() => {
+          sessions = scope.sessions;
+          var stop = watchTurns(scope);
+          return () => {
+            sessions = null;
+            stop();
+          };
+        }, 'dsh-desktop-signal: turn endings to the desktop shell');
+      });
+
+      // What each session is waiting on, and what a press on a toast answers.
+      // Absent on a dsh whose web composition has no `uiSession`, and then
+      // this scope simply never runs; see the note at the top of the file.
+      ctx.inject(['uiSession'], (scope) => {
+        scope.effect(() => {
+          waits = scope.uiSession.pendingInteractions;
+          var stop = watchWaits(scope);
+          return () => {
+            waits = null;
+            stop();
+          };
+        }, 'dsh-desktop-signal: pending questions to the desktop shell');
+      });
     }
 
     /**

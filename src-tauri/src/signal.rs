@@ -8,10 +8,15 @@
 //! are gone; `git log` has them if the reasoning is ever wanted back.
 //!
 //! The state is read where it is published instead. A client plugin —
-//! `plugin/` in this repository — injects dsh's `sessions` and `uiSession`
+//! `plugin/` in this repository — waits for dsh's `sessions` and `uiSession`
 //! services, subscribes to `sessions.list` (which carries `running` and
 //! `completed` per session) and to `uiSession.pendingInteractions` (the live
 //! map of what each session is waiting on), and reports each transition here.
+//!
+//! Each of the two separately, and neither as a condition of the plugin
+//! loading: a dsh whose web composition has no `uiSession` reports turns and
+//! no waits, rather than failing to start. See the note at the top of
+//! `plugin/lib/client.js`.
 //!
 //! Which makes the plugin a hard dependency of every notification this app
 //! raises, and that is why the switch that turns notifications on is only
