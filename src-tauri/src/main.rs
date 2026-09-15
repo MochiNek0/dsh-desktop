@@ -20,7 +20,6 @@ mod setup;
 mod signal;
 mod theme;
 mod toast;
-mod transport;
 mod update;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -262,11 +261,6 @@ fn build_window(
             "window.__DSH_VERSION__ = {:?};",
             env!("CARGO_PKG_VERSION")
         ))
-        // One reload for a page holding a plugin-bundle address the server has
-        // moved on from — which is what installing or removing a plugin does to
-        // every document loaded before it. See [`transport`], which is mostly an
-        // explanation of why the failure is otherwise permanent.
-        .initialization_script(transport::script())
         // Over dsh's refusal, for the moment between it loading and `auth`
         // getting the window past it. Document start is as early as there is,
         // and the reason the exchange itself cannot run here is that the token

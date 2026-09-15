@@ -15,9 +15,9 @@
 //! ## What it costs, and why it does not look like a cookie
 //!
 //! dsh serves every plugin's browser half as one combined script whose URL names
-//! all of them at once — 2.6 KB of request line on an ordinary profile; see
-//! [`crate::transport`]. That request therefore carries a larger header block
-//! than any other the window makes, and it is the first to cross the 16 KB
+//! all of them at once — 2.6 KB of request line on an ordinary profile. That
+//! request therefore carries a larger header block than any other the window
+//! makes, and it is the first to cross the 16 KB
 //! `maxHeaderSize` Node answers `431 Request Header Fields Too Large` to. The
 //! index is a short URL and still fits, so the page loads, dsh's boot card comes
 //! up, and what it says is "Failed to load plugins" over a list of forty-odd
