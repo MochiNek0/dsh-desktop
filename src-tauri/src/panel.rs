@@ -129,6 +129,7 @@ pub fn script() -> String {
     let scheme = crate::controls::SCHEME;
     let font = crate::controls::FONT;
     let maker = crate::controls::dom_make();
+    let icons = crate::controls::lucide();
     let watcher = crate::controls::theme_watcher("dsh-pp-dark");
     let labels = labels();
     let relabel = RELABEL;
@@ -158,6 +159,8 @@ pub fn script() -> String {
 
 {maker}
 
+{icons}
+
   function button(parent, text, onclick) {{
     var node = make('button', '', parent);
     node.type = 'button';
@@ -185,38 +188,28 @@ pub fn script() -> String {
     return tag;
   }}
 
-  // A path apiece, wrapped by `svg` below -- the same shape `controls` keeps
-  // its titlebar glyphs in, and for the same reason: the page underneath has
-  // an icon set of its own and none of it is reachable from here.
+  // What each mark on a card is, named for what it means here rather than for
+  // the shape it happens to be. The shapes are `LUCIDE` above -- the set the
+  // titlebar draws from too, for the same reason it exists at all: the page
+  // underneath has an icon set of its own and none of it is reachable here.
   var ICONS = {{
-    about: '<circle cx="8" cy="8" r="6.2"/><path d="M8 7.4v3.7"/>' +
-      '<path d="M8 5.1h.01"/>',
+    about: 'info',
     // The arrow leaving the box: this one goes out to the user's browser.
-    repo: '<path d="M9.7 3.2h3.1v3.1"/><path d="M12.8 3.2 8 8"/>' +
-      '<path d="M11.2 9.6v2c0 .7-.5 1.2-1.2 1.2H4.4c-.7 0-1.2-.5-1.2-1.2V6' +
-      'c0-.7.5-1.2 1.2-1.2h2"/>',
-    // Filled, so a star this size reads as a star rather than as a scribble.
-    recommended: '<path fill="currentColor" stroke="none" d="M8 2.4l1.75 3.54' +
-      ' 3.85.55-2.8 2.7.66 3.85L8 11.27l-3.46 1.77.66-3.85-2.8-2.7 3.85-.55z"/>',
-    authored: '<circle cx="8" cy="5.6" r="2.3"/>' +
-      '<path d="M3.7 13a4.4 4.4 0 0 1 8.6 0"/>',
-    other: '<path d="M8 2.7l5 2.6v5.4L8 13.3 3 10.7V5.3z"/>',
-    // The one inside a ticked box. Drawn rather than typed, because a glyph
-    // would inherit whatever the page underneath does to fonts -- and drawn
-    // rather than built out of a rotated corner, which is what this replaces:
-    // a corner has to be nudged into the middle of the box by hand, and it
-    // was a pixel and a half high of it.
-    tick: '<path d="M3.2 8.5l3.1 3.1 6.5-6.8"/>',
+    repo: 'externalLink',
+    recommended: 'star',
+    authored: 'user',
+    other: 'package',
+    // The one inside a ticked box. A shape rather than a character, because a
+    // glyph would inherit whatever the page underneath does to fonts.
+    tick: 'check',
     // An arrow up off a line: what the card would fetch, rather than the box
     // with an arrow going out of it that `repo` already is.
-    update: '<path d="M8 10.9V2.9"/><path d="M4.9 6 8 2.9 11.1 6"/>' +
-      '<path d="M3.2 13.1h9.6"/>'
+    update: 'arrowUpFromLine'
   }};
 
-  function svg(shape) {{
-    return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" ' +
-      'stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" ' +
-      'aria-hidden="true">' + shape + '</svg>';
+  /** One of them at the size a card draws its marks, which is all of them. */
+  function svg(name) {{
+    return lucide(name, 16);
   }}
 
   /** Which list a preset came off: the mark it wears, and what that says.
@@ -375,7 +368,18 @@ pub fn script() -> String {
       var bump = act(bar, ICONS.update, TEXT.update.replace('{{}}', item.update.to));
       bump.classList.add('dsh-pp-bump');
       bump.addEventListener('click', function () {{
-        signal('plugins-update?names=' + encodeURIComponent(item.value));
+        // The version goes with the name, and the update does not work without
+        // it. `pnpm add <name>` on a package that is already a dependency whose
+        // recorded range still admits what the lockfile pinned is a no-op —
+        // pnpm answers "Already up to date" and rewrites nothing, so the button
+        // ran, reported success, and left the old version in place. `outdated`
+        // has no such scruples, so the card kept offering the same update.
+        //
+        // `@to` is what the button already says it will do, which makes this
+        // the version the user was promised rather than whatever the registry
+        // has by the time the click lands.
+        signal('plugins-update?names=' +
+          encodeURIComponent(item.value + '@' + item.update.to));
       }});
     }}
 
@@ -592,7 +596,10 @@ pub fn script() -> String {
       'background:var(--pp-accent)}}' +
       // The check itself: centred by the box's own flexbox, which is the one
       // way it is certain to be. See `ICONS.tick`.
-      '.dsh-pp-tick svg{{width:11px;height:11px;color:#fff;stroke-width:2;' +
+      // 3 rather than 2 on a 24-unit grid, which is what it takes to come out
+      // the weight it was on the 16-unit one this icon used to be drawn on: a
+      // tick 11 pixels across inside a filled box wants the heavier stroke.
+      '.dsh-pp-tick svg{{width:11px;height:11px;color:#fff;stroke-width:3;' +
       'transform:scale(.4);opacity:0;' +
       'transition:transform .15s,opacity .15s}}' +
       '.dsh-pp-row.dsh-pp-on .dsh-pp-tick svg{{transform:scale(1);opacity:1}}' +
@@ -889,4 +896,25 @@ pub fn script() -> String {
   }};
 }})();"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    /// The update button puts the version on the wire, not just the name.
+    ///
+    /// `dsh plugin add <name>` on a dependency whose recorded range already
+    /// admits what the lockfile pinned is a no-op: pnpm says "Already up to
+    /// date" and rewrites nothing, while `pnpm outdated` goes on reporting the
+    /// newer release. So the button ran, reported success, drew itself again,
+    /// and the plugin stayed where it was — silent in every direction. See
+    /// [`crate::plugins::update`], which is the half that receives this.
+    #[test]
+    fn the_update_button_names_the_version_it_offers() {
+        let script = super::script();
+
+        assert!(
+            script.contains("item.value + '@' + item.update.to"),
+            "the update signal has to carry the version, or pnpm does nothing"
+        );
+    }
 }

@@ -567,13 +567,6 @@ fn notes() -> String {
             ),
         ),
         (
-            "check-app",
-            t!(
-                "看看这个桌面端有没有新版本。",
-                "Whether this desktop app has a newer release."
-            ),
-        ),
-        (
             "autostart",
             t!(
                 "登录后自动把 dsh desktop 启动起来。",
@@ -633,6 +626,63 @@ pub(crate) fn dom_make() -> &'static str {
     if (className) node.className = className;
     if (parent) parent.appendChild(node);
     return node;
+  }"#
+}
+
+/// `var LUCIDE`, the shape of every icon the cards draw, keyed by its name in
+/// the set it came from.
+///
+/// Lucide 1.46.0, under the ISC licence. Copied rather than depended on: there
+/// is no frontend build here — these scripts are injected into a page that
+/// belongs to dsh — so an icon has to arrive as the literal path data it is
+/// drawn from, and a `<img src>` or a webfont would be a fetch into a page whose
+/// network this app does not own.
+///
+/// One set rather than each card drawing its own. The shapes here were hand
+/// written, a few strokes at a time, against whatever viewBox the card that
+/// wanted them happened to use — 16 in [`crate::panel`], 14 and 12 here — so
+/// the same tick existed twice at two weights and the chevron on a settings row
+/// was not a shape at all but a `›` out of the page's own font. Every one of
+/// them is on Lucide's 24-unit grid now, at Lucide's stroke width, so a card
+/// picks the pixel size and gets the same weight the others have.
+///
+/// Pasted into both scripts by [`crate::panel::script`] and [`script`], the way
+/// [`dom_make`] is, so adding an icon is an edit here rather than in each.
+pub(crate) fn lucide() -> &'static str {
+    r#"  // Lucide 1.46.0 icons, ISC licence. https://lucide.dev
+  var LUCIDE = {
+    menu: '<path d="M4 5h16"/><path d="M4 12h16"/><path d="M4 19h16"/>',
+    check: '<path d="M20 6 9 17l-5-5"/>',
+    chevronRight: '<path d="m9 18 6-6-6-6"/>',
+    info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/>' +
+      '<path d="M12 8h.01"/>',
+    externalLink: '<path d="M15 3h6v6"/><path d="M10 14 21 3"/>' +
+      '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+    // Filled, which the set does not ship: a star this size drawn as an
+    // outline reads as a scribble. The fill is the only change to the path.
+    star: '<path fill="currentColor" d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 ' +
+      '4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.7' +
+      '36 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4' +
+      '.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.' +
+      '881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.90' +
+      '6l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/>',
+    user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>' +
+      '<circle cx="12" cy="7" r="4"/>',
+    package: '<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0' +
+      '-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/>' +
+      '<path d="M12 22V12"/><polyline points="3.29 7 12 12 20.71 7"/>' +
+      '<path d="m7.5 4.27 9 5.15"/>',
+    arrowUpFromLine: '<path d="m18 9-6-6-6 6"/><path d="M12 3v14"/>' +
+      '<path d="M5 21h14"/>'
+  };
+
+  /** One icon at `size` pixels, on Lucide's own grid and at its own weight. */
+  function lucide(name, size, className) {
+    return '<svg' + (className ? ' class="' + className + '"' : '') +
+      ' width="' + size + '" height="' + size + '" viewBox="0 0 24 24"' +
+      ' fill="none" stroke="currentColor" stroke-width="2"' +
+      ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      LUCIDE[name] + '</svg>';
   }"#
 }
 
@@ -708,6 +758,7 @@ pub fn script() -> String {
     let labels = labels();
     let notes = notes();
     let maker = dom_make();
+    let icons = lucide();
     let watcher = theme_watcher("dsh-wc-dark");
 
     format!(
@@ -762,6 +813,11 @@ pub fn script() -> String {
     // Hidden until there is something to undo. See `__dshSafeMode`.
     {{ verb: 'safe-off', hidden: true }},
     {{ verb: 'update-dsh' }},
+    // Beside the other update rather than on the card behind `settings`: the
+    // two read as one pair — dsh, and the app dsh is running in — and neither
+    // is a setting. The card is for what is configured once; this is a thing
+    // done, and it was the one row on that card with nothing to remember.
+    {{ verb: 'check-app' }},
     {{ separator: true }},
     {{ verb: 'settings', panel: true }},
     {{ separator: true }},
@@ -777,7 +833,6 @@ pub fn script() -> String {
     // Where dsh is fetched from, which is only ever a question on a machine
     // whose npm is pointed somewhere of the user's own; see `settings.rs`.
     {{ verb: 'registry' }},
-    {{ verb: 'check-app' }},
     {{ verb: 'autostart', check: true }},
     {{ verb: 'notify-turns', check: true }},
     // The way out that is visible. Escape and the scrim close it too, and
@@ -785,13 +840,16 @@ pub fn script() -> String {
     {{ verb: 'settings-done', close: true }}
   ];
 
-  var MENU_GLYPH = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" ' +
-    'stroke="currentColor" stroke-width="1.4" stroke-linecap="round">' +
-    '<path d="M3 4.5h8M3 7h8M3 9.5h8"/></svg>';
+{icons}
 
-  var TICK = '<svg class="dsh-wc-tick" width="11" height="11" viewBox="0 0 12 12" ' +
-    'fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" ' +
-    'stroke-linejoin="round"><path d="M2.4 6.4l2.3 2.3 4.9-5.1"/></svg>';
+  var MENU_GLYPH = lucide('menu', 14);
+
+
+  // On every row of the settings card that opens something else. It was a `›`
+  // until now -- a character, so it was set in whatever font dsh's page had
+  // loaded, at whatever weight that font draws it, beside icons that are
+  // strokes. See `LUCIDE`.
+  var GO_GLYPH = lucide('chevronRight', 14);
 
   function svg(shape) {{
     return '<svg width="8" height="8" viewBox="0 0 10 10" fill="none" ' +
@@ -884,11 +942,16 @@ pub fn script() -> String {
       '.dsh-wc,.dsh-wc-set{{--dsh-wc-fg:rgba(0,0,0,.55);--dsh-wc-fg-hi:rgba(0,0,0,.85);' +
       '--dsh-wc-panel:rgba(255,255,255,.96);--dsh-wc-line:rgba(0,0,0,.09);' +
       '--dsh-wc-hover:rgba(0,0,0,.06);--dsh-wc-accent:#4d6bfe;' +
+      // The switch track when it is off. Not `--dsh-wc-line`, which is the
+      // hairline between rows: at 9% a track reads as absent rather than as
+      // off, and the switch was the one control on the card you had to look
+      // twice at to find.
+      '--dsh-wc-sw-off:rgba(0,0,0,.22);' +
       '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.18),0 0 0 .5px rgba(0,0,0,.09);}}' +
       '.dsh-wc.dsh-wc-dark,.dsh-wc-set.dsh-wc-dark{{' +
       '--dsh-wc-fg:rgba(255,255,255,.62);--dsh-wc-fg-hi:rgba(255,255,255,.94);' +
       '--dsh-wc-panel:rgba(42,42,46,.96);--dsh-wc-line:rgba(255,255,255,.11);' +
-      '--dsh-wc-hover:rgba(255,255,255,.09);' +
+      '--dsh-wc-hover:rgba(255,255,255,.09);--dsh-wc-sw-off:rgba(255,255,255,.26);' +
       '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.5),0 0 0 .5px rgba(255,255,255,.09);}}' +
       'html,body{{height:100%!important;margin:0!important;overflow:hidden!important;}}' +
       '#root{{height:calc(100% - var(--dsh-titlebar-height))!important;margin-top:var(--dsh-titlebar-height)!important;box-sizing:border-box!important;}}' +
@@ -969,16 +1032,12 @@ pub fn script() -> String {
       '.dsh-wc-pop button:hover{{background:var(--dsh-wc-hover)}}' +
       '.dsh-wc-pop hr{{border:0;height:1px;margin:5px 8px;' +
       'background:var(--dsh-wc-line)}}' +
-      '.dsh-wc-tick{{margin-left:auto;opacity:0;transition:opacity .12s ease}}' +
-      '.dsh-wc-pop button.dsh-wc-checked .dsh-wc-tick{{opacity:1}}' +
       // A switch whose precondition is missing. Dimmed and inert rather than
       // hidden: a setting that vanishes is one the user cannot find again to
-      // ask why. `title` says what is missing; see `sync_notify`. Both places
-      // a row can be drawn, since the one row this is ever about moved to the
-      // card and the machinery that marks it did not.
-      '.dsh-wc-pop button.dsh-wc-unavailable,' +
+      // ask why. `title` says what is missing; see `sync_notify`. On the card
+      // and nowhere else: the one row this is ever about lives there, and so
+      // does every entry in `checks`, which is how `sync_notify` finds it.
       '.dsh-wc-set button.dsh-wc-unavailable{{opacity:.4;cursor:default}}' +
-      '.dsh-wc-pop button.dsh-wc-unavailable:hover,' +
       '.dsh-wc-set button.dsh-wc-unavailable:hover{{background:none}}' +
       // ---------------------------------------------- the settings card --
       // Behind everything, and the click that closes the card without
@@ -1026,26 +1085,34 @@ pub fn script() -> String {
       'min-width:0;text-align:left}}' +
       '.dsh-wc-set-note{{color:var(--dsh-wc-fg);font:11px/1.45 {FONT};' +
       'white-space:normal}}' +
-      // The one glyph that says "this opens something else".
-      '.dsh-wc-set-go{{margin-left:auto;flex:none;color:var(--dsh-wc-fg);' +
-      'font:13px/1 {FONT}}}' +
+      // The one glyph that says "this opens something else". A flex box
+      // rather than a font size, because what is in it is a shape now.
+      '.dsh-wc-set-go{{display:flex;margin-left:auto;flex:none;' +
+      'color:var(--dsh-wc-fg);opacity:.75}}' +
       // A switch rather than the menu's checkmark: a row two lines tall with a
       // tick floating beside it reads as a list item, not as something on or
       // off. Driven by the same `dsh-wc-checked` class `mark` already sets, so
       // nothing about how state arrives changed.
+      //
+      // 38 by 22 around a knob of 16, rather than 34 by 20 around one of 16.
+      // The old pair left two pixels of track above and below the knob and
+      // barely more at the ends, so the knob was the switch and the track was
+      // a rim around it -- which is what made it read as flat however round it
+      // actually was. Three pixels of clearance and a longer throw give the
+      // knob somewhere to travel, which is the whole of what the control says.
       '.dsh-wc-sw{{position:relative;margin-left:auto;flex:none;' +
-      'width:34px;height:20px;border-radius:999px;' +
-      'background:var(--dsh-wc-line);transition:background .16s ease}}' +
+      'width:38px;height:22px;border-radius:999px;' +
+      'background:var(--dsh-wc-sw-off);transition:background .16s ease}}' +
       // Double quotes inside a single-quoted string: this whole stylesheet is
       // JavaScript, and an apostrophe here would end the string it is in.
-      '.dsh-wc-sw::after{{content:"";position:absolute;top:2px;left:2px;' +
+      '.dsh-wc-sw::after{{content:"";position:absolute;top:3px;left:3px;' +
       'width:16px;height:16px;border-radius:50%;background:#fff;' +
-      'box-shadow:0 1px 2px rgba(0,0,0,.28);' +
+      'box-shadow:0 1px 2px rgba(0,0,0,.24),0 0 0 .5px rgba(0,0,0,.04);' +
       'transition:transform .16s cubic-bezier(.2,.9,.24,1)}}' +
       '.dsh-wc-set button.dsh-wc-checked .dsh-wc-sw{{' +
       'background:var(--dsh-wc-accent)}}' +
       '.dsh-wc-set button.dsh-wc-checked .dsh-wc-sw::after{{' +
-      'transform:translateX(14px)}}' +
+      'transform:translateX(16px)}}' +
       // Standing, not passing: the launch is running on no plugins, and says so
       // for as long as that is true. Drawn as an outline rather than as text so
       // it does not read as another of the toast's transient messages, and left
@@ -1144,6 +1211,12 @@ pub fn script() -> String {
 
     var pop = document.createElement('div');
     pop.className = 'dsh-wc-pop';
+    // The settings card's switches, by verb. Declared out here rather than
+    // with the card because `mark` and `__dshNotifyTurns` reach it from the
+    // same closure; nothing in the menu writes to it. The menu used to, for
+    // the two switches that were rows on it, and drew a checkmark beside each
+    // -- both the branch and the glyph went when the switches moved to the
+    // card, since a row that is never `check` cannot fill either.
     var checks = {{}};
     // Kept for the same reason `checks` is: something out here changes them
     // after they are drawn. See `__dshRelabel`.
@@ -1172,10 +1245,6 @@ pub fn script() -> String {
       label.textContent = LABELS[item.verb];
       (spans[item.verb] = spans[item.verb] || []).push(label);
       entry.appendChild(label);
-      if (item.check) {{
-        entry.insertAdjacentHTML('beforeend', TICK);
-        checks[item.verb] = entry;
-      }}
       entry.addEventListener('click', function () {{
         // A row whose precondition is missing is inert. It is not a `disabled`
         // button, so that it can still be hovered for the reason why; this is
@@ -1230,10 +1299,9 @@ pub fn script() -> String {
 
     // --------------------------------------------------------- the settings --
     //
-    // Five rows that used to be menu items. None of them is reached mid-task —
-    // which Node runs dsh, which registry it comes from, whether to look for an
-    // app update, and the two switches — and together they were more than half
-    // the menu.
+    // Four rows that used to be menu items. None of them is reached mid-task —
+    // which Node runs dsh, which registry it comes from, and the two switches —
+    // and together they were more than half the menu.
     //
     // Everything on it is drawn from `LABELS` and `NOTES`, which this script
     // already holds, and every row signals the verb it always signalled. So
@@ -1281,7 +1349,7 @@ pub fn script() -> String {
         make('span', 'dsh-wc-sw', row);
         checks[item.verb] = row;
       }} else if (!item.close) {{
-        make('span', 'dsh-wc-set-go', row).textContent = '›';
+        make('span', 'dsh-wc-set-go', row).innerHTML = GO_GLYPH;
       }}
 
       row.addEventListener('click', function () {{
@@ -1648,13 +1716,7 @@ mod tests {
             .next()
             .expect("the script declares both lists");
 
-        for verb in [
-            "runtime",
-            "registry",
-            "check-app",
-            "autostart",
-            "notify-turns",
-        ] {
+        for verb in ["runtime", "registry", "autostart", "notify-turns"] {
             let row = format!("verb: '{verb}'");
             assert!(!menu.contains(&row), "{verb} is still drawn into the menu");
             assert!(script.contains(&row), "{verb} is on neither list");
@@ -1873,6 +1935,36 @@ mod tests {
     /// The titlebar is in the list now. It used to build its row by hand and
     /// have no `make` to share; the settings card is a card, so it uses the
     /// same helper the other three do.
+    /// And the icons they draw, for a third time: the shapes were hand written
+    /// against whatever viewBox each card happened to use, so the same tick
+    /// existed twice at two weights and a settings row's chevron was a `›` out
+    /// of the page's own font rather than a shape at all. One set, on one grid.
+    ///
+    /// The titlebar's four window buttons are deliberately not in it. They are
+    /// macOS's own symbols — the split square, the two arrows turned inward —
+    /// drawn filled at 10 units to sit inside a 12-pixel dot, and no icon set
+    /// has them because they belong to the platform rather than to a UI.
+    #[test]
+    fn the_cards_share_one_icon_set() {
+        for (what, script) in [
+            ("the plugin panel", crate::panel::script()),
+            ("the settings card", super::script()),
+        ] {
+            assert!(
+                script.contains(lucide()),
+                "{what} must draw icons from `lucide`, not shapes of its own"
+            );
+        }
+
+        // Nothing left in the panel is drawn by hand. The titlebar still has
+        // its four, which is what the doc above is about.
+        let panel = include_str!("panel.rs");
+        assert!(
+            !panel.contains("'<path"),
+            "the panel draws every shape it has from `lucide` now"
+        );
+    }
+
     #[test]
     fn the_cards_share_one_element_helper() {
         for (what, script) in [

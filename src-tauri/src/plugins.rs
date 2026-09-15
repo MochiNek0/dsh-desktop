@@ -1370,20 +1370,29 @@ pub fn install(
     add(app, &specs, log)
 }
 
-/// Bring the named plugins up to their newest release.
+/// Bring the named plugins up to the release the panel offered.
 ///
-/// `dsh plugin add <name>` with no version is what an update is: pnpm resolves
-/// the name again, takes the newest release that exists, and rewrites the range
-/// in the profile manifest. Which makes this the install path with the specs
-/// picked differently, and it is the install path — `add` below — rather than a
-/// second one that would have to grow its own `ensure_pnpm`, its own repair and
-/// its own reconcile.
+/// `dsh plugin add <name>@<version>` is what an update is, and the version is
+/// not optional. A bare name reads as "make sure this is installed", and pnpm
+/// answers it against what is already recorded: a package whose range in the
+/// profile manifest still admits the version the lockfile pinned is already
+/// satisfied, so pnpm prints "Already up to date", resolves nothing and
+/// rewrites nothing. `pnpm outdated` compares against the registry instead and
+/// keeps reporting the newer release — which is how this managed to draw an
+/// update button that ran, said it had worked, and left the old version in
+/// place. Naming the version is what forces the range to be rewritten.
 ///
-/// The names come from a click on a card the panel drew, which drew it from the
-/// profile manifest — so they are already installed by construction. They are
+/// Which makes this the install path with the specs picked differently, and it
+/// is the install path — `add` below — rather than a second one that would have
+/// to grow its own `ensure_pnpm`, its own repair and its own reconcile.
+///
+/// The specs come from a click on a card the panel drew, which drew the name
+/// from the profile manifest and the version from [`outdated`] — so they are
+/// already installed by construction, at a version that exists. They are
 /// checked anyway: the verb arrives on a navigation, and `controls` cannot tell
 /// one this app's panel sent from one a script in the page sent. See
-/// [`is_package_spec`], which is the same gate the free-text box passes.
+/// [`is_package_spec`], which takes `name@range` and is the same gate the
+/// free-text box passes.
 pub fn update(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String> {
     let mut specs: Vec<String> = Vec::new();
 
