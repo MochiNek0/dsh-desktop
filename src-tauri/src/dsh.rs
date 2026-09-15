@@ -1206,14 +1206,48 @@ pub fn npm(app: &AppHandle) -> Option<Command> {
         }
     };
 
-    let mut command = Command::new(node);
+    let mut command = Command::new(&node);
     command.arg(cli).stdin(Stdio::null());
+
+    // npm runs a dependency's install script through the shell, and the ones
+    // that build something spell it `node …` — resolved off the child's PATH,
+    // not from the Node running npm. This process's own PATH is whatever the
+    // app was launched with, which on a GUI launch is neither a version
+    // manager's nor, of course, the Node the bootstrap script unpacked: on
+    // macOS a `.app` started from Finder gets launchd's minimal PATH and never
+    // the user's shell. So `npm install -g pnpm` reaches pnpm's `node
+    // install.js` preinstall and dies with `sh: node: command not found`,
+    // exit 127 — issue #11.
+    //
+    // Both installer scripts already do this for their own `npm install -g`
+    // (`install-deps.sh` and `install-deps.ps1`); this is the same fix for the
+    // npm this module spawns. The chosen Node's own directory goes in front
+    // rather than merely somewhere on the list, so the install script runs the
+    // Node npm itself is running and not one that happens to be earlier on the
+    // inherited PATH.
+    if let Ok(path) = std::env::join_paths(node_first(&node, search_path(app))) {
+        command.env("PATH", path);
+    }
     unbundle(&mut command);
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
 
     Some(command)
+}
+
+/// `rest` with the directory holding `node` in front of it.
+///
+/// Split out so that the ordering — the whole point of it — is testable
+/// without a running app. A `node` with no parent is not a path any of the
+/// callers can produce; it leaves the list as it was rather than inventing an
+/// entry.
+fn node_first(node: &Path, rest: Vec<PathBuf>) -> Vec<PathBuf> {
+    node.parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(rest)
+        .collect()
 }
 
 /// Run `command` and take the single line it prints, giving it `timeout` to do
@@ -1688,7 +1722,7 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        dsh_on, executable, first_writable_prefix, host_entries, marker, node_version,
+        dsh_on, executable, first_writable_prefix, host_entries, marker, node_first, node_version,
         package_root, prefix_of, present, resolve, shim_dir, writable, DSH, NODE_MINIMUM, PACKAGE,
     };
     use std::path::{Path, PathBuf};
@@ -1738,6 +1772,29 @@ mod tests {
         let value = std::ffi::OsString::from("/tmp/.mount_dshdesQWERTYnot/lib");
 
         assert_eq!(host_entries(&value, appdir), Some(value.clone()));
+    }
+
+    /// The Node npm is being run with has to be the one its install scripts
+    /// find, so its directory goes in *front* of everything the search path
+    /// already had — including an earlier entry holding a different Node. This
+    /// is what keeps `npm install -g pnpm` from dying in pnpm's `node
+    /// install.js` preinstall on a launch whose PATH never saw the user's shell.
+    #[test]
+    fn npm_runs_with_its_own_node_at_the_front_of_the_path() {
+        let node = PathBuf::from("/home/user/.nvm/versions/node/v24.3.0/bin/node");
+        let path = node_first(
+            &node,
+            vec![PathBuf::from("/usr/bin"), PathBuf::from("/opt/other/bin")],
+        );
+
+        assert_eq!(
+            path,
+            vec![
+                PathBuf::from("/home/user/.nvm/versions/node/v24.3.0/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/opt/other/bin"),
+            ]
+        );
     }
 
     /// The floor lives in three files: this one, and the two scripts. Ours
