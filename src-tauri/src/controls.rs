@@ -414,13 +414,13 @@ pub fn sync_notify(app: &AppHandle) {
         crate::plugins::signalling(app),
         if crate::plugins::safe(app) {
             t!(
-                "这次启动没有加载任何插件，「会话信号」也在内。用上面的「重新加载插件」装回来。",
-                "This launch loaded no plugins, Session signals included. Use “Load plugins again” above to bring them back."
+                "这次启动没有加载任何插件，「会话信号」也在内。用菜单里的「重新加载插件」装回来。",
+                "This launch loaded no plugins, Session signals included. Use “Load plugins again” in the menu to bring them back."
             )
         } else {
             t!(
                 "需要「会话信号」插件，在菜单的「插件」里安装。",
-                "Needs the Session signals plugin — install it from Plugins in this menu."
+                "Needs the Session signals plugin — install it from Plugins in the menu."
             )
         },
     );
@@ -515,6 +515,11 @@ fn labels() -> String {
         // clicking it does.
         ("safe-off", t!("重新加载插件", "Load plugins again")),
         ("update-dsh", t!("更新 dsh…", "Update dsh…")),
+        // The one row that opens a card rather than doing something. Everything
+        // behind it is a setting nobody changes twice, and the menu is what
+        // they were making long; see [`SETTINGS`] in [`script`].
+        ("settings", t!("设置…", "Settings…")),
+        ("settings-done", t!("关闭", "Close")),
         ("runtime", t!("运行环境…", "Runtime…")),
         ("registry", t!("安装源…", "Install source…")),
         (
@@ -537,6 +542,61 @@ fn labels() -> String {
     serde_json::to_string(&map).expect("a map of strings is always serializable")
 }
 
+/// The line under each row of the settings card, against the same verb its
+/// label is under.
+///
+/// Separate from [`labels`] rather than `"runtime-note"` keys in it, because
+/// that map is one string per verb and [`every_menu_entry_is_labelled`] is what
+/// keeps it that way. These exist for the rows that moved off the menu: a menu
+/// row has only its own words to explain itself and has to be short, and
+/// "Runtime…" on its own never said which of node and dsh it was about.
+fn notes() -> String {
+    let notes = [
+        (
+            "runtime",
+            t!(
+                "选哪个 Node 跑 dsh，以及装上或卸掉 dsh 本身。",
+                "Which Node runs dsh, and installing or removing dsh itself."
+            ),
+        ),
+        (
+            "registry",
+            t!(
+                "dsh 从哪个 npm 源安装和更新。",
+                "The npm registry dsh is installed and updated from."
+            ),
+        ),
+        (
+            "check-app",
+            t!(
+                "看看这个桌面端有没有新版本。",
+                "Whether this desktop app has a newer release."
+            ),
+        ),
+        (
+            "autostart",
+            t!(
+                "登录后自动把 dsh desktop 启动起来。",
+                "Start dsh desktop after you log in."
+            ),
+        ),
+        (
+            "notify-turns",
+            t!(
+                "一轮跑完、或者 dsh 要问你点什么的时候提醒你。",
+                "Tell you when a turn finishes, or when dsh stops to ask something."
+            ),
+        ),
+    ];
+
+    let map: serde_json::Map<String, serde_json::Value> = notes
+        .into_iter()
+        .map(|(verb, note)| (verb.to_string(), note.into()))
+        .collect();
+
+    serde_json::to_string(&map).expect("a map of strings is always serializable")
+}
+
 /// Put the menu into the language dsh has just switched to.
 ///
 /// Only what is already drawn needs this. Everything else in the app reads the
@@ -552,7 +612,11 @@ pub fn relabel(app: &AppHandle) {
     );
     eval(
         app,
-        &format!("window.__dshRelabel && window.__dshRelabel({})", labels()),
+        &format!(
+            "window.__dshRelabel && window.__dshRelabel({}, {})",
+            labels(),
+            notes()
+        ),
     );
 }
 
@@ -642,6 +706,8 @@ pub fn script() -> String {
     let night = crate::theme::dark_css();
 
     let labels = labels();
+    let notes = notes();
+    let maker = dom_make();
     let watcher = theme_watcher("dsh-wc-dark");
 
     format!(
@@ -677,8 +743,17 @@ pub fn script() -> String {
   // see `i18n`. Keyed by verb rather than laid out in order, because
   // `__dshRelabel` sends this same shape again when dsh changes language.
   var LABELS = {labels};
+  // The second line each settings row carries; see `notes` in controls.rs.
+  var NOTES = {notes};
 
-  // The menu, top to bottom. `check` marks the one item that carries state.
+  // The menu, top to bottom. `panel` marks the one row that opens a card of
+  // this app's own instead of signalling Rust.
+  //
+  // What is here is what someone reaches for while using dsh. Five rows that
+  // were not — which Node, which registry, the app updater, and the two
+  // switches — are in the card below: the menu had grown to eleven rows and
+  // four unlabelled rules, and picking the one you wanted out of it had become
+  // reading rather than aiming.
   var ITEMS = [
     {{ verb: 'plugins' }},
     {{ verb: 'terminal' }},
@@ -687,19 +762,27 @@ pub fn script() -> String {
     // Hidden until there is something to undo. See `__dshSafeMode`.
     {{ verb: 'safe-off', hidden: true }},
     {{ verb: 'update-dsh' }},
-    // One item for the whole of which Node and which dsh, rather than one per
-    // verb: the panel behind it can switch, install and uninstall, and this
-    // menu is already long. See `setup`.
-    {{ verb: 'runtime' }},
-    // Where dsh is fetched from, which is only ever a question on a machine
-    // whose npm is pointed somewhere of the user's own; see `settings`.
-    {{ verb: 'registry' }},
-    {{ verb: 'check-app' }},
     {{ separator: true }},
-    {{ verb: 'autostart', check: true }},
-    {{ verb: 'notify-turns', check: true }},
+    {{ verb: 'settings', panel: true }},
     {{ separator: true }},
     {{ verb: 'quit' }}
+  ];
+
+  // The settings card, top to bottom. `check` marks a row that carries state
+  // and stays put when it is clicked; the rest act and close the card.
+  var SETTINGS = [
+    // One row for the whole of which Node and which dsh, rather than one per
+    // verb: the panel behind it can switch, install and uninstall. See `setup`.
+    {{ verb: 'runtime' }},
+    // Where dsh is fetched from, which is only ever a question on a machine
+    // whose npm is pointed somewhere of the user's own; see `settings.rs`.
+    {{ verb: 'registry' }},
+    {{ verb: 'check-app' }},
+    {{ verb: 'autostart', check: true }},
+    {{ verb: 'notify-turns', check: true }},
+    // The way out that is visible. Escape and the scrim close it too, and
+    // neither is something a user finds by looking at the card.
+    {{ verb: 'settings-done', close: true }}
   ];
 
   var MENU_GLYPH = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" ' +
@@ -720,6 +803,12 @@ pub fn script() -> String {
   function signal(verb) {{
     window.location.href = '{SCHEME}://' + verb;
   }}
+
+  // --------------------------------------------------------- the elements --
+  // Pasted in from `dom_make`, the one this app's cards are built with. The
+  // titlebar used to have no card in it and built its row by hand; the
+  // settings panel below is a card, so it uses the shared helper.
+{maker}
 
   // ----------------------------------------------------------- the theme --
   // Pasted in from `controls::theme_watcher`, which every card in this app
@@ -784,14 +873,19 @@ pub fn script() -> String {
     style.textContent =
       ':root{{--dsh-titlebar-height:{titlebar_height}px;}}' +
       // Everything the menu is drawn out of, in one place and in both themes.
-      // On the bar rather than on `:root`, so `dsh-wc-dark` -- put on by
+      // On the two roots rather than on `:root`, so `dsh-wc-dark` -- put on by
       // `repaint` below out of what the page says, not out of the media query
       // -- is all it takes to swap the set.
-      '.dsh-wc{{--dsh-wc-fg:rgba(0,0,0,.55);--dsh-wc-fg-hi:rgba(0,0,0,.85);' +
+      //
+      // Two roots because the settings card is not inside the bar: the bar is
+      // drawn at `opacity:.85`, which every descendant inherits, and a card
+      // washed out to 85% is not a card. So it is a sibling on the body, with
+      // its own copy of the set and its own `paint`.
+      '.dsh-wc,.dsh-wc-set{{--dsh-wc-fg:rgba(0,0,0,.55);--dsh-wc-fg-hi:rgba(0,0,0,.85);' +
       '--dsh-wc-panel:rgba(255,255,255,.96);--dsh-wc-line:rgba(0,0,0,.09);' +
-      '--dsh-wc-hover:rgba(0,0,0,.06);' +
+      '--dsh-wc-hover:rgba(0,0,0,.06);--dsh-wc-accent:#4d6bfe;' +
       '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.18),0 0 0 .5px rgba(0,0,0,.09);}}' +
-      '.dsh-wc.dsh-wc-dark{{' +
+      '.dsh-wc.dsh-wc-dark,.dsh-wc-set.dsh-wc-dark{{' +
       '--dsh-wc-fg:rgba(255,255,255,.62);--dsh-wc-fg-hi:rgba(255,255,255,.94);' +
       '--dsh-wc-panel:rgba(42,42,46,.96);--dsh-wc-line:rgba(255,255,255,.11);' +
       '--dsh-wc-hover:rgba(255,255,255,.09);' +
@@ -879,9 +973,79 @@ pub fn script() -> String {
       '.dsh-wc-pop button.dsh-wc-checked .dsh-wc-tick{{opacity:1}}' +
       // A switch whose precondition is missing. Dimmed and inert rather than
       // hidden: a setting that vanishes is one the user cannot find again to
-      // ask why. `title` says what is missing; see `sync_notify`.
-      '.dsh-wc-pop button.dsh-wc-unavailable{{opacity:.4;cursor:default}}' +
-      '.dsh-wc-pop button.dsh-wc-unavailable:hover{{background:none}}' +
+      // ask why. `title` says what is missing; see `sync_notify`. Both places
+      // a row can be drawn, since the one row this is ever about moved to the
+      // card and the machinery that marks it did not.
+      '.dsh-wc-pop button.dsh-wc-unavailable,' +
+      '.dsh-wc-set button.dsh-wc-unavailable{{opacity:.4;cursor:default}}' +
+      '.dsh-wc-pop button.dsh-wc-unavailable:hover,' +
+      '.dsh-wc-set button.dsh-wc-unavailable:hover{{background:none}}' +
+      // ---------------------------------------------- the settings card --
+      // Behind everything, and the click that closes the card without
+      // choosing anything. Under the drag strip as well as under the bar, so
+      // that the window can still be moved and closed while the card is up --
+      // the same thing `dialog` is careful about, for the same reason: this is
+      // modal to the page, not to the operating system.
+      '.dsh-wc-scrim{{position:fixed;inset:0;z-index:2147483645;' +
+      'background:rgba(0,0,0,.28);opacity:0;visibility:hidden;' +
+      'transition:opacity .16s ease,visibility 0s .16s}}' +
+      '.dsh-wc-scrim.dsh-wc-shown{{opacity:1;visibility:visible;' +
+      'transition-delay:0s}}' +
+      // Centred rather than hung off the menu button: it is a page of its own
+      // now, not a longer menu, and the rows have two lines each.
+      '.dsh-wc-set{{position:fixed;top:50%;left:50%;z-index:2147483647;' +
+      'width:min(420px,calc(100vw - 48px));max-height:calc(100vh - 96px);' +
+      'overflow:auto;box-sizing:border-box;padding:14px;' +
+      'background:var(--dsh-wc-panel);border-radius:14px;' +
+      'box-shadow:var(--dsh-wc-shadow);' +
+      '-webkit-backdrop-filter:blur(24px) saturate(180%);' +
+      'backdrop-filter:blur(24px) saturate(180%);' +
+      'opacity:0;visibility:hidden;pointer-events:none;' +
+      'transform:translate(-50%,-48%) scale(.98);' +
+      'transition:opacity .16s ease,' +
+      'transform .16s cubic-bezier(.2,.9,.24,1),visibility 0s .16s}}' +
+      '.dsh-wc-set.dsh-wc-shown{{opacity:1;visibility:visible;' +
+      'pointer-events:auto;transform:translate(-50%,-50%) scale(1);' +
+      'transition-delay:0s}}' +
+      '.dsh-wc-set-head{{display:flex;align-items:center;' +
+      'margin:2px 4px 10px;color:var(--dsh-wc-fg-hi);' +
+      'font:600 14px/1 {FONT}}}' +
+      '.dsh-wc-set button{{all:unset;box-sizing:border-box;pointer-events:auto;' +
+      'display:flex;align-items:center;gap:12px;width:100%;' +
+      'padding:9px 10px;border-radius:9px;cursor:pointer;' +
+      'color:var(--dsh-wc-fg-hi);font:13px/1 {FONT}}}' +
+      '.dsh-wc-set button:hover{{background:var(--dsh-wc-hover)}}' +
+      // `all: unset` above took the focus ring with it, and this card is
+      // opened with the keyboard as readily as with the pointer.
+      '.dsh-wc-set button:focus-visible{{outline:2px solid var(--dsh-wc-accent);' +
+      'outline-offset:2px}}' +
+      '.dsh-wc-set button.dsh-wc-set-shut{{justify-content:center;' +
+      'margin-top:8px;color:var(--dsh-wc-fg);' +
+      'box-shadow:inset 0 0 0 1px var(--dsh-wc-line)}}' +
+      '.dsh-wc-set-text{{display:flex;flex-direction:column;gap:4px;' +
+      'min-width:0;text-align:left}}' +
+      '.dsh-wc-set-note{{color:var(--dsh-wc-fg);font:11px/1.45 {FONT};' +
+      'white-space:normal}}' +
+      // The one glyph that says "this opens something else".
+      '.dsh-wc-set-go{{margin-left:auto;flex:none;color:var(--dsh-wc-fg);' +
+      'font:13px/1 {FONT}}}' +
+      // A switch rather than the menu's checkmark: a row two lines tall with a
+      // tick floating beside it reads as a list item, not as something on or
+      // off. Driven by the same `dsh-wc-checked` class `mark` already sets, so
+      // nothing about how state arrives changed.
+      '.dsh-wc-sw{{position:relative;margin-left:auto;flex:none;' +
+      'width:34px;height:20px;border-radius:999px;' +
+      'background:var(--dsh-wc-line);transition:background .16s ease}}' +
+      // Double quotes inside a single-quoted string: this whole stylesheet is
+      // JavaScript, and an apostrophe here would end the string it is in.
+      '.dsh-wc-sw::after{{content:"";position:absolute;top:2px;left:2px;' +
+      'width:16px;height:16px;border-radius:50%;background:#fff;' +
+      'box-shadow:0 1px 2px rgba(0,0,0,.28);' +
+      'transition:transform .16s cubic-bezier(.2,.9,.24,1)}}' +
+      '.dsh-wc-set button.dsh-wc-checked .dsh-wc-sw{{' +
+      'background:var(--dsh-wc-accent)}}' +
+      '.dsh-wc-set button.dsh-wc-checked .dsh-wc-sw::after{{' +
+      'transform:translateX(14px)}}' +
       // Standing, not passing: the launch is running on no plugins, and says so
       // for as long as that is true. Drawn as an outline rather than as text so
       // it does not read as another of the toast's transient messages, and left
@@ -983,7 +1147,14 @@ pub fn script() -> String {
     var checks = {{}};
     // Kept for the same reason `checks` is: something out here changes them
     // after they are drawn. See `__dshRelabel`.
+    //
+    // A list per verb rather than one element, because a verb is drawn in two
+    // places now: `settings` is a menu row and the heading of the card that
+    // row opens, and a language switch has to move both.
     var spans = {{}};
+    // The second line of a settings row, keyed the same way and relabelled
+    // alongside the first; see `__dshRelabel`.
+    var noteSpans = {{}};
     // And the rows themselves, for the one that comes and goes.
     var entries = {{}};
 
@@ -999,7 +1170,7 @@ pub fn script() -> String {
       if (item.hidden) entry.hidden = true;
       var label = document.createElement('span');
       label.textContent = LABELS[item.verb];
-      spans[item.verb] = label;
+      (spans[item.verb] = spans[item.verb] || []).push(label);
       entry.appendChild(label);
       if (item.check) {{
         entry.insertAdjacentHTML('beforeend', TICK);
@@ -1014,7 +1185,11 @@ pub fn script() -> String {
         // Closed first: the verb can end in a modal, and a menu still hanging
         // open behind it is a menu that is open again when the modal goes.
         shut();
-        signal(item.verb);
+        // The one row that goes nowhere near Rust: the card it opens is drawn
+        // here, out of labels this script already holds, and everything on it
+        // signals for itself.
+        if (item.panel) showSettings();
+        else signal(item.verb);
       }});
       pop.appendChild(entry);
     }});
@@ -1051,6 +1226,107 @@ pub fn script() -> String {
     // A dialog taking the focus is one of the ways a click here ends.
     window.addEventListener('blur', function () {{
       if (open) shut();
+    }});
+
+    // --------------------------------------------------------- the settings --
+    //
+    // Five rows that used to be menu items. None of them is reached mid-task —
+    // which Node runs dsh, which registry it comes from, whether to look for an
+    // app update, and the two switches — and together they were more than half
+    // the menu.
+    //
+    // Everything on it is drawn from `LABELS` and `NOTES`, which this script
+    // already holds, and every row signals the verb it always signalled. So
+    // Rust gained no verb for this card: `settings` opens it here, the rows
+    // reach the same handlers they reached from the menu, and `mark` finds the
+    // switches where it always looked — under `checks`, by verb.
+
+    var scrim = make('div', 'dsh-wc-scrim');
+    var card = make('div', 'dsh-wc-set');
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-modal', 'true');
+    card.setAttribute('aria-labelledby', 'dsh-wc-settings-title');
+
+    var head = make('div', 'dsh-wc-set-head', card);
+    head.id = 'dsh-wc-settings-title';
+    spans['settings'].push(head);
+
+    // The card's heading is the menu row's own words, minus the ellipsis: the
+    // "…" is a promise that clicking opens something, and on the thing it
+    // opened that promise has already been kept. One setter rather than one
+    // strip here and another in `__dshRelabel`, which is the copy that would
+    // have been forgotten.
+    function word(node, text) {{
+      node.textContent = node === head ? String(text).replace(/…$/, '') : text;
+    }}
+
+    word(head, LABELS['settings']);
+
+    SETTINGS.forEach(function (item) {{
+      var row = make('button', item.close ? 'dsh-wc-set-shut' : '', card);
+      row.type = 'button';
+
+      var text = make('span', 'dsh-wc-set-text', row);
+      var name = make('span', '', text);
+      word(name, LABELS[item.verb]);
+      (spans[item.verb] = spans[item.verb] || []).push(name);
+
+      if (NOTES[item.verb]) {{
+        var note = make('span', 'dsh-wc-set-note', text);
+        note.textContent = NOTES[item.verb];
+        noteSpans[item.verb] = note;
+      }}
+
+      if (item.check) {{
+        make('span', 'dsh-wc-sw', row);
+        checks[item.verb] = row;
+      }} else if (!item.close) {{
+        make('span', 'dsh-wc-set-go', row).textContent = '›';
+      }}
+
+      row.addEventListener('click', function () {{
+        // The same refusal a menu row makes; see the handler above.
+        if (row.getAttribute('aria-disabled') === 'true') return;
+        // A switch leaves the card where it is: the user came here to set it,
+        // and Rust answers by marking this very row. Everything else either
+        // leaves for a card of its own or is the way out.
+        if (!item.check) hideSettings();
+        if (!item.close) signal(item.verb);
+      }});
+    }});
+
+    // Where the focus was when the card went up, so it can be handed back.
+    var returnTo = null;
+
+    function showSettings() {{
+      returnTo = document.activeElement;
+      scrim.classList.add('dsh-wc-shown');
+      card.classList.add('dsh-wc-shown');
+      var first = card.querySelector('button');
+      if (first) first.focus();
+    }}
+
+    function hideSettings() {{
+      if (!card.classList.contains('dsh-wc-shown')) return;
+      scrim.classList.remove('dsh-wc-shown');
+      card.classList.remove('dsh-wc-shown');
+      if (returnTo && returnTo.focus) returnTo.focus();
+      returnTo = null;
+    }}
+
+    scrim.addEventListener('mousedown', hideSettings);
+    document.addEventListener('keydown', function (event) {{
+      if (!card.classList.contains('dsh-wc-shown')) return;
+      if (event.key === 'Escape') return hideSettings();
+      // Kept inside the card, the way `dialog` keeps its own: without this,
+      // Tab walks out of a modal and into dsh's page behind it.
+      if (event.key !== 'Tab') return;
+      var rows = card.querySelectorAll('button');
+      if (!rows.length) return;
+      var edge = rows[event.shiftKey ? 0 : rows.length - 1];
+      if (document.activeElement !== edge) return;
+      event.preventDefault();
+      rows[event.shiftKey ? rows.length - 1 : 0].focus();
     }});
 
     // Called from Rust; see `sync_autostart`, `sync_notify` and `busy`.
@@ -1102,10 +1378,16 @@ pub fn script() -> String {
       said.textContent = text || '';
       toast.classList.toggle('dsh-wc-shown', !!text);
     }};
-    // Called from Rust after the language moved; see `relabel`.
-    window.__dshRelabel = function (next) {{
+    // Called from Rust after the language moved; see `relabel`. Two objects,
+    // because a settings row has two lines and they come from two maps.
+    window.__dshRelabel = function (next, notes) {{
       for (var verb in next) {{
-        if (spans[verb]) spans[verb].textContent = next[verb];
+        (spans[verb] || []).forEach(function (span) {{
+          word(span, next[verb]);
+        }});
+      }}
+      for (var noted in notes || {{}}) {{
+        if (noteSpans[noted]) noteSpans[noted].textContent = notes[noted];
       }}
     }};
 
@@ -1161,9 +1443,14 @@ pub fn script() -> String {
     window.__dshThemePainted = band;
 
     paint(bar);
+    // Its own watcher, because the card is not inside the bar; see the note on
+    // the palette in the stylesheet above.
+    paint(card);
 
     document.body.appendChild(drag);
     document.body.appendChild(bar);
+    document.body.appendChild(scrim);
+    document.body.appendChild(card);
 
     // Dock-style magnification. Hover states would make this three separate
     // on/off steps as the pointer crosses the row, which is what reads as
@@ -1299,9 +1586,10 @@ mod tests {
         assert!(action(&url_no_param).is_none());
     }
 
-    /// Every entry in the menu has a label and every label has an entry.
-    /// They are two lists now — see [`super::labels`] — and a verb in one and
-    /// not the other is a blank row, or a string nothing ever draws.
+    /// Every row this script draws — the menu's and the settings card's alike
+    /// — has a label, and every label has a row. They are two lists — see
+    /// [`super::labels`] — and a verb in one and not the other is a blank row,
+    /// or a string nothing ever draws.
     #[test]
     fn every_menu_entry_is_labelled() {
         let script = super::script();
@@ -1345,6 +1633,50 @@ mod tests {
             script.contains("'.dsh-wc-safe[hidden]{display:none}'"),
             "the safe-mode label sets its own display, so [hidden] needs a rule too"
         );
+    }
+
+    /// What moved off the menu, and that it moved rather than being copied.
+    ///
+    /// Two rows drawn for one verb would each be `checks[verb]`, and the
+    /// second assignment wins: the switch the user was looking at would stop
+    /// following what Rust pushes. Which is silent, so it is pinned here.
+    #[test]
+    fn the_settings_rows_left_the_menu_for_the_card() {
+        let script = super::script();
+        let menu = script
+            .split("var SETTINGS")
+            .next()
+            .expect("the script declares both lists");
+
+        for verb in [
+            "runtime",
+            "registry",
+            "check-app",
+            "autostart",
+            "notify-turns",
+        ] {
+            let row = format!("verb: '{verb}'");
+            assert!(!menu.contains(&row), "{verb} is still drawn into the menu");
+            assert!(script.contains(&row), "{verb} is on neither list");
+        }
+
+        // And the one row that opens the card rather than signalling. Without
+        // the mark it would navigate to `dsh-window://settings`, which nothing
+        // in `action` answers — a menu row that does nothing at all.
+        assert!(
+            script.contains("verb: 'settings', panel: true"),
+            "the row that opens the card has to say that it does"
+        );
+        // Every string on the card, against the rows that carry one. A note
+        // for a verb no row draws is a string nobody reads.
+        let notes: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&super::notes()).unwrap();
+        for verb in notes.keys() {
+            assert!(
+                script.contains(&format!("verb: '{verb}'")),
+                "{verb} has a note and no row"
+            );
+        }
     }
 
     /// What a launch running on no plugins puts on screen, and that the script
@@ -1535,17 +1867,19 @@ mod tests {
         }
     }
 
-    /// The three cards built out of elements share one `make`, for the same
-    /// reason: three copies is three places a fourth card copies from.
+    /// The cards built out of elements share one `make`, for the same reason:
+    /// four copies is four places a fifth card copies from.
     ///
-    /// The titlebar is not in the list. It builds its row by hand and has no
-    /// `make` to share — if it ever grows one, it belongs here too.
+    /// The titlebar is in the list now. It used to build its row by hand and
+    /// have no `make` to share; the settings card is a card, so it uses the
+    /// same helper the other three do.
     #[test]
     fn the_cards_share_one_element_helper() {
         for (what, script) in [
             ("a dialog", crate::dialog::script()),
             ("the plugin panel", crate::panel::script()),
             ("the runtime chooser", crate::setup::script()),
+            ("the settings card", super::script()),
         ] {
             assert!(
                 script.contains(dom_make()),
@@ -1554,4 +1888,3 @@ mod tests {
         }
     }
 }
-
