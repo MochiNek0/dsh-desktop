@@ -593,6 +593,50 @@ fn open_runtime(app: &tauri::AppHandle) {
     std::thread::spawn(move || setup::manage(&app));
 }
 
+/// Put the registry question again, from the menu.
+///
+/// The same dialog the first install raised, with whatever was answered then
+/// already on the machine — so this is how a user who kept their own registry
+/// tries ours, and how one who let us choose goes back.
+///
+/// On its own thread: `dialog::confirm` blocks until the click comes back, and
+/// the click comes back on the main one.
+fn open_registry(app: &tauri::AppHandle) {
+    let app = app.clone();
+
+    std::thread::spawn(move || {
+        // Asking npm takes a moment, and the menu has just closed over a window
+        // with nothing to show for the click yet.
+        let saying = |text: &str| controls::busy(&app, text);
+        saying(t!("正在读取 npm 配置…", "Reading npm's configuration…"));
+        let configured = dsh::configured_registry(&app);
+        saying("");
+
+        // Nothing of their own to choose against. Said rather than silently
+        // doing nothing, because a menu item that leads nowhere looks broken —
+        // and this is the answer to "why was I never asked".
+        let Some(configured) = configured else {
+            dsh::note(
+                &app,
+                t!("没有可选的源", "Nothing to choose between"),
+                t!(
+                    "你的 npm 没有配置自己的源，dsh desktop 会自己测速选一个最快的。\n\n\
+                     如果以后用 npm config set registry 配置了自己的源，这里就可以选了。",
+                    "Your npm has no registry of its own, so dsh measures its own \
+                     sources and takes the fastest.\n\nPoint npm somewhere with npm \
+                     config set registry and this becomes a choice."
+                ),
+            );
+            return;
+        };
+
+        // Nothing written down when nothing was answered; see `choose_registry`.
+        if let Some(source) = dsh::choose_registry(&app, &configured) {
+            settings::set_registry(&app, source);
+        }
+    });
+}
+
 /// Take the setup panel down; see `setup`.
 ///
 /// Queued through the splash like the delivery above, and for the same reason

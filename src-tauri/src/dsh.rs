@@ -56,6 +56,8 @@ use std::time::{Duration, Instant};
 use semver::Version;
 use tauri::{AppHandle, Manager};
 
+use crate::settings::RegistrySource;
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
@@ -1056,6 +1058,14 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
 pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<bool, String> {
     let script = script(app).ok_or_else(|| format!("找不到安装脚本 {SCRIPT}"))?;
 
+    // Before the spawn and not inside it: this can put a dialog up, and the
+    // question is about the install that is being started here. Only for a mode
+    // that fetches -- see `FETCHES` -- so the chooser's `list`, which runs on
+    // every launch that finds no dsh, never asks anything.
+    let source = mode_of(args)
+        .filter(|mode| FETCHES.iter().any(|fetches| OsStr::new(fetches) == *mode))
+        .and_then(|_| registry_source(app));
+
     let mut command = interpreter(&script);
     command
         .args(args)
@@ -1065,6 +1075,10 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+
+    if let Some(source) = source {
+        command.arg("-Registry").arg(source.as_str());
+    }
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
@@ -1291,6 +1305,110 @@ pub(crate) fn printed(mut command: Command, timeout: Duration) -> Option<String>
     // costs nothing: they all end with a process that is gone or killed.
     let printed = reader.join().ok()?;
     Some(String::from_utf8_lossy(&printed).trim().to_string())
+}
+
+/// npm's own registry, and what an unset one resolves to. Written here as well
+/// as in both installer scripts because all three have to agree on which
+/// address means "no opinion"; see [`configured_registry`].
+const PUBLIC_REGISTRY: &str = "https://registry.npmjs.org";
+
+/// The registry npm is configured to, when it is one of the user's own.
+///
+/// `None` covers every way of having no opinion: unset, npm's literal
+/// `undefined`, and the public registry itself. Those are the machines where
+/// there is nothing to choose between, and so nothing to ask.
+///
+/// The last line rather than the whole output, the way both scripts read it:
+/// an `.npmrc` problem makes npm print a warning first and the value last.
+pub fn configured_registry(app: &AppHandle) -> Option<String> {
+    let mut npm = npm(app)?;
+    npm.args(["config", "get", "registry"]);
+
+    let printed = printed(npm, CHECK_TIMEOUT)?;
+    let configured = printed.lines().next_back()?.trim().trim_end_matches('/');
+
+    if configured.is_empty() || configured == "undefined" || configured == PUBLIC_REGISTRY {
+        return None;
+    }
+
+    Some(configured.to_string())
+}
+
+/// Which source an install takes dsh from, as `-Registry` spells it.
+///
+/// `None` is a machine with no registry of its own: there is nothing to choose
+/// between, so the flag is left off and the scripts do what they always did.
+///
+/// On a machine that does have one, the question is put once and the answer
+/// kept in `desktop.json`. Once rather than per install, because it is a
+/// preference and not a confirmation -- the menu is where it is changed
+/// afterwards; see [`crate::settings::RegistrySource`].
+///
+/// Blocking, like the update question below and for the same reason: the answer
+/// decides what the install about to run is pointed at.
+pub fn registry_source(app: &AppHandle) -> Option<RegistrySource> {
+    if let Some(stored) = crate::settings::registry(app) {
+        return Some(stored);
+    }
+
+    let configured = configured_registry(app)?;
+    let source = choose_registry(app, &configured)?;
+    crate::settings::set_registry(app, source);
+    Some(source)
+}
+
+/// The question itself. Also what the menu item calls to change the answer.
+///
+/// `None` is nobody having answered — no window to ask on, or the card left
+/// alone. Nothing is written down for that, and the install runs with no flag
+/// at all: the scripts then do what they did before there was a question, which
+/// is to defer to the registry the machine is configured to. The conservative
+/// half of the choice is the one an unanswered question falls to.
+pub fn choose_registry(app: &AppHandle, configured: &str) -> Option<RegistrySource> {
+    let auto = crate::dialog::choose(
+        app,
+        crate::dialog::Ask {
+            title: t!("从哪里安装 dsh", "Where to install dsh from").to_string(),
+            body: t!(
+                "检测到你配置了自己的 npm 源：\n{}\n\n\
+                 可以继续用它，也可以让 dsh desktop 自己测速选一个。私有源或公司代理\
+                 通常是有原因的，不确定就用你自己的。\n\n\
+                 这个选择会记住，之后可以在菜单的「安装源…」里改。",
+                "Your npm is pointed at a registry of your own:\n{}\n\n\
+                 dsh can keep using it, or measure its own sources and take the \
+                 fastest. A private mirror or a company proxy is usually there for a \
+                 reason — if you are not sure, keep yours.\n\n\
+                 This is remembered, and can be changed later under “Install source…”.",
+                configured
+            ),
+            choices: vec![
+                crate::dialog::Choice::new("auto", t!("自动选源", "Choose for me")),
+                crate::dialog::Choice::primary("own", t!("用我配置的源", "Keep mine")),
+            ],
+            // Replaced by `confirm`; it is the channel send that answers.
+            answered: Box::new(|_, _| {}),
+        },
+        "auto",
+    )?;
+
+    Some(if auto {
+        RegistrySource::Auto
+    } else {
+        RegistrySource::Own
+    })
+}
+
+/// The modes that fetch dsh from a registry, and so the only ones the question
+/// belongs in front of. `list` and `switch` reach no registry at all, and
+/// neither does any of the removals.
+const FETCHES: [&str; 3] = ["update", "install-dsh", "install-node"];
+
+/// The `-Mode` out of a caller's argument list, for [`FETCHES`] to be checked
+/// against. Read back out rather than passed alongside, so a call site that
+/// grows a new mode cannot silently miss this.
+fn mode_of<'a>(args: &'a [&'a OsStr]) -> Option<&'a OsStr> {
+    let at = args.iter().position(|arg| *arg == OsStr::new("-Mode"))?;
+    args.get(at + 1).copied()
 }
 
 /// Blocking, unlike every other dialog here: the answer decides what this
@@ -1722,9 +1840,12 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        dsh_on, executable, first_writable_prefix, host_entries, marker, node_first, node_version,
-        package_root, prefix_of, present, resolve, shim_dir, writable, DSH, NODE_MINIMUM, PACKAGE,
+        dsh_on, executable, first_writable_prefix, host_entries, marker, mode_of, node_first,
+        node_version, package_root, prefix_of, present, resolve, shim_dir, writable, DSH, FETCHES,
+        NODE_MINIMUM, PACKAGE, PUBLIC_REGISTRY,
     };
+    use crate::settings::RegistrySource;
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
     /// What `AppRun` hands a child, and what has to come back out of it: the
@@ -1816,6 +1937,111 @@ mod tests {
             let script = std::fs::read(path).expect("a readable bootstrap script");
             let script = String::from_utf8_lossy(&script);
             assert!(script.contains(&literal), "{path} does not say {literal}");
+        }
+    }
+
+    /// `-Registry` is spelled in three places: here, and the option parser in
+    /// each script. A value this side sends that neither parser takes is an
+    /// install that exits 2 before it does anything, so the two spellings are
+    /// read back out of the scripts rather than trusted to stay in step.
+    #[test]
+    fn both_scripts_take_the_registry_values_this_one_sends() {
+        let sh = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/install-deps.sh"
+        ))
+        .expect("a readable bootstrap script");
+        let sh = String::from_utf8_lossy(&sh);
+
+        let ps1 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/install-deps.ps1"
+        ))
+        .expect("a readable bootstrap script");
+        let ps1 = String::from_utf8_lossy(&ps1);
+
+        // The one line in each that decides what is accepted, so a value added
+        // here without touching the parsers fails rather than passing on a
+        // mention somewhere in the prose.
+        assert!(
+            sh.contains("own|auto) REGISTRY=$2 ;;"),
+            "install-deps.sh does not accept own and auto"
+        );
+        assert!(
+            ps1.contains("[ValidateSet('', 'own', 'auto')]"),
+            "install-deps.ps1 does not accept own and auto"
+        );
+
+        for source in [RegistrySource::Own, RegistrySource::Auto] {
+            let spelling = source.as_str();
+            assert!(
+                sh.contains(spelling) && ps1.contains(spelling),
+                "{spelling} is not a value either script names"
+            );
+        }
+    }
+
+    /// Both scripts have to agree with this one about which address means "no
+    /// opinion": disagree, and a machine on the public registry is asked a
+    /// question it has no second answer to.
+    #[test]
+    fn the_public_registry_is_the_one_the_scripts_recognise() {
+        for (path, literal) in [
+            (
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.ps1"),
+                format!("$PublicRegistry = '{PUBLIC_REGISTRY}/'"),
+            ),
+            (
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.sh"),
+                format!("PUBLIC_REGISTRY='{PUBLIC_REGISTRY}'"),
+            ),
+        ] {
+            let script = std::fs::read(path).expect("a readable bootstrap script");
+            let script = String::from_utf8_lossy(&script);
+            assert!(script.contains(&literal), "{path} does not say {literal}");
+        }
+    }
+
+    /// The mode is read back out of the argument list the caller already built,
+    /// so that the flag reaches exactly the modes that fetch. Finding nothing
+    /// has to mean nothing, not the first mode in the list.
+    #[test]
+    fn finds_the_mode_a_caller_asked_for() {
+        let args: Vec<&OsStr> = ["-Mode", "install-node", "-Prefix", "/tmp/x"]
+            .iter()
+            .map(OsStr::new)
+            .collect();
+        assert_eq!(mode_of(&args), Some(OsStr::new("install-node")));
+
+        // `-Mode` last, with nothing after it: a malformed list, and not one to
+        // read the flag off the end of.
+        let dangling: Vec<&OsStr> = ["-Prefix", "/tmp/x", "-Mode"]
+            .iter()
+            .map(OsStr::new)
+            .collect();
+        assert_eq!(mode_of(&dangling), None);
+
+        let none: Vec<&OsStr> = ["-Progress"].iter().map(OsStr::new).collect();
+        assert_eq!(mode_of(&none), None);
+    }
+
+    /// Every mode that fetches is one the scripts actually dispatch. A typo
+    /// here is a mode that quietly never gets the flag, which is the failure
+    /// this whole thing was written to stop.
+    #[test]
+    fn every_fetching_mode_is_one_the_scripts_run() {
+        let ps1 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/install-deps.ps1"
+        ))
+        .expect("a readable bootstrap script");
+        let ps1 = String::from_utf8_lossy(&ps1);
+
+        for mode in FETCHES {
+            assert!(
+                ps1.contains(&format!("'{mode}'")),
+                "install-deps.ps1 has no mode {mode}"
+            );
         }
     }
 

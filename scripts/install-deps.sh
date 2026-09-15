@@ -25,7 +25,7 @@
 # `src-tauri/src/dsh.rs` calls both with the same arguments:
 #
 #   sh install-deps.sh -Mode update|uninstall|list|switch|install-dsh|install-node
-#                      [-Prefix <dir>] [-NodeExe <path>]
+#                      [-Prefix <dir>] [-NodeExe <path>] [-Registry own|auto]
 #                      [-RemoveDsh] [-RemoveNode] [-Progress]
 #
 # Output is a plain log. Pass `-Progress` and it also emits `::status <text>`,
@@ -42,6 +42,7 @@ set -u
 MODE=''
 PREFIX=''
 NODE_EXE=''
+REGISTRY=''
 REMOVE_DSH=0
 REMOVE_NODE=0
 PROGRESS=0
@@ -70,6 +71,18 @@ while [ $# -gt 0 ]; do
         -NodeExe)
             [ $# -ge 2 ] || { echo "-NodeExe 后面要跟一个路径" >&2; exit 2; }
             NODE_EXE=$2
+            shift 2
+            ;;
+        # The answer to "you have a registry of your own; use it, or ours?",
+        # which the app asks once and remembers -- see `settings.rs`. Absent is
+        # a machine that has not been asked, and keeps the behaviour that
+        # predates the question: a configured registry is deferred to.
+        -Registry)
+            [ $# -ge 2 ] || { echo "-Registry 后面要跟 own 或 auto" >&2; exit 2; }
+            case $2 in
+                own|auto) REGISTRY=$2 ;;
+                *) echo "-Registry 只认 own 或 auto，收到的是：$2" >&2; exit 2 ;;
+            esac
             shift 2
             ;;
         -RemoveDsh) REMOVE_DSH=1; shift ;;
@@ -474,10 +487,15 @@ MIRRORS
 
 # The registries in the order to try them, fastest first.
 #
-# Not measured at all when npm is configured to a registry of the user's own:
-# that one is used first whatever it would have scored, and racing three mirrors
-# it is going to beat anyway would only add its own timeouts to an install on a
-# network where they are all blocked.
+# Not measured at all when npm is configured to a registry of the user's own and
+# that is the source to use: it is used first whatever it would have scored, and
+# racing three mirrors it is going to beat anyway would only add its own timeouts
+# to an install on a network where they are all blocked.
+#
+# `-Registry` carries the user's answer to which of the two it is, asked once by
+# the app and remembered there. Without it -- an older app, or a machine nobody
+# has put the question to -- a configured registry is deferred to, which is what
+# this did before there was a question to answer.
 rank_registries() {
     RANKED=$REGISTRIES
 
@@ -485,12 +503,25 @@ rank_registries() {
     # what would be assigned, and this runs in the middle of its loop.
     configured=$("$1" "$2" config get registry 2>/dev/null | tr -d '\r' | tail -n 1)
     case "${configured%/}" in
-        ''|"$PUBLIC_REGISTRY") ;;
-        *)
-            say "检测到你自己配置的 npm 源（$configured），优先用它，不参与测速。"
-            return 0
-            ;;
+        ''|"$PUBLIC_REGISTRY") configured='' ;;
     esac
+
+    if [ -n "$configured" ] && [ "$REGISTRY" != auto ]; then
+        say "检测到你自己配置的 npm 源（$configured），优先用它，不参与测速。"
+        return 0
+    fi
+
+    # Asked for ours over one of their own. The first entry means "let npm
+    # decide", and npm would decide on the very registry this was told to pass
+    # over -- so it is spelled out instead, and relabelled, because the word
+    # 默认 would now name something that is not this machine's default.
+    if [ -n "$configured" ]; then
+        say "按你的选择，这次不使用 .npmrc 里的源（$configured）。"
+        REGISTRIES=$(printf '%s
+' "$REGISTRIES" |
+            awk -v url="$PUBLIC_REGISTRY" 'NR == 1 { print "npm 官方|" url; next } { print }')
+        RANKED=$REGISTRIES
+    fi
 
     have curl || return 0
 

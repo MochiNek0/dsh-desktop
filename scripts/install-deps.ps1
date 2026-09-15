@@ -80,6 +80,13 @@ param(
     # holding it — hangs off it.
     [string] $NodeExe = '',
 
+    # The answer to "you have a registry of your own; use it, or ours?", which
+    # the app asks once and remembers -- see `settings.rs`. Empty is a machine
+    # nobody has put the question to, and keeps the behaviour that predates it:
+    # a configured registry is deferred to.
+    [ValidateSet('', 'own', 'auto')]
+    [string] $Registry = '',
+
     # `uninstall` only. Node cannot go without dsh going too: dsh is a Node
     # program, and leaving it behind would leave a command that cannot run.
     [switch] $RemoveDsh,
@@ -471,21 +478,40 @@ function Sort-Mirrors([string] $Name) {
 
 # The registries in the order to try them, fastest first.
 #
-# Not measured at all when npm is configured to a registry of the user's own:
-# that one is used first whatever it would have scored, and racing three mirrors
-# it is going to beat anyway would only add its own timeouts to an install on a
-# network where they are all blocked.
+# Not measured at all when npm is configured to a registry of the user's own and
+# that is the source to use: it is used first whatever it would have scored, and
+# racing three mirrors it is going to beat anyway would only add its own timeouts
+# to an install on a network where they are all blocked.
+#
+# `-Registry` carries the user's answer to which of the two it is, asked once by
+# the app and remembered there. Empty -- an older app, or a machine nobody has
+# put the question to -- defers to a configured registry, which is what this did
+# before there was a question to answer.
 function Sort-Registries([string] $Exe, [string] $Cli, [double] $At) {
     $configured = Get-Registry $Exe $Cli
-    if ($configured -and $configured.TrimEnd('/') -ne $PublicRegistry.TrimEnd('/')) {
+    if ($configured -and $configured.TrimEnd('/') -eq $PublicRegistry.TrimEnd('/')) {
+        $configured = ''
+    }
+
+    if ($configured -and $Registry -ne 'auto') {
         Say "检测到你自己配置的 npm 源（$configured），优先用它，不参与测速。"
         return $Registries
+    }
+
+    # Asked for ours over one of their own. The first entry means "let npm
+    # decide", and npm would decide on the very registry this was told to pass
+    # over -- so it is spelled out instead, and relabelled, because the word
+    # 默认 would now name something that is not this machine's default.
+    $sources = $Registries
+    if ($configured) {
+        Say "按你的选择，这次不使用 .npmrc 里的源（$configured）。"
+        $sources = @(@{ Label = 'npm 官方'; Url = $PublicRegistry }) + $Registries[1..($Registries.Count - 1)]
     }
 
     Step '正在测试各个源的速度…' $At
 
     $order = 0
-    $timed = foreach ($source in $Registries) {
+    $timed = foreach ($source in $sources) {
         # The default source is npm's own, and npm's own is the public registry —
         # the branch above is what handles it being anything else.
         $url = if ($source.Url) { $source.Url } else { $PublicRegistry }

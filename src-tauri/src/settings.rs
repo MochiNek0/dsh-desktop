@@ -86,6 +86,78 @@ pub fn toggle_notifications(app: &AppHandle) -> bool {
     wanted
 }
 
+/// Which registry an install of dsh is taken from, when the machine has an
+/// opinion of its own about that.
+///
+/// npm reads a registry out of the user's `.npmrc`, and a private mirror or a
+/// corporate proxy is there for a reason — it may be the only route out of the
+/// network at all. So the installer has always deferred to it and said so in
+/// its log. What it could not do was ask: a mirror that answers but lags behind
+/// serves an old `dsh@latest` and the install succeeds, so nothing ever fails
+/// over to a source that has the current one, and the user is never told which
+/// of the two they got.
+///
+/// This is that question, asked once and remembered. [`RegistrySource::Own`]
+/// keeps the machine's own configured registry; [`RegistrySource::Auto`] hands
+/// the choice to the installer's own list, which measures the mirrors and takes
+/// the fastest. Absent means nobody has been asked yet — which is not the same
+/// as either answer, and is why this reads as an `Option`.
+///
+/// ## The choice is stored, not the address
+///
+/// `own` rather than the URL that was configured when the question was asked.
+/// A user who later points their `.npmrc` somewhere else is still a user who
+/// said "mine", and re-asking them because the address moved would be asking
+/// the wrong question. It also means the file cannot go stale against a
+/// registry that no longer exists.
+const REGISTRY_KEY: &str = "registry";
+
+/// Where `dsh` is installed from. See [`REGISTRY_KEY`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegistrySource {
+    /// The registry the machine's own npm configuration names.
+    Own,
+    /// Whichever of the installer's sources measures fastest.
+    Auto,
+}
+
+impl RegistrySource {
+    /// The spelling both installer scripts take for `-Registry`, and the one
+    /// stored in `desktop.json`. One function so the two can never drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RegistrySource::Own => "own",
+            RegistrySource::Auto => "auto",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "own" => Some(RegistrySource::Own),
+            "auto" => Some(RegistrySource::Auto),
+            _ => None,
+        }
+    }
+}
+
+/// The answer, or `None` when the question has not been put yet.
+///
+/// A value this build does not recognise reads as `None` — the same forgiveness
+/// every other key here gets, and it means a source a future version adds
+/// degrades to asking again rather than to a panic.
+pub fn registry(app: &AppHandle) -> Option<RegistrySource> {
+    read(app)
+        .get(REGISTRY_KEY)
+        .and_then(Value::as_str)
+        .and_then(RegistrySource::parse)
+}
+
+/// Write the answer down. Called once when the question is first put, and again
+/// whenever the user changes it from the menu.
+pub fn set_registry(app: &AppHandle, source: RegistrySource) {
+    write(app, REGISTRY_KEY, Value::String(source.as_str().to_string()));
+}
+
 /// The whole document, or an empty one. Never `Err`: see the module docs.
 fn read(app: &AppHandle) -> Map<String, Value> {
     let Some(path) = file(app) else {

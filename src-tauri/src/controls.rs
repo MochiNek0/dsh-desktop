@@ -116,6 +116,10 @@ pub enum Action {
     /// Show the profile directory in the file manager — the one step the panel
     /// does not take on the user's behalf. See [`crate::plugins`].
     PluginsDirectory,
+    /// Change which registry an install of dsh is taken from, on a machine
+    /// whose npm points somewhere of the user's own choosing; see
+    /// [`crate::settings::RegistrySource`].
+    Registry,
     /// A choice in the runtime chooser; see [`crate::setup`]. The index is the
     /// Node's place in the list the chooser was given.
     SetupUse(usize),
@@ -195,6 +199,7 @@ pub fn action(url: &Url) -> Option<Action> {
         "setup-close" => Some(Action::SetupClose),
         "setup-quit" => Some(Action::SetupQuit),
         "runtime" => Some(Action::Runtime),
+        "registry" => Some(Action::Registry),
         "terminal" => Some(Action::Terminal),
         "restart-dsh" => Some(Action::RestartDsh),
         "safe-start" => Some(Action::SafeStart),
@@ -303,6 +308,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::SetupClose => return crate::setup::answered(crate::setup::Choice::Close),
         Action::SetupQuit => return crate::setup::answered(crate::setup::Choice::Quit),
         Action::Runtime => return crate::open_runtime(app),
+        Action::Registry => return crate::open_registry(app),
         Action::RestartDsh => return crate::restart_dsh(app, false),
         Action::SafeStart => return crate::safe_start(app),
         Action::SafeOff => return crate::safe_off(app),
@@ -503,6 +509,7 @@ fn labels() -> String {
         ("safe-off", t!("重新加载插件", "Load plugins again")),
         ("update-dsh", t!("更新 dsh…", "Update dsh…")),
         ("runtime", t!("运行环境…", "Runtime…")),
+        ("registry", t!("安装源…", "Install source…")),
         (
             "check-app",
             t!("检查应用更新…", "Check for app updates…"),
@@ -677,6 +684,9 @@ pub fn script() -> String {
     // verb: the panel behind it can switch, install and uninstall, and this
     // menu is already long. See `setup`.
     {{ verb: 'runtime' }},
+    // Where dsh is fetched from, which is only ever a question on a machine
+    // whose npm is pointed somewhere of the user's own; see `settings`.
+    {{ verb: 'registry' }},
     {{ verb: 'check-app' }},
     {{ separator: true }},
     {{ verb: 'autostart', check: true }},

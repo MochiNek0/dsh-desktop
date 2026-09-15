@@ -406,7 +406,21 @@ pub fn ask(app: &AppHandle, ask: Ask) -> bool {
 ///     and failing the receive;
 ///   - nothing happens for [`ANSWER_TIMEOUT`], which is the backstop for a card
 ///     that went away without being able to say so — see the note there.
-pub fn confirm(app: &AppHandle, mut ask_for: Ask, affirmative: &'static str) -> bool {
+pub fn confirm(app: &AppHandle, ask_for: Ask, affirmative: &'static str) -> bool {
+    choose(app, ask_for, affirmative).unwrap_or(false)
+}
+
+/// [`confirm`], but able to say that nothing was answered.
+///
+/// `None` is a question that was never put — there was no window to put it on —
+/// or one that was replaced by another, or left alone until the timeout. A
+/// caller that only needs a yes or a no takes [`confirm`], which reads all
+/// three as a no and is right to.
+///
+/// This exists for the caller that writes the answer down. Recording "no" for a
+/// question nobody saw would mean never asking it again, which is the one
+/// outcome worse than asking twice.
+pub fn choose(app: &AppHandle, mut ask_for: Ask, affirmative: &'static str) -> Option<bool> {
     // The deadlock this prevents is total: the dialog is up, and the thread
     // that would carry the click back is the one about to block. Debug-only
     // because the cost in a release build is a hang nobody can report usefully,
@@ -426,20 +440,20 @@ pub fn confirm(app: &AppHandle, mut ask_for: Ask, affirmative: &'static str) -> 
     // Nothing to wait for when there was no window: the sender is already
     // dropped and the receive below would only confirm it the slow way.
     if !ask(app, ask_for) {
-        return false;
+        return None;
     }
 
     match receive.recv_timeout(ANSWER_TIMEOUT) {
-        Ok(answer) => answer,
+        Ok(answer) => Some(answer),
         // Disconnected: the dialog was replaced, and its sender went with it.
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => false,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             eprintln!(
                 "dsh-desktop: nothing answered the dialog in {} minutes; \
                  taking it as a no",
                 ANSWER_TIMEOUT.as_secs() / 60
             );
-            false
+            None
         }
     }
 }
