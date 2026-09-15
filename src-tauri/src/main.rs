@@ -1403,7 +1403,45 @@ fn show_plugins(app: &tauri::AppHandle, session: &Session, first: bool) {
     };
 
     PANEL.store(true, Ordering::SeqCst);
-    session.splash.plugins(&window, &plugins::listing(app), first);
+    // Drawn with no update marks on it. Finding out which plugins are behind
+    // means asking a registry, and the list is what the user came for — so it
+    // goes up now and the marks arrive when they arrive; see `look_for_updates`.
+    session.splash.plugins(&window, &plugins::listing(app, &[]), first);
+    look_for_updates(app, session);
+}
+
+/// Ask pnpm which installed plugins are behind, and redraw the lists with what
+/// it says. On a thread, because it reaches the network.
+///
+/// Nothing waits on this and nothing goes wrong when it never answers: the
+/// panel simply keeps the lists it already has, which is what it had before
+/// there were update buttons at all.
+///
+/// Two things are checked before the redraw, both of them about the panel
+/// having moved on while the network was being waited for. A panel the user has
+/// already left is not one to draw into — `plugin_lists` would evaluate into
+/// whatever page replaced it — and a plugin job that has started since owns the
+/// lists until it finishes, having stopped dsh to do it.
+fn look_for_updates(app: &tauri::AppHandle, session: &Session) {
+    let app = app.clone();
+    let session = session.clone();
+
+    std::thread::spawn(move || {
+        let behind = plugins::outdated(&app);
+        if behind.is_empty() {
+            return;
+        }
+
+        if !PANEL.load(Ordering::SeqCst) || BUSY.load(Ordering::SeqCst) {
+            return;
+        }
+
+        if let Some(window) = app.get_webview_window("main") {
+            session
+                .splash
+                .plugin_lists(&window, &plugins::listing(&app, &behind));
+        }
+    });
 }
 
 /// Run one pnpm job against the profile with `dsh web` down for the duration,
@@ -1451,7 +1489,13 @@ where
         let log = |line: &str| session.splash.plugin_log(&window, line);
         match work(&app, &log) {
             Ok(()) => {
-                session.splash.plugin_lists(&window, &plugins::listing(&app));
+                session
+                    .splash
+                    .plugin_lists(&window, &plugins::listing(&app, &[]));
+                // What was behind a moment ago may not be any more — an update
+                // is exactly the job that changes this — so it is asked again
+                // rather than carried over.
+                look_for_updates(&app, &session);
                 session.splash.plugin_done(&window, true, done);
             }
             Err(error) => session.splash.plugin_done(&window, false, &error),
@@ -1473,6 +1517,26 @@ fn install_plugins(app: &tauri::AppHandle, ids: Vec<String>, spec: Option<String
             "Done. dsh restarts on the way back, and the plugins take effect then."
         ),
         move |app, log| plugins::install(app, &ids, spec.as_deref(), log),
+    );
+}
+
+/// Bring one plugin up to its newest release.
+///
+/// The same machinery an install runs through — dsh comes down, pnpm rewrites
+/// the profile, dsh goes back up on the way out of the panel — because that is
+/// what an update is: `dsh plugin add <name>` with no version, resolved again.
+fn update_plugins(app: &tauri::AppHandle, names: Vec<String>) {
+    change_plugins(
+        app,
+        t!(
+            "dsh 正在启动或更新中，等它忙完再动插件。",
+            "dsh is starting or updating; wait for that to finish before changing plugins."
+        ),
+        t!(
+            "更新完成。回到 dsh 时会重新启动它。",
+            "Updated. dsh restarts on the way back."
+        ),
+        move |app, log| plugins::update(app, &names, log),
     );
 }
 

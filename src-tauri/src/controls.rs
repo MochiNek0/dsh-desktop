@@ -110,6 +110,11 @@ pub enum Action {
     PluginsInstall(Vec<String>, Option<String>),
     /// Take the ticked ones back out again.
     PluginsRemove(Vec<String>),
+    /// Bring the named ones up to their newest release. One card's button, so
+    /// one name — but carried as a list because the payload is the same
+    /// `?names=` field a removal uses, and narrowing it would be a second
+    /// parser for no gain. See [`crate::plugins::update`].
+    PluginsUpdate(Vec<String>),
     /// Leave the panel: back to dsh, starting it if the panel was shown before
     /// the boot ever got that far.
     PluginsDone,
@@ -185,6 +190,7 @@ pub fn action(url: &Url) -> Option<Action> {
             Some(Action::PluginsInstall(ids, spec))
         }
         "plugins-remove" => Some(Action::PluginsRemove(crate::plugins::wanted_gone(url))),
+        "plugins-update" => Some(Action::PluginsUpdate(crate::plugins::wanted_gone(url))),
         "plugins-done" => Some(Action::PluginsDone),
         "plugins-directory" => Some(Action::PluginsDirectory),
         // The runtime chooser's verbs; see `setup`. The Node index travels as
@@ -290,6 +296,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::Plugins => return crate::open_plugins(app),
         Action::PluginsInstall(ids, spec) => return crate::install_plugins(app, ids, spec),
         Action::PluginsRemove(names) => return crate::remove_plugins(app, names),
+        Action::PluginsUpdate(names) => return crate::update_plugins(app, names),
         Action::PluginsDone => return crate::leave_plugins(app),
         Action::PluginsDirectory => return crate::plugins::open_directory(app),
         Action::SetupUse(i) => return crate::setup::answered(crate::setup::Choice::Use(i)),

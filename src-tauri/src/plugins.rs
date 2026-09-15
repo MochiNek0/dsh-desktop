@@ -67,6 +67,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::channel;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use tauri::AppHandle;
 
@@ -432,7 +433,7 @@ fn preset_file(app: &AppHandle) -> Option<PathBuf> {
 
 /// The presets and their state, as the panel's `dshPlugins` hook wants them.
 /// See `dist/index.html`.
-pub fn listing(app: &AppHandle) -> String {
+pub fn listing(app: &AppHandle, behind: &[(String, String, String)]) -> String {
     let presets = presets(app);
     // One read and one parse for both questions below. They used to be a call
     // apiece, each opening the profile manifest for itself — and pnpm is free
@@ -506,6 +507,15 @@ pub fn listing(app: &AppHandle) -> String {
                 // card the user is told is residue reads differently from one
                 // that says a plugin is working.
                 "stale": stale,
+                // Only where there is one, so the card can draw the button on
+                // the presence of the field rather than on a comparison of its
+                // own. Residue is never in `behind` — it is not a dependency,
+                // so pnpm does not report it — and neither is a `link:` or a
+                // `file:`, which have no release to be behind of.
+                "update": behind
+                    .iter()
+                    .find(|(package, _, _)| package == &name)
+                    .map(|(_, from, to)| serde_json::json!({ "from": from, "to": to })),
             })
         })
         .collect();
@@ -516,6 +526,141 @@ pub fn listing(app: &AppHandle) -> String {
         "directory": profile_dir(app),
     })
     .to_string()
+}
+
+/// How long the update check may take before it is given up on.
+///
+/// Two seconds on a profile with five plugins and a registry that answers. The
+/// budget is for the one that does not: pnpm reaches the network here, and
+/// behind a proxy that black-holes the connection it will sit there — the same
+/// reason `dsh::CHECK_TIMEOUT` exists. Nothing waits on this, so a generous
+/// number costs nothing but a thread; what it buys is not leaving a pnpm behind.
+const OUTDATED_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Which installed plugins have a newer release, as `(name, installed, latest)`.
+///
+/// `dsh plugin --profile web outdated`, forwarded to `pnpm outdated` in the
+/// profile the way every other command in this module is. Asked of pnpm rather
+/// than of the registry directly, because pnpm is what an update would run:
+/// it reads the same `.npmrc`, the same lockfile and the same ranges, so what
+/// it calls outdated is what updating would actually change. A registry query
+/// of our own would be a second opinion with no bearing on the install.
+///
+/// `--no-table` because the table form is drawn with box characters and padded
+/// columns; the list form is two lines an entry — the name, then `old => new`.
+///
+/// Three things this deliberately does not report. A `link:` or `file:`
+/// dependency has no release to be behind of, and pnpm leaves both out on its
+/// own — which is what keeps the bundled signal plugin from ever growing an
+/// update button. And residue, which is not a dependency at all, is not in
+/// pnpm's answer either.
+///
+/// Everything that can go wrong answers with an empty list: no dsh, a profile
+/// that is not there, a registry that will not answer, output in a shape this
+/// does not recognise. The panel then draws no update buttons, which is exactly
+/// what it did before there were any.
+pub fn outdated(app: &AppHandle) -> Vec<(String, String, String)> {
+    let Some(dsh) = crate::dsh::current(app) else {
+        return Vec::new();
+    };
+
+    let mut command = Command::new(&dsh.bin);
+    command.args(["plugin", "--profile", PROFILE, "outdated", "--no-table"]);
+    crate::dsh::apply_path(app, &mut command);
+
+    match captured(command, OUTDATED_TIMEOUT) {
+        Some(printed) => parse_outdated(&printed),
+        None => Vec::new(),
+    }
+}
+
+/// Run `command` and take its stdout, whatever it exits with.
+///
+/// The exit code is deliberately not consulted. `pnpm outdated` answers 1 when
+/// it *found* something — which is the whole of what this is for — and dsh
+/// prints a line of its own about pnpm having "failed" behind it. Reading
+/// either as an error would throw away the answer at exactly the moment there
+/// is one.
+///
+/// `None` only for a command that would not start, or one still running when
+/// the deadline passed; that one is killed rather than left behind.
+fn captured(mut command: Command, timeout: Duration) -> Option<String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // Both npm and pnpm turn colour off for a pipe on their own. This is for
+        // the one that decides otherwise: an escape sequence would be parsed as
+        // part of a package name and drawn as line noise on a card.
+        .env("NO_COLOR", "1");
+
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+
+    // Drained on a thread of its own: a child that fills the pipe would block on
+    // the write while this blocked on the exit, and nothing would break the tie.
+    let reader = std::thread::spawn(move || {
+        let mut printed = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut printed);
+        printed
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                crate::server::kill_tree(&mut child);
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+
+    let printed = reader.join().ok()?;
+    Some(String::from_utf8_lossy(&printed).into_owned())
+}
+
+/// Pull `(name, installed, latest)` out of what `pnpm outdated --no-table`
+/// prints: a package name on one line, `1.45.1 => 1.47.0` on the next.
+///
+/// Written to ignore everything it does not recognise rather than to reject the
+/// whole answer, because the output has a line in it that is nobody's entry —
+/// dsh appends its own "pnpm failed in profile directory" when pnpm exits 1,
+/// which is every run that found something. A name is only taken when the line
+/// after it is an arrow line, so that trailing line cannot become a plugin.
+fn parse_outdated(printed: &str) -> Vec<(String, String, String)> {
+    let lines: Vec<&str> = printed.lines().map(str::trim).collect();
+    let mut behind = Vec::new();
+
+    for (at, line) in lines.iter().enumerate() {
+        let Some((from, to)) = line.split_once("=>") else {
+            continue;
+        };
+        let (from, to) = (from.trim(), to.trim());
+        if from.is_empty() || to.is_empty() {
+            continue;
+        }
+
+        // The name is the line above, and it has to be one: a blank line, or
+        // another arrow, means this is not an entry in the shape expected.
+        let Some(name) = at.checked_sub(1).and_then(|above| lines.get(above)) else {
+            continue;
+        };
+        if name.is_empty() || name.contains("=>") {
+            continue;
+        }
+
+        behind.push((name.to_string(), from.to_string(), to.to_string()));
+    }
+
+    behind
 }
 
 /// The profile manifest, read and parsed once.
@@ -1222,6 +1367,51 @@ pub fn install(
         return Err(t!("没有选择任何插件", "nothing was selected").to_string());
     }
 
+    add(app, &specs, log)
+}
+
+/// Bring the named plugins up to their newest release.
+///
+/// `dsh plugin add <name>` with no version is what an update is: pnpm resolves
+/// the name again, takes the newest release that exists, and rewrites the range
+/// in the profile manifest. Which makes this the install path with the specs
+/// picked differently, and it is the install path — `add` below — rather than a
+/// second one that would have to grow its own `ensure_pnpm`, its own repair and
+/// its own reconcile.
+///
+/// The names come from a click on a card the panel drew, which drew it from the
+/// profile manifest — so they are already installed by construction. They are
+/// checked anyway: the verb arrives on a navigation, and `controls` cannot tell
+/// one this app's panel sent from one a script in the page sent. See
+/// [`is_package_spec`], which is the same gate the free-text box passes.
+pub fn update(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String> {
+    let mut specs: Vec<String> = Vec::new();
+
+    for name in names {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !is_package_spec(name) {
+            return Err(t!(
+                "{} 不是可以更新的插件名。",
+                "{} is not a plugin name this can update.",
+                name
+            ));
+        }
+        specs.push(name.to_string());
+    }
+
+    if specs.is_empty() {
+        return Err(t!("没有选择任何插件", "nothing was selected").to_string());
+    }
+
+    add(app, &specs, log)
+}
+
+/// Hand `specs` to `dsh plugin add`, which is the whole of installing and the
+/// whole of updating alike.
+fn add(app: &AppHandle, specs: &[String], log: &Log) -> Result<(), String> {
     let dsh = crate::dsh::current(app).ok_or_else(|| {
         // `current` answers `None` both for a machine with no dsh and for one
         // whose `dsh` shim is present but broken — a dangling symlink left by a
@@ -1260,7 +1450,7 @@ pub fn install(
     if profile_dir(app).join("pnpm-workspace.yaml").is_file() {
         command.arg("-w");
     }
-    command.args(&specs);
+    command.args(specs);
     crate::dsh::apply_path(app, &mut command);
 
     // Marked for as long as pnpm is in the profile. The `?` on this run and on
@@ -1298,7 +1488,7 @@ pub fn install(
             if profile_dir(app).join("pnpm-workspace.yaml").is_file() {
                 retry.arg("-w");
             }
-            retry.args(&specs);
+            retry.args(specs);
             crate::dsh::apply_path(app, &mut retry);
             retry.env("PNPM_CONFIG_MINIMUM_RELEASE_AGE", "0");
             outcome = run(retry, log)?;
@@ -2320,12 +2510,72 @@ pub fn open_directory(app: &AppHandle) {
 mod tests {
     use super::{
         dependencies_in, holdings, installed_bundles, is_package_spec, local_spec, parse,
-        pnpm_blamed, pnpm_codes, pnpm_stuck, requested, spec_name, stale_bundles, sweep,
-        wanted_gone, with_bundles, without_bundles, Outcome, BUNDLED, IN_BOX, PRESETS,
-        RELEASE_AGE, SIGNAL,
+        parse_outdated, pnpm_blamed, pnpm_codes, pnpm_stuck, requested, spec_name,
+        stale_bundles, sweep, wanted_gone, with_bundles, without_bundles, Outcome, BUNDLED,
+        IN_BOX, PRESETS, RELEASE_AGE, SIGNAL,
     };
     use std::path::{Path, PathBuf};
     use tauri::Url;
+
+    /// Verbatim from `dsh plugin --profile web outdated --no-table` on a real
+    /// profile, trailing line and all: pnpm exits 1 when it found something, so
+    /// dsh says pnpm failed on every run that has an answer in it. That line
+    /// must not become a plugin, and the answer above it must survive it.
+    #[test]
+    fn reads_what_pnpm_outdated_actually_prints() {
+        let printed = "dshmarket\n1.45.1 => 1.47.0\ndsh: pnpm failed in profile \
+                       directory /home/u/.dsh/profiles/web\n";
+
+        assert_eq!(
+            parse_outdated(printed),
+            vec![(
+                "dshmarket".to_string(),
+                "1.45.1".to_string(),
+                "1.47.0".to_string()
+            )]
+        );
+    }
+
+    /// More than one, which is the shape a blank line separates. The name is
+    /// taken from the line above the arrow, so a separator between entries must
+    /// not shift the pairing by one.
+    #[test]
+    fn reads_several_outdated_plugins() {
+        let printed = "dshmarket\n1.45.1 => 1.47.0\n\ndsh-vendor-login\n0.2.0 => 0.3.1\n";
+
+        assert_eq!(
+            parse_outdated(printed),
+            vec![
+                (
+                    "dshmarket".to_string(),
+                    "1.45.1".to_string(),
+                    "1.47.0".to_string()
+                ),
+                (
+                    "dsh-vendor-login".to_string(),
+                    "0.2.0".to_string(),
+                    "0.3.1".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// Nothing outdated is the common answer and has to read as an empty list
+    /// rather than as anything else; so does output in a shape this has never
+    /// seen, which is the only honest reading of it.
+    #[test]
+    fn an_answer_with_no_entries_is_no_entries() {
+        assert!(parse_outdated("").is_empty());
+        assert!(parse_outdated("\n\n").is_empty());
+        assert!(parse_outdated("dsh: pnpm failed in profile directory /x\n").is_empty());
+
+        // An arrow with nothing above it: not an entry, and not a reason to
+        // take the line before the file.
+        assert!(parse_outdated("1.0.0 => 2.0.0\n").is_empty());
+
+        // An arrow whose halves are missing.
+        assert!(parse_outdated("dshmarket\n=>\n").is_empty());
+    }
 
     /// `dependencies_in` reads a parsed manifest now, because `listing` parses
     /// the file once and asks it two questions. What a manifest that will not

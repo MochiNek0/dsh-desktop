@@ -72,6 +72,11 @@ fn labels() -> String {
         "groupRecommended": t!("推荐", "Recommended"),
         "groupAuthored": t!("作者创建", "By the author"),
         "groupOther": t!("其他", "More"),
+        // On the one button that changes the machine from a card rather than
+        // from the bar at the bottom. The version it would move to is in the
+        // label, because the button is an icon and the number is the whole
+        // reason to press it.
+        "update": t!("更新到 {}", "Update to {}"),
         "repo": t!("查看仓库", "View repository"),
         "allIn": t!(
             "推荐的插件都装上了。要装别的，用下面的输入框。",
@@ -201,7 +206,11 @@ pub fn script() -> String {
     // rather than built out of a rotated corner, which is what this replaces:
     // a corner has to be nudged into the middle of the box by hand, and it
     // was a pixel and a half high of it.
-    tick: '<path d="M3.2 8.5l3.1 3.1 6.5-6.8"/>'
+    tick: '<path d="M3.2 8.5l3.1 3.1 6.5-6.8"/>',
+    // An arrow up off a line: what the card would fetch, rather than the box
+    // with an arrow going out of it that `repo` already is.
+    update: '<path d="M8 10.9V2.9"/><path d="M4.9 6 8 2.9 11.1 6"/>' +
+      '<path d="M3.2 13.1h9.6"/>'
   }};
 
   function svg(shape) {{
@@ -355,6 +364,21 @@ pub fn script() -> String {
       act(bar, ICONS.repo, TEXT.repo, 'a').href = item.url;
     }}
 
+    // Only where there is one to do. A card with no newer release has no
+    // button rather than a disabled one: the panel is three cards to a row and
+    // a control that never does anything is the one worth not drawing.
+    //
+    // It acts on the one plugin it is on, not on whatever happens to be ticked.
+    // The tick means install or remove, and a button that quietly obeyed it
+    // would update a card the pointer was nowhere near.
+    if (item.update) {{
+      var bump = act(bar, ICONS.update, TEXT.update.replace('{{}}', item.update.to));
+      bump.classList.add('dsh-pp-bump');
+      bump.addEventListener('click', function () {{
+        signal('plugins-update?names=' + encodeURIComponent(item.value));
+      }});
+    }}
+
     // Which list it came off. A mark rather than a button -- there is nothing
     // to press -- and what it means is on the hover.
     var kind = kindOf(item.section);
@@ -450,7 +474,10 @@ pub fn script() -> String {
         url: item.url,
         section: item.section,
         installed: true,
-        stale: !!item.stale
+        stale: !!item.stale,
+        // Absent until the check behind the panel comes back, and absent for
+        // good on a plugin that is current; see `look_for_updates` in main.rs.
+        update: item.update || null
       }};
     }}));
 
@@ -599,6 +626,12 @@ pub fn script() -> String {
       'border-color:var(--pp-accent);background:var(--pp-tint)}}' +
       '.dsh-pp .dsh-pp-act:focus-visible{{outline:2px solid var(--pp-accent);' +
       'outline-offset:1px}}' +
+      // The one action on a card that changes the machine, so it wears the
+      // accent rather than waiting for a hover to say it does something. The
+      // other two only explain or navigate, and stay muted until pointed at.
+      '.dsh-pp .dsh-pp-act.dsh-pp-bump{{color:var(--pp-accent);' +
+      'border-color:var(--pp-accent)}}' +
+      '.dsh-pp .dsh-pp-act.dsh-pp-bump:hover{{background:var(--pp-tint)}}' +
       // Not a button: nothing to press, and no box around it, so the two that
       // are pressable still read as the only two.
       '.dsh-pp-kind{{display:inline-flex;align-items:center;margin-left:auto;' +
