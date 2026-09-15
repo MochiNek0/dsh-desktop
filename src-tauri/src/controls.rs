@@ -217,12 +217,17 @@ pub fn action(url: &Url) -> Option<Action> {
             .find_map(|(key, value)| (key == "tag").then(|| value.into_owned()))
             .filter(|tag| !tag.is_empty())
             .map(Action::Locale),
-        "open" => {
-            url.query_pairs()
-                .find_map(|(key, value)| if key == "url" { Some(value.into_owned()) } else { None })
-                .filter(|target| is_web_link(target))
-                .map(Action::OpenUrl)
-        }
+        "open" => url
+            .query_pairs()
+            .find_map(|(key, value)| {
+                if key == "url" {
+                    Some(value.into_owned())
+                } else {
+                    None
+                }
+            })
+            .filter(|target| is_web_link(target))
+            .map(Action::OpenUrl),
         // The only one carrying a payload the app reads rather than acts on,
         // and the only one that can decline: an empty notification is dropped
         // here rather than raised as a blank toast.
@@ -303,7 +308,9 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::SetupInstallDsh(i) => {
             return crate::setup::answered(crate::setup::Choice::InstallDsh(i))
         }
-        Action::SetupInstallNode => return crate::setup::answered(crate::setup::Choice::InstallNode),
+        Action::SetupInstallNode => {
+            return crate::setup::answered(crate::setup::Choice::InstallNode)
+        }
         Action::SetupUninstallDsh(i) => {
             return crate::setup::answered(crate::setup::Choice::UninstallDsh(i))
         }
@@ -522,10 +529,7 @@ fn labels() -> String {
         ("settings-done", t!("关闭", "Close")),
         ("runtime", t!("运行环境…", "Runtime…")),
         ("registry", t!("安装源…", "Install source…")),
-        (
-            "check-app",
-            t!("检查应用更新…", "Check for app updates…"),
-        ),
+        ("check-app", t!("检查应用更新…", "Check for app updates…")),
         ("autostart", t!("开机自启动", "Start at login")),
         // Not "Notify when a turn finishes": the switch behind it gates every
         // notification this app raises, a plugin's included. See
@@ -672,8 +676,13 @@ pub(crate) fn lucide() -> &'static str {
       '-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/>' +
       '<path d="M12 22V12"/><polyline points="3.29 7 12 12 20.71 7"/>' +
       '<path d="m7.5 4.27 9 5.15"/>',
-    arrowUpFromLine: '<path d="m18 9-6-6-6 6"/><path d="M12 3v14"/>' +
-      '<path d="M5 21h14"/>'
+    // Round again: the same plugin at the next version. What this replaced was
+    // an arrow rising off a line, which is the shape an upload wears -- and a
+    // plugin card sends nothing anywhere.
+    refreshCw: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>' +
+      '<path d="M21 3v5h-5"/>' +
+      '<path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>' +
+      '<path d="M8 16H3v5"/>'
   };
 
   /** One icon at `size` pixels, on Lucide's own grid and at its own weight. */
@@ -684,6 +693,45 @@ pub(crate) fn lucide() -> &'static str {
       ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
       LUCIDE[name] + '</svg>';
   }"#
+}
+
+/// `corner-shape: round`, for every element and pseudo-element under `roots`.
+///
+/// Round corners, in a page that draws squircles. `corner-shape` decides what
+/// a `border-radius` is actually drawn as, and dsh's page has moved it off its
+/// initial `round`: every component in dsh's own stylesheet writes
+/// `corner-shape:round` beside its own radius to opt back out, which is a
+/// thing nobody writes six times unless the default around it is something
+/// else. That default reaches whatever is drawn into the document, every card
+/// in this app included — so a knob written as a 50% circle came out a rounded
+/// square, and the capsule under it came out a box, however the radius was
+/// written.
+///
+/// The property is not inherited, so the pseudo-elements are named here as
+/// well as the elements: the switch knob is a `::after`.
+///
+/// One function because there is one answer, and because the four cards are
+/// four stylesheets — the same drift [`theme_watcher`] exists to prevent.
+/// `every_card_takes_its_corners_back` pins that they all come from here.
+///
+/// A browser that has not shipped `corner-shape` drops the declaration and
+/// goes on drawing the ellipse corners it always drew, which is the same
+/// picture.
+pub(crate) fn corners(roots: &[&str]) -> String {
+    let selector = roots
+        .iter()
+        .flat_map(|root| {
+            [
+                format!(".{root}"),
+                format!(".{root} *"),
+                format!(".{root} *::before"),
+                format!(".{root} *::after"),
+            ]
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("{selector}{{corner-shape:round}}")
 }
 
 /// `function paint(node)`, which puts `dark_class` on `node` for as long as
@@ -760,6 +808,7 @@ pub fn script() -> String {
     let maker = dom_make();
     let icons = lucide();
     let watcher = theme_watcher("dsh-wc-dark");
+    let corners = corners(&["dsh-wc", "dsh-wc-set", "dsh-wc-scrim"]);
 
     format!(
         r#"(function () {{
@@ -842,7 +891,10 @@ pub fn script() -> String {
 
 {icons}
 
-  var MENU_GLYPH = lucide('menu', 14);
+  // 12, which is the diameter of a dot. The three bars sit beside the three
+  // dots and were drawn two pixels wider than them, so the one thing in the
+  // bar that is not a window control was the largest thing in it.
+  var MENU_GLYPH = lucide('menu', 12);
 
 
   // On every row of the settings card that opens something else. It was a `›`
@@ -956,6 +1008,10 @@ pub fn script() -> String {
       'html,body{{height:100%!important;margin:0!important;overflow:hidden!important;}}' +
       '#root{{height:calc(100% - var(--dsh-titlebar-height))!important;margin-top:var(--dsh-titlebar-height)!important;box-sizing:border-box!important;}}' +
       'body:not(:has(#root)){{padding-top:var(--dsh-titlebar-height)!important;box-sizing:border-box!important;}}' +
+      // The corners this bar and its card draw, taken back from the page; see
+      // `corners`. The two roots are separate because the card is not inside
+      // the bar.
+      '{corners}' +
       '.dsh-wc{{position:fixed;top:0;left:0;z-index:2147483647;display:flex;' +
       'align-items:center;height:{titlebar_height}px;padding:0 {pad}px;' +
       'opacity:.85;transition:opacity .2s ease;pointer-events:none}}' +
@@ -1638,7 +1694,8 @@ mod tests {
 
     #[test]
     fn parses_open_action() {
-        let url = Url::parse("dsh-window://open?url=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1").unwrap();
+        let url =
+            Url::parse("dsh-window://open?url=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1").unwrap();
         match action(&url) {
             Some(Action::OpenUrl(target)) => assert_eq!(target, "https://example.com/path?a=1"),
             _ => panic!("expected Action::OpenUrl"),
@@ -1884,6 +1941,30 @@ mod tests {
     /// The assertion is deliberately the whole generated block rather than a
     /// phrase out of it: a copy that drifts by one line is exactly the failure
     /// this is here to catch, and matching on a fragment would let it through.
+    #[test]
+    fn every_card_takes_its_corners_back() {
+        for (what, script, roots) in [
+            (
+                "the titlebar",
+                script(),
+                &["dsh-wc", "dsh-wc-set", "dsh-wc-scrim"][..],
+            ),
+            ("a dialog", crate::dialog::script(), &["dsh-ask"][..]),
+            ("the plugin panel", crate::panel::script(), &["dsh-pp"][..]),
+            (
+                "the runtime chooser",
+                crate::setup::script(),
+                &["dsh-su"][..],
+            ),
+        ] {
+            assert!(
+                script.contains(&corners(roots)),
+                "{what} is drawn over a page that makes every corner a \
+                 squircle, so it has to ask for round ones from `corners`"
+            );
+        }
+    }
+
     #[test]
     fn every_card_reads_the_theme_the_same_way() {
         for (what, script, class) in [

@@ -918,6 +918,7 @@ pub fn script() -> String {
     let font = crate::controls::FONT;
     let maker = crate::controls::dom_make();
     let watcher = crate::controls::theme_watcher("dsh-su-dark");
+    let corners = crate::controls::corners(&["dsh-su"]);
     let labels = labels();
     let relabel = RELABEL;
 
@@ -1089,6 +1090,10 @@ pub fn script() -> String {
       '--su-soft:rgba(255,255,255,.04);--su-ok:#3ccb9a;--su-bad:#f97066}}' +
       '.dsh-su.dsh-su-shown{{display:flex}}' +
       '.dsh-su,.dsh-su *{{box-sizing:border-box;font-family:{font}}}' +
+      // And the corners, which the page would otherwise draw as squircles:
+      // this card is a list of rows with a chip on each. See
+      // `controls::corners`.
+      '{corners}' +
       '.dsh-su-card{{display:flex;flex-direction:column;min-height:0;' +
       'max-height:100%;width:min(620px,100%);padding:22px 24px;' +
       'border-radius:14px;background:var(--su-bg);color:var(--su-fg);' +

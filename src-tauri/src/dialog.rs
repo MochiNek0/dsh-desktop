@@ -507,6 +507,7 @@ pub fn script() -> String {
     let dismissed = DISMISSED;
     let maker = crate::controls::dom_make();
     let watcher = crate::controls::theme_watcher("dsh-ask-dark");
+    let corners = crate::controls::corners(&["dsh-ask"]);
 
     format!(
         r#"(function () {{
@@ -569,6 +570,10 @@ pub fn script() -> String {
       '--ask-soft:rgba(255,255,255,.04)}}' +
       '.dsh-ask.dsh-ask-shown{{display:flex}}' +
       '.dsh-ask,.dsh-ask *{{box-sizing:border-box;font-family:{font}}}' +
+      // And the corners, which the page would otherwise draw as squircles:
+      // the card, its buttons and the ring around the primary one. See
+      // `controls::corners`.
+      '{corners}' +
       // Narrower than the plugin panel: this is a paragraph and some buttons,
       // and a question set in a 760px line is a question that looks like a
       // document.

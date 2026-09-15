@@ -131,6 +131,7 @@ pub fn script() -> String {
     let maker = crate::controls::dom_make();
     let icons = crate::controls::lucide();
     let watcher = crate::controls::theme_watcher("dsh-pp-dark");
+    let corners = crate::controls::corners(&["dsh-pp"]);
     let labels = labels();
     let relabel = RELABEL;
 
@@ -202,9 +203,10 @@ pub fn script() -> String {
     // The one inside a ticked box. A shape rather than a character, because a
     // glyph would inherit whatever the page underneath does to fonts.
     tick: 'check',
-    // An arrow up off a line: what the card would fetch, rather than the box
-    // with an arrow going out of it that `repo` already is.
-    update: 'arrowUpFromLine'
+    // The same plugin come round at the next version. Not an arrow off a
+    // line, which is what a file being uploaded wears, and this card uploads
+    // nothing.
+    update: 'refreshCw'
   }};
 
   /** One of them at the size a card draws its marks, which is all of them. */
@@ -324,7 +326,10 @@ pub fn script() -> String {
 
     var body = make('div', 'dsh-pp-body', line);
     var name = make('div', 'dsh-pp-name', body);
-    name.appendChild(document.createTextNode(item.name));
+    // Its own element rather than a bare text node, so the stylesheet can make
+    // the name the part of this line that gives way when there is not room for
+    // all of it. See `.dsh-pp-title`.
+    make('span', 'dsh-pp-title', name).textContent = item.name;
     if (item.fix) name.appendChild(chip('fix', TEXT.fix));
     // Last on the line, after any chip a preset came with. Residue instead of
     // "installed", never both: the tick does the same thing to either, but
@@ -366,7 +371,6 @@ pub fn script() -> String {
     // would update a card the pointer was nowhere near.
     if (item.update) {{
       var bump = act(bar, ICONS.update, TEXT.update.replace('{{}}', item.update.to));
-      bump.classList.add('dsh-pp-bump');
       bump.addEventListener('click', function () {{
         // The version goes with the name, and the update does not work without
         // it. `pnpm add <name>` on a package that is already a dependency whose
@@ -541,7 +545,7 @@ pub fn script() -> String {
       // `hover` is the border a card takes before it is ticked, and `tint` the
       // wash it takes after: both sit between the line colour and the accent,
       // and both have to be given per theme rather than mixed from the accent.
-      '--pp-soft:#f7f8fa;--pp-fix:#b54708;--pp-star:#e0a30c;' +
+      '--pp-soft:#f7f8fa;--pp-fix:#b54708;--pp-star:#fab105;' +
       '--pp-hover:#c3cbe6;--pp-tint:rgba(77,107,254,.07)}}' +
       '.dsh-pp.dsh-pp-dark{{background:rgba(0,0,0,.5);' +
       '--pp-bg:#17171d;--pp-fg:#ececf1;--pp-muted:#9aa0ac;--pp-line:#2b2b34;' +
@@ -553,6 +557,10 @@ pub fn script() -> String {
       // out of. The family is the one thing worth taking back wholesale; the
       // sizes are written onto each piece below.
       '.dsh-pp,.dsh-pp *{{box-sizing:border-box;font-family:{font}}}' +
+      // The corners are the other thing worth taking back wholesale: without
+      // this the capsule on a chip, the cards and the tick were all drawn as
+      // superellipses. See `controls::corners`, which says why.
+      '{corners}' +
       '.dsh-pp-card{{display:flex;flex-direction:column;min-height:0;' +
       'max-height:100%;width:min(760px,100%);padding:22px 24px;' +
       'border-radius:14px;background:var(--pp-bg);color:var(--pp-fg);' +
@@ -609,7 +617,15 @@ pub fn script() -> String {
       'outline-offset:2px}}' +
       '.dsh-pp-body{{min-width:0;flex:1}}' +
       '.dsh-pp-name{{font-weight:600;font-size:13.5px;line-height:1.35;' +
-      'display:flex;align-items:center;gap:6px;flex-wrap:wrap}}' +
+      'display:flex;align-items:center;gap:6px}}' +
+      // The name is what gives way, and the tag at the end of it never does.
+      // This line used to wrap instead, which put "installed" on a line of its
+      // own under any name long enough -- a second line of card spent saying
+      // what a tag beside the name had already said. So the name is ellipsised
+      // here the way the package under it already is, and the tag keeps its
+      // place at the end of the one line.
+      '.dsh-pp-title{{min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+      'white-space:nowrap}}' +
       // The package name, said quietly: it is what the row installs, not what
       // the row is called. Monospace because it is a thing to be typed —
       // `dsh plugin add` takes this exact string.
@@ -620,25 +636,30 @@ pub fn script() -> String {
       'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}' +
       // The bottom line of a card: what it can be asked, then the mark for
       // which list it came off, at the far end.
-      '.dsh-pp-tools{{display:flex;align-items:center;gap:6px;margin-top:8px}}' +
+      // Pulled left by the slack inside the first icon's hit box, so the row
+      // of glyphs starts where the name and the package above it start. The
+      // box used to draw that slack and make it look deliberate; nothing draws
+      // it now, so it read as an indent.
+      '.dsh-pp-tools{{display:flex;align-items:center;gap:6px;' +
+      'margin:8px 0 0 -5px}}' +
       '.dsh-pp-tools svg{{display:block;width:14px;height:14px}}' +
       // Written with the class twice over to outrank `.dsh-pp button` below,
       // which is the panel's ordinary button and nothing like this one.
+      //
+      // No box around them. Three outlined squares in the corner of a card
+      // this small were three more rectangles than the card needed, and they
+      // sat there whether or not anyone was going to press one. The glyph is
+      // the button; the tint arrives under the pointer, which is the only
+      // moment anything has to say "this can be pressed".
       '.dsh-pp .dsh-pp-act{{display:inline-flex;align-items:center;' +
       'justify-content:center;width:24px;height:24px;padding:0;' +
-      'border:1px solid var(--pp-line);border-radius:7px;background:none;' +
+      'border:0;border-radius:7px;background:none;' +
       'color:var(--pp-muted);cursor:pointer;text-decoration:none;' +
-      'transition:color .15s,border-color .15s,background .15s}}' +
+      'transition:color .15s,background .15s}}' +
       '.dsh-pp .dsh-pp-act:hover{{color:var(--pp-accent);' +
-      'border-color:var(--pp-accent);background:var(--pp-tint)}}' +
+      'background:var(--pp-tint)}}' +
       '.dsh-pp .dsh-pp-act:focus-visible{{outline:2px solid var(--pp-accent);' +
       'outline-offset:1px}}' +
-      // The one action on a card that changes the machine, so it wears the
-      // accent rather than waiting for a hover to say it does something. The
-      // other two only explain or navigate, and stay muted until pointed at.
-      '.dsh-pp .dsh-pp-act.dsh-pp-bump{{color:var(--pp-accent);' +
-      'border-color:var(--pp-accent)}}' +
-      '.dsh-pp .dsh-pp-act.dsh-pp-bump:hover{{background:var(--pp-tint)}}' +
       // Not a button: nothing to press, and no box around it, so the two that
       // are pressable still read as the only two.
       '.dsh-pp-kind{{display:inline-flex;align-items:center;margin-left:auto;' +
@@ -659,8 +680,8 @@ pub fn script() -> String {
       '@media (prefers-reduced-motion:reduce){{.dsh-pp-row,.dsh-pp-tick,' +
       '.dsh-pp-tick svg,.dsh-pp .dsh-pp-act{{transition:none}}' +
       '.dsh-pp-row:hover{{transform:none}}}}' +
-      '.dsh-pp-chip{{font-size:11px;font-weight:500;line-height:1.5;padding:0 7px;' +
-      'border-radius:999px;border:1px solid currentColor}}' +
+      '.dsh-pp-chip{{flex:none;font-size:11px;font-weight:500;line-height:1.5;' +
+      'padding:0 7px;border-radius:999px;border:1px solid currentColor}}' +
       '.dsh-pp-chip.dsh-pp-fix{{color:var(--pp-fix)}}' +
       '.dsh-pp-chip.dsh-pp-installed{{color:var(--pp-ok)}}' +
       // The same red the removal button wears, because it is the same verb:
