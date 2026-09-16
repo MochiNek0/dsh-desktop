@@ -42,6 +42,12 @@ tauri-plugin-single-instance = "2"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+# `MemoryUsageTargetLevel`, for the webview nobody is looking at; see `memory`.
+# Both of these are already in the tree under wry, and the versions have to stay
+# matched to the ones Tauri hands `PlatformWebview::controller` out of, or the
+# cast to `ICoreWebView2_19` is a cast between two unrelated types.
+webview2-com = "0.38"
+windows-core = "0.61"
 # Job objects: the kernel-side backstop that kills the dsh process tree when the
 # app dies without running its own shutdown. See `server::Job`.
 windows-sys = { version = "0.61", features = [

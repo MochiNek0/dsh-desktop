@@ -11,6 +11,7 @@ mod controls;
 mod cookies;
 mod dialog;
 mod dsh;
+mod memory;
 mod notify;
 mod panel;
 mod plugins;
@@ -352,6 +353,7 @@ fn build_window(
             api.prevent_close();
             if let Some(window) = closer.get_webview_window("main") {
                 let _ = window.hide();
+                memory::trim(&window);
             }
         }
         // The maximise button's glyph. A snap or a Win+Up never reaches the
@@ -542,6 +544,7 @@ pub(crate) fn reveal(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        memory::restore(&window);
     }
 
     // The app has been asked for, so a check held back for want of a window to
