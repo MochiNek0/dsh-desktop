@@ -10,6 +10,7 @@ DeepSeek Harness (`dsh web`) 的跨平台桌面客户端
 
 [![Website](https://img.shields.io/badge/Website-dsh--desktop.cc.cd-2ea44f?logo=googlechrome&logoColor=white)](https://dsh-desktop.cc.cd/)
 [![Release](https://img.shields.io/github/v/release/MochiNek0/dsh-desktop?color=blue)](https://github.com/MochiNek0/dsh-desktop/releases)
+![QQ 群](https://img.shields.io/badge/QQ群-1125671315-12B7F5?logo=tencentqq&logoColor=white)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -70,6 +71,11 @@ npm install     # 安装依赖
 npm run dev     # 开发模式
 npm run build   # 构建发布包，输出至 src-tauri/target/release/bundle/
 ```
+
+## 交流与反馈
+
+- **QQ 交流群**：`1125671315`（欢迎入群交流使用体验、反馈问题与建议）
+- **Issue 反馈**：欢迎在 [GitHub Issues](https://github.com/MochiNek0/dsh-desktop/issues) 提交建议与 Bug
 
 ## 相关链接
 
