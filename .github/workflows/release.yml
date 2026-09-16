@@ -242,6 +242,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # The background and the icon positions on the disk image are set by
+          # an AppleScript that tauri-bundler passes `--skip-jenkins` to whenever
+          # `CI` is `true` — a guard for headless Jenkins agents, where driving
+          # Finder fails. A GitHub macOS runner has a window server, so the
+          # script runs fine here, and without this the disk image ships with the
+          # background file copied in but nothing referencing it.
+          #
+          #   https://github.com/tauri-apps/tauri/issues/592
+          TAURI_BUNDLER_DMG_IGNORE_CI: true
         with:
           tagName: ${{ github.ref_name }}
           releaseName: dsh desktop ${{ github.ref_name }}
