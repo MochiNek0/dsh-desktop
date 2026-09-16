@@ -43,7 +43,7 @@ Download the package for your system from the **[website](https://dsh-desktop.cc
 | OS | Format | Size | Details |
 | :--- | :--- | :--- | :--- |
 | **Windows** | `.exe` (NSIS) | 2.3 MB | Needs WebView2; downloaded automatically if missing (verified) |
-| **macOS** | `.dmg` | 5.8 MB | Universal binary for Apple Silicon and Intel (unverified, feedback welcome) |
+| **macOS** | `.dmg` | 5.8 MB | Universal binary for Apple Silicon and Intel (verified) |
 | **Linux** | `.deb` / `.AppImage` | 3.8 MB / 78 MB | `.AppImage` carries its own WebKit, hence the size, but has the most complete self-updater support (verified on Debian) |
 
 ## Notes

@@ -43,7 +43,7 @@ DeepSeek Harness (`dsh web`) 的跨平台桌面客户端
 | 系统 | 格式 | 体积 | 说明 |
 | :--- | :--- | :--- | :--- |
 | **Windows** | `.exe`（NSIS） | 2.3 MB | 需 WebView2，缺失时自动引导安装（已验证） |
-| **macOS** | `.dmg` | 5.8 MB | 通用二进制，支持 Apple Silicon 与 Intel（暂未验证，欢迎反馈） |
+| **macOS** | `.dmg` | 5.8 MB | 通用二进制，支持 Apple Silicon 与 Intel（已验证） |
 | **Linux** | `.deb` / `.AppImage` | 3.8 MB / 78 MB | `.AppImage` 自带 WebKit 故体积较大，但自更新支持最完整（Debian 系已验证） |
 
 ## 注意事项
