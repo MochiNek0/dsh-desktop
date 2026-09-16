@@ -25,7 +25,6 @@
     "dev": "tauri dev",
     "build": "tauri build",
     "bundle:runtime": "node scripts/bundle-runtime.mjs",
-    "art:dmg": "node scripts/make-dmg-background.mjs",
     "check:installer": "node scripts/check-installer-hooks.mjs",
     "version": "node scripts/sync-version.mjs && git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock",
     "tauri": "tauri"
