@@ -946,6 +946,7 @@ mod tests {
             ("controls.js", crate::controls::script()),
             ("notify.js", crate::notify::script()),
             ("setup.js", crate::setup::script()),
+            ("remote.js", crate::remote::script()),
         ] {
             std::fs::write(out.join(name), text).expect("a written script");
         }

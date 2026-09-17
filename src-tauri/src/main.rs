@@ -15,6 +15,7 @@ mod memory;
 mod notify;
 mod panel;
 mod plugins;
+mod remote;
 mod server;
 mod settings;
 mod setup;
@@ -161,6 +162,17 @@ fn main() {
                 auth,
             };
             app.manage(session.clone());
+            // Nothing is bound and no port is open until the user asks for one;
+            // this is the state the button on the titlebar reaches. See
+            // [`remote`].
+            app.manage(remote::Remote::new(app.handle().clone()));
+
+            // Once a launch, and only for someone who has the patch switched
+            // on, so that a fix for a newer dsh reaches them without waiting
+            // for a release of this app. Quiet: they did not ask for it, and
+            // the stylesheet already on disk is what the phone uses meanwhile.
+            // See [`remote::refresh_patch`].
+            remote::refresh_patch(app.handle(), false);
 
             build_tray(app.handle())?;
 
@@ -171,10 +183,13 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("failed to build the dsh desktop app");
 
-    app.run(move |_handle, event| {
+    app.run(move |handle, event| {
         if let tauri::RunEvent::Exit = event {
             dsh::stop();
             plugins::stop();
+            // Before the server, because what this takes down is a socket bound
+            // to every interface on the machine; see `remote::shutdown`.
+            remote::shutdown(handle);
             if let Some(child) = server.lock().unwrap().as_mut() {
                 child.stop();
             }
@@ -250,6 +265,10 @@ fn build_window(
         .initialization_script(setup::script())
         // The app's own dialogs, in place of the window manager's; see `dialog`.
         .initialization_script(dialog::script())
+        // The pairing card: a QR code and who is on it. Drawn over dsh's page
+        // like the plugin panel, and for the same reason — that is where the
+        // user is looking. See `remote`.
+        .initialization_script(remote::script())
         // Which language the pages pick their own strings out of; see `i18n`.
         .initialization_script(format!(
             "window.__DSH_LANG__ = {:?};",
@@ -854,7 +873,7 @@ fn update_dsh(app: &tauri::AppHandle) {
             return;
         };
 
-        stop_server(&session);
+        stop_server(&app, &session);
         // Back to queueing until the loading page below has loaded; the reports
         // that follow would otherwise be evaluated into the outgoing document.
         session.splash.rearm();
@@ -990,7 +1009,7 @@ fn reporter<'a>(splash: &'a Splash, window: &'a WebviewWindow) -> impl Fn(&str, 
 /// about to see it exit, and this is what tells it the exit was asked for. Moved
 /// before the child is killed, so there is no window in which the watcher could
 /// read the old number.
-fn stop_server(session: &Session) {
+fn stop_server(app: &tauri::AppHandle, session: &Session) {
     session.epoch.fetch_add(1, Ordering::SeqCst);
 
     if let Some(mut running) = session.server.lock().unwrap().take() {
@@ -999,6 +1018,9 @@ fn stop_server(session: &Session) {
     // The dsh page went with it, so nothing may be treated as ours until a new
     // server says otherwise.
     *session.origin.write().unwrap() = None;
+    // And a phone on the gateway is told dsh stopped, rather than being handed
+    // whatever a connection to a closed port looks like. See `remote`.
+    remote::dsh_gone(app);
 }
 
 /// Wait for the running server to exit, start it again where that is worth
@@ -1166,6 +1188,11 @@ fn attempt(
             let same = session.origin.read().unwrap().as_deref() == Some(origin.as_str());
             *session.origin.write().unwrap() = Some(origin);
 
+            // The restart path, and the one the gateway would otherwise get
+            // wrong: same port, new process, new token, and the cookie the
+            // gateway is holding is now worth nothing. See `remote::upstream`.
+            remote::dsh_ready(app, &url);
+
             // Only when the port moved. On the same one the page is already
             // pointed at a server that is back, and reloading it would throw
             // away the very thing staying put is for.
@@ -1221,6 +1248,7 @@ fn served_port(origin: &Origin) -> Option<u16> {
 /// dsh again has stopped being worth trying.
 fn give_up(window: &WebviewWindow, session: &Session, output: &str) {
     *session.origin.write().unwrap() = None;
+    remote::dsh_gone(window.app_handle());
     session.splash.rearm();
 
     let handle = window.app_handle().clone();
@@ -1300,7 +1328,7 @@ fn restart_dsh(app: &tauri::AppHandle, into_plugins: bool) {
 
         // Down first: a server still serving has to stop before a fresh one
         // starts, and from the retry button there is nothing to stop.
-        stop_server(&session);
+        stop_server(&app, &session);
 
         // The dsh page died with the server above; only the loading page can
         // show a start's progress, so back there the way an update goes back.
@@ -1487,7 +1515,7 @@ where
             return;
         };
 
-        stop_server(&session);
+        stop_server(&app, &session);
 
         let log = |line: &str| session.splash.plugin_log(&window, line);
         match work(&app, &log) {
@@ -1698,6 +1726,11 @@ fn serve(
                 };
 
                 *origin.write().unwrap() = Some(url.origin().ascii_serialization());
+                // The token on this URL is what the phone gateway exchanges for
+                // a dsh session of its own, and it belongs to this dsh process
+                // rather than to this launch — so every URL dsh prints has to
+                // reach `remote`, not just the first. See `remote::upstream`.
+                remote::dsh_ready(window.app_handle(), &url);
                 splash.status(window, t!("正在打开界面…", "Opening the interface…"));
 
                 // Before the navigation rather than after it: the header this

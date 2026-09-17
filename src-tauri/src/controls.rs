@@ -104,6 +104,19 @@ pub enum Action {
     /// dsh switched language under a document that is not going to load
     /// again; see [`relabel`]. Carries the tag `<html lang>` moved to.
     Locale(String),
+    /// Open the pairing card: a QR code for a phone to scan. See
+    /// [`crate::remote`].
+    Remote,
+    /// Throw one paired device off. Carries the id the card drew it under.
+    RemoteKick(String),
+    /// Throw them all off and change the signing key.
+    RemoteKickAll,
+    /// The card was closed. The gateway stays up; the devices on it are still
+    /// working.
+    RemoteClose,
+    /// The stylesheet-patch box on the card was ticked or unticked. Carries the
+    /// state it is now in, not a request to flip.
+    RemoteStyle(bool),
     /// Open the plugin panel on the loading page.
     Plugins,
     /// Install what was ticked in it, and whatever was typed into its box.
@@ -184,6 +197,23 @@ pub fn action(url: &Url) -> Option<Action> {
         "autostart" => Some(Action::Autostart),
         "notify-turns" => Some(Action::NotifyTurns),
         "quit" => Some(Action::Quit),
+        "remote" => Some(Action::Remote),
+        // The id is the store's own handle for a device, and it is checked by
+        // being looked for: a forged one names no row and revokes nothing. See
+        // [`crate::remote::session::SessionStore::revoke`].
+        "remote-kick" => url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "id").then(|| value.into_owned()))
+            .filter(|id| !id.is_empty())
+            .map(Action::RemoteKick),
+        "remote-kick-all" => Some(Action::RemoteKickAll),
+        "remote-close" => Some(Action::RemoteClose),
+        // The state, not a flip: a signal that went missing would otherwise
+        // leave the box and the flag disagreeing until the next click.
+        "remote-style" => url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "on").then(|| value == "1"))
+            .map(Action::RemoteStyle),
         "plugins" => Some(Action::Plugins),
         "plugins-install" => {
             let (ids, spec) = crate::plugins::requested(url);
@@ -297,6 +327,11 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::Autostart => return crate::toggle_autostart(app),
         Action::NotifyTurns => return crate::toggle_notify_turns(app),
         Action::Quit => return crate::quit(app),
+        Action::Remote => return crate::remote::open(app),
+        Action::RemoteKick(id) => return crate::remote::kick(app, &id),
+        Action::RemoteKickAll => return crate::remote::kick_all(app),
+        Action::RemoteClose => return crate::remote::close(app),
+        Action::RemoteStyle(on) => return crate::remote::style(app, on),
         Action::Locale(tag) => return crate::switch_language(app, &tag),
         Action::Plugins => return crate::open_plugins(app),
         Action::PluginsInstall(ids, spec) => return crate::install_plugins(app, ids, spec),
@@ -515,6 +550,11 @@ pub(crate) fn eval(app: &AppHandle, call: &str) {
 /// whole titlebar with it.
 fn labels() -> String {
     let labels = [
+        // Not a menu row: the one button beside the menu, whose label is its
+        // tooltip. It is here because this is where the app's two languages
+        // live, and a string drawn in the titlebar is no more exempt from that
+        // than a row in the panel below it.
+        ("remote", t!("手机连接…", "Connect a phone…")),
         ("plugins", t!("插件…", "Plugins…")),
         ("terminal", t!("打开终端", "Open a terminal")),
         ("restart-dsh", t!("重启 dsh", "Restart dsh")),
@@ -673,6 +713,8 @@ pub(crate) fn lucide() -> &'static str {
       '6l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/>',
     user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>' +
       '<circle cx="12" cy="7" r="4"/>',
+    smartphone: '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/>' +
+      '<path d="M12 18h.01"/>',
     package: '<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0' +
       '-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/>' +
       '<path d="M12 22V12"/><polyline points="3.29 7 12 12 20.71 7"/>' +
@@ -897,6 +939,16 @@ pub fn script() -> String {
   // bar that is not a window control was the largest thing in it.
   var MENU_GLYPH = lucide('menu', 12);
 
+  // The one button in the bar that is not a window control and not the menu.
+  // It sits to the menu's right because that is the only other place in this
+  // strip that is reliably empty, and it is a button rather than a menu row
+  // because what it opens is a thing you do — see `remote`.
+  //
+  // Written with a `verb:` the way the menu's rows are, so that the label check
+  // in controls.rs's tests counts it like the rest of them.
+  var PHONE = {{ verb: 'remote' }};
+  var PHONE_GLYPH = lucide('smartphone', 13);
+
 
   // On every row of the settings card that opens something else. It was a `›`
   // until now -- a character, so it was set in whatever font dsh's page had
@@ -1062,6 +1114,10 @@ pub fn script() -> String {
       '.dsh-wc button.dsh-wc-menu:hover,.dsh-wc button.dsh-wc-menu.dsh-wc-shown{{' +
       'background:var(--dsh-wc-hover);color:var(--dsh-wc-fg-hi)}}' +
       '.dsh-wc button.dsh-wc-menu:active{{filter:none}}' +
+      // Beside the menu rather than away from it: the gap before the menu is
+      // there to keep the magnification off the green dot, and there is no dot
+      // on this side to keep clear of.
+      '.dsh-wc button.dsh-wc-phone{{margin-left:2px}}' +
       // The panel. `visibility` rather than `display` so the fade has something
       // to fade, with its own transition delayed until the opacity is done.
       '.dsh-wc-pop{{position:absolute;top:calc(100% - 3px);left:0;min-width:184px;' +
@@ -1251,6 +1307,19 @@ pub fn script() -> String {
     opener.className = 'dsh-wc-menu';
     opener.innerHTML = MENU_GLYPH;
     bar.appendChild(opener);
+
+    // ------------------------------------------------------------ the phone --
+
+    var phone = document.createElement('button');
+    phone.type = 'button';
+    phone.className = 'dsh-wc-menu dsh-wc-phone';
+    phone.innerHTML = PHONE_GLYPH;
+    phone.title = LABELS[PHONE.verb] || '';
+    phone.setAttribute('aria-label', phone.title);
+    phone.addEventListener('click', function () {{
+      signal(PHONE.verb);
+    }});
+    bar.appendChild(phone);
 
     var safe = document.createElement('div');
     safe.className = 'dsh-wc-safe';

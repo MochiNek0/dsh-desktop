@@ -29,7 +29,7 @@ use std::os::unix::process::CommandExt;
 
 /// Keeps a spawned process off the console it would otherwise pop up.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// How many output lines to keep around for the failure message.
 const TAIL_LINES: usize = 30;

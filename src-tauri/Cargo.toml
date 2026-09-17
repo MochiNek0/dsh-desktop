@@ -34,6 +34,45 @@ sys-locale = "0.3"
 # $DSH_HOME, and a dsh update would rewrite the tree the other one is running.
 tauri-plugin-single-instance = "2"
 
+# The phone gateway; see `remote`. Everything below this line was already in the
+# tree — reqwest brings hyper, tokio, http and the body helpers, tauri brings
+# base64 and the hashes — so what is new here is the feature flags and this
+# crate's right to name them, not the crates themselves. `if-addrs` is the one
+# addition, and it is the same trade `sys-locale` above is: one function, no
+# dependencies of its own, and three different platform calls underneath that
+# are the whole reason not to write it here.
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+# `net` for the listener, `io-util` for the byte copy that carries every
+# WebSocket frame, `sync` for the channels the pairing handshake waits on.
+# `macros` for `select!` and `join!`, which are what the accept loop and the
+# WebSocket copy are written out of.
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
+if-addrs = "0.13"
+# The device cookie: `sha2` under the HMAC written out in `remote::session`,
+# `subtle` for the comparison that must not return early, `getrandom` for the
+# nonce, `base64` to write both down. No `hmac` crate — see the RFC 4231
+# vectors in that module's tests.
+sha2 = "0.10"
+subtle = "2"
+# The stylesheet patch's update channel; see `remote::patch`. Both of these
+# are already in the tree as `tauri-plugin-updater` dependencies -- the same
+# reqwest, on the same rustls -- so what is new is this crate's right to name
+# them. The alternative for the fetch was hyper, which is here too but brings
+# no TLS of its own, so it would have meant a second TLS stack for one GET.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+minisign-verify = "0.2"
+# Named only to install the crypto provider reqwest expects; `ring` is what
+# rustls already has switched on in this tree, so this adds no code.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+getrandom = "0.3"
+base64 = "0.22"
+# Reading `?pair_token=` off a URL the phone typed, decoded the way a form is.
+form_urlencoded = "1"
+
 [target.'cfg(unix)'.dependencies]
 # Process groups: `setpgid` before the exec and a signal to the whole group on
 # the way out, which is the ordinary shutdown path — see `server::group_leader`.

@@ -1313,7 +1313,7 @@ pub fn profile_dir(app: &AppHandle) -> PathBuf {
     dsh_home().join("profiles").join(PROFILE)
 }
 
-fn dsh_home() -> PathBuf {
+pub(crate) fn dsh_home() -> PathBuf {
     if let Some(home) = std::env::var_os("DSH_HOME") {
         return PathBuf::from(home);
     }
