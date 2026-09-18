@@ -334,6 +334,16 @@ const MOBILE_CSS = [
   '  right: 14px;',
   '  z-index: 2;',
   '}',
+  // Make workspace and session row actions visible on mobile without hover,
+  // so the user can tap "+" to create a session in that workspace.
+  '[class*="_projectRow"] [class*="_rowActions"], [class*="_sessionRow"] [class*="_rowActions"] {',
+  '  display: inline-flex;',
+  '}',
+  // Ensure the workspace chip in the hero conversation view is easily tappable.
+  '[class*="_heroWorkspaceRow"] [class*="_workspace"] {',
+  '  min-height: 36px;',
+  '  padding: 0 12px;',
+  '}',
   '}',
 ].join('\n');
 

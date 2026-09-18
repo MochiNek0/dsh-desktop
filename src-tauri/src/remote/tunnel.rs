@@ -174,20 +174,35 @@ fn reachable(address: Ipv4Addr) -> bool {
         && !address.is_unspecified()
         && !address.is_broadcast()
         && !address.is_multicast()
+        && !is_benchmarking_or_fake_ip(address)
+}
+
+/// 198.18.0.0/15 is the RFC 2544 benchmark testing range, used by Clash, Mihomo,
+/// Sing-box, etc. for TUN / Fake-IP mode. It is purely local to the proxy core
+/// on this machine and never routable from an external LAN phone.
+fn is_benchmarking_or_fake_ip(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    octets[0] == 198 && (octets[1] & 0xfe) == 18
+}
+
+fn is_virtual(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    VIRTUAL.iter().any(|marker| lower.contains(marker))
 }
 
 /// Higher is better. Pure, so the table below is something a test can hold.
+///
+/// Physical network cards (Wi-Fi, Ethernet) always beat virtual adapters
+/// (Docker, WSL, Clash TUN, Tailscale) so that proxy or VPN software hijacking
+/// the default route does not publish an address a LAN phone cannot reach.
 fn rank(name: &str, routed: bool) -> u32 {
-    if routed {
-        return 3;
+    let virtual_card = is_virtual(name);
+    match (virtual_card, routed) {
+        (false, true) => 4,
+        (false, false) => 3,
+        (true, true) => 2,
+        (true, false) => 1,
     }
-    if VIRTUAL
-        .iter()
-        .any(|marker| name.to_ascii_lowercase().contains(marker))
-    {
-        return 1;
-    }
-    2
 }
 
 /// Adapter names that belong to something other than the network the phone is
@@ -219,6 +234,13 @@ const VIRTUAL: &[&str] = &[
     "isatap",
     "bluetooth",
     "vpn",
+    "clash",
+    "meta",
+    "sing-box",
+    "wintun",
+    "wireguard",
+    "tun",
+    "tap",
 ];
 
 /// The address the default route leaves through, or `None` on a machine with no
@@ -245,13 +267,21 @@ fn routed_address() -> Option<Ipv4Addr> {
 mod tests {
     use super::*;
 
-    /// The routing table beats every name, including a name on the list: a
-    /// machine whose traffic really does leave through a Tailscale card is one
-    /// whose Tailscale address is the honest answer.
+    /// For LAN pairing, a physical network card must always beat a virtual adapter,
+    /// even if the virtual adapter (e.g. Clash TUN, VPN) has hijacked the default route.
     #[test]
-    fn the_routed_card_wins() {
-        assert!(rank("Tailscale", true) > rank("Wi-Fi", false));
+    fn a_real_card_beats_a_routed_virtual_card() {
+        assert!(rank("Wi-Fi", false) > rank("Tailscale", true));
+        assert!(rank("Wi-Fi", false) > rank("Clash", true));
+        assert!(rank("以太网", false) > rank("Meta", true));
+        assert!(rank("Ethernet", false) > rank("wintun", true));
+    }
+
+    #[test]
+    fn the_routed_card_wins_among_equals() {
         assert!(rank("Wi-Fi", true) > rank("Wi-Fi", false));
+        assert!(rank("Tailscale", true) > rank("Tailscale", false));
+        assert!(rank("Clash", true) > rank("Clash", false));
     }
 
     #[test]
@@ -275,6 +305,11 @@ mod tests {
             "Docker Desktop",
             "Tailscale",
             "ZeroTier One [abc]",
+            "Clash Core Adapter",
+            "Meta TUN",
+            "sing-box tun",
+            "Wintun Userspace Tunnel",
+            "WireGuard Tunnel",
         ] {
             assert_eq!(rank(name, false), 1, "{name} is not the card to publish");
         }
@@ -289,6 +324,8 @@ mod tests {
             Ipv4Addr::new(169, 254, 3, 4),
             Ipv4Addr::UNSPECIFIED,
             Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(198, 18, 0, 1),
+            Ipv4Addr::new(198, 19, 255, 254),
         ] {
             assert!(!reachable(address), "{address} is not reachable");
         }

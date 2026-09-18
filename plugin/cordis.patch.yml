@@ -1,17 +1,19 @@
 # dsh bundle patch for dsh-desktop-signal.
 #
-# One insert and nothing else. This plugin overrides no seam and repoints
-# nothing: its host half is empty, and its client half only reads services dsh
-# may provide (`sessions`, `uiSession`) and reports what it sees to the desktop
-# shell. It requires neither — see the note at the top of `lib/client.js` on
-# what an entry that waits does to dsh's web boot. Installing it adds a
-# listener; removing it drops the layer and dsh is exactly as it was.
+# 1. Force directory-picker to browse mode.
+# When dsh web is proxied through the desktop gateway, dsh sees loopback
+# (127.0.0.1) and auto-mounts the native OS file picker, which fails on mobile
+# phones (the OS dialog opens on the desktop PC display).
+# Pinning the browse interaction replaces the native chooser with the in-app
+# Miller-column browser dialog that works across all mobile browsers and desktop.
 #
-# The insert is what makes it a profile layer at all. `dsh plugin add`
-# reconciles `dsh.profile.bundles` by installed state, and a dependency joins
-# the layer stack only when its manifest declares `dsh.bundle.patch` — without
-# this file the package installs as a plain dependency, warns once, and never
-# loads.
+# 2. Register dsh-desktop-signal.
+- id: directory-picker
+  disabled: true
 - insert:
+    - id: directory-picker-browse-backend
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: directory-picker-browse-surface
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
     - id: desktop-signal
       name: 'dsh-desktop-signal'
