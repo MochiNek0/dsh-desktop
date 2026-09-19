@@ -114,7 +114,8 @@ impl Harness {
             approve: Approve::Fixed(answer),
             store: SessionStore::default(),
             upstream,
-            tunnel: Mutex::new(tunnel),
+            tunnel: Mutex::new(Box::new(tunnel)),
+            authorities: Mutex::new(None),
             guesses: super::trust::Guesses::default(),
             exchange: tokio::sync::Mutex::new(()),
             seen: AtomicU64::new(0),
@@ -506,6 +507,49 @@ fn the_fence_turns_away_what_it_should() {
     // And the nonce none of them spent is still good.
     let handshake = harness.get(&format!("/?pair_token={nonce}"), &[]);
     assert_eq!(handshake.status, 303);
+}
+
+/// The one refusal that is not silent: a phone paired before the desktop
+/// switched channels, still knocking on the address it was paired at.
+///
+/// The switch is staged by putting an unstarted tunnel in place, which is
+/// exactly the state a real one leaves behind — the socket is still bound and
+/// still accepting, and the set of `Host` values it vouches for no longer has
+/// the old address in it.
+#[test]
+fn a_phone_left_on_the_old_channel_is_told_where_everyone_went() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    // Paired while the LAN channel was up, which is where the cookie comes
+    // from.
+    let handshake = harness.get(&format!("/?pair_token={}", harness.nonce()), &[]);
+    assert_eq!(handshake.status, 303);
+    let cookie = format!(
+        "{}={}",
+        super::session::COOKIE,
+        handshake.device_cookie().expect("a device cookie")
+    );
+    let authority = harness.authority.clone();
+
+    *harness.shared.tunnel.lock().unwrap() = Box::new(super::tunnel::LanTunnel::default());
+    harness.shared.forget_authorities();
+
+    let stranded = harness.get("/", &[("Cookie", cookie.as_str())]);
+    assert_eq!(stranded.status, 403);
+    assert!(
+        stranded.body.contains("通道") || stranded.body.contains("channel"),
+        "the page says what happened: {}",
+        stranded.body
+    );
+
+    // The same address without a cookie is a stranger, and a stranger is told
+    // nothing — this page is for phones that were once let in, not for whatever
+    // is scanning the port.
+    let stranger = harness.get("/", &[("Host", authority.as_str())]);
+    assert_eq!(stranger.status, 403);
+    assert!(stranger.body.is_empty());
 }
 
 /// A nonce is worth one redemption, whatever the desktop answers. Without that,

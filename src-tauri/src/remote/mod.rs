@@ -16,8 +16,8 @@
 //! The five pieces, each its own file:
 //!
 //! - [`tunnel`] — how the phone reaches us, and which `Host` values that makes
-//!   legitimate. One implementation today; the interface is what keeps Phase 2
-//!   from being a rewrite.
+//!   legitimate. Two implementations, one active at a time; the interface is
+//!   what keeps the third from being a rewrite.
 //! - [`trust`] — the browser fence dsh has and this rewrite disarms, rebuilt on
 //!   the near side. Not optional; read the module.
 //! - [`session`] — the pairing nonce and the device cookie.
@@ -49,6 +49,11 @@ mod upstream;
 #[cfg(test)]
 mod tests;
 
+/// Out for [`crate::settings`] to store and [`crate::controls`] to parse, so
+/// that the name of a channel is spelled in one place. See
+/// [`TunnelType::name`].
+pub use tunnel::TunnelType;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -56,7 +61,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager, Url};
 
 use session::SessionStore;
-use tunnel::{LanTunnel, RemoteTunnel};
+use tunnel::{LanTunnel, RemoteTunnel, TailscaleTunnel};
 use upstream::Upstream;
 
 /// How long the card waits before suggesting the firewall.
@@ -68,6 +73,14 @@ use upstream::Upstream;
 /// arrived sooner would be accusing the firewall of what is really just a user
 /// walking across the room.
 const SILENCE: Duration = Duration::from_secs(12);
+
+/// How long [`Shared::authorities`] may answer from the last enumeration.
+///
+/// A second. Long enough that one page load's requests share a single walk of
+/// the machine's network adapters, short enough that nobody notices it when a
+/// laptop lands on a new network — and short enough that it is never the thing
+/// a stale fence is blamed on.
+const AUTHORITIES_TTL: Duration = Duration::from_secs(1);
 
 /// Who decides whether a device that redeemed a nonce gets in.
 ///
@@ -111,7 +124,13 @@ pub struct Shared {
     approve: Approve,
     store: SessionStore,
     upstream: Upstream,
-    tunnel: Mutex<LanTunnel>,
+    /// The one active tunnel. A box rather than a type parameter: the channel
+    /// is switched while the app runs — see [`Remote::switch`] — and there is
+    /// never more than one, because `base_url` is the single authority every
+    /// pairing URL and every entry in [`Shared::authorities`] is derived from.
+    tunnel: Mutex<Box<dyn RemoteTunnel>>,
+    /// The last answer [`Shared::authorities`] gave, and when it gave it.
+    authorities: Mutex<Option<(std::time::Instant, Vec<String>)>>,
     /// Wrong short codes, per address. The QR's nonce is not counted — 128 bits
     /// is not a thing anyone guesses — so this is only ever touched by the
     /// typed entrance. See [`trust::Guesses`].
@@ -128,8 +147,53 @@ pub struct Shared {
 impl Shared {
     /// The `Host` values a request may carry right now, from the tunnel that
     /// would have carried it.
+    ///
+    /// Cached for [`AUTHORITIES_TTL`], because [`trust::provenance`] asks on
+    /// every single request — thirty of them for one page load — and the LAN's
+    /// answer walks every network adapter on the machine to produce it. The TTL
+    /// is what keeps the other half of the promise: the set is a fact about the
+    /// network this laptop is on *now*, so a machine that moved to another
+    /// Wi-Fi has to be let back in without being restarted.
     fn authorities(&self) -> Vec<String> {
-        self.tunnel.lock().unwrap().authorities()
+        let now = std::time::Instant::now();
+
+        if let Some((taken, cached)) = self.authorities.lock().unwrap().as_ref() {
+            if now.duration_since(*taken) < AUTHORITIES_TTL {
+                return cached.clone();
+            }
+        }
+
+        // Not while holding the cache: this is the slow call, and the lock it
+        // wants is the tunnel's.
+        let fresh = self.tunnel.lock().unwrap().authorities();
+        *self.authorities.lock().unwrap() = Some((now, fresh.clone()));
+        fresh
+    }
+
+    /// Throw the cached answer away. For the moments when waiting a second for
+    /// it to lapse would mean a fence that is open on a tunnel that is gone.
+    fn forget_authorities(&self) {
+        *self.authorities.lock().unwrap() = None;
+    }
+
+    /// Whether a cookie issued now may carry `Secure`. See [`tunnel::Scheme`].
+    fn secure(&self) -> bool {
+        self.tunnel.lock().unwrap().scheme().secure()
+    }
+
+    /// Who is actually asking, as the active tunnel accounts for it.
+    ///
+    /// The socket's peer is the fallback and today it is also always the
+    /// answer, because neither tunnel in M2 has a proxy in front of it. The
+    /// call goes through the tunnel all the same: the day one does, the two
+    /// places that care — the rate limiter and the desktop dialog — are already
+    /// asking the party that knows. See [`RemoteTunnel::client_ip`].
+    fn client_ip(&self, headers: &http::HeaderMap, peer: std::net::SocketAddr) -> std::net::IpAddr {
+        self.tunnel
+            .lock()
+            .unwrap()
+            .client_ip(headers)
+            .unwrap_or_else(|| peer.ip())
     }
 }
 
@@ -144,6 +208,18 @@ pub struct Remote {
     firewall: OnceLock<firewall::Firewall>,
 }
 
+/// An unstarted tunnel of the asked-for kind.
+///
+/// The one place a [`TunnelType`] becomes an implementation, so that the stored
+/// setting, the card's buttons and [`Remote::switch`] all agree on what the
+/// name means.
+fn raise(kind: TunnelType) -> Box<dyn RemoteTunnel> {
+    match kind {
+        TunnelType::Lan => Box::new(LanTunnel::default()),
+        TunnelType::Tailscale => Box::new(TailscaleTunnel::default()),
+    }
+}
+
 /// The nonce on the card, in both of the shapes the card draws it in: one for
 /// the QR and the copy button, one for the phone that would rather type.
 #[derive(Clone)]
@@ -154,20 +230,30 @@ struct Showing {
 
 /// The listener, while there is one.
 struct Running {
-    /// `http://<address>:<port>`, as the tunnel published it.
+    /// `http://<address>:<port>`, as the tunnel published it. Replaced when the
+    /// channel changes under it; see [`Remote::switch`].
     base: String,
+    /// The port the socket is bound to, so that a new tunnel can be told to
+    /// publish the listener that is already up rather than needing a new one.
+    port: u16,
     /// Dropped to stop the accept loop. See [`proxy::serve`].
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Remote {
     pub fn new(app: AppHandle) -> Self {
+        // Read before the handle is moved into `approve`, and read here rather
+        // than at the first `start`: the channel decides which tunnel exists,
+        // and `resume` raises one before any card has been opened to pick it.
+        let channel = crate::settings::channel(&app);
+
         Self {
             shared: Arc::new(Shared {
                 store: SessionStore::persisted(&app),
                 approve: Approve::Desktop(app),
                 upstream: Upstream::default(),
-                tunnel: Mutex::new(LanTunnel::default()),
+                tunnel: Mutex::new(raise(channel)),
+                authorities: Mutex::new(None),
                 guesses: trust::Guesses::default(),
                 exchange: tokio::sync::Mutex::new(()),
                 seen: AtomicU64::new(0),
@@ -228,6 +314,10 @@ impl Remote {
             (base, tunnel.tunnel_type())
         };
 
+        // The set the fence holds is the old tunnel's, or an empty one from
+        // before this started. Either way it is not this port's.
+        self.shared.forget_authorities();
+
         // The one line this writes anywhere. A socket bound to every interface
         // on the machine is worth saying out loud, and the channel it is bound
         // for is the part a later build will change.
@@ -238,9 +328,65 @@ impl Remote {
 
         *running = Some(Running {
             base: base.clone(),
+            port,
             shutdown: Some(stop),
         });
         Ok(base)
+    }
+
+    /// Move to another channel, on the socket that is already bound.
+    ///
+    /// The listener does not move and does not need to: both of these tunnels
+    /// publish an address for the same `0.0.0.0` socket, and *which* address is
+    /// the whole of the difference between them. So the old tunnel is stopped,
+    /// the new one is started on the same port, and the base URL every pairing
+    /// URL is built from is replaced.
+    ///
+    /// The paired devices are left alone. Their cookies are scoped by the
+    /// browser to the host they were issued on, so none of them will be sent to
+    /// the new address and every phone has to pair again there — but that is
+    /// the browser's doing, not a revocation, and it runs backwards too: a user
+    /// who switches to the tailnet and home again finds the LAN pairings still
+    /// good. Throwing them away here would turn a reversible change into a
+    /// permanent one. What the user is told before this happens is in
+    /// [`channel`].
+    ///
+    /// A channel that will not start leaves the gateway bound and publishing
+    /// nothing, which the fence reads as "no authorities" and refuses
+    /// everything. That is the correct answer to "put me on a tailnet this
+    /// machine is not on", and switching back undoes it.
+    fn switch(&self, kind: TunnelType) -> Result<(), String> {
+        let mut running = self.running.lock().unwrap();
+        let mut tunnel = self.shared.tunnel.lock().unwrap();
+
+        let _ = tunnel.stop();
+        *tunnel = raise(kind);
+
+        let started = running
+            .as_ref()
+            .map(|live| tunnel.start(live.port).map_err(|error| error.to_string()));
+
+        drop(tunnel);
+        self.shared.forget_authorities();
+
+        match started {
+            // Nothing is bound, so there is nothing to publish and nothing to
+            // repair: the next `start` raises this tunnel instead.
+            None => Ok(()),
+            Some(Ok(base)) => {
+                if let Some(live) = running.as_mut() {
+                    live.base = base;
+                }
+                Ok(())
+            }
+            Some(Err(why)) => Err(why),
+        }
+    }
+
+    /// Which channel is up right now, for the card to draw the switch in the
+    /// position it is actually in.
+    fn channel(&self) -> TunnelType {
+        self.shared.tunnel.lock().unwrap().tunnel_type()
     }
 
     /// Stop serving. Whether the devices go with it is the user's call.
@@ -258,6 +404,9 @@ impl Remote {
             }
         }
         let _ = self.shared.tunnel.lock().unwrap().stop();
+        // Now, rather than a second from now: a fence still holding the stopped
+        // tunnel's addresses is a fence that is open for no tunnel at all.
+        self.shared.forget_authorities();
 
         if self
             .shared
@@ -387,37 +536,125 @@ pub fn open(app: &AppHandle) {
             return;
         };
 
-        match remote.start() {
-            Ok(base) => {
-                let minted = remote.shared.store.mint_pair();
-                *remote.showing.lock().unwrap() = Some(Showing {
-                    url: format!("{base}/?pair_token={}", minted.token),
-                    code: minted.code,
-                });
-                redraw(&app, &remote, None);
+        let started = remote.start();
+        let up = started.is_ok();
+        present(&app, &remote, started);
 
-                // Both of these take a while and neither should hold the card
-                // back: the firewall check shells out, and the silence watch is
-                // twelve seconds by definition.
-                watch_firewall(&app);
-                watch_silence(&app);
-            }
-            Err(why) => {
-                *remote.showing.lock().unwrap() = None;
-                card::show(
-                    &app,
-                    &card::View {
-                        url: None,
-                        code: None,
-                        error: Some(why),
-                        devices: Vec::new(),
-                        hint: None,
-                        style_patch: style::enabled(),
-                        forget_on_exit: crate::settings::forget_pairings_on_exit(&app),
-                    },
-                );
-            }
+        // Both of these take a while and neither should hold the card back: the
+        // firewall check shells out, and the silence watch is twelve seconds by
+        // definition.
+        if up {
+            watch_firewall(&app);
+            watch_silence(&app);
         }
+    });
+}
+
+/// Put the card up on whatever the gateway's state now is: a fresh nonce over
+/// the address it is publishing, or the reason there is no address.
+///
+/// The two ways to arrive here are the titlebar button and a channel switch,
+/// and they want the same card — which is why the nonce is minted here rather
+/// than by whichever of them happened to run.
+fn present(app: &AppHandle, remote: &Remote, started: Result<String, String>) {
+    match started {
+        Ok(base) => {
+            let minted = remote.shared.store.mint_pair();
+            *remote.showing.lock().unwrap() = Some(Showing {
+                url: format!("{base}/?pair_token={}", minted.token),
+                code: minted.code,
+            });
+            redraw(app, remote, None);
+        }
+        Err(why) => {
+            *remote.showing.lock().unwrap() = None;
+            card::show(
+                app,
+                &card::View {
+                    url: None,
+                    code: None,
+                    error: Some(why),
+                    // Still listed, and still paired: a channel that will not
+                    // start has not thrown anybody off, and the rows are what
+                    // say how much is waiting on the switch going back.
+                    devices: remote.shared.store.devices(),
+                    hint: None,
+                    channel: remote.channel(),
+                    style_patch: style::enabled(),
+                    forget_on_exit: crate::settings::forget_pairings_on_exit(app),
+                },
+            );
+        }
+    }
+}
+
+/// The card's channel switch.
+///
+/// Every paired phone has to scan again on the new channel — the browser scopes
+/// the device cookie to the host it was issued on, and the host is exactly what
+/// changes — so a switch with devices on the list asks first. Nothing is
+/// revoked either way; see [`Remote::switch`].
+pub fn channel(app: &AppHandle, kind: TunnelType) {
+    let Some(remote) = app.try_state::<Remote>() else {
+        return;
+    };
+    if remote.channel() == kind {
+        return;
+    }
+
+    let waiting = remote.shared.store.devices().len();
+    if waiting == 0 {
+        return switch_to(app, kind);
+    }
+
+    let app_for_answer = app.clone();
+    crate::dialog::ask(
+        app,
+        crate::dialog::Ask {
+            title: t!("切换连接通道", "Change the channel").to_string(),
+            body: t!(
+                "换一个通道，手机看到的地址就变了，而配对是跟着地址走的：现在的 {} 台设备都要重新扫一次码。\
+                 它们不会被吊销——换回来的话，原来的配对还在。",
+                "The phone reaches a different address over a different channel, and a pairing \
+                 follows the address: all {} of the paired devices will have to scan again. \
+                 Nothing is revoked — switch back and the old pairings still hold.",
+                waiting
+            ),
+            choices: vec![
+                crate::dialog::Choice::new("keep", t!("取消", "Cancel")),
+                crate::dialog::Choice::primary("switch", t!("切换", "Switch")),
+            ],
+            // A cancel needs no redraw: the card draws the channel it was told
+            // about, and it was told nothing.
+            answered: Box::new(move |_app, id| {
+                if id == "switch" {
+                    switch_to(&app_for_answer, kind);
+                }
+            }),
+        },
+    );
+}
+
+/// Change channel and put the card back up on the result.
+///
+/// On a thread for the same reason [`open`] is: this runs from the webview's
+/// navigation handler or from a dialog's answer, and raising a tunnel walks
+/// every network adapter on the machine.
+fn switch_to(app: &AppHandle, kind: TunnelType) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Some(remote) = app.try_state::<Remote>() else {
+            return;
+        };
+
+        // Written before the attempt, not after it: the user asked for this
+        // channel, and a tailnet that is not up yet is a reason to show them
+        // why — not a reason to quietly put them back on the LAN and have the
+        // switch snap back under their hand.
+        crate::settings::set_channel(&app, kind);
+
+        let started = remote.switch(kind).and_then(|()| remote.start());
+        present(&app, &remote, started);
     });
 }
 
@@ -576,6 +813,7 @@ fn redraw(app: &AppHandle, remote: &Remote, hint: Option<String>) {
             error: None,
             devices: remote.shared.store.devices(),
             hint,
+            channel: remote.channel(),
             style_patch: style::enabled(),
             forget_on_exit: crate::settings::forget_pairings_on_exit(app),
         },

@@ -154,17 +154,23 @@ const COOLDOWN: Duration = Duration::from_secs(5 * 60);
 ///
 /// ## The address has to be the phone's
 ///
-/// Today it is: the LAN tunnel hands the gateway a real socket, so the peer
-/// address on it is the device that opened it. Behind a reverse proxy — which
-/// is what `cloudflared` and `tailscale serve` both are — it stops being, and
-/// every request arrives from `127.0.0.1`.
+/// Both of today's tunnels hand the gateway a real socket, so the peer address
+/// on it is the device that opened it. Behind a reverse proxy — which is what
+/// `cloudflared` and `tailscale serve` both are — it stops being, and every
+/// request arrives from `127.0.0.1`.
 ///
 /// Keying on that would not merely weaken this; it would invert it. One
 /// attacker's failures would count against the loopback address that *every*
 /// device shares, and the tenth wrong guess would lock out the user's own
 /// phone. A rate limit that the attacker aims at the victim is worse than no
-/// rate limit, so when a tunnel of that shape lands, this has to be fed from
-/// the forwarded-for header that tunnel vouches for, not from the socket.
+/// rate limit.
+///
+/// So this is no longer fed from the socket. What the caller passes is
+/// [`RemoteTunnel::client_ip`] falling back to the peer — the active tunnel's
+/// own answer to who is asking — and a tunnel with a proxy in front of it is
+/// the one party that can say which header to believe.
+///
+/// [`RemoteTunnel::client_ip`]: crate::remote::tunnel::RemoteTunnel::client_ip
 #[derive(Default)]
 pub struct Guesses {
     runs: std::sync::Mutex<HashMap<IpAddr, Run>>,

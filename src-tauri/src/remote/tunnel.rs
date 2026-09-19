@@ -1,10 +1,15 @@
 //! How the phone reaches the gateway, behind one interface so that it can stop
 //! being the local network later without anything above noticing.
 //!
-//! Phase 1 has exactly one of these — [`LanTunnel`], which is `0.0.0.0` and the
-//! machine's own Wi-Fi address. The trait exists anyway, and not as decoration:
-//! two things above it would otherwise have "the LAN" written into them, and
-//! both are things Phase 2 changes.
+//! Two of these: [`LanTunnel`], which is `0.0.0.0` and the machine's own Wi-Fi
+//! address, and [`TailscaleTunnel`], which is the same socket at a `100.x`
+//! address that a phone off the Wi-Fi can still open. One is active at a time —
+//! see [`crate::remote::Remote::switch`] — and whichever it is, its `base_url`
+//! is the only authority on where the phone was sent.
+//!
+//! The trait was here before the second implementation was, and not as
+//! decoration: two things above it would otherwise have "the LAN" written into
+//! them.
 //!
 //! The first is the QR code, which is a URL with a scheme in it. A Cloudflare
 //! tunnel hands back `https://…`, and a pairing URL assembled from an address
@@ -20,13 +25,74 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 
-/// Which channel the phone came in over. One arm today; the rest are the
-/// Phase 2/3 entries of the evolution plan, and are not pretended to exist
-/// until something implements them.
+use http::HeaderMap;
+
+/// Which channel the phone came in over. The rest are the Phase 3 entries of
+/// the evolution plan, and are not pretended to exist until something
+/// implements them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TunnelType {
     /// The local network: bind `0.0.0.0`, hand out this machine's LAN address.
     Lan,
+    /// The tailnet: the same socket, at this machine's `100.x` address, reached
+    /// by a device that has joined the same one. See [`TailscaleTunnel`].
+    Tailscale,
+}
+
+impl TunnelType {
+    /// What this channel is called on the wire: in `desktop.json`, and in the
+    /// verb the card signals. Deliberately not the [`Debug`] spelling — that
+    /// one is free to change, and this one is written to a file that outlives
+    /// the build that wrote it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Tailscale => "tailscale",
+        }
+    }
+
+    /// The other way round. `None` for anything else, which is what a settings
+    /// file from a newer build — or a hand-edited one — looks like from here.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "lan" => Some(Self::Lan),
+            "tailscale" => Some(Self::Tailscale),
+            _ => None,
+        }
+    }
+}
+
+/// How the phone's browser addressed this gateway, and the only thing `Secure`
+/// on the device cookie is ever decided by.
+///
+/// Not detected, and not detectable. This listener terminates nothing and
+/// speaks plain HTTP whatever stands in front of it, so by the time a request
+/// arrives the TLS — if there was any — is over and left no trace in the bytes.
+/// The tunnel is the only party that knows, which is why this hangs off the
+/// trait rather than being read somewhere in the proxy.
+///
+/// `X-Forwarded-Proto` is specifically not it. That is a header, which is to
+/// say it is whatever the client put in it. Believed, it would hand a
+/// plain-HTTP phone a `Secure` cookie the browser will then never send back —
+/// and the same trust, pointed the other way, is what would let a downgrade
+/// pass for a secure session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheme {
+    Http,
+    /// Nothing answers with this yet: neither of the two tunnels terminates
+    /// TLS, and the one that will is M3's. It is here because what the method
+    /// owes its caller is *which* scheme, not a yes-or-no about secureness —
+    /// a `bool` on the trait is the shape somebody eventually computes out of
+    /// a header.
+    #[allow(dead_code)]
+    Https,
+}
+
+impl Scheme {
+    /// Whether a cookie issued over this scheme may carry `Secure`.
+    pub fn secure(self) -> bool {
+        matches!(self, Self::Https)
+    }
 }
 
 /// Why a tunnel could not be raised.
@@ -40,6 +106,8 @@ pub enum TunnelType {
 pub enum TunnelError {
     /// Nothing on this machine is on a network a phone could reach.
     NoAddress,
+    /// The tailnet was asked for and this machine is not on one.
+    NoTailnet,
 }
 
 impl std::fmt::Display for TunnelError {
@@ -48,6 +116,12 @@ impl std::fmt::Display for TunnelError {
             Self::NoAddress => formatter.write_str(t!(
                 "这台电脑没有连上任何局域网，手机没有地址可以连。",
                 "This computer is not on a network, so there is no address for a phone to reach."
+            )),
+            Self::NoTailnet => formatter.write_str(t!(
+                "没有检测到正在运行的 Tailscale。先让这台电脑和手机登录同一个 tailnet，再回到这里；\
+                 或者切回局域网。",
+                "No running Tailscale was found. Sign this computer and the phone into the same \
+                 tailnet and come back, or switch to the local network."
             )),
         }
     }
@@ -65,6 +139,32 @@ pub trait RemoteTunnel: Send + Sync {
     fn stop(&mut self) -> Result<(), TunnelError>;
 
     fn tunnel_type(&self) -> TunnelType;
+
+    /// Which scheme the phone's browser used to get here. See [`Scheme`].
+    fn scheme(&self) -> Scheme;
+
+    /// The phone's own address, out of whatever forwarded-for header this
+    /// tunnel vouches for — and `None` when this tunnel has no proxy in front
+    /// of it, in which case the socket's peer *is* the phone.
+    ///
+    /// Two things downstream are about which *device* is talking, and both go
+    /// silently wrong the moment a reverse proxy lands in front of the
+    /// listener, because every request then arrives from `127.0.0.1`. The rate
+    /// limiter on wrong short codes would count every device's attempts against
+    /// the one address they all share, so one attacker's failures would lock
+    /// out the user's own phone — a rate limit aimed at the victim, which is
+    /// worse than none. And the desktop's approval dialog shows the human the
+    /// address they are being asked to trust, which would become the loopback
+    /// address of the machine asking.
+    ///
+    /// Trusting a header here is not trusting the client: it is trusting that
+    /// the only thing which can open a connection to this listener over that
+    /// tunnel is a proxy process this app launched itself. A tunnel with no
+    /// such promise must answer `None` and must not look at the headers at
+    /// all — which is the whole reason this is a method on the tunnel instead
+    /// of a function reading `X-Forwarded-For` wherever somebody needs an
+    /// address.
+    fn client_ip(&self, headers: &HeaderMap) -> Option<IpAddr>;
 
     /// The `Host` values a request arriving over this tunnel may legitimately
     /// carry, lowercased and with the port on them.
@@ -101,6 +201,21 @@ impl RemoteTunnel for LanTunnel {
         TunnelType::Lan
     }
 
+    fn scheme(&self) -> Scheme {
+        Scheme::Http
+    }
+
+    /// Nothing, and the headers are not read.
+    ///
+    /// There is no proxy here: the phone opened this socket itself. A
+    /// forwarded-for header on a request that arrived over the LAN was written
+    /// by the phone, and honouring it would let a device choose which address
+    /// its wrong guesses are counted against — which is to say, opt out of the
+    /// rate limit, or point it at somebody else's phone.
+    fn client_ip(&self, _headers: &HeaderMap) -> Option<IpAddr> {
+        None
+    }
+
     fn authorities(&self) -> Vec<String> {
         let Some(port) = self.port else {
             return Vec::new();
@@ -110,6 +225,112 @@ impl RemoteTunnel for LanTunnel {
             .map(|address| format!("{address}:{port}"))
             .collect()
     }
+}
+
+/// The tailnet: the same listener, reached at this machine's `100.x` address by
+/// a device that has joined the same one.
+///
+/// It is the cheapest second tunnel there is, which is why it is the first.
+/// Nothing is launched, nothing is downloaded, no account holds a token and
+/// nothing fails several seconds after being asked: Tailscale is either running
+/// on this machine or it is not, and the whole of this is working out which,
+/// from the machine's own network cards. No call to `tailscale`, no LocalAPI,
+/// no MagicDNS.
+///
+/// What it does not buy is TLS. `tailscale serve` would terminate it and answer
+/// on a MagicDNS name, and that is the one thing standing between this app and
+/// a PWA that survives the desktop being off — but it wants a CLI that is not
+/// on the PATH on Windows, a LocalAPI whose token lives in the registry, and a
+/// tailnet admin who has turned HTTPS on. What this buys is reachability: the
+/// phone on mobile data, off the Wi-Fi, still gets in. See the roadmap.
+#[derive(Default)]
+pub struct TailscaleTunnel {
+    port: Option<u16>,
+}
+
+impl RemoteTunnel for TailscaleTunnel {
+    fn start(&mut self, local_gateway_port: u16) -> Result<String, TunnelError> {
+        let address = tailscale_address().ok_or(TunnelError::NoTailnet)?;
+        self.port = Some(local_gateway_port);
+        Ok(format!("http://{address}:{local_gateway_port}"))
+    }
+
+    fn stop(&mut self) -> Result<(), TunnelError> {
+        self.port = None;
+        Ok(())
+    }
+
+    fn tunnel_type(&self) -> TunnelType {
+        TunnelType::Tailscale
+    }
+
+    /// Plain HTTP, like the LAN. WireGuard has already encrypted every byte of
+    /// it on the wire, but that is not what `Secure` is about: the browser
+    /// knows only that it typed `http://`, and a `Secure` cookie on such an
+    /// origin is one it will never send back.
+    fn scheme(&self) -> Scheme {
+        Scheme::Http
+    }
+
+    /// Nothing, for the same reason as the LAN: the phone dials this socket
+    /// directly over WireGuard, so the peer address already *is* the phone —
+    /// its `100.x` one.
+    fn client_ip(&self, _headers: &HeaderMap) -> Option<IpAddr> {
+        None
+    }
+
+    /// Re-read rather than remembered from [`start`], as the LAN's is: a
+    /// machine that left the tailnet has no tailnet address, and the fence
+    /// closing behind it is the correct answer.
+    ///
+    /// [`start`]: RemoteTunnel::start
+    fn authorities(&self) -> Vec<String> {
+        let Some(port) = self.port else {
+            return Vec::new();
+        };
+        tailscale_address()
+            .map(|address| vec![format!("{address}:{port}")])
+            .unwrap_or_default()
+    }
+}
+
+/// This machine's address on the tailnet, if it is on one.
+///
+/// Two conditions, and neither is sufficient alone.
+///
+/// The address has to be inside `100.64.0.0/10`, which is what Tailscale
+/// assigns out of. But that range is not Tailscale's — it is RFC 6598
+/// carrier-grade NAT, which is exactly what a Chinese mobile network hands a
+/// tethered phone and what some ISPs hand a home router. A `100.x` address on
+/// the Wi-Fi card is the ISP's, and publishing it as a tailnet address would
+/// put a QR code on screen that nothing on earth can reach.
+///
+/// So the card holding it has to be named like Tailscale's as well:
+/// `Tailscale` in the Windows friendly name, `tailscale0` on Linux, a `utun`
+/// on macOS. That is not sufficient either — `utun` is every VPN and every
+/// WireGuard client on macOS, and a Windows friendly name is whatever the user
+/// renamed the adapter to — which is why both have to hold.
+fn tailscale_address() -> Option<Ipv4Addr> {
+    if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .find_map(|interface| match interface.addr.ip() {
+            IpAddr::V4(address) if is_tailnet(address) && named_like_tailscale(&interface.name) => {
+                Some(address)
+            }
+            _ => None,
+        })
+}
+
+/// `100.64.0.0/10`: the second octet from 64 to 127.
+fn is_tailnet(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn named_like_tailscale(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("tailscale") || lower.starts_with("utun")
 }
 
 /// Every IPv4 address on this machine a phone on the same network could
@@ -393,5 +614,74 @@ mod tests {
             tunnel.stop().unwrap();
             assert!(tunnel.authorities().is_empty(), "and none survive the stop");
         }
+    }
+
+    /// The same, for the tunnel that may well not be able to start on the
+    /// machine running the test.
+    #[test]
+    fn a_stopped_tailscale_tunnel_trusts_nothing() {
+        let mut tunnel = TailscaleTunnel::default();
+        assert!(tunnel.authorities().is_empty());
+
+        match tunnel.start(59000) {
+            Ok(base) => {
+                assert!(base.starts_with("http://100."), "{base} is a tailnet URL");
+                tunnel.stop().unwrap();
+                assert!(tunnel.authorities().is_empty());
+            }
+            // No tailnet on this machine, which is the ordinary case in CI and
+            // is not a failure of anything here.
+            Err(error) => assert!(matches!(error, TunnelError::NoTailnet)),
+        }
+    }
+
+    /// The range Tailscale assigns out of, and the one an ISP hands a home
+    /// router out of. They are the same range — which is the whole reason the
+    /// adapter name has to agree before an address is published.
+    #[test]
+    fn the_tailnet_range_is_the_cgnat_range() {
+        for address in ["100.64.0.1", "100.101.102.103", "100.127.255.255"] {
+            assert!(is_tailnet(address.parse().unwrap()), "{address}");
+        }
+        for address in ["100.63.255.255", "100.128.0.1", "10.0.0.5", "192.168.1.9"] {
+            assert!(!is_tailnet(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn the_adapter_has_to_be_named_like_tailscale_too() {
+        for name in ["Tailscale", "tailscale0", "utun3", "Tailscale Tunnel"] {
+            assert!(named_like_tailscale(name), "{name}");
+        }
+        for name in ["Wi-Fi", "以太网", "eth0", "Clash", "wintun", "vEthernet (WSL)"] {
+            assert!(!named_like_tailscale(name), "{name}");
+        }
+    }
+
+    /// The guarantee the rate limiter and the approval dialog are built on: a
+    /// tunnel with no proxy in front of it does not read a forwarded-for
+    /// header, so a phone cannot choose the address it is judged by.
+    ///
+    /// Written against every spelling a later tunnel might legitimately want to
+    /// honour, because the failure this is guarding against is somebody adding
+    /// a helpful general-purpose header reader.
+    #[test]
+    fn a_direct_tunnel_ignores_every_forwarded_for_header() {
+        let mut headers = HeaderMap::new();
+        for name in ["x-forwarded-for", "cf-connecting-ip", "x-real-ip"] {
+            headers.insert(name, "203.0.113.7".parse().unwrap());
+        }
+
+        assert_eq!(LanTunnel::default().client_ip(&headers), None);
+        assert_eq!(TailscaleTunnel::default().client_ip(&headers), None);
+    }
+
+    /// And the one the cookie is built on. Neither of M2's tunnels terminates
+    /// TLS, and no header is allowed to say otherwise.
+    #[test]
+    fn nothing_in_m2_claims_a_secure_scheme() {
+        assert!(!LanTunnel::default().scheme().secure());
+        assert!(!TailscaleTunnel::default().scheme().secure());
+        assert!(Scheme::Https.secure());
     }
 }

@@ -203,6 +203,32 @@ pub fn set_gateway_port(app: &AppHandle, port: u16) {
     write(app, GATEWAY_PORT_KEY, Value::from(port));
 }
 
+/// Which channel the phone reaches this machine over.
+///
+/// Stored by name rather than by number, because the number is an enum
+/// discriminant and this file outlives the build that wrote it; see
+/// [`crate::remote::TunnelType::name`].
+const CHANNEL_KEY: &str = "remoteChannel";
+
+/// The channel to raise, defaulting to the local network.
+///
+/// A name this build does not recognise falls back to the default rather than
+/// refusing to start: the gateway on the LAN is always a usable answer, and a
+/// settings file written by a newer version is not a reason to have no phone
+/// connection at all.
+pub fn channel(app: &AppHandle) -> crate::remote::TunnelType {
+    read(app)
+        .get(CHANNEL_KEY)
+        .and_then(Value::as_str)
+        .and_then(crate::remote::TunnelType::named)
+        .unwrap_or(crate::remote::TunnelType::Lan)
+}
+
+/// Remember the channel the user switched to.
+pub fn set_channel(app: &AppHandle, kind: crate::remote::TunnelType) {
+    write(app, CHANNEL_KEY, Value::String(kind.name().to_string()));
+}
+
 /// The phones the gateway has let in, and the counter their ids come from.
 ///
 /// State, not a preference — the only thing in this file that is, so it is

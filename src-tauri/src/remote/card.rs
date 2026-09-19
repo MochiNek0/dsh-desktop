@@ -50,6 +50,9 @@ pub struct View {
     /// A line under the code: the firewall warning, or the one about nothing
     /// having connected. `None` most of the time.
     pub hint: Option<String>,
+    /// Which channel the phone is being told to come in over. Drawn as the
+    /// position of a two-way switch; see [`crate::remote::channel`].
+    pub channel: super::TunnelType,
     /// Whether the phone's stylesheet patch is on. See [`crate::remote::style`].
     pub style_patch: bool,
     /// Whether closing the app throws every paired phone off. See
@@ -64,6 +67,7 @@ pub fn show(app: &AppHandle, view: &View) {
         "code": view.code,
         "error": view.error,
         "hint": view.hint,
+        "channel": view.channel.name(),
         "stylePatch": view.style_patch,
         "forgetOnExit": view.forget_on_exit,
         "devices": view.devices.iter().map(|device| serde_json::json!({
@@ -105,6 +109,13 @@ fn text() -> serde_json::Value {
             "Or open the address on the phone and type these six characters in."
         ),
         "refresh": t!("换一个码", "New code"),
+        "channelLan": t!("局域网", "Local network"),
+        "channelTailscale": t!("Tailscale", "Tailscale"),
+        "channelWhy": t!(
+            "手机和电脑在同一个 Wi-Fi 下用局域网。手机在外面、走蜂窝网络，就用 Tailscale——两边登录同一个 tailnet 即可。",
+            "Use the local network when the phone is on the same Wi-Fi. Use Tailscale when it is \
+             not — on mobile data, say — with both signed into the same tailnet."
+        ),
         "connected": t!("已连接 {} 台设备", "{} connected"),
         "since": t!("{} 起", "since {}"),
         "kick": t!("断开", "Disconnect"),
@@ -174,7 +185,8 @@ pub fn script() -> String {
   if (window.__dshRemoteCard) return;
   window.__dshRemoteCard = true;
 
-  var root = null, sheet, head, lede, code, pin, link, status, list, note, patch, keep, foot;
+  var root = null, sheet, head, lede, chan, chanWhy, code, pin, link, status, list,
+      note, patch, keep, foot;
   var TEXT = {{}};
 
   function signal(verb) {{
@@ -210,7 +222,18 @@ pub fn script() -> String {
       'box-sizing:border-box;padding:22px;border-radius:16px;' +
       'background:var(--rc-bg);color:var(--rc-fg);box-shadow:var(--rc-shadow)}}' +
       '.dsh-rc-head{{margin:0 0 6px;font-size:16px;font-weight:600}}' +
-      '.dsh-rc-lede{{margin:0 0 16px;color:var(--rc-muted)}}' +
+      '.dsh-rc-lede{{margin:0 0 14px;color:var(--rc-muted)}}' +
+      // The channel switch: two segments in a trough, the active one lifted
+      // out of it. A pair of buttons rather than a radio group, because what a
+      // click starts is a question on a dialog and not a change to this box.
+      '.dsh-rc-chan{{display:flex;gap:4px;margin:0 0 7px;padding:3px;' +
+      'border-radius:10px;background:var(--rc-hover)}}' +
+      '.dsh-rc button.dsh-rc-tab{{flex:1;padding:6px 0;border-radius:7px;' +
+      'text-align:center;font-size:13px;color:var(--rc-muted)}}' +
+      '.dsh-rc button.dsh-rc-tab.on{{background:var(--rc-bg);color:var(--rc-fg);' +
+      'box-shadow:0 1px 3px rgba(0,0,0,.14)}}' +
+      '.dsh-rc-chan-why{{margin:0 0 14px;font-size:11px;line-height:1.5;' +
+      'color:var(--rc-muted)}}' +
       // The code itself. A grid of cells rather than an image: nothing is
       // fetched, and the quiet zone is padding on the frame around it.
       '.dsh-rc-code{{display:grid;gap:0;width:236px;margin:0 auto 12px;' +
@@ -273,6 +296,8 @@ pub fn script() -> String {
     sheet = make('div', 'dsh-rc-sheet', root);
     head = make('h2', 'dsh-rc-head', sheet);
     lede = make('p', 'dsh-rc-lede', sheet);
+    chan = make('div', 'dsh-rc-chan', sheet);
+    chanWhy = make('p', 'dsh-rc-chan-why', sheet);
     code = make('div', 'dsh-rc-code', sheet);
     pin = make('div', 'dsh-rc-pin', sheet);
     link = make('button', 'dsh-rc-link', sheet);
@@ -413,6 +438,22 @@ pub fn script() -> String {
     paint(root);
     head.textContent = TEXT.title || '';
     lede.textContent = TEXT.lede || '';
+
+    // Two segments, and the one already selected does nothing: the switch is
+    // the thing a dialog is going to ask about, and asking about a change to
+    // the channel the gateway is already on would be a question with no
+    // answer. The verbs are spelled out rather than built, so that the test
+    // which reads them out of this script can see them.
+    chan.textContent = '';
+    [['lan', TEXT.channelLan, 'remote-channel?to=lan'],
+     ['tailscale', TEXT.channelTailscale, 'remote-channel?to=tailscale']]
+      .forEach(function (option) {{
+        var on = view.channel === option[0];
+        button(chan, option[1] || '', 'dsh-rc-tab' + (on ? ' on' : ''), function () {{
+          if (!on) signal(option[2]);
+        }});
+      }});
+    chanWhy.textContent = TEXT.channelWhy || '';
 
     paintCode(view.url || '');
 
@@ -889,6 +930,8 @@ mod tests {
             "remote-kick?id=",
             "remote-kick-all",
             "remote-refresh",
+            "remote-channel?to=lan",
+            "remote-channel?to=tailscale",
             "remote-style?on=",
             "remote-forget?on=",
         ] {
@@ -901,6 +944,14 @@ mod tests {
             ("dsh-window://remote-kick?id=d1", true),
             ("dsh-window://remote-kick-all", true),
             ("dsh-window://remote-refresh", true),
+            ("dsh-window://remote-channel?to=lan", true),
+            ("dsh-window://remote-channel?to=tailscale", true),
+            // A channel this build has no implementation for names nothing to
+            // switch to, and is dropped rather than defaulted: a switch that
+            // silently lands somewhere else is worse than one that does
+            // nothing.
+            ("dsh-window://remote-channel?to=cloudflare", false),
+            ("dsh-window://remote-channel", false),
             // An id is the whole payload; without one there is nothing to kick.
             ("dsh-window://remote-kick", false),
             ("dsh-window://remote-kick?id=", false),

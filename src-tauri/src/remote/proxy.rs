@@ -149,7 +149,19 @@ async fn handle(
     );
     if let Err(why) = refusal {
         eprintln!("dsh-desktop: refused a remote request from {peer}: {why}");
-        return Ok(refused());
+
+        // The one refusal that deserves words. A phone holding a device cookie
+        // for this gateway, knocking on an address this machine really has and
+        // the active tunnel no longer publishes, is not an attack: it is a
+        // phone that was paired before the channel moved under it, and a blank
+        // 403 tells it nothing it can act on.
+        //
+        // The cookie is the cheap half and is tested first. A port scanner has
+        // none, and the thing this path must never do is walk the machine's
+        // network adapters once per probe — see [`trust::Refusal`].
+        let stranded = cookie_value(&request, DEVICE_COOKIE).is_some()
+            && this_machine(header(&request, HOST));
+        return Ok(if stranded { moved() } else { refused() });
     }
 
     // Before the cookie is looked at, and that is the point of them: see
@@ -170,7 +182,7 @@ async fn handle(
 
     if let Some(offer) = offer {
         if device.is_some() {
-            return Ok(redirect("/", None));
+            return Ok(redirect("/", None, false));
         }
         return Ok(pair(shared, peer, request, offer).await);
     }
@@ -205,10 +217,13 @@ async fn pair(
     request: Request<Incoming>,
     offer: Offer,
 ) -> Response<Body> {
-    // The socket's peer, which today is the phone. See
-    // [`trust::Guesses`] for what has to change here the moment a tunnel puts
-    // a reverse proxy in front of this listener.
-    let who = peer.ip();
+    // Whoever the active tunnel says is asking: the socket's peer on a tunnel
+    // the phone dialled itself, and a header the tunnel vouches for once there
+    // is a reverse proxy in front of this listener. Both of the things below
+    // are about *which device* is talking — the rate limit and the address a
+    // human is shown — and both are wrong the moment every request arrives
+    // from `127.0.0.1`. See [`RemoteTunnel::client_ip`].
+    let who = shared.client_ip(request.headers(), peer);
 
     let redeemed = match &offer {
         Offer::Token(token) => shared.store.redeem_pair(token),
@@ -267,7 +282,7 @@ async fn pair(
     super::spent(&shared);
 
     let label = trust::label(header_named(&request, USER_AGENT.as_str()));
-    let address = peer.ip().to_string();
+    let address = who.to_string();
 
     let answer = shared.approve.ask(&label, &address);
     let allowed = matches!(
@@ -289,12 +304,13 @@ async fn pair(
 
     let (_device, cookie) = shared.store.authorize(label, address);
     super::paired(&shared);
+    let secure = shared.secure();
 
     // 303 rather than serving the index here: the phone lands on a clean `/`
     // with the pairing nonce out of its address bar, so a reload or a bookmark
     // does not carry a spent token around forever. Exactly the shape dsh's own
     // token exchange uses, for exactly the same reason.
-    redirect("/", Some(&cookie))
+    redirect("/", Some(&cookie), secure)
 }
 
 /// Hand the request to dsh and the answer back.
@@ -492,11 +508,15 @@ fn query_value<B>(request: &Request<B>, name: &str) -> Option<String> {
 
 /// 303 to somewhere on this gateway, optionally handing over the device cookie.
 ///
-/// No `Secure`, because Phase 1 is plain HTTP on the local network and a
-/// `Secure` cookie would simply never be sent. That is the accepted risk written
-/// down in the specification, and the attribute goes on the day there is a
-/// tunnel with TLS on it.
-fn redirect(target: &str, cookie: Option<&str>) -> Response<Body> {
+/// `Secure` comes from the active tunnel's [`scheme`] and from nowhere else —
+/// never from a header, and never from anything this process can observe about
+/// the connection, which terminates no TLS and would report plaintext under a
+/// proxy that did. Both of today's tunnels are plain HTTP, so the attribute
+/// stays off and the LAN's sniffing risk is the accepted one written down in
+/// the specification.
+///
+/// [`scheme`]: crate::remote::tunnel::RemoteTunnel::scheme
+fn redirect(target: &str, cookie: Option<&str>, secure: bool) -> Response<Body> {
     let mut response = Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(LOCATION, target);
@@ -505,7 +525,8 @@ fn redirect(target: &str, cookie: Option<&str>) -> Response<Body> {
         response = response.header(
             SET_COOKIE,
             format!(
-                "{DEVICE_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Strict; Max-Age={COOKIE_MAX_AGE}"
+                "{DEVICE_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Strict;                  Max-Age={COOKIE_MAX_AGE}{}",
+                if secure { "; Secure" } else { "" }
             ),
         );
     }
@@ -525,6 +546,52 @@ fn refused() -> Response<Body> {
         .status(StatusCode::FORBIDDEN)
         .body(empty())
         .expect("a bare 403 is always buildable")
+}
+
+/// Whether a `Host` the fence turned away names an address this machine
+/// actually has.
+///
+/// The port is not compared: a request that arrived at this listener arrived
+/// here whatever port it thinks it asked for, and what is being decided is only
+/// whether to spend words on the sender.
+///
+/// Loopback is not on the list [`tunnel::addresses`] returns, deliberately, and
+/// that carries through to here: a request whose `Host` is `127.0.0.1` is a page
+/// in the *desktop's* browser, which is the case the fence exists for. It keeps
+/// the bare refusal.
+///
+/// [`tunnel::addresses`]: crate::remote::tunnel::addresses
+fn this_machine(host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    let Some(address) = host.trim().split(':').next() else {
+        return false;
+    };
+
+    super::tunnel::addresses()
+        .iter()
+        .any(|local| local.to_string() == address)
+}
+
+/// What a phone stranded on the old channel is told.
+///
+/// It cannot be helped back in from here — the six-character entrance would
+/// hand it a cookie scoped to an address the fence is going to refuse on the
+/// very next request — so this page is honest about being a dead end and points
+/// at the only thing that does work, which is the card on the desktop.
+fn moved() -> Response<Body> {
+    page(
+        StatusCode::FORBIDDEN,
+        t!(
+            "这台电脑换了连接通道",
+            "This computer moved to another channel"
+        ),
+        t!(
+            "手机用的还是原来的地址，而电脑现在从另一个通道对外，配对是跟着地址走的。             回到电脑上打开「手机连接」，扫一下新的二维码——换回原来的通道，这个地址就又能用了。",
+            "The phone is still on the old address, and this computer now publishes another              one; a pairing follows the address. Open Connect a phone on the computer and scan              the new code — or switch the channel back, and this address works again."
+        ),
+    )
 }
 
 /// The two files that turn the phone's tab into an icon on its home screen, or
@@ -863,21 +930,34 @@ mod tests {
     /// what makes it work at all over plain HTTP.
     #[test]
     fn the_device_cookie_goes_out_with_the_attributes_it_needs() {
-        let response = redirect("/", Some("v1.d1.0.mac"));
+        let response = redirect("/", Some("v1.d1.0.mac"), false);
         let cookie = response.headers()[SET_COOKIE].to_str().unwrap();
 
         assert!(cookie.starts_with("dsh_mobile_session=v1.d1.0.mac;"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Path=/"));
-        assert!(!cookie.contains("Secure"), "Phase 1 is plain HTTP");
+        assert!(!cookie.contains("Secure"), "both of M2's tunnels are plain HTTP");
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers()[LOCATION], "/");
     }
 
+    /// And the same cookie on a tunnel that terminates TLS. Nothing answers
+    /// that way yet — see `tunnel::Scheme` — so this pins the attribute to the
+    /// one thing allowed to decide it, which is the argument and never a
+    /// header.
+    #[test]
+    fn a_secure_scheme_is_the_only_thing_that_adds_secure() {
+        let cookie = redirect("/", Some("v1.d1.0.mac"), true);
+        let cookie = cookie.headers()[SET_COOKIE].to_str().unwrap();
+
+        assert!(cookie.ends_with("; Secure"));
+        assert!(cookie.contains("SameSite=Strict"));
+    }
+
     #[test]
     fn a_redirect_that_is_not_a_handshake_sets_nothing() {
-        assert!(!redirect("/", None).headers().contains_key(SET_COOKIE));
+        assert!(!redirect("/", None, false).headers().contains_key(SET_COOKIE));
     }
 
     /// A refusal says nothing at all, on purpose.

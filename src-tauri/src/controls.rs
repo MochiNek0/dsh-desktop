@@ -113,6 +113,9 @@ pub enum Action {
     RemoteKickAll,
     /// Replace the nonce on the card with a fresh one.
     RemoteRefresh,
+    /// Move the gateway to another channel. Carries the one the card asked
+    /// for, already resolved to something this build implements.
+    RemoteChannel(crate::remote::TunnelType),
     /// The card was closed. The gateway stays up; the devices on it are still
     /// working.
     RemoteClose,
@@ -213,6 +216,14 @@ pub fn action(url: &Url) -> Option<Action> {
             .map(Action::RemoteKick),
         "remote-kick-all" => Some(Action::RemoteKickAll),
         "remote-refresh" => Some(Action::RemoteRefresh),
+        // Parsed into the enum here rather than carried as a string: a name
+        // this build does not implement is not a channel, and the place to
+        // find that out is before anything acts on it.
+        "remote-channel" => url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "to").then(|| value.into_owned()))
+            .and_then(|name| crate::remote::TunnelType::named(&name))
+            .map(Action::RemoteChannel),
         "remote-close" => Some(Action::RemoteClose),
         // The state, not a flip: a signal that went missing would otherwise
         // leave the box and the flag disagreeing until the next click.
@@ -341,6 +352,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::RemoteKick(id) => return crate::remote::kick(app, &id),
         Action::RemoteKickAll => return crate::remote::kick_all(app),
         Action::RemoteRefresh => return crate::remote::refresh(app),
+        Action::RemoteChannel(kind) => return crate::remote::channel(app, kind),
         Action::RemoteClose => return crate::remote::close(app),
         Action::RemoteStyle(on) => return crate::remote::style(app, on),
         Action::RemoteForget(on) => return crate::remote::forget_on_exit(app, on),
