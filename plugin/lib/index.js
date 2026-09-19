@@ -258,14 +258,26 @@ export function apply(ctx) {
  * Verified to match exactly one element while the dialog is open, and none while
  * it is shut.
  *
- * ## Why the media query
+ * ## Why the media queries
  *
- * `max-width`, not the `width <= 560px` range syntax dsh's own CSS uses, because
- * the range form needs Safari 16.4 and this has to work on whatever phone is to
- * hand. The breakpoint is dsh's own 560px, so a desktop window narrowed past the
+ * There are two, because there are two different things wrong with dsh on a
+ * phone and they are not the same question.
+ *
+ * The first is width: a dialog laid out as a row does not fit. `max-width`,
+ * not the `width <= 560px` range syntax dsh's own CSS uses, because the range
+ * form needs Safari 16.4 and this has to work on whatever phone is to hand.
+ * The breakpoint is dsh's own 560px, so a desktop window narrowed past the
  * point where dsh itself starts adapting gets the same treatment, and a normal
  * desktop window is untouched — confirmed identical, patched and unpatched, at
  * 1280px.
+ *
+ * The second is hover: a control dsh reveals on `:hover` has no way to be
+ * revealed by a finger. Width is the wrong proxy for that. An iPad, a phone in
+ * landscape and an unfolded foldable are all wider than 560px and all still
+ * have no pointer to hover with, and gating these rules on width is what left
+ * the workspace "+" unreachable on every one of them. `(hover: none)` is the
+ * claim actually being made, and it leaves a desktop window untouched at any
+ * width for the same reason the first query does.
  */
 const MOBILE_CSS = [
   '@media (max-width: 560px) {',
@@ -334,13 +346,38 @@ const MOBILE_CSS = [
   '  right: 14px;',
   '  z-index: 2;',
   '}',
-  // Make workspace and session row actions visible on mobile without hover,
-  // so the user can tap "+" to create a session in that workspace.
+  '}',
+
+  // Row actions that only exist on hover. dsh writes them as
+  //
+  //     .rowActions { display: none }
+  //     .projectRow:hover .rowActions,
+  //     .sessionRow:hover .rowActions,
+  //     .projectRow.menuOpen .rowActions,
+  //     .sessionRow.menuOpen .rowActions { display: inline-flex }
+  //
+  // and on a phone the first rule is the only one that ever applies, so the
+  // "+" that creates a session in a workspace is not merely hard to reach, it
+  // is not rendered. Specificity carries the override without `!important`:
+  // (0,2,0) against dsh's (0,1,0) base. It does not have to beat dsh's own
+  // hover rule at (0,3,0) — that one turns the same thing on.
+  '@media (hover: none) {',
   '[class*="_projectRow"] [class*="_rowActions"], [class*="_sessionRow"] [class*="_rowActions"] {',
   '  display: inline-flex;',
   '}',
-  // Ensure the workspace chip in the hero conversation view is easily tappable.
-  '[class*="_heroWorkspaceRow"] [class*="_workspace"] {',
+  // And the hero view's workspace chip, which is dsh's `min-height: 28px` and
+  // `padding: 0 8px` -- a comfortable mouse target and a mean thumb one. 36px
+  // rather than the 44px Apple asks for: the chip sits in a dense row under
+  // the composer, and 44 pushes the hero layout around for a control that is
+  // already the widest thing on that line.
+  //
+  // The child combinator is load-bearing. The chip is a <button> whose label
+  // is a <span class="…_workspaceLabel"> inside it, so a descendant selector
+  // matches both, and `padding: 0 12px` on a blockified flex item would put
+  // 24px of dead space inside a chip that is already `max-width: min(100%,
+  // 360px)` with an ellipsis -- paid for out of the path the user is trying
+  // to read.
+  '[class*="_heroWorkspaceRow"] > [class*="_workspace"] {',
   '  min-height: 36px;',
   '  padding: 0 12px;',
   '}',

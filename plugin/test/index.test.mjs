@@ -263,14 +263,30 @@ import { MOBILE_CSS, TRANSPORT, apply, flag, inject, override, rows, viewport } 
   assert.ok(MOBILE_CSS.includes('nav[class*="_nav"]'), 'anchored on the nav element');
   assert.ok(MOBILE_CSS.includes(':has('), 'and on structure rather than a name');
 
-  // Everything is inside one width query, which is what keeps the desktop
-  // window untouched.
+  // Every rule is inside a query, which is what keeps the desktop window
+  // untouched. Two of them: width for the dialog that does not fit, and
+  // `hover: none` for the controls dsh only reveals on hover -- an iPad and a
+  // phone in landscape are both wider than 560px and neither has a pointer, so
+  // gating the second on width is what left them unreachable there.
   const opens = (MOBILE_CSS.match(/\{/g) || []).length;
   const closes = (MOBILE_CSS.match(/\}/g) || []).length;
   assert.equal(opens, closes, 'the stylesheet is balanced');
-  assert.ok(MOBILE_CSS.startsWith('@media (max-width: 560px) {'), "one query, dsh's own breakpoint");
+  assert.ok(MOBILE_CSS.startsWith('@media (max-width: 560px) {'), "dsh's own breakpoint");
   assert.ok(MOBILE_CSS.trimEnd().endsWith('}'));
-  assert.equal((MOBILE_CSS.match(/@media/g) || []).length, 1, 'and only the one');
+  assert.deepEqual(MOBILE_CSS.match(/@media[^{]*/g).map((one) => one.trim()),
+    ['@media (max-width: 560px)', '@media (hover: none)'],
+    'and those are the only two');
+
+  // A hover-gated rule inside the width query is the bug this split fixed, so
+  // nothing reaches for hover from inside it.
+  const [width, hover] = MOBILE_CSS.split('@media (hover: none) {');
+  assert.ok(!/_rowActions|_heroWorkspaceRow/.test(width), 'nothing hover-gated is width-gated');
+  assert.ok(/_rowActions/.test(hover) && /_heroWorkspaceRow/.test(hover));
+
+  // The chip's own label carries a class matching `_workspace` too, so a
+  // descendant selector pads the text as well as the button it sits in.
+  assert.ok(hover.includes('[class*="_heroWorkspaceRow"] > [class*="_workspace"]'),
+    'the chip is padded, not its label');
 
   // `width <= 560px` needs Safari 16.4; this has to work on whatever phone is
   // to hand.
@@ -278,7 +294,7 @@ import { MOBILE_CSS, TRANSPORT, apply, flag, inject, override, rows, viewport } 
 
   // A `style` row is inlined into a <style> element, so this would end it early.
   assert.ok(!/<\/style/i.test(MOBILE_CSS), 'nothing that closes the element');
-  console.log('ok  the patch is hash-free, balanced and width-gated');
+  console.log('ok  the patch is hash-free, balanced, and gated on width and hover');
 }
 
 // --- the dialog still scrolls ---

@@ -136,13 +136,26 @@ pub fn addresses() -> Vec<Ipv4Addr> {
 /// The one to put on the QR code.
 ///
 /// Three things decide it, in this order. An address that is not on a network
-/// at all is out ([`reachable`]). Of the rest, the one the default route goes
-/// through wins outright — that is the card the machine actually talks to the
-/// world through, and no amount of reading adapter names is as good as asking
-/// the routing table. What is left is ranked by name, which is what breaks the
-/// tie on a machine with no route: a real card beats the virtual one Docker,
-/// WSL or VMware installed, all of which sit on private addresses that look
-/// exactly like a home network from here.
+/// at all is out ([`reachable`]). Of the rest, a real card beats a virtual one
+/// ([`rank`] over [`VIRTUAL`]) — Docker, WSL and VMware all sit on private
+/// addresses that look exactly like a home network from here. The routing
+/// table breaks the tie *within* each of those two groups, and only there.
+///
+/// That ordering is the wrong way round from what it looks like it should be,
+/// and the reason is that the question here is not "which card does this
+/// machine talk to the world through" but "which address can the phone open a
+/// connection to". A desktop running Clash, mihomo or sing-box in TUN mode
+/// answers the first question with a virtual card that holds the default route
+/// and answers the second one with nothing at all: the phone is not on that
+/// machine's proxy core. Asking the routing table there returns an address the
+/// QR code must never carry, which is exactly the bug this ordering fixes.
+///
+/// What it costs is the tie it used to break. On a machine whose route is
+/// hijacked, every physical card ranks the same, and [`Iterator::max_by_key`]
+/// yields the last of them — so a laptop with Wi-Fi and a dock both up
+/// publishes whichever one `if_addrs` happens to enumerate second. Both are
+/// normally on the same network and both normally work; when that stops being
+/// true this is the line to come back to.
 pub fn best_address() -> Option<Ipv4Addr> {
     let Ok(interfaces) = if_addrs::get_if_addrs() else {
         return None;
@@ -219,6 +232,22 @@ fn rank(name: &str, routed: bool) -> u32 {
 /// joined the tailnet, and Phase 2 gives it a tunnel of its own that knows
 /// better than this table does. It stays in [`addresses`] — the fence has no
 /// reason to turn away a request that did arrive on it.
+///
+/// The second half of the list is the proxy stack a Chinese desktop is likely
+/// to be running, in TUN mode, holding the default route: `clash` and `mihomo`
+/// and `meta` are the friendly names the Clash family gives its adapter
+/// (Clash Verge Rev, the current mainstream build, names it `Mihomo`), and
+/// `sing-box`, `wintun` and `wireguard` cover the rest. `tun` and `tap` are
+/// deliberately bare: they catch `utun0` on macOS and `tun0` on Linux, and on
+/// Windows they catch whatever a wintun-based client decided to call itself
+/// this release. `tap` subsumes the `tap-windows` entry that used to be here.
+///
+/// `meta` is the one short enough to worry about — a friendly name is whatever
+/// the user renamed the card to, and four letters is not much. It stays
+/// because the cost of a false positive is small and bounded: a card wrongly
+/// called virtual is still in [`addresses`], so the fence still lets it
+/// through, and it loses only to a *real* card, never to the TUN adapter this
+/// list exists to demote.
 const VIRTUAL: &[&str] = &[
     "vmware",
     "virtualbox",
@@ -229,12 +258,12 @@ const VIRTUAL: &[&str] = &[
     "tailscale",
     "zerotier",
     "loopback",
-    "tap-windows",
     "teredo",
     "isatap",
     "bluetooth",
     "vpn",
     "clash",
+    "mihomo",
     "meta",
     "sing-box",
     "wintun",
@@ -306,10 +335,12 @@ mod tests {
             "Tailscale",
             "ZeroTier One [abc]",
             "Clash Core Adapter",
+            "Mihomo",
             "Meta TUN",
             "sing-box tun",
             "Wintun Userspace Tunnel",
             "WireGuard Tunnel",
+            "TAP-Windows Adapter V9",
         ] {
             assert_eq!(rank(name, false), 1, "{name} is not the card to publish");
         }
