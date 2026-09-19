@@ -115,6 +115,7 @@ impl Harness {
             store: SessionStore::default(),
             upstream,
             tunnel: Mutex::new(tunnel),
+            guesses: super::trust::Guesses::default(),
             exchange: tokio::sync::Mutex::new(()),
             seen: AtomicU64::new(0),
         });
@@ -133,7 +134,13 @@ impl Harness {
 
     /// A pairing nonce, as the card would have put on a QR code.
     fn nonce(&self) -> String {
-        self.shared.store.mint_pair()
+        self.shared.store.mint_pair().token
+    }
+
+    /// The same nonce as the card prints it, for the phone that types instead
+    /// of scanning.
+    fn code(&self) -> String {
+        self.shared.store.mint_pair().code
     }
 
     /// One request, written out by hand. `extra` is whatever headers the case
@@ -516,6 +523,192 @@ fn a_refused_device_cannot_try_the_same_code_twice() {
 
     let again = harness.get(&format!("/?pair_token={nonce}"), &[]);
     assert_eq!(again.status, 403, "the nonce was spent by the first try");
+}
+
+/// The whole point of the typed entrance, end to end: a phone that has lost its
+/// cookie types six characters into the page it already has open and is back in
+/// — no camera, and no walking to the computer.
+#[test]
+fn a_phone_that_types_the_six_characters_gets_back_in() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let unpaired = harness.get("/", &[]);
+    assert_eq!(unpaired.status, 401);
+    assert!(
+        unpaired.body.contains("name=\"pair_code\""),
+        "the 401 carries the way back in, not just the bad news: {}",
+        unpaired.body
+    );
+
+    let code = harness.code();
+    let handshake = harness.get(&format!("/?pair_code={code}"), &[]);
+
+    assert_eq!(handshake.status, 303);
+    assert_eq!(handshake.header("location"), Some("/"));
+
+    let cookie = handshake
+        .device_cookie()
+        .expect("typing the code hands over a device cookie, exactly as scanning does");
+
+    let index = harness.get(
+        "/",
+        &[("Cookie", &format!("{}={cookie}", super::session::COOKIE))],
+    );
+    assert_eq!(index.status, 200);
+    assert!(index.body.contains("dsh index"), "{}", index.body);
+}
+
+/// As it comes off a keyboard rather than out of the generator: lower case, and
+/// with the space someone put in to keep their place — which a `GET` form sends
+/// as `+`, so this is also the check that the query is read the way a form
+/// writes one.
+#[test]
+fn the_code_is_read_the_way_a_person_types_it() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let code = harness.code();
+    let typed = format!("{}+{}", code[..3].to_lowercase(), code[3..].to_lowercase());
+
+    let handshake = harness.get(&format!("/?pair_code={typed}"), &[]);
+    assert_eq!(handshake.status, 303, "typed as {typed:?}");
+}
+
+/// Spent by the first taker, the same as the token is — they are one nonce.
+#[test]
+fn a_code_is_spent_once_and_the_qr_goes_with_it() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let minted = harness.shared.store.mint_pair();
+
+    assert_eq!(
+        harness
+            .get(&format!("/?pair_code={}", minted.code), &[])
+            .status,
+        303
+    );
+    assert_eq!(
+        harness
+            .get(&format!("/?pair_token={}", minted.token), &[])
+            .status,
+        403,
+        "redeeming the code spent the QR's token too"
+    );
+}
+
+/// A wrong code lands back on the page with the box on it, not on a dead end:
+/// the user is one typo from being in, and sending them to the computer for a
+/// camera is the trip this entrance exists to save.
+#[test]
+fn a_wrong_code_comes_back_to_the_same_box() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    harness.code();
+    let wrong = harness.get("/?pair_code=00000000", &[]);
+
+    assert_eq!(wrong.status, 401);
+    assert!(wrong.body.contains("name=\"pair_code\""), "{}", wrong.body);
+    assert_eq!(wrong.device_cookie(), None);
+}
+
+/// And a run of them costs the address five minutes. Ten is the limit, so the
+/// eleventh is refused without the store being asked at all — which is what
+/// keeps a billion codes from being searchable in a five-minute window.
+#[test]
+fn guessing_codes_stops_being_free() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let minted = harness.shared.store.mint_pair();
+    for _ in 0..10 {
+        assert_eq!(harness.get("/?pair_code=00000000", &[]).status, 401);
+    }
+
+    assert_eq!(
+        harness.get("/?pair_code=00000000", &[]).status,
+        429,
+        "the eleventh wrong code is made to wait"
+    );
+
+    // And the wait is real: the right code, offered from the same address
+    // during the cooldown, is not redeemed either.
+    let blocked = harness.get(&format!("/?pair_code={}", minted.code), &[]);
+    assert_eq!(blocked.status, 429);
+    assert_eq!(blocked.device_cookie(), None);
+
+    // The nonce was never spent, so it still works once the wait is over —
+    // which the token half, never rate limited, can show without waiting.
+    assert_eq!(
+        harness
+            .get(&format!("/?pair_token={}", minted.token), &[])
+            .status,
+        303
+    );
+}
+
+/// The manifest answers without a cookie, which is the whole reason it is
+/// served here rather than behind the session check: a browser fetches a
+/// manifest with credentials omitted, so behind the check it would be handed
+/// the pairing page where it expected JSON and the icon would silently never
+/// install.
+#[test]
+fn the_manifest_is_served_to_a_phone_that_has_no_session() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let manifest = harness.get("/dsh-mobile-manifest.json", &[]);
+
+    assert_eq!(manifest.status, 200, "not the 401 every other path gets");
+    assert_eq!(
+        manifest.header("content-type"),
+        Some("application/manifest+json")
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&manifest.body).expect("valid JSON");
+    assert_eq!(parsed["display"], "standalone", "or it opens in a tab");
+    assert_eq!(parsed["start_url"], "/");
+    assert_eq!(
+        parsed["icons"][0]["src"], "/dsh-mobile-icon.png",
+        "the path the plugin's apple-touch-icon link also names"
+    );
+}
+
+/// A nonce is good for five minutes and for one use. Writing one into the thing
+/// a home-screen icon opens for the next thirty days would bake in a dead token
+/// — and the failure would be an icon that opens on a refusal page.
+#[test]
+fn the_manifest_start_url_carries_no_nonce() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let body = harness.get("/dsh-mobile-manifest.json", &[]).body;
+    assert!(!body.contains("pair_token"), "{body}");
+    assert!(!body.contains("pair_code"), "{body}");
+}
+
+/// The fence comes first, even for the paths that need no cookie. A page on
+/// another origin must not be able to read these any more than it can read
+/// anything else here.
+#[test]
+fn the_public_paths_are_still_behind_the_fence() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    for path in ["/dsh-mobile-manifest.json", "/dsh-mobile-icon.png"] {
+        let refused = harness.get(path, &[("Sec-Fetch-Site", "cross-site")]);
+        assert_eq!(refused.status, 403, "{path}");
+    }
 }
 
 /// The path that only breaks after dsh has died once: same port, new process,

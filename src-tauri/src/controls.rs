@@ -117,6 +117,9 @@ pub enum Action {
     /// The stylesheet-patch box on the card was ticked or unticked. Carries the
     /// state it is now in, not a request to flip.
     RemoteStyle(bool),
+    /// The forget-on-exit box on the card was ticked or unticked. Same shape,
+    /// and for the same reason.
+    RemoteForget(bool),
     /// Open the plugin panel on the loading page.
     Plugins,
     /// Install what was ticked in it, and whatever was typed into its box.
@@ -214,6 +217,10 @@ pub fn action(url: &Url) -> Option<Action> {
             .query_pairs()
             .find_map(|(key, value)| (key == "on").then(|| value == "1"))
             .map(Action::RemoteStyle),
+        "remote-forget" => url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "on").then(|| value == "1"))
+            .map(Action::RemoteForget),
         "plugins" => Some(Action::Plugins),
         "plugins-install" => {
             let (ids, spec) = crate::plugins::requested(url);
@@ -332,6 +339,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::RemoteKickAll => return crate::remote::kick_all(app),
         Action::RemoteClose => return crate::remote::close(app),
         Action::RemoteStyle(on) => return crate::remote::style(app, on),
+        Action::RemoteForget(on) => return crate::remote::forget_on_exit(app, on),
         Action::Locale(tag) => return crate::switch_language(app, &tag),
         Action::Plugins => return crate::open_plugins(app),
         Action::PluginsInstall(ids, spec) => return crate::install_plugins(app, ids, spec),

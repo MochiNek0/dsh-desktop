@@ -112,6 +112,10 @@ pub struct Shared {
     store: SessionStore,
     upstream: Upstream,
     tunnel: Mutex<LanTunnel>,
+    /// Wrong short codes, per address. The QR's nonce is not counted — 128 bits
+    /// is not a thing anyone guesses — so this is only ever touched by the
+    /// typed entrance. See [`trust::Guesses`].
+    guesses: trust::Guesses,
     /// Held across the launch-token exchange so that a page load's thirty
     /// simultaneous requests do it once between them; see
     /// `proxy::ensure_cookie`.
@@ -133,11 +137,19 @@ impl Shared {
 pub struct Remote {
     shared: Arc<Shared>,
     running: Mutex<Option<Running>>,
-    /// The pairing URL currently on the card, or `None` when no card is up.
-    /// What makes a redraw possible without minting a second nonce.
-    showing: Mutex<Option<String>>,
+    /// The nonce currently on the card, or `None` when no card is up. What
+    /// makes a redraw possible without minting a second one.
+    showing: Mutex<Option<Showing>>,
     /// Asked once — it costs a second and a megabyte of text — and remembered.
     firewall: OnceLock<firewall::Firewall>,
+}
+
+/// The nonce on the card, in both of the shapes the card draws it in: one for
+/// the QR and the copy button, one for the phone that would rather type.
+#[derive(Clone)]
+struct Showing {
+    url: String,
+    code: String,
 }
 
 /// The listener, while there is one.
@@ -152,10 +164,11 @@ impl Remote {
     pub fn new(app: AppHandle) -> Self {
         Self {
             shared: Arc::new(Shared {
+                store: SessionStore::persisted(&app),
                 approve: Approve::Desktop(app),
-                store: SessionStore::default(),
                 upstream: Upstream::default(),
                 tunnel: Mutex::new(LanTunnel::default()),
+                guesses: trust::Guesses::default(),
                 exchange: tokio::sync::Mutex::new(()),
                 seen: AtomicU64::new(0),
             }),
@@ -167,26 +180,44 @@ impl Remote {
 
     /// Bind and start serving, or answer with the address already being served.
     ///
-    /// Port `0`, so the OS picks: nothing else needs to know the number in
-    /// advance. That is the part of method A the specification calls out — the
-    /// alternative hands dsh a `--trusted-host` at launch, which would make the
-    /// gateway's port something dsh has to be restarted to change.
+    /// Nothing else needs to know the port in advance — that is the part of
+    /// method A the specification calls out, the alternative being a
+    /// `--trusted-host` handed to dsh at launch, which would make the gateway's
+    /// port something dsh has to be restarted to change. What that argument
+    /// settles is that the port need not be *agreed*; it says nothing about
+    /// whether it should *move*, and the phone is the party that suffers when
+    /// it does. See [`crate::settings::gateway_port`].
+    ///
+    /// So: ask for the port last time ended on, and take whatever the OS gives
+    /// if that one is spoken for.
     fn start(&self) -> Result<String, String> {
         let mut running = self.running.lock().unwrap();
         if let Some(live) = running.as_ref() {
             return Ok(live.base.clone());
         }
 
-        let listener = tauri::async_runtime::block_on(tokio::net::TcpListener::bind((
-            std::net::Ipv4Addr::UNSPECIFIED,
-            0,
-        )))
-        .map_err(|error| error.to_string())?;
+        let remembered = self
+            .shared
+            .approve
+            .app()
+            .and_then(crate::settings::gateway_port);
+
+        let listener = bind(remembered).map_err(|error| error.to_string())?;
 
         let port = listener
             .local_addr()
             .map_err(|error| error.to_string())?
             .port();
+
+        // Written on every launch that did not land where it meant to: the
+        // first one, and any after it that found the port taken. Writing the
+        // port back unconditionally would rewrite the file on every single
+        // launch for no change.
+        if Some(port) != remembered {
+            if let Some(app) = self.shared.approve.app() {
+                crate::settings::set_gateway_port(app, port);
+            }
+        }
 
         // After the bind, because the tunnel is told which port to publish. A
         // machine with no network fails here, with the socket already open —
@@ -212,7 +243,14 @@ impl Remote {
         Ok(base)
     }
 
-    /// Stop serving and forget every device.
+    /// Stop serving. Whether the devices go with it is the user's call.
+    ///
+    /// This used to throw them all off unconditionally, which was not so much a
+    /// policy as a description: the key was in memory, so closing the app ended
+    /// every session whatever this function did. Now that the key outlives the
+    /// process, the line has to say what it means — and what it means by
+    /// default is that the phone works tomorrow. See
+    /// [`crate::settings::forget_pairings_on_exit`].
     fn stop(&self) {
         if let Some(mut running) = self.running.lock().unwrap().take() {
             if let Some(stop) = running.shutdown.take() {
@@ -220,9 +258,46 @@ impl Remote {
             }
         }
         let _ = self.shared.tunnel.lock().unwrap().stop();
-        self.shared.store.revoke_all();
+
+        if self
+            .shared
+            .approve
+            .app()
+            .is_some_and(crate::settings::forget_pairings_on_exit)
+        {
+            self.shared.store.revoke_all();
+        }
+
         *self.showing.lock().unwrap() = None;
     }
+}
+
+/// The listener: on the port we asked for, or on one the OS picked.
+///
+/// A remembered port that will not bind is the ordinary case, not a failure —
+/// something else took it while the app was closed, or another copy of this app
+/// is up. Falling back is what keeps that from being the end of the feature,
+/// and it costs the home-screen icon on that machine until the port is free
+/// again, which is strictly better than not starting.
+///
+/// Only the fallback's error is returned. A machine where binding `0` fails has
+/// no usable network stack at all, and that is the failure worth showing on the
+/// card — not "port 59123 is busy", which is not something the user can act on.
+fn bind(remembered: Option<u16>) -> std::io::Result<tokio::net::TcpListener> {
+    let at = |port| {
+        tauri::async_runtime::block_on(tokio::net::TcpListener::bind((
+            std::net::Ipv4Addr::UNSPECIFIED,
+            port,
+        )))
+    };
+
+    if let Some(port) = remembered {
+        if let Ok(listener) = at(port) {
+            return Ok(listener);
+        }
+    }
+
+    at(0)
 }
 
 /// dsh is serving at this URL — the first launch and every restart after it.
@@ -243,11 +318,13 @@ pub fn dsh_gone(app: &AppHandle) {
     }
 }
 
-/// The app is closing: take the listener down and let every device go.
+/// The app is closing: take the listener down.
 ///
-/// The sessions are in memory only, so "clean up" is the process ending — but
-/// the listener is not, and a socket still bound while the window is gone is a
-/// port answering for an app that no longer exists.
+/// The socket is the part that has to go. One still bound while the window is
+/// gone is a port answering for an app that no longer exists. The sessions are
+/// the part that now does not — they are on the disk, and they are meant to be
+/// there when the app comes back. See [`Remote::stop`] for the switch that says
+/// otherwise.
 pub fn shutdown(app: &AppHandle) {
     if let Some(remote) = app.try_state::<Remote>() {
         remote.stop();
@@ -270,8 +347,11 @@ pub fn open(app: &AppHandle) {
 
         match remote.start() {
             Ok(base) => {
-                let url = format!("{base}/?pair_token={}", remote.shared.store.mint_pair());
-                *remote.showing.lock().unwrap() = Some(url);
+                let minted = remote.shared.store.mint_pair();
+                *remote.showing.lock().unwrap() = Some(Showing {
+                    url: format!("{base}/?pair_token={}", minted.token),
+                    code: minted.code,
+                });
                 redraw(&app, &remote, None);
 
                 // Both of these take a while and neither should hold the card
@@ -286,10 +366,12 @@ pub fn open(app: &AppHandle) {
                     &app,
                     &card::View {
                         url: None,
+                        code: None,
                         error: Some(why),
                         devices: Vec::new(),
                         hint: None,
                         style_patch: style::enabled(),
+                        forget_on_exit: crate::settings::forget_pairings_on_exit(&app),
                     },
                 );
             }
@@ -332,7 +414,10 @@ pub fn kick_all(app: &AppHandle) {
         .lock()
         .unwrap()
         .as_ref()
-        .map(|live| format!("{}/?pair_token={minted}", live.base));
+        .map(|live| Showing {
+            url: format!("{}/?pair_token={}", live.base, minted.token),
+            code: minted.code,
+        });
     *remote.showing.lock().unwrap() = next;
 
     redraw(app, &remote, None);
@@ -395,7 +480,7 @@ fn paired(shared: &Shared) {
 /// store each time rather than kept anywhere, so there is never a stale view to
 /// catch up.
 fn redraw(app: &AppHandle, remote: &Remote, hint: Option<String>) {
-    let Some(url) = remote.showing.lock().unwrap().clone() else {
+    let Some(showing) = remote.showing.lock().unwrap().clone() else {
         return;
     };
 
@@ -404,11 +489,13 @@ fn redraw(app: &AppHandle, remote: &Remote, hint: Option<String>) {
     card::show(
         app,
         &card::View {
-            url: Some(url),
+            url: Some(showing.url),
+            code: Some(showing.code),
             error: None,
             devices: remote.shared.store.devices(),
             hint,
             style_patch: style::enabled(),
+            forget_on_exit: crate::settings::forget_pairings_on_exit(app),
         },
     );
 }
@@ -437,6 +524,20 @@ pub fn style(app: &AppHandle, on: bool) {
     // this is the round that reports its own failures. `refresh` does nothing
     // when the switch went the other way.
     patch::refresh(app, true);
+}
+
+/// Decide whether closing the app throws every paired phone off.
+///
+/// Recorded and no more: the phones on the card stay where they are, because
+/// this is a choice about what happens at exit and acting on it now would be
+/// answering a question nobody asked. The redraw is only to put the box back
+/// where the user just clicked it.
+pub fn forget_on_exit(app: &AppHandle, on: bool) {
+    crate::settings::set_forget_pairings_on_exit(app, on);
+
+    if let Some(remote) = app.try_state::<Remote>() {
+        redraw(app, &remote, None);
+    }
 }
 
 /// Fetch the published stylesheet, if the patch is switched on.

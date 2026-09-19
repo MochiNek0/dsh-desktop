@@ -31,6 +31,10 @@
 //!
 //! [`RemoteTunnel::authorities`]: crate::remote::tunnel::RemoteTunnel::authorities
 
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
+
 /// Why a request was turned away, in the words that go to the terminal.
 ///
 /// A `&'static str` rather than a formatted message: this is written on the
@@ -124,6 +128,109 @@ pub fn label(user_agent: Option<&str>) -> String {
         }
     }
     t!("未知设备", "Unknown device").to_string()
+}
+
+/// How many wrong short codes one address may offer inside [`WINDOW`].
+///
+/// Ten, which is more than anyone mistypes six characters and far fewer than
+/// anyone needs to search a billion of them. The limit is not what makes the
+/// code safe — see [`crate::remote::session`] for the four things that do — it
+/// is what keeps the search from being free.
+const GUESSES: u32 = 10;
+
+/// The span they are counted over.
+const WINDOW: Duration = Duration::from_secs(60);
+
+/// And what a run of them costs.
+///
+/// Five minutes, which is [`PAIR_TTL`] — so an address that spent its guesses
+/// on one code waits out that code entirely, and comes back to a card the user
+/// has had to refresh anyway.
+///
+/// [`PAIR_TTL`]: crate::remote::session
+const COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+/// Wrong short codes, counted per address.
+///
+/// ## The address has to be the phone's
+///
+/// Today it is: the LAN tunnel hands the gateway a real socket, so the peer
+/// address on it is the device that opened it. Behind a reverse proxy — which
+/// is what `cloudflared` and `tailscale serve` both are — it stops being, and
+/// every request arrives from `127.0.0.1`.
+///
+/// Keying on that would not merely weaken this; it would invert it. One
+/// attacker's failures would count against the loopback address that *every*
+/// device shares, and the tenth wrong guess would lock out the user's own
+/// phone. A rate limit that the attacker aims at the victim is worse than no
+/// rate limit, so when a tunnel of that shape lands, this has to be fed from
+/// the forwarded-for header that tunnel vouches for, not from the socket.
+#[derive(Default)]
+pub struct Guesses {
+    runs: std::sync::Mutex<HashMap<IpAddr, Run>>,
+}
+
+/// One address's recent wrong answers.
+struct Run {
+    wrong: u32,
+    /// When the count started. The window slides by being restarted, not by
+    /// keeping timestamps: what is being measured is "a burst", and a burst is
+    /// adequately described by when it began and how big it got.
+    since: Instant,
+    /// Set when the run went over, and cleared by nothing — the entry itself is
+    /// dropped once this has passed.
+    until: Option<Instant>,
+}
+
+impl Guesses {
+    /// Whether this address has to wait before it may guess again.
+    pub fn blocked(&self, who: IpAddr) -> bool {
+        self.runs
+            .lock()
+            .unwrap()
+            .get(&who)
+            .and_then(|run| run.until)
+            .is_some_and(|until| until > Instant::now())
+    }
+
+    /// Record a wrong code, and start the wait if that was one too many.
+    pub fn wrong(&self, who: IpAddr) {
+        let now = Instant::now();
+        let mut runs = self.runs.lock().unwrap();
+
+        // Before the insert, so that an address that guessed twice last week is
+        // not still in here. Nothing else prunes: the map is written only on
+        // this path, which is the path that would otherwise grow it.
+        runs.retain(|_, run| lively(run, now));
+
+        let run = runs.entry(who).or_insert(Run {
+            wrong: 0,
+            since: now,
+            until: None,
+        });
+
+        if now.duration_since(run.since) > WINDOW {
+            run.wrong = 0;
+            run.since = now;
+        }
+
+        run.wrong += 1;
+        if run.wrong >= GUESSES {
+            run.until = Some(now + COOLDOWN);
+        }
+    }
+
+    /// A right one. The run is forgotten, so a user who fumbled the code twice
+    /// before getting it does not carry those two into their next pairing.
+    pub fn right(&self, who: IpAddr) {
+        self.runs.lock().unwrap().remove(&who);
+    }
+}
+
+/// Whether an entry is still worth keeping: inside its window, or still owed a
+/// wait.
+fn lively(run: &Run, now: Instant) -> bool {
+    run.until.is_some_and(|until| until > now) || now.duration_since(run.since) <= WINDOW
 }
 
 #[cfg(test)]
@@ -294,5 +401,106 @@ mod tests {
     fn a_client_that_says_nothing_still_gets_a_name() {
         assert!(!label(None).is_empty());
         assert!(!label(Some("")).is_empty());
+    }
+
+    fn phone() -> IpAddr {
+        "192.168.1.9".parse().unwrap()
+    }
+
+    fn other() -> IpAddr {
+        "192.168.1.10".parse().unwrap()
+    }
+
+    /// Nine wrong codes is somebody typing badly. The tenth is the limit.
+    #[test]
+    fn a_run_of_wrong_codes_ends_in_a_wait() {
+        let guesses = Guesses::default();
+        assert!(!guesses.blocked(phone()));
+
+        for _ in 0..GUESSES - 1 {
+            guesses.wrong(phone());
+            assert!(!guesses.blocked(phone()), "still within the allowance");
+        }
+
+        guesses.wrong(phone());
+        assert!(guesses.blocked(phone()));
+    }
+
+    /// And it is the guesser who waits, not everyone. This is the whole reason
+    /// the address has to be the phone's own — see the type's docs.
+    #[test]
+    fn the_wait_falls_only_on_the_address_that_earned_it() {
+        let guesses = Guesses::default();
+        for _ in 0..GUESSES {
+            guesses.wrong(phone());
+        }
+
+        assert!(guesses.blocked(phone()));
+        assert!(!guesses.blocked(other()), "a second phone is unaffected");
+    }
+
+    /// A user who fumbled the code twice and then got it does not carry those
+    /// two into the next pairing.
+    #[test]
+    fn getting_it_right_forgets_the_run() {
+        let guesses = Guesses::default();
+        guesses.wrong(phone());
+        guesses.wrong(phone());
+        guesses.right(phone());
+
+        for _ in 0..GUESSES - 1 {
+            guesses.wrong(phone());
+        }
+        assert!(
+            !guesses.blocked(phone()),
+            "the count started again at the right answer"
+        );
+    }
+
+    /// The count is a burst, not a lifetime total: wrong answers spread wider
+    /// than the window do not add up.
+    #[test]
+    fn the_window_slides() {
+        let guesses = Guesses::default();
+
+        {
+            let mut runs = guesses.runs.lock().unwrap();
+            runs.insert(
+                phone(),
+                Run {
+                    wrong: GUESSES - 1,
+                    since: Instant::now() - WINDOW - Duration::from_secs(1),
+                    until: None,
+                },
+            );
+        }
+
+        guesses.wrong(phone());
+        assert!(
+            !guesses.blocked(phone()),
+            "the stale burst was dropped rather than added to"
+        );
+    }
+
+    /// Entries that are neither inside a window nor owed a wait are dropped, so
+    /// the map does not grow one row per address that ever mistyped.
+    #[test]
+    fn the_map_forgets_addresses_that_are_done() {
+        let guesses = Guesses::default();
+
+        {
+            let mut runs = guesses.runs.lock().unwrap();
+            runs.insert(
+                other(),
+                Run {
+                    wrong: 1,
+                    since: Instant::now() - WINDOW - Duration::from_secs(1),
+                    until: None,
+                },
+            );
+        }
+
+        guesses.wrong(phone());
+        assert!(!guesses.runs.lock().unwrap().contains_key(&other()));
     }
 }

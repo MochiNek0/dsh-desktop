@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MOBILE_CSS, TRANSPORT, apply, flag, inject, override, rows, viewport } from '../lib/index.js';
+import { MOBILE_CSS, TRANSPORT, apply, flag, homescreen, inject, override, rows, viewport } from '../lib/index.js';
 
 // --- the tag itself ---
 {
@@ -102,9 +102,10 @@ import { MOBILE_CSS, TRANSPORT, apply, flag, inject, override, rows, viewport } 
   apply({ inject: (deps, callback) => { waited = deps; callback(scope); } });
 
   assert.deepEqual(waited, ['webServer'], 'and waits for it in a child fiber');
-  assert.equal(taps.length, 1, 'one tap registered');
-  assert.equal(effects.length, 1, 'through an effect, so disposal takes it off');
+  assert.equal(taps.length, 2, 'both taps registered');
+  assert.equal(effects.length, 2, 'through effects, so disposal takes them off');
   assert.ok(taps[0]('<head></head>').includes('name="viewport"'));
+  assert.ok(taps[1]('<head></head>').includes('rel="manifest"'));
   assert.deepEqual(
     Object.keys(listeners),
     ['webserver/index-inject'],
@@ -325,6 +326,46 @@ import { MOBILE_CSS, TRANSPORT, apply, flag, inject, override, rows, viewport } 
   assert.ok(rule('[class*="_options"]').includes('overscroll-behavior: contain'),
     "dsh's scroller does not chain to the page");
   console.log('ok  the stacked dialog keeps a live scroller');
+}
+
+// --- the home-screen tags ---
+{
+  // iOS has never read a manifest for this: `apple-mobile-web-app-capable` is
+  // what opens the home-screen window without Safari's chrome, and it is the
+  // one that must not go missing. It needs no HTTPS, unlike the Service Worker
+  // that would make this a full PWA -- which is why the offline half is absent
+  // and this half is not.
+  const out = homescreen('<html lang="en"><head><title>DeepSeek Harness</title></head><body></body></html>');
+
+  assert.ok(out.includes('<link rel="manifest" href="/dsh-mobile-manifest.json">'), 'Android reads this one');
+  assert.ok(out.includes('<link rel="apple-touch-icon" href="/dsh-mobile-icon.png">'),
+    'or iOS uses a screenshot of the page as the icon');
+  assert.ok(out.includes('name="apple-mobile-web-app-capable"'), 'deprecated, and still the only one older iOS reads');
+  assert.ok(out.includes('name="mobile-web-app-capable"'), 'and the standard spelling of it');
+  assert.ok(out.includes('content="black-translucent"'),
+    "so dsh's own background runs under the status bar");
+
+  // The paths are the gateway's, answered in `remote/proxy.rs` before anything
+  // is forwarded. Spell either one differently on either side and the icon
+  // silently stops installing, with no error anywhere -- the same two-process
+  // agreement `flag()` above is half of.
+  assert.ok(out.includes('/dsh-mobile-manifest.json'));
+  assert.ok(out.includes('/dsh-mobile-icon.png'));
+
+  assert.ok(out.includes('<title>DeepSeek Harness</title>'), 'nothing else is touched');
+  assert.ok(out.indexOf('rel="manifest"') < out.indexOf('<title>'), 'and they land inside the head');
+  console.log('ok  puts the home-screen tags on the index');
+}
+
+// --- an index this does not recognise ---
+{
+  // The same rule the viewport tap follows: a body with no head is returned
+  // untouched rather than guessed at. This runs on the path that serves dsh's
+  // index, and a plugin that can break that is a plugin that can stop the
+  // window opening.
+  const odd = '<html><body>no head at all</body></html>';
+  assert.equal(homescreen(odd), odd, 'left alone rather than repaired');
+  console.log('ok  leaves an index it does not recognise alone');
 }
 
 // --- a dsh with no webserver ---

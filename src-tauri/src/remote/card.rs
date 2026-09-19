@@ -42,6 +42,9 @@ pub struct View {
     /// The pairing URL the QR code carries. `None` when the gateway could not
     /// be raised, in which case `error` says why.
     pub url: Option<String>,
+    /// The six characters that stand for the same nonce, for a phone that would
+    /// rather type than scan. `None` exactly when `url` is.
+    pub code: Option<String>,
     pub error: Option<String>,
     pub devices: Vec<Device>,
     /// A line under the code: the firewall warning, or the one about nothing
@@ -49,15 +52,20 @@ pub struct View {
     pub hint: Option<String>,
     /// Whether the phone's stylesheet patch is on. See [`crate::remote::style`].
     pub style_patch: bool,
+    /// Whether closing the app throws every paired phone off. See
+    /// [`crate::settings::forget_pairings_on_exit`].
+    pub forget_on_exit: bool,
 }
 
 /// Put the card up, or update the one already up.
 pub fn show(app: &AppHandle, view: &View) {
     let payload = serde_json::json!({
         "url": view.url,
+        "code": view.code,
         "error": view.error,
         "hint": view.hint,
         "stylePatch": view.style_patch,
+        "forgetOnExit": view.forget_on_exit,
         "devices": view.devices.iter().map(|device| serde_json::json!({
             "id": device.id,
             "label": device.label,
@@ -92,6 +100,10 @@ fn text() -> serde_json::Value {
             "Scan this with the phone's camera. The computer will ask you once more before letting it in."
         ),
         "waiting": t!("等待手机扫码…", "Waiting for a phone to scan…"),
+        "codeWhy": t!(
+            "不方便扫码，就在手机上打开这个地址，把这六个字符输进去。",
+            "Or open the address on the phone and type these six characters in."
+        ),
         "connected": t!("已连接 {} 台设备", "{} connected"),
         "since": t!("{} 起", "since {}"),
         "kick": t!("断开", "Disconnect"),
@@ -104,6 +116,11 @@ fn text() -> serde_json::Value {
         "stylePatchWhy": t!(
             "dsh 的设置弹窗在窄屏下会挤成一列。等 dsh 官方适配了就可以关掉。改完刷新手机页面生效。",
             "dsh's settings dialog collapses into a column on a narrow screen. Turn this off once dsh ships its own. Reload the page on the phone after changing it."
+        ),
+        "forgetOnExit": t!("退出时断开所有已配对设备", "Disconnect every phone when this app closes"),
+        "forgetOnExitWhy": t!(
+            "默认不断开：配对能撑三十天，手机第二天还能直接用。打开它就回到「关掉应用等于全部作废」——代价是每次开机都要重扫一次码。",
+            "Off by default, so a pairing lasts thirty days and the phone still works tomorrow. Turning it on means closing the app revokes everything — and scanning the code again every time you start it."
         ),
     })
 }
@@ -156,7 +173,7 @@ pub fn script() -> String {
   if (window.__dshRemoteCard) return;
   window.__dshRemoteCard = true;
 
-  var root = null, sheet, head, lede, code, link, status, list, note, patch, foot;
+  var root = null, sheet, head, lede, code, pin, link, status, list, note, patch, keep, foot;
   var TEXT = {{}};
 
   function signal(verb) {{
@@ -200,6 +217,15 @@ pub fn script() -> String {
       '.dsh-rc-code i{{display:block;width:100%;padding-bottom:100%;' +
       'background:#fff}}' +
       '.dsh-rc-code i.on{{background:#000}}' +
+      // The same nonce as the code above it, for the phone that cannot point a
+      // camera at a screen it is not near. Monospace and spaced out because it
+      // is read one character at a time and then typed.
+      '.dsh-rc-pin{{margin:0 0 12px;text-align:center}}' +
+      '.dsh-rc-pin b{{display:block;font:600 21px/1.2 ui-monospace,SFMono-Regular,' +
+      'Menlo,Consolas,monospace;letter-spacing:.24em;text-indent:.24em;' +
+      'user-select:text;-webkit-user-select:text}}' +
+      '.dsh-rc-pin small{{display:block;margin:5px 0 0;font-size:11px;' +
+      'line-height:1.5;color:var(--rc-muted)}}' +
       '.dsh-rc-status{{margin:0 0 10px;font-weight:500}}' +
       '.dsh-rc-list{{margin:0 0 14px;padding:0;list-style:none;' +
       'border-top:1px solid var(--rc-line)}}' +
@@ -246,12 +272,14 @@ pub fn script() -> String {
     head = make('h2', 'dsh-rc-head', sheet);
     lede = make('p', 'dsh-rc-lede', sheet);
     code = make('div', 'dsh-rc-code', sheet);
+    pin = make('div', 'dsh-rc-pin', sheet);
     link = make('button', 'dsh-rc-link', sheet);
     link.type = 'button';
     status = make('p', 'dsh-rc-status', sheet);
     list = make('ul', 'dsh-rc-list', sheet);
     note = make('p', 'dsh-rc-note', sheet);
     patch = make('label', 'dsh-rc-patch', sheet);
+    keep = make('label', 'dsh-rc-patch', sheet);
     foot = make('div', 'dsh-rc-foot', sheet);
     document.body.appendChild(root);
 
@@ -296,6 +324,29 @@ pub fn script() -> String {
   function close() {{
     if (root) root.classList.remove('dsh-rc-shown');
     signal('remote-close');
+  }}
+
+  /** A real checkbox inside a real label, so the whole row is the hit area and
+   *  a keyboard reaches it without this card inventing focus handling.
+   *
+   *  The signal carries the state the box is now in, not a request to flip it:
+   *  see the note on `remote-style` in `controls`.
+   *
+   *  `flag` arrives with its `?on=` already on it rather than being built here.
+   *  The verbs this card can signal are checked by looking for them in this
+   *  script — see `every_verb_the_card_signals_is_one_the_app_answers` — and a
+   *  verb assembled at runtime is one that check cannot see. */
+  function tick(row, on, label, why, flag) {{
+    row.textContent = '';
+    var box = make('input', '', row);
+    box.type = 'checkbox';
+    box.checked = !!on;
+    box.addEventListener('change', function () {{
+      signal(flag + (box.checked ? '1' : '0'));
+    }});
+    var text = make('span', '', row);
+    text.textContent = label || '';
+    make('small', '', text).textContent = why || '';
   }}
 
   function button(parent, text, className, onclick) {{
@@ -362,6 +413,14 @@ pub fn script() -> String {
     lede.textContent = TEXT.lede || '';
 
     paintCode(view.url || '');
+
+    pin.style.display = view.code ? 'block' : 'none';
+    if (view.code) {{
+      pin.textContent = '';
+      make('b', '', pin).textContent = view.code;
+      make('small', '', pin).textContent = TEXT.codeWhy || '';
+    }}
+
     link.style.display = view.url ? 'block' : 'none';
     if (view.url) {{
       link.setAttribute('data-url', view.url);
@@ -391,18 +450,10 @@ pub fn script() -> String {
     note.style.display = view.hint ? 'block' : 'none';
     note.textContent = view.hint || '';
 
-    // A real checkbox inside a real label, so the whole row is the hit area
-    // and a keyboard reaches it without this card inventing focus handling.
-    patch.textContent = '';
-    var box = make('input', '', patch);
-    box.type = 'checkbox';
-    box.checked = !!view.stylePatch;
-    box.addEventListener('change', function () {{
-      signal('remote-style?on=' + (box.checked ? '1' : '0'));
-    }});
-    var why = make('span', '', patch);
-    why.textContent = TEXT.stylePatch || '';
-    make('small', '', why).textContent = TEXT.stylePatchWhy || '';
+    tick(patch, view.stylePatch, TEXT.stylePatch, TEXT.stylePatchWhy,
+         'remote-style?on=');
+    tick(keep, view.forgetOnExit, TEXT.forgetOnExit, TEXT.forgetOnExitWhy,
+         'remote-forget?on=');
 
     foot.textContent = '';
     if (count) {{
@@ -831,6 +882,7 @@ mod tests {
             "remote-kick?id=",
             "remote-kick-all",
             "remote-style?on=",
+            "remote-forget?on=",
         ] {
             assert!(script.contains(verb), "the card signals {verb}");
         }
@@ -848,6 +900,9 @@ mod tests {
             // The box sends the state it is in, so a signal with no state is
             // not a request to flip — it is a signal that lost its payload.
             ("dsh-window://remote-style", false),
+            ("dsh-window://remote-forget?on=1", true),
+            ("dsh-window://remote-forget?on=0", true),
+            ("dsh-window://remote-forget", false),
         ] {
             let parsed = crate::controls::action(&url.parse().unwrap());
             assert_eq!(parsed.is_some(), recognised, "{url}");
@@ -867,6 +922,19 @@ mod tests {
             match crate::controls::action(&url.parse().unwrap()) {
                 Some(Action::RemoteStyle(on)) => assert_eq!(on, expected, "{url}"),
                 _ => panic!("{url} did not parse as a style switch"),
+            }
+        }
+
+        // The same worry, and a worse outcome: read the wrong way round, this
+        // one throws every paired phone off at exit while the box says it will
+        // not.
+        for (url, expected) in [
+            ("dsh-window://remote-forget?on=1", true),
+            ("dsh-window://remote-forget?on=0", false),
+        ] {
+            match crate::controls::action(&url.parse().unwrap()) {
+                Some(Action::RemoteForget(on)) => assert_eq!(on, expected, "{url}"),
+                _ => panic!("{url} did not parse as a forget switch"),
             }
         }
     }

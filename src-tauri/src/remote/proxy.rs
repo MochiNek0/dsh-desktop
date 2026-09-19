@@ -152,17 +152,27 @@ async fn handle(
         return Ok(refused());
     }
 
+    // Before the cookie is looked at, and that is the point of them: see
+    // [`homescreen`].
+    if let Some(response) = homescreen(&shared, request.uri().path()) {
+        return Ok(response);
+    }
+
     let device =
         cookie_value(&request, DEVICE_COOKIE).and_then(|value| shared.store.verify(&value));
 
     // A pairing URL from somebody who is already paired is a phone that scanned
-    // the code twice. Sending it to `/` costs nobody a nonce and is what the
-    // user meant by scanning.
-    if let Some(token) = query_value(&request, "pair_token") {
+    // the code twice, or typed one it did not need. Sending it to `/` costs
+    // nobody a nonce and is what the user meant either way.
+    let offer = query_value(&request, "pair_token")
+        .map(Offer::Token)
+        .or_else(|| query_value(&request, "pair_code").map(Offer::Code));
+
+    if let Some(offer) = offer {
         if device.is_some() {
             return Ok(redirect("/", None));
         }
-        return Ok(pair(shared, peer, request, token).await);
+        return Ok(pair(shared, peer, request, offer).await);
     }
 
     if device.is_none() {
@@ -170,6 +180,16 @@ async fn handle(
     }
 
     Ok(forward(shared, request).await)
+}
+
+/// How the phone offered the nonce: off the QR code, or typed by hand.
+///
+/// The two are the same nonce and reach the same dialog. They are kept apart
+/// only so far as the answers differ — what to say when it is wrong, and
+/// whether a wrong one is worth counting.
+enum Offer {
+    Token(String),
+    Code(String),
 }
 
 /// The handshake: spend the nonce, ask the desktop, and answer with what the
@@ -183,18 +203,61 @@ async fn pair(
     shared: Arc<Shared>,
     peer: SocketAddr,
     request: Request<Incoming>,
-    token: String,
+    offer: Offer,
 ) -> Response<Body> {
-    if !shared.store.redeem_pair(&token) {
-        return page(
-            StatusCode::FORBIDDEN,
-            t!("这个二维码已经失效", "This code is no longer valid"),
-            t!(
-                "配对码只有五分钟有效，而且只能用一次。回到电脑上重新打开「手机连接」再扫一次。",
-                "A pairing code lasts five minutes and can be used once. \
-                 Open Connect a phone on the computer again and scan the new one."
+    // The socket's peer, which today is the phone. See
+    // [`trust::Guesses`] for what has to change here the moment a tunnel puts
+    // a reverse proxy in front of this listener.
+    let who = peer.ip();
+
+    let redeemed = match &offer {
+        Offer::Token(token) => shared.store.redeem_pair(token),
+        Offer::Code(typed) => {
+            if shared.guesses.blocked(who) {
+                return repair(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Some(t!(
+                        "错的次数太多了。等五分钟再试，或者回到电脑上重新扫码。",
+                        "Too many wrong codes. Wait five minutes and try again, \
+                         or go back to the computer and scan instead."
+                    )),
+                );
+            }
+
+            let redeemed = shared.store.redeem_code(typed);
+            if redeemed {
+                shared.guesses.right(who);
+            } else {
+                shared.guesses.wrong(who);
+            }
+            redeemed
+        }
+    };
+
+    if !redeemed {
+        return match offer {
+            Offer::Token(_) => page(
+                StatusCode::FORBIDDEN,
+                t!("这个二维码已经失效", "This code is no longer valid"),
+                t!(
+                    "配对码只有五分钟有效，而且只能用一次。回到电脑上重新打开「手机连接」再扫一次。",
+                    "A pairing code lasts five minutes and can be used once. \
+                     Open Connect a phone on the computer again and scan the new one."
+                ),
             ),
-        );
+            // Back to the same page with the box still on it. A dead end here
+            // would send the user to the computer for a code they are one
+            // typo away from — which is the trip this whole entrance exists to
+            // save them.
+            Offer::Code(_) => repair(
+                StatusCode::UNAUTHORIZED,
+                Some(t!(
+                    "这六个字符不对，或者已经过期了。看一眼电脑上的卡片再输一次。",
+                    "Those six characters are wrong, or they have expired. \
+                     Check the card on the computer and try again."
+                )),
+            ),
+        };
     }
 
     let label = trust::label(header_named(&request, USER_AGENT.as_str()));
@@ -458,29 +521,193 @@ fn refused() -> Response<Body> {
         .expect("a bare 403 is always buildable")
 }
 
-/// What a browser with no session gets: 401, and dsh's own words for it.
+/// The two files that turn the phone's tab into an icon on its home screen, or
+/// `None` for every other path.
 ///
-/// The same status dsh answers an unauthenticated index request with, because
-/// the phone is talking to something that stands in for dsh and should not be
-/// distinguishable from it by status code.
+/// Served here rather than by dsh because they are nothing to do with dsh: the
+/// names are outside its route table, so nothing collides, and the tags that
+/// point at them are put on its index by `plugin/lib/index.js` — which is the
+/// only place they can go, since dsh gzips the index before the gateway sees a
+/// byte of it.
+///
+/// ## Why these two answer without a cookie
+///
+/// Every other path on this listener needs one. These two do not, for two
+/// reasons that point the same way.
+///
+/// The first is that a manifest is fetched with credentials omitted unless the
+/// `<link>` carries `crossorigin="use-credentials"` — so behind the cookie
+/// check, the browser would be handed the 401 page where it expected JSON, and
+/// the failure would be a home-screen icon that silently does not install. The
+/// attribute exists and would work; what it would not do is help the icon,
+/// which the operating system may re-fetch long after a session has aged out,
+/// and a broken icon is a thing the OS caches.
+///
+/// The second is that there is nothing here to protect. An app icon and a name
+/// are not secrets, and anything that can reach this port already learns more
+/// than they carry from the pairing page it gets for asking — see
+/// [`repair`]. The trust fence still applies to both: a cross-site request for
+/// either one is refused before this function is reached.
+fn homescreen(shared: &Shared, path: &str) -> Option<Response<Body>> {
+    match path {
+        "/dsh-mobile-manifest.json" => Some(manifest()),
+        "/dsh-mobile-icon.png" => Some(icon(shared)),
+        _ => None,
+    }
+}
+
+/// The manifest, which is what Android reads. iOS has never read one for this —
+/// the `apple-` meta tags in the plugin are its half.
+///
+/// `start_url` deliberately carries no `pair_token`. A nonce is good for five
+/// minutes and for one use, and writing one into the thing a home-screen icon
+/// opens for the next thirty days would bake in a dead token.
+///
+/// One icon, at 512. Chrome's installability floor is 144, so this clears it,
+/// and every consumer downscales. A second file at 192 would be sharper on a
+/// low-density phone and is the only thing missing here; it is left out because
+/// it would mean carrying an image resampler in the build for one image.
+fn manifest() -> Response<Body> {
+    let json = serde_json::json!({
+        "id": "/",
+        "name": "DeepSeek Harness",
+        "short_name": "DSH",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#ffffff",
+        "theme_color": "#ffffff",
+        "icons": [{
+            "src": "/dsh-mobile-icon.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "any",
+        }],
+    })
+    .to_string();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/manifest+json")
+        .header(http::header::CACHE_CONTROL, "no-cache")
+        .body(
+            Full::new(Bytes::from(json))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("a manifest with a fixed shape is always buildable")
+}
+
+/// The home-screen icon: the app's whale, flattened onto white.
+///
+/// Read off the disk on each request rather than compiled in. It is staged into
+/// the resource directory by `scripts/make-mobile-icon.mjs`, which runs from
+/// `beforeBuildCommand` — and a build that has not run that script yet is a
+/// build `include_bytes!` would refuse to compile at all, which would make a
+/// bare `cargo test` in a fresh clone fail over an icon.
+///
+/// So a missing file is a 404 and nothing worse. The phone loses the icon and
+/// keeps everything else.
+fn icon(shared: &Shared) -> Response<Body> {
+    let bytes = shared
+        .approve
+        .app()
+        .and_then(crate::dsh::resources)
+        .map(|resources| resources.join("mobile-icon.png"))
+        .and_then(|path| std::fs::read(path).ok());
+
+    let Some(bytes) = bytes else {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(empty())
+            .expect("a bare 404 is always buildable");
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "image/png")
+        // A day. The icon changes when the app is updated and not otherwise, and
+        // the alternative — revalidating on every home-screen launch — is a
+        // round trip on the path where the user is waiting for dsh to appear.
+        .header(http::header::CACHE_CONTROL, "public, max-age=86400")
+        .body(
+            Full::new(Bytes::from(bytes))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("a png response with a fixed shape is always buildable")
+}
+
+/// What a browser with no session gets: 401, dsh's own status for it, and the
+/// way back in.
+///
+/// The status is dsh's because the phone is talking to something that stands in
+/// for dsh and should not be distinguishable from it by status code.
 fn unauthenticated() -> Response<Body> {
-    page(
-        StatusCode::UNAUTHORIZED,
+    repair(StatusCode::UNAUTHORIZED, None)
+}
+
+/// The page with the box on it: type the six characters from the card.
+///
+/// This is the one page in the gateway that is a *way out* of a failure rather
+/// than a report of one, so it is worth saying what it is not. It cannot help a
+/// phone whose problem is that this address stopped answering — a moved port,
+/// a new DHCP lease, a tunnel switched underneath it. In that case nothing
+/// here runs at all; the browser shows its own connection-refused page and this
+/// gateway never hears about it. What it is for is the far commoner failure
+/// where the gateway is fine and only the cookie is gone.
+///
+/// A plain `GET` form, with no script anywhere on the page. Submitting it is an
+/// ordinary same-origin navigation to `/?pair_code=…`, which is what keeps an
+/// iOS home-screen window from spilling the user back into Safari — and what
+/// makes this work at all on a gateway serving plain HTTP, where a scanner
+/// could not: `getUserMedia` needs a secure context and a form does not.
+fn repair(status: StatusCode, problem: Option<&str>) -> Response<Body> {
+    let form = format!(
+        "<form method=\"get\" action=\"/\">\
+         <input name=\"pair_code\" maxlength=\"16\" autocomplete=\"off\" autocorrect=\"off\" \
+         autocapitalize=\"characters\" spellcheck=\"false\" aria-label=\"{label}\" \
+         placeholder=\"{placeholder}\">\
+         <button type=\"submit\">{submit}</button>\
+         </form>{problem}",
+        label = escape(t!("配对码", "Pairing code")),
+        placeholder = escape(t!("六个字符", "six characters")),
+        submit = escape(t!("连接", "Connect")),
+        problem = problem
+            .map(|why| format!("<p class=\"bad\">{}</p>", escape(why)))
+            .unwrap_or_default(),
+    );
+
+    shell(
+        status,
         t!("这台设备还没有配对", "This device is not paired"),
-        t!(
-            "回到电脑上打开「手机连接」，扫一下那个二维码。",
-            "Open Connect a phone on the computer and scan the code it shows."
+        &format!(
+            "<p>{}</p>{form}",
+            escape(t!(
+                "电脑上的「手机连接」卡片，二维码旁边有六个字符。输进去就行——不用相机，也不用离开这一页。",
+                "The card on the computer shows six characters beside the QR code. \
+                 Type them in — no camera needed, and no leaving this page."
+            ))
         ),
     )
 }
 
-/// One of this gateway's own pages.
+/// One of this gateway's own pages, from a title and a line of text.
+fn page(status: StatusCode, title: &str, body: &str) -> Response<Body> {
+    shell(status, title, &format!("<p>{}</p>", escape(body)))
+}
+
+/// The shell both of those go in.
 ///
 /// Self-contained and tiny: it is served to a phone that may have no session,
 /// on a gateway that will not proxy anything for it, so there is nowhere to
 /// fetch a stylesheet from. The dark half is a media query rather than dsh's
 /// theme — this page never gets to ask dsh anything.
-fn page(status: StatusCode, title: &str, body: &str) -> Response<Body> {
+///
+/// `body` is markup, not text, and it is the one argument here that is not
+/// escaped on the way in. Every caller builds it out of [`escape`] and literals
+/// in this file; nothing reaches it from a request.
+fn shell(status: StatusCode, title: &str, body: &str) -> Response<Body> {
     let html = format!(
         "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -492,11 +719,20 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response<Body> {
          main{{max-width:22em;text-align:center}}\
          h1{{margin:0 0 .6em;font-size:1.15rem;font-weight:600}}\
          p{{margin:0;opacity:.7}}\
-         @media (prefers-color-scheme:dark){{body{{background:#1c1c1e;color:#f2f2f7}}}}\
-         </style></head><body><main><h1>{title}</h1><p>{body}</p></main></body></html>",
+         form{{display:flex;gap:8px;margin:1.4em 0 0}}\
+         input{{flex:1;min-width:0;padding:.55em .6em;box-sizing:border-box;\
+         font:inherit;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;\
+         letter-spacing:.16em;text-align:center;text-transform:uppercase;\
+         color:inherit;background:transparent;border:1px solid;border-color:currentColor;\
+         border-radius:9px;opacity:.85}}\
+         button{{padding:.55em 1.1em;font:inherit;color:#fff;background:#1c1c1e;\
+         border:0;border-radius:9px;cursor:pointer}}\
+         p.bad{{margin:1em 0 0;font-size:.9rem;opacity:1;color:#c0392b}}\
+         @media (prefers-color-scheme:dark){{body{{background:#1c1c1e;color:#f2f2f7}}\
+         button{{color:#1c1c1e;background:#f2f2f7}}p.bad{{color:#ff7a6b}}}}\
+         </style></head><body><main><h1>{title}</h1>{body}</main></body></html>",
         lang = crate::i18n::tag(),
         title = escape(title),
-        body = escape(body),
     );
 
     Response::builder()

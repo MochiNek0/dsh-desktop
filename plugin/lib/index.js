@@ -1,12 +1,15 @@
 /**
  * dsh desktop signal plugin, node half.
  *
- * Three things, and all three have to be true before dsh's client boots, which
- * is why none of them can live in the browser half: the `<meta name="viewport">`
- * on dsh's index, the page global that tells dsh's connection layer this page
- * owns its host, and — when the desktop says so — a small stylesheet that makes
- * dsh's settings dialog usable on a phone. All three are for the phone that
- * reaches dsh through the desktop's gateway. See `remote` in the Rust half.
+ * Four things, none of which can live in the browser half — the first three
+ * because they have to be true before dsh's client boots, and the fourth
+ * because a browser reads it out of the document it was served: the `<meta
+ * name="viewport">` on dsh's index, the page global that tells dsh's connection
+ * layer this page owns its host, — when the desktop says so — a small
+ * stylesheet that makes dsh's settings dialog usable on a phone, and the head
+ * tags that let the phone keep dsh as an icon on its home screen. All four are
+ * for the phone that reaches dsh through the desktop's gateway. See `remote` in
+ * the Rust half.
  *
  * ## Why they are here and not in Rust
  *
@@ -215,6 +218,7 @@ export function rows() {
 export function apply(ctx) {
   ctx.inject(['webServer'], (web) => {
     web.effect(() => web.webServer.tapIndex(viewport), 'tapIndex(viewport)');
+    web.effect(() => web.webServer.tapIndex(homescreen), 'tapIndex(homescreen)');
     web.on('webserver/index-inject', (table) => table.push(...rows()));
   });
 }
@@ -413,4 +417,68 @@ export function viewport(html) {
   const tag = `<meta name="viewport" content="${CONTENT}">`;
   if (META.test(html)) return html.replace(META, tag);
   return html.replace(/<head(\s[^>]*)?>/i, (head) => head + tag);
+}
+
+/**
+ * What turns the phone's tab into an icon on its home screen.
+ *
+ * ## Why this is worth having at all
+ *
+ * The feature exists for the user who is not at the computer. Getting to it
+ * through a browser means finding the browser, finding the tab or the address,
+ * and reading dsh inside a window with an address bar taking a tenth of the
+ * screen. An icon removes all three. It is also the one piece of this that
+ * cannot be added later without the rest: an installed icon is bound to an
+ * origin, so it only means anything once the gateway's origin survives a
+ * restart — which is what the fixed port and the stored signing key are for.
+ *
+ * ## The tags, and what actually reads each one
+ *
+ * `manifest` is Android's. Chrome reads the name, the icon and `standalone`
+ * from it and offers to install.
+ *
+ * The three `apple-` tags are iOS's, which has never read a manifest for this.
+ * `apple-mobile-web-app-capable` is what makes the home-screen window open
+ * without Safari's chrome, and **it does not need HTTPS** — unlike a Service
+ * Worker, which does, and which is why the offline half of a PWA is not here
+ * and cannot be until a tunnel puts this behind TLS. The icon is a real fetch
+ * of a real file rather than a screenshot of the page, which is what iOS falls
+ * back to without it. `mobile-web-app-capable` is the standard spelling of the
+ * first one; the Apple-prefixed name is deprecated and is still the only one
+ * older iOS reads, so both go out.
+ *
+ * `black-translucent` is chosen over `default` deliberately. It is the one
+ * value that lets dsh's own background run under the status bar, so a dark
+ * theme does not get a white strip stapled to the top of it.
+ *
+ * ## Why the paths are the gateway's and not dsh's
+ *
+ * `/dsh-mobile-manifest.json` and `/dsh-mobile-icon.png` are answered by the
+ * Rust gateway before anything is forwarded — they are outside dsh's route
+ * table, so nothing collides, and dsh is not asked to serve files that are
+ * nothing to do with it.
+ *
+ * ## It goes to the desktop's page too
+ *
+ * Same as the transport row above, and for the same reason: this plugin sees
+ * one index render and cannot tell which side asked for it. A `<link
+ * rel="manifest">` in the desktop's webview is inert — Tauri's window is not a
+ * browser tab and has no home screen to be added to — so the cost of not
+ * distinguishing is nothing, and the alternative is threading a signal through
+ * dsh for no gain.
+ *
+ * Exported so the test can hold it. Pure string in, string out.
+ */
+export function homescreen(html) {
+  const tags =
+    '<link rel="manifest" href="/dsh-mobile-manifest.json">' +
+    '<link rel="apple-touch-icon" href="/dsh-mobile-icon.png">' +
+    '<meta name="mobile-web-app-capable" content="yes">' +
+    '<meta name="apple-mobile-web-app-capable" content="yes">' +
+    '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">';
+
+  // An index with no head is returned untouched: `replace` with no match
+  // changes nothing, which is the right answer for a body this does not
+  // recognise. The same rule the viewport tap follows, for the same reason.
+  return html.replace(/<head(\s[^>]*)?>/i, (head) => head + tags);
 }

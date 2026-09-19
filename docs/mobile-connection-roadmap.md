@@ -1,0 +1,230 @@
+# DSH 手机连接：接下来做什么
+
+> 续 `docs/mobile-connection-spec.md`。核心铁律以那份为准，冲突时以那份为准。
+> 这份只回答一个问题：Phase 1 已经跑起来了，接下来按什么顺序做、每一步做完怎么验。
+
+## 现在卡在哪
+
+Phase 1 能扫码连上，但有三处让人不想日常使用：
+
+1. 扫码太频繁——每次重启桌面 app 都要重扫；
+2. 进入方式笨——要开浏览器输地址，或者掏相机、微信扫一下；
+3. 出了局域网就连不上。
+
+**1 和 2 是同一个因**：配对活不过一次重启，于是扫码从一次性动作变成了日常动作，而"日常"才让扫码本身的不顺手暴露出来。修掉 1，2 的大半会跟着消失。3 是另一件事，排在后面。
+
+## 路线
+
+| | 内容 | 依赖 |
+| :--- | :--- | :--- |
+| **M1** | 配对活过重启 + 重新配对入口 + 主屏幕图标 | 无，现在就能做 |
+| **M2** | 通道抽象 + 三个横切问题 + Tailscale | M1 |
+| **M3** | Cloudflare Named Tunnel + 公网守卫 | M2 |
+| 之后 | 自托管中继（第四个 `RemoteTunnel` 实现） | M2 |
+
+---
+
+# M1：让配对活过重启
+
+## 为什么排第一
+
+三处代码让配对活不过重启：
+
+| 位置 | 现状 | 后果 |
+| :--- | :--- | :--- |
+| `remote/mod.rs` `start()` | `bind` 到端口 `0` | 每次启动新端口，**origin 变了** |
+| `remote/session.rs` `secret()` | 密钥 "minted at startup and never written anywhere" | 此前签的每个 mac 都验不过 |
+| `session.rs` `Inner::devices` | 纯内存 | 重启即清空 |
+
+端口这条最要命，**而且和 cookie 无关**：PWA 的 origin 是 `scheme://host:port`，端口变了就是另一个 origin。主屏幕图标点下去是浏览器自己的「连接被拒」页——不是 401，我们一行代码都跑不到，用户拿不到任何「该去重新扫码」的线索。
+
+顺带澄清一个常见误解：**dsh 重启手机是无感的**，网关会自动重新 exchange launch token，有测试守着（`remote::tests::a_dsh_that_restarted_is_reauthenticated_without_the_phone_noticing`）。要重扫的是**桌面 app** 重启。
+
+## 做四件事
+
+### 1. 固定网关端口
+
+首次 `bind(0)` 拿到端口后写进 `desktop.json`，之后优先复用，被占用才回落到 `0`。
+
+- `mod.rs` 那句「Port `0`，所以 OS 来挑」讲的是 **dsh 不需要提前知道端口**（方案 A 对方案 B 的优势），与端口是否跨重启稳定无关。固定端口不影响方案 A。
+- 防火墙不受影响：`firewall.rs` 的规则**按程序**匹配，不按端口。
+
+**verify**：重启桌面 app 三次，卡片上端口不变；先用别的进程占住该端口再启动，网关仍能起来且卡片显示新端口。
+
+### 2. 签名密钥与设备列表落盘
+
+密钥进 `app_dir` 下单独一个 `gateway.key`（unix 上 0600，Windows 上继承用户目录 ACL），设备列表进 `desktop.json`（沿用 `settings.rs` 的容错读取——损坏或缺失一律当空）。
+
+**没有用 `keyring`**，虽然这份文档第一版是这么写的。理由是它在主力平台上并不更强：Windows Credential Manager 对同用户的任何进程都开放，没有按程序的 ACL，和一个用户目录下的文件是同一个保证；而 Linux 要开 secret-service feature，为一个 32 字节的值拖进整棵 zbus，与铁律 #6 正面冲突。macOS Keychain 确实更强（有按程序 ACL，前提是 app 正确签名），但不足以支撑另外两个平台的代价。
+
+两者都要分清：**能读到这个文件的进程 = 以该用户身份运行的进程**，而这样的进程本来就能读 dsh 的 launch token、直接驱动本机的 dsh 会话。密钥是它的一条更慢的路，不是它的第一把钥匙。
+
+这才对得起 `SESSION_TTL`。那里写着 30 天，注释说 "a session that has to be re-paired every launch is one nobody would turn on"，**而当前实现恰恰就是每次启动都要重配**。
+
+保留 `revoke_all` 的语义（它同时清列表并轮换密钥），并在设置里给一个「退出时清除所有配对」的开关。
+
+**verify**：配对一台手机 → 退出 app → 重启 → 手机刷新，不需要重新扫码。
+**verify**：点「断开全部」后重启，该手机需要重新扫码。
+**verify**：`SESSION_TTL` 过期后仍要求重新配对。
+**verify**：打开「退出时清除所有配对」后，第一条 verify 的结果反过来。
+
+### 3. 6 位短码 + 重新配对页
+
+落点是现成的 `proxy.rs::unauthenticated()`——那个页面现在只有一句「回到电脑上扫二维码」，给它加一个输入框。
+
+桌面卡片在二维码旁边多显示一个 6 位短码，网关内部映射到同一个 16 字节 nonce，共享同一个 `PAIR_TTL` 与一次性语义；输进去之后桌面照常弹原生确认框。
+
+- 字母表用去掉易混字符（`I` `L` `O` `U`）的 base32，6 位约 10.7 亿组合。
+- 不让用户直接输 `pair_token`：16 字节 base64 是 22 个字符，没人会去输。
+- 安全性够：5 分钟 TTL + 一次性 + 限流 + **桌面人工确认这道真正的闸门**。`pair_token` 本来的职责就只是「别让网络上随便谁都能按门铃」，不是身份凭证。
+
+这个方案的价值全在「它什么都不需要」：不碰摄像头，所以不受 secure context 限制，**明文 HTTP 的 LAN 下能用**；而且是**同源导航**，iOS 上不会跳出独立窗口、不会多出第二个图标。
+
+它覆盖的是「服务端活着、只是没凭证」这一类失败——密钥轮换、TTL 到期、点过「断开全部」、iOS 独立窗口的 cookie 隔离。**地址变了那一类它治不了**，见文末「躲不掉的坑」。
+
+**verify**：点「断开全部」→ 手机不碰电脑、不用相机，只把六个字符输进它已经打开的页面，桌面弹框，允许后回到 dsh。
+**verify**：iOS 上从主屏幕图标进来走完全程，始终在独立窗口内，没跳出 Safari，没多出第二个图标。
+**verify**：短码过期不可兑换；兑换过一次不可再兑换；连续输错触发限流。
+
+### 4. 主屏幕图标（前三件做完才做）
+
+`/dsh-mobile-manifest.json` 与图标由网关直接提供（这些路径在 dsh 的路由表之外，不会撞）；`plugin/lib/index.js` 扩展现有的 `webserver/index-inject`，注入 `<link rel="manifest">`、`apple-touch-icon` 与 `apple-mobile-web-app-capable`（已 deprecated 但老 iOS 只认它，和 `mobile-web-app-capable` 一起发）。`start_url` 不带 `pair_token`。
+
+**LAN 明文 HTTP 下这一步仍然成立，但只成立一半**：iOS 的独立窗口不要求 HTTPS，图标能用、能全屏；Service Worker 要求 secure context，所以没有离线壳。Android 上是普通快捷方式（不是 WebAPK），在浏览器里开，但同样免去了输地址。
+
+**图标不能直接用 `src-tauri/icons/icon.png`**：它是透明底的，而 **iOS 会把 `apple-touch-icon` 的透明合成到黑色**。那只虎鲸是近黑色的，直接用等于在主屏幕上放一个黑方块。要在构建时压到白底再发（`scripts/make-mobile-icon.mjs`），生成物不进 git——和安装器位图同一条规矩。
+
+**门槛是 origin 必须跨重启不变，host 和 port 都算**——所以第 1、2 件事没做完之前一律不注入。装一个第二天就打不开的图标，比没有图标糟得多。
+
+卡片上同时显示可复制的地址文本与短码，让「手机上直接敲地址 + 输六个字符」成为一条不需要相机的完整路径。引导用**系统相机**扫码，不要用微信——微信扫出来是在它自带的 webview 里开。
+
+**verify**：装好图标 → 重启桌面 app → 点图标能打开（这一条同时验了第 1 件事）。
+
+## 这一步改变了安全模型
+
+从「关掉应用等于全部作废」变成「30 天内一直有效，密钥落盘，能读到那份凭据的人就能伪造 cookie」。落地时必须同步改 `session.rs` 的模块文档——那里现在写的是密钥 "never written anywhere"。
+
+---
+
+# M2：通道抽象 + Tailscale
+
+## 通道抽象改多少
+
+`Shared.tunnel` 从 `Mutex<LanTunnel>` 改成 `Mutex<Box<dyn RemoteTunnel>>` 加一个 `switch()`，trait 补三件东西：
+
+- `state() -> TunnelState`（`Stopped / Starting / Running { base_url } / Failed`）——`start()` 改成 async 且立即返回，cloudflared 从启动到吐出域名要几秒，卡片靠轮询 `state()` 而不是靠 `start()` 阻塞；
+- `scheme()`——cookie `Secure` 标记的唯一判据；
+- `client_ip(&HeaderMap)`——手机的真实地址。
+
+**不要注册表、不要多通道并发**：任何时刻只有一个活跃通道。`base_url` 是唯一权威，`authorities` 与配对 URL 都从它派生。
+
+顺带：`trust.rs` 每个请求都调 `authorities()`，而它每次都跑一遍 `if_addrs::get_if_addrs()`。加个短 TTL 缓存，但要保留「笔记本换网后不重启也能更新」的语义。
+
+## 三个横切问题（写任何新通道之前先落地）
+
+**1. 手机的真实 IP。** 经 cloudflared（以及 `tailscale serve`，它同样是反向代理）转发后，网关的 socket peer address 恒为 `127.0.0.1`。两处依赖它，都要改走 `client_ip()`：
+
+- 限流器——按回环地址限流，等于把全世界当一个 IP，攻击者的失败握手会把合法手机连坐拉黑，防御变成 DoS 自己的开关；
+- 桌面授权弹窗——规格里那句「客户端信息：iPhone (IP: 192.168.x.x)」在隧道下会显示 `127.0.0.1`，人工确认这道防线被抽空。
+
+此处信任 header 之所以安全，不是因为 header 可信，而是因为连接只可能来自本机那个我们自己拉起的子进程。**`client_ip()` 挂在 trait 上就是为了让这个前提跟着通道走**——LAN 通道必须返回 `None` 并忽略这些头，否则手机可以伪造自己的 IP 绕过限流。
+
+**2. `Secure` 的唯一来源是 `scheme()`。** 网关看到的永远是反代发来的明文 HTTP，不存在「网关检测到 HTTPS 握手」这回事。明确禁止读 `X-Forwarded-Proto`——那是客户端可控的。
+
+**3. 切通道会让所有已配对设备失效。** 原因**不是**我们的 cookie 绑了地址（`session.rs` 签的只有 id 和签发时间，且特意说明了为什么不放地址），而是**浏览器的 cookie 按 host 作用域**——换了通道 host 就变了，手机根本不会把旧 cookie 带上来。带 `Secure` 签发的 cookie 在 HTTP 回退时同样不会回发。
+
+产品行为：切换前提示「当前 N 台已连接设备需要重新扫码」，用户确认后再切，切完卡片回到「等待扫码」。手机侧看到的必须是 M1 那个重新配对页，不是裸 401。
+
+（另一条路是让 session 绑设备指纹而非 host，更好用，但要重新审 DNS rebinding 的防御是否还成立——不建议在这一轮做。）
+
+## Tailscale 只做一件事
+
+匹配 `100.64.0.0/10`（`100.64.0.0` ~ `100.127.255.255`），交叉验证接口名（Windows 友好名含 `Tailscale`，macOS `utun*`，Linux `tailscale0`）避免误认运营商 CGNAT 地址，`base_url` = `http://100.x.y.z:<port>`，`scheme()` = `Http`。纯本地判定，零外部依赖。
+
+**MagicDNS 与 Serve HTTPS 不做**，它们给的是好看的域名和 PWA 的 secure context，不是可达性，而成本不低：Windows 上 `tailscale.exe` 默认不在 PATH，LocalAPI 是带认证的本地 HTTP 服务（token 要从注册表取），`tailscale cert` 还需要 tailnet 管理员在控制台开启 HTTPS Certificates。
+
+Serve 与 Funnel 不是一回事：**Serve 是 tailnet 内 HTTPS，Funnel 是暴露到公网**。Serve 将来若做，会引入和上面第 1 条完全相同的源 IP 问题；**Funnel 默认不做**，要做就得走 M3 那套公网守卫。
+
+未检测到活跃 Tailscale 网卡时，卡片显示引导文案，**并且不生成二维码**——发一个连不上的二维码比不发更糟。
+
+**verify**：手机关 Wi-Fi 走蜂窝、加入同一 tailnet，扫码后能进 dsh 并能回答权限审批。
+**verify**：退出 Tailscale 客户端后，卡片显示降级文案且不画二维码。
+**verify**：构造一个伪 `CF-Connecting-IP` 的单元测试，LAN 通道必须忽略它。
+**verify**：Secure Context 下 `dsh_mobile_session` 带 `Secure`，非 Secure Context 下不带。
+**verify**：手动切换通道后，已配对手机刷新看到的是重新配对页，不是 401。
+
+---
+
+# M3：Cloudflare Named Tunnel + 公网守卫
+
+## 只推 Named，Quick 标注为试用
+
+Quick Tunnel（`--url`）域名每次重启都变，**已配对设备与主屏幕图标全部失效**——等于把 M1 的成果抵消掉。加上 `*.trycloudflare.com` 在国内连通性不可靠、Cloudflare 官方声明其不适合生产（无 SLA、无固定域名），它只能是「快速试一下」。
+
+Named Tunnel（`--token` + 自有域名）域名稳定，PWA 成立，已配对设备跨重启存活。**Quick Tunnel 模式下不注入 manifest。**
+
+这也意味着：计划不应假装 Cloudflare 能覆盖「普通用户」。国内的广域网主线是 Tailscale 和自托管中继，Cloudflare 是给有自有域名的用户的选项。
+
+## cloudflared 二进制
+
+**不打包**（约 50MB，与铁律 #6 的「目标增量 < 500KB」直接冲突）。这一轮**只做探测 + 安装指引**（检测 PATH 与 app local data 目录，找不到就展示各平台安装命令），**不做应用内自动下载**。
+
+自动下载单独评估：它是「从网上下一个 exe 然后执行它」，没有校验和或签名验证就是供应链缺口；macOS 下载的二进制带 quarantine 属性，直接 exec 会被 Gatekeeper 拦；国内 GitHub Release 可能根本下不动。工作量和风险都比通道本身大。
+
+## 子进程生命周期
+
+`tokio::process::Command` 拉起，实时读 stderr 捕获域名；应用退出、通道切换、用户主动停止时显式 kill 并 await 退出；**Windows Job Object**（及各平台对应机制）保证桌面端崩溃时不残留孤儿进程。
+
+**`cloudflared` 自己的日志不能原样写进应用日志**——它会打印隧道 token 和连接元数据。
+
+Named Tunnel Token **不进 `desktop.json`**，和 M1 的签名密钥同一套办法（`app_dir` 下单独的文件，0600）。它是能操作用户 Cloudflare 账号下该隧道的 bearer 凭证——注意这一条和签名密钥的威胁模型**不同**：签名密钥只开这台机器的门，而这个 token 开的是用户 Cloudflare 账号下的门，所以「反正同用户进程本来就能……」那套推理在这里不成立。如果哪天要上 `keyring`，是为它上，不是为签名密钥。
+
+## 公网守卫（与通道同批交付，不允许先发通道后补开关）
+
+LAN 模式忘了关，风险限于同一个 Wi-Fi。公网隧道忘了关一整晚是另一个量级的事——而 DSH 会话拥有本机完整的终端执行权。
+
+1. **空闲自动停机**：无已连接设备且超过 N 分钟（默认 30）无请求，自动停并在卡片上说明原因；
+2. **常驻可见性**：隧道运行期间托盘图标或主窗口有明确的「本机当前可从公网访问」指示，点击直达关停——不是藏在弹窗里的一行状态文字；
+3. **退出确认**：应用退出时若隧道仍在运行，显式提示而不是静默关掉。
+
+## 必须写进文档的一条事实
+
+**隧道开启期间，信任栅栏的强度是下降的。** `addresses()` 只收在网的物理网卡地址，正是为了保证「`Host: 127.0.0.1` 的请求一定不是手机发的」。隧道一开，authorities 里多了一个公网主机名，而本机任何进程都可以构造一个带该 Host 的请求打到网关——socket 层区分不出它和 cloudflared。剩下的防线只有 cookie 和一次性 nonce。
+
+这不是 showstopper（纵深防御本来就是这么用的），但别让后来的人以为栅栏还兜着底。
+
+**verify**：kill 桌面进程后 `cloudflared` 不残留。
+**verify**：从两个不同公网 IP 打失败握手，只有超限的那个被拉黑；隧道重启后黑名单清空。
+**verify**：无设备连接 30 分钟后隧道自动停止且卡片说明原因。
+**verify**：`desktop.json` 里 grep 不到 token。
+
+---
+
+# 之后：中继
+
+**自托管中继**——Rust 单二进制（Axum + Tokio + yamux），一条出站 WebSocket 长连接 + 流多路复用，**不做 E2EE，只靠 TLS**，用户自己丢到 VPS 上，桌面端填个地址就能用。它就是第四个 `RemoteTunnel` 实现，与 M2 的抽象天然契合，工作量约官方托管的 1/5，没有运营成本、滥用责任与合规负担，而且将来做官方托管可以原样复用。
+
+**官方托管中继在三个问题回答之前不排期**：
+
+1. **纯浏览器做不出「零知识」。** 手机端做加密的那段 JS 正是中继自己下发的，中继想看明文只需对特定 session 下发一份改过的脚本。这是信任引导问题，无解——除非装原生壳（与铁律 #3 冲突）或浏览器扩展。要做可以，但承诺必须降级为「防御被动监听与中继侧存储泄露」，**不能写「零知识」「硬件级」**。（另外 X25519 在 SubtleCrypto 里普及很晚，Safari 17+ / Chrome 133+，要准备 ECDH P-256 回退。）
+2. **滥用与合规。** DSH 会话等于目标机器上的一个 shell。运营一个把它暴露到公网的服务，挖矿、跳板、勒索的责任，以及国内备案与网络安全法下的日志留存义务，全部落在我们身上。「完全匿名 + 无日志」和这件事不相容。
+3. **谁付账单。**
+
+---
+
+# 躲不掉的坑
+
+| 坑 | 说明 |
+| :--- | :--- |
+| **iOS 独立窗口有自己的 cookie jar** | 在 Safari 里配对成功 → 添加到主屏幕 → 从图标打开，是一个全新的未认证会话。所以 M1 的重新配对页不是锦上添花，是**首次安装流程的必经一步** |
+| **地址变了，我们一行代码都跑不到** | 端口变、DHCP 换 IP、切通道——图标指向死 origin，用户看到的是浏览器的「连接被拒」。唯一的解是 Service Worker 缓存离线壳，而它要求 secure context，**LAN 明文 HTTP 下这条路是堵死的** |
+| **跨 origin 的扫码解决不了图标** | 就算扫到了新地址，导航过去等于离开 PWA 的 scope，iOS 上会跳出 Safari，用户最后有两个图标。UI 上要说实话：扫码解决的是「我能连上」，不是「我的图标还能用」 |
+| **扫任意 QR 然后导航过去 = 开放重定向** | 若将来做页内扫码，必须校验形状（`http(s)://<host>[:<port>]/?pair_token=<32 hex>`）并**在跳转前把目标 host 显示给用户确认**，否则这是个很好用的钓鱼跳板 |
+
+# 明确不做
+
+- **Phase 2 不解决 LAN 明文 HTTP 的嗅探风险。** LAN 通道在可预见的将来都是明文 HTTP，`Secure` 只对 HTTPS 通道有意义。诚实的表述是：LAN 模式接受此风险，需要传输加密的用户改用 Tailscale 或 Cloudflare 通道。
+- **mDNS**（广播 `dsh-desktop.local`，host 与 IP 脱钩）。它是「DHCP 换 IP 导致 origin 变」的唯一治本解，iOS/macOS 原生支持、Android 参差。列为 M1 之后的可选项，不进这一轮。
+- **实时摄像头扫码**（`getUserMedia` 要 secure context）。想在页内扫码，回退方案是 `<input type="file" accept="image/*" capture="environment">` 加纯 JS 解码——普通表单控件，不受 secure context 限制。
+- **内网优先直连 + 自动故障转移。** `https://` 页面 fetch `http://192.168.x.x` 会被当作 active mixed content 直接阻断，连超时都等不到。可行的替代是顶层导航（丢页面状态）或干脆让用户手动选「我在家 / 我在外面」——难看但诚实。
+- **靠 Service Worker 保活。** 它是事件驱动的，空闲约 30 秒被终止，锁屏更快。断线恢复只能是：resume 凭证存 IndexedDB，回到前台被唤醒后重放握手，**桌面端为断连 session 保留一个有 TTL 的重连窗口**。

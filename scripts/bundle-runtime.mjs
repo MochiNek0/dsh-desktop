@@ -83,6 +83,12 @@ for (const file of ['package.json', 'cordis.patch.yml', 'LICENSE']) {
 }
 console.log('[bundle] staged plugin/');
 
+// The home-screen icon, flattened out of the app icon. Every platform, unlike
+// the installer art below: what reads it is the phone gateway, which runs
+// wherever this app does. See `make-mobile-icon.mjs` for why the transparent
+// original will not do.
+await import('./make-mobile-icon.mjs');
+
 // The installer's two bitmaps, drawn from the app icon. They go into
 // `src-tauri/installer/` rather than here, because everything in `resources/`
 // is copied into the installation directory and these are only read while the

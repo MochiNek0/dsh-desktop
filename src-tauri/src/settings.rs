@@ -158,6 +158,109 @@ pub fn set_registry(app: &AppHandle, source: RegistrySource) {
     write(app, REGISTRY_KEY, Value::String(source.as_str().to_string()));
 }
 
+/// The port the phone gateway bound last time, so that it can ask for the same
+/// one again.
+///
+/// The gateway binds port `0` and lets the operating system pick — nothing else
+/// needs to know the number in advance, which is the whole advantage of the
+/// forwarding method [`crate::remote`] uses. But "nobody needs to know it in
+/// advance" is not the same as "it may change", and the phone at the other end
+/// is the thing that does not get a say: a browser's notion of a site is
+/// `scheme://host:port`, so a new port every launch is a new site every launch.
+/// A cookie issued to the old one is not sent to the new one, and an icon
+/// added to a home screen points at a port nothing is listening on — which
+/// fails as the browser's own connection-refused page, before a single line of
+/// ours runs, so there is nowhere to put "scan the code again".
+///
+/// Hence: remembered, asked for, and not insisted on. Something else holding
+/// the port is not an error — the gateway falls back to `0` and writes down
+/// whatever it got, which is the same state a first launch is in.
+///
+/// The firewall rule is not affected either way: [`crate::remote::firewall`]
+/// matches on the program, not the port.
+const GATEWAY_PORT_KEY: &str = "remoteGatewayPort";
+
+/// The remembered port, or `None` on the first launch — and on any file that
+/// holds something that is not a port.
+///
+/// `0` reads as `None` rather than as itself. It is the spelling of "you pick",
+/// so a file containing it is a file asking for exactly what `None` already
+/// means, and treating it as a port to request would be asking the OS to pick
+/// and then recording that it was asked.
+pub fn gateway_port(app: &AppHandle) -> Option<u16> {
+    read(app)
+        .get(GATEWAY_PORT_KEY)
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+}
+
+/// Remember the port the gateway is actually on.
+///
+/// Called with what the listener reports rather than with what was asked for,
+/// so the fallback path records the port it fell back to.
+pub fn set_gateway_port(app: &AppHandle, port: u16) {
+    write(app, GATEWAY_PORT_KEY, Value::from(port));
+}
+
+/// The phones the gateway has let in, and the counter their ids come from.
+///
+/// State, not a preference — the only thing in this file that is, so it is
+/// worth saying why it is here rather than in a file of its own. It is small,
+/// it is this app's alone, it has to survive exactly as long as the other keys
+/// here do, and it wants the same forgiveness: a device list that fails to
+/// parse should cost the user a re-scan, not a launch. A second file with a
+/// second reader, a second corruption story and a second thing to clean up on
+/// uninstall would buy nothing for that.
+///
+/// The shape is [`crate::remote::session`]'s, and stays there — this file
+/// stores the value without reading into it, the way it stores the others.
+/// What does *not* go in here is the key those devices' cookies are signed
+/// with: see that module for where that lives and why it is not this file.
+const PAIRING_KEY: &str = "remotePairing";
+
+/// What was written last time, whatever shape it is in.
+///
+/// Handed back unread. A document this build cannot make sense of is the
+/// caller's problem to shrug at, and [`crate::remote::session`] does.
+pub fn pairing(app: &AppHandle) -> Option<Value> {
+    read(app).get(PAIRING_KEY).cloned()
+}
+
+/// Write the device list back. Called on every change to it — a device let in,
+/// one kicked, all of them kicked.
+pub fn set_pairing(app: &AppHandle, state: Value) {
+    write(app, PAIRING_KEY, state);
+}
+
+/// Whether closing the app should throw every paired phone off.
+///
+/// Off by default, because the feature exists so that the phone in a pocket
+/// still works tomorrow morning, and a pairing that ends when the window closes
+/// is one that has to be redone before every single use.
+///
+/// It is here for the user who reads [`crate::remote::session`]'s module docs
+/// and does not like what they say: with the switch off there is a key on this
+/// disk that signs cookies into a shell, and the honest answer to someone who
+/// would rather that key not outlive the session is a switch, not an argument.
+const FORGET_ON_EXIT_KEY: &str = "remoteForgetPairingsOnExit";
+
+const FORGET_ON_EXIT_DEFAULT: bool = false;
+
+/// Read the switch. Any problem reading it is the default.
+pub fn forget_pairings_on_exit(app: &AppHandle) -> bool {
+    read(app)
+        .get(FORGET_ON_EXIT_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(FORGET_ON_EXIT_DEFAULT)
+}
+
+/// Set it to what the box on the card now shows — the state, not a flip. See
+/// [`crate::controls::Action::RemoteForget`].
+pub fn set_forget_pairings_on_exit(app: &AppHandle, on: bool) {
+    write(app, FORGET_ON_EXIT_KEY, Value::Bool(on));
+}
+
 /// The whole document, or an empty one. Never `Err`: see the module docs.
 fn read(app: &AppHandle) -> Map<String, Value> {
     let Some(path) = file(app) else {
@@ -262,6 +365,37 @@ mod tests {
     #[test]
     fn defaults_to_notifying() {
         const { assert!(super::NOTIFY_DEFAULT) };
+    }
+
+    /// The read half of [`super::gateway_port`], mirrored the same way and with
+    /// the same warning as `parse` above.
+    fn port(text: &str) -> Option<u16> {
+        parse(text)
+            .get(super::GATEWAY_PORT_KEY)
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+    }
+
+    #[test]
+    fn reads_the_remembered_port() {
+        assert_eq!(port(r#"{"remoteGatewayPort": 59123}"#), Some(59123));
+    }
+
+    /// Nothing recorded, or something recorded that is not a port a listener
+    /// could be asked for. All one answer: let the operating system pick, which
+    /// is what a first launch does anyway.
+    #[test]
+    fn anything_that_is_not_a_port_means_let_the_os_pick() {
+        assert_eq!(port("{}"), None);
+        assert_eq!(port("{"), None);
+        assert_eq!(port(r#"{"remoteGatewayPort": "59123"}"#), None);
+        assert_eq!(port(r#"{"remoteGatewayPort": -1}"#), None);
+        // Past what a port number can be — a file written by something else,
+        // or by hand.
+        assert_eq!(port(r#"{"remoteGatewayPort": 70000}"#), None);
+        // The spelling of "you pick", which is already what `None` says.
+        assert_eq!(port(r#"{"remoteGatewayPort": 0}"#), None);
     }
 
     /// A key this build does not know about survives a write of one that it
