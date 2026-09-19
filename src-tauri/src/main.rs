@@ -186,17 +186,30 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("failed to build the dsh desktop app");
 
-    app.run(move |handle, event| {
-        if let tauri::RunEvent::Exit = event {
+    app.run(move |handle, event| match event {
+        // Asked to quit while this machine is answering the internet. The
+        // tunnel would come down here anyway — that is what `Exit` below does —
+        // but coming down silently is what makes it the same experience as
+        // having remembered to switch it off, which is how a user learns that
+        // leaving it on costs nothing. See `remote::confirm_exit`.
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            if remote::confirm_exit(handle) {
+                api.prevent_exit();
+            }
+        }
+        tauri::RunEvent::Exit => {
             dsh::stop();
             plugins::stop();
             // Before the server, because what this takes down is a socket bound
-            // to every interface on the machine; see `remote::shutdown`.
+            // to every interface on the machine — and, on a public channel, a
+            // `cloudflared` holding a connection to Cloudflare's edge. See
+            // `remote::shutdown`.
             remote::shutdown(handle);
             if let Some(child) = server.lock().unwrap().as_mut() {
                 child.stop();
             }
         }
+        _ => {}
     });
 }
 
@@ -418,7 +431,65 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     )?;
     let quit = MenuItem::with_id(app, "quit", t!("退出 dsh", "Quit dsh"), true, None::<&str>)?;
 
-    Menu::with_items(app, &[&show, &quit])
+    // The standing indication the specification asks for, and the third and
+    // fourth items this menu has ever had. They are here rather than only on
+    // the card because the card is a thing you have to go and open: a tunnel
+    // that is still up at midnight is exactly the tunnel nobody is looking at
+    // a card about.
+    //
+    // Two rows, not one: the hostname is what makes the warning concrete, and
+    // a row that says what is happening and a row that ends it are different
+    // clicks. The first is disabled — it is a label, and a label you can press
+    // is a button that does nothing.
+    let Some(host) = remote::exposed(app) else {
+        return Menu::with_items(app, &[&show, &quit]);
+    };
+
+    let warning = MenuItem::with_id(
+        app,
+        "public-host",
+        t!("⚠ 公网可访问：{}", "⚠ On the internet at {}", host),
+        false,
+        None::<&str>,
+    )?;
+    let close = MenuItem::with_id(
+        app,
+        "public-off",
+        t!("关闭公网通道", "Switch the public tunnel off"),
+        true,
+        None::<&str>,
+    )?;
+
+    Menu::with_items(app, &[&warning, &close, &show, &quit])
+}
+
+/// Draw the tray again, because what it says may have changed.
+///
+/// Called from [`remote`] whenever a tunnel arrives somewhere or leaves it. A
+/// menu cannot be relabelled in place — see [`tray_menu`] — so this is the same
+/// rebuild [`switch_language`] does, for the same reason.
+pub(crate) fn refresh_tray(app: &tauri::AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY) else {
+        return;
+    };
+
+    match tray_menu(app) {
+        Ok(menu) => {
+            let _ = tray.set_menu(Some(menu));
+        }
+        Err(error) => eprintln!("dsh-desktop: could not redraw the tray menu: {error}"),
+    }
+
+    // The tooltip is the half that shows without a click, which on Windows is
+    // the half a user actually meets.
+    let _ = tray.set_tooltip(Some(match remote::exposed(app) {
+        Some(host) => t!(
+            "dsh desktop — 公网可访问：{}",
+            "dsh desktop — on the internet at {}",
+            host
+        ),
+        None => "dsh desktop".to_string(),
+    }));
 }
 
 /// Follow dsh into the language it has just been switched to.
@@ -489,6 +560,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             "show" => reveal(app),
             // Exits the run loop, which stops the dsh server on the way out.
             "quit" => app.exit(0),
+            "public-off" => remote::stop_public(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

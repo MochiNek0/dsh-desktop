@@ -97,8 +97,11 @@ impl Harness {
         let at = listener.local_addr().expect("a bound listener");
 
         let mut tunnel = LanTunnel::default();
-        let base = tunnel.start(at.port()).expect("an address to publish");
-        let authority = base
+        tunnel.start(at.port()).expect("an address to publish");
+        let authority = tunnel
+            .state()
+            .base_url()
+            .expect("a started lan tunnel is running")
             .strip_prefix("http://")
             .expect("the lan tunnel publishes http")
             .to_string();
@@ -119,6 +122,8 @@ impl Harness {
             guesses: super::trust::Guesses::default(),
             exchange: tokio::sync::Mutex::new(()),
             seen: AtomicU64::new(0),
+            live: AtomicU64::new(0),
+            last: Mutex::new(std::time::Instant::now()),
         });
 
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -724,6 +729,189 @@ fn the_manifest_is_served_to_a_phone_that_has_no_session() {
         parsed["icons"][0]["src"], "/dsh-mobile-icon.png",
         "the path the plugin's apple-touch-icon link also names"
     );
+}
+
+/// The offline shell and the worker that serves it, which together are the
+/// answer to a home-screen icon opened while this computer is off.
+///
+/// Both answer without a cookie, like the manifest and for the same reason: a
+/// worker registered by a phone whose session has aged out is the one that
+/// still has to work, and there is nothing in either file to protect.
+#[test]
+fn the_offline_shell_is_served_without_a_session() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let worker = harness.get("/dsh-mobile-sw.js", &[]);
+    assert_eq!(worker.status, 200, "not the 401 every other path gets");
+    assert_eq!(
+        worker.header("content-type"),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert!(
+        worker.body.contains("/dsh-mobile-offline"),
+        "the worker caches the shell it will serve: {}",
+        worker.body
+    );
+    assert!(
+        worker.body.contains("'navigate'"),
+        "and answers nothing else: {}",
+        worker.body
+    );
+
+    // 200 specifically: `cache.add` refuses anything that is not ok, so an
+    // error status here would leave the worker installed with an empty cache
+    // and the white screen exactly where it was.
+    let shell = harness.get("/dsh-mobile-offline", &[]);
+    assert_eq!(shell.status, 200);
+    assert!(shell.body.contains("<html"), "{}", shell.body);
+}
+
+/// A `trycloudflare.com` hostname lasts until the process stops, so nothing on
+/// it is worth installing: an icon added today points at a name that will not
+/// resolve tomorrow, and the failure is the browser's own page, before a line
+/// of this app runs.
+///
+/// This is the specification's "no manifest under a quick tunnel", and it lands
+/// in the gateway rather than in the plugin that injects the `<link>`, because
+/// the gateway is the only party that knows which channel is up.
+#[test]
+fn a_quick_tunnel_serves_nothing_worth_installing() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let host = "abc-def.trycloudflare.com";
+    *harness.shared.tunnel.lock().unwrap() = Box::new(
+        super::cloudflare::CloudflareTunnel::pretending(super::TunnelType::CloudflareQuick, host),
+    );
+    harness.shared.forget_authorities();
+
+    for path in [
+        "/dsh-mobile-manifest.json",
+        "/dsh-mobile-icon.png",
+        "/dsh-mobile-sw.js",
+        "/dsh-mobile-offline",
+    ] {
+        let answer = harness.get(path, &[("Host", host)]);
+        assert_eq!(
+            answer.status, 404,
+            "{path} is not offered on a quick tunnel"
+        );
+    }
+}
+
+/// The named tunnel, by contrast, is exactly the address those files exist for:
+/// a hostname that outlives the process, on HTTPS — which is what finally makes
+/// a Service Worker registrable at all.
+///
+/// Incidentally the one test of the whole path with a tunnel-shaped authority
+/// under it: no port on the `Host`, and a fence that has to accept it anyway.
+#[test]
+fn a_named_tunnel_publishes_the_home_screen_files() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let host = "dsh.example.com";
+    *harness.shared.tunnel.lock().unwrap() = Box::new(
+        super::cloudflare::CloudflareTunnel::pretending(super::TunnelType::Cloudflare, host),
+    );
+    harness.shared.forget_authorities();
+
+    assert_eq!(
+        harness.get("/dsh-mobile-sw.js", &[("Host", host)]).status,
+        200
+    );
+    assert_eq!(
+        harness
+            .get("/dsh-mobile-manifest.json", &[("Host", host)])
+            .status,
+        200
+    );
+
+    // And the hostname is the whole of the authority: a `Host` that still
+    // carries the gateway's own port is not one the tunnel published.
+    let wrong = harness.get("/dsh-mobile-manifest.json", &[("Host", &harness.authority)]);
+    assert_eq!(wrong.status, 403, "the LAN authority is not this tunnel's");
+}
+
+/// `Secure` on the device cookie, and the one thing allowed to decide it.
+///
+/// Over a tunnel that terminates TLS the attribute has to be there — a browser
+/// on an `https://` origin is fine with it, and it is what keeps the cookie off
+/// a plaintext downgrade. On the two direct channels it has to be absent, or
+/// the phone would be handed a cookie it will never send back. Neither answer
+/// comes from a header; see `tunnel::Scheme`.
+#[test]
+fn the_cookie_is_secure_exactly_when_the_channel_is() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let plain = harness.get(&format!("/?pair_token={}", harness.nonce()), &[]);
+    assert_eq!(plain.status, 303);
+    let header = plain
+        .header("set-cookie")
+        .expect("a device cookie")
+        .to_string();
+    assert!(
+        !header.contains("Secure"),
+        "the LAN is plain HTTP: {header}"
+    );
+
+    let host = "dsh.example.com";
+    *harness.shared.tunnel.lock().unwrap() = Box::new(
+        super::cloudflare::CloudflareTunnel::pretending(super::TunnelType::Cloudflare, host),
+    );
+    harness.shared.forget_authorities();
+
+    let tunnelled = harness.get(
+        &format!("/?pair_token={}", harness.nonce()),
+        &[("Host", host)],
+    );
+    assert_eq!(tunnelled.status, 303);
+    let header = tunnelled
+        .header("set-cookie")
+        .expect("a device cookie")
+        .to_string();
+    assert!(
+        header.contains("; Secure"),
+        "over TLS it carries it: {header}"
+    );
+}
+
+/// What the idle timer asks before it takes a public tunnel down, and why it is
+/// two questions.
+///
+/// A phone sitting in a session holds a WebSocket and sends no request for as
+/// long as the agent is thinking. A timer reading only the request clock would
+/// close the tunnel under it — which is the failure that makes a safety feature
+/// something users switch off.
+#[test]
+fn a_live_connection_is_not_an_idle_gateway() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    // Nothing has happened for a while.
+    *harness.shared.last.lock().unwrap() =
+        std::time::Instant::now() - std::time::Duration::from_secs(3600);
+    assert!(harness.shared.idle(Duration::from_secs(60)));
+
+    // Except that somebody is holding a socket open.
+    harness.shared.live.fetch_add(1, Ordering::Relaxed);
+    assert!(!harness.shared.idle(Duration::from_secs(60)));
+
+    harness.shared.live.fetch_sub(1, Ordering::Relaxed);
+    assert!(harness.shared.idle(Duration::from_secs(60)));
+
+    // And a request is the other half: one that just arrived resets it, even a
+    // refused one — a tunnel taken down under a phone being turned away is a
+    // phone with no way left to find out why.
+    harness.shared.touched();
+    assert!(!harness.shared.idle(Duration::from_secs(60)));
 }
 
 /// A nonce is good for five minutes and for one use. Writing one into the thing

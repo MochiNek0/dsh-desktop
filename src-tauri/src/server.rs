@@ -394,6 +394,13 @@ pub struct Job(windows_sys::Win32::Foundation::HANDLE);
 #[cfg(windows)]
 unsafe impl Send for Job {}
 
+// SAFETY: and sharing a reference is safe for the same reason plus one more —
+// the handle is never dereferenced and never handed out, so a `&Job` gives a
+// thread access to nothing at all. `CloudflareTunnel` holds one behind the
+// `Sync` bound on `RemoteTunnel`; see `remote::cloudflare`.
+#[cfg(windows)]
+unsafe impl Sync for Job {}
+
 #[cfg(windows)]
 impl Job {
     /// Put `child` — and, by inheritance, everything it spawns — in a fresh job.

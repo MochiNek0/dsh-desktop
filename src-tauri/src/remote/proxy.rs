@@ -137,6 +137,18 @@ async fn handle(
     peer: SocketAddr,
     request: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
+    // What the idle timer measures. Counted before the fence, because what it
+    // is asking is whether anything at all is using this gateway — a refused
+    // request is still a reason not to consider it abandoned, and a tunnel
+    // taken down under a phone that is being turned away is a phone with no
+    // way to find out why.
+    shared.touched();
+
+    if off_tunnel(shared.public(), peer.ip()) {
+        eprintln!("dsh-desktop: refused a direct connection from {peer} while a tunnel is up");
+        return Ok(refused());
+    }
+
     // First and unconditionally. Everything after this point is allowed to
     // assume the request came from a browser talking to an address this machine
     // actually has.
@@ -368,7 +380,11 @@ async fn forward(shared: Arc<Shared>, mut request: Request<Incoming>) -> Respons
     let switching = response.status() == StatusCode::SWITCHING_PROTOCOLS;
     if switching {
         if let Some(downstream) = downstream {
-            join(downstream, hyper::upgrade::on(&mut response));
+            join(
+                shared.clone(),
+                downstream,
+                hyper::upgrade::on(&mut response),
+            );
         }
     }
 
@@ -382,17 +398,35 @@ async fn forward(shared: Arc<Shared>, mut request: Request<Incoming>) -> Respons
 /// or there is no socket on this side to take over. Both futures resolve once
 /// hyper has finished with their connections, which is after this function's
 /// caller has sent the response.
-fn join(downstream: hyper::upgrade::OnUpgrade, upstream_side: hyper::upgrade::OnUpgrade) {
+fn join(
+    shared: Arc<Shared>,
+    downstream: hyper::upgrade::OnUpgrade,
+    upstream_side: hyper::upgrade::OnUpgrade,
+) {
     tokio::spawn(async move {
         let (Ok(phone), Ok(dsh)) = tokio::join!(downstream, upstream_side) else {
             return;
         };
+
+        // The one place in this app that knows a device is *connected* rather
+        // than merely paired, which is what the idle timer has to ask before
+        // it takes a public tunnel down: a phone sitting in a session sends no
+        // HTTP request for as long as the agent is thinking, and a timer
+        // reading only the request clock would close the tunnel under it. See
+        // [`crate::remote::Shared::idle`].
+        shared
+            .live
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mut phone = TokioIo::new(phone);
         let mut dsh = TokioIo::new(dsh);
         // Ends when either side closes, which is the phone navigating away or
         // dsh going down. Nothing to do about either but stop copying.
         let _ = tokio::io::copy_bidirectional(&mut phone, &mut dsh).await;
+
+        shared
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     });
 }
 
@@ -536,6 +570,27 @@ fn redirect(target: &str, cookie: Option<&str>, secure: bool) -> Response<Body> 
         .expect("a redirect with a fixed shape is always buildable")
 }
 
+/// Whether this connection reached the gateway around the tunnel rather than
+/// through it.
+///
+/// While a public tunnel is up, the only thing that may talk to this listener
+/// is the `cloudflared` this app launched, and it talks from loopback. The
+/// socket is bound to `0.0.0.0` regardless — one socket serves whichever
+/// channel is active — so without this a machine on the same Wi-Fi could open
+/// the port directly and carry the tunnel's hostname in its `Host`, which the
+/// fence is about to accept as one of this gateway's own.
+///
+/// Not a substitute for the fence and not an addition to it: it is the premise
+/// the fence's `Host` check quietly depends on while the authority is a name
+/// rather than an address, and it is also what makes
+/// [`CloudflareTunnel::client_ip`] safe to believe a header. See
+/// [`crate::remote::trust`] for what this does *not* fix.
+///
+/// [`CloudflareTunnel::client_ip`]: crate::remote::cloudflare::CloudflareTunnel
+fn off_tunnel(public: bool, peer: std::net::IpAddr) -> bool {
+    public && !peer.is_loopback()
+}
+
 /// What a request that failed the fence gets.
 ///
 /// No explanation and no page. Whatever sent it is not a phone the user
@@ -594,8 +649,9 @@ fn moved() -> Response<Body> {
     )
 }
 
-/// The two files that turn the phone's tab into an icon on its home screen, or
-/// `None` for every other path.
+/// The four files that turn the phone's tab into an icon on its home screen —
+/// and, on a channel that can have one, into something that still says
+/// *something* when this computer is off. `None` for every other path.
 ///
 /// Served here rather than by dsh because they are nothing to do with dsh: the
 /// names are outside its route table, so nothing collides, and the tags that
@@ -603,10 +659,10 @@ fn moved() -> Response<Body> {
 /// only place they can go, since dsh gzips the index before the gateway sees a
 /// byte of it.
 ///
-/// ## Why these two answer without a cookie
+/// ## Why these answer without a cookie
 ///
-/// Every other path on this listener needs one. These two do not, for two
-/// reasons that point the same way.
+/// Every other path on this listener needs one. These do not, for two reasons
+/// that point the same way.
 ///
 /// The first is that a manifest is fetched with credentials omitted unless the
 /// `<link>` carries `crossorigin="use-credentials"` — so behind the cookie
@@ -616,17 +672,162 @@ fn moved() -> Response<Body> {
 /// which the operating system may re-fetch long after a session has aged out,
 /// and a broken icon is a thing the OS caches.
 ///
-/// The second is that there is nothing here to protect. An app icon and a name
+/// The second is that there is nothing here to protect. An app icon, a name,
+/// a worker that caches one page and a page that says "the computer is off"
 /// are not secrets, and anything that can reach this port already learns more
-/// than they carry from the pairing page it gets for asking — see
-/// [`repair`]. The trust fence still applies to both: a cross-site request for
-/// either one is refused before this function is reached.
+/// than they carry from the pairing page it gets for asking — see [`repair`].
+/// The trust fence still applies to all four: a cross-site request for any of
+/// them is refused before this function is reached.
+///
+/// The worker in particular *has* to answer without one. It is registered by a
+/// phone that may be logged in today and expired tomorrow, and the moment it
+/// matters is the moment nothing can be authenticated against anything, because
+/// the computer is off.
+/// ## Why the quick tunnel gets none of them
+///
+/// A `*.trycloudflare.com` hostname lasts until `cloudflared` stops. An icon
+/// installed against one points, the next morning, at a name that no longer
+/// resolves — and a Service Worker registered on it is a registration for an
+/// origin nothing will ever visit again. So on that one channel these paths
+/// answer 404 rather than serving something whose whole value is that it
+/// survives a restart. See [`Shared::installable`].
+///
+/// This is the specification's "no manifest under a quick tunnel", landing here
+/// rather than in the plugin that injects the `<link>`: the tags go into dsh's
+/// index, which is served to the desktop's own webview as well and is composed
+/// by something with no idea which channel is up. The gateway is the only party
+/// that knows.
 fn homescreen(shared: &Shared, path: &str) -> Option<Response<Body>> {
-    match path {
-        "/dsh-mobile-manifest.json" => Some(manifest()),
-        "/dsh-mobile-icon.png" => Some(icon(shared)),
-        _ => None,
+    let known = matches!(
+        path,
+        "/dsh-mobile-manifest.json" | "/dsh-mobile-icon.png" | "/dsh-mobile-sw.js" | OFFLINE
+    );
+    if !known {
+        return None;
     }
+    if !shared.installable() {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(empty())
+                .expect("a bare 404 is always buildable"),
+        );
+    }
+
+    Some(match path {
+        "/dsh-mobile-manifest.json" => manifest(),
+        "/dsh-mobile-icon.png" => icon(shared),
+        "/dsh-mobile-sw.js" => worker(),
+        _ => offline(),
+    })
+}
+
+/// Where the offline shell lives. One path, named in three places — the worker
+/// caches it, the worker serves it, and the gateway answers it — so it is a
+/// constant.
+const OFFLINE: &str = "/dsh-mobile-offline";
+
+/// The Service Worker, and the answer to the one failure this app could not
+/// explain to anybody.
+///
+/// A home-screen icon opened while this computer is off is a navigation that
+/// never reaches a server. On iOS a standalone window has no browser chrome to
+/// put an error page in, so what the user gets is a white screen with nothing
+/// on it at all — no address bar, no reload, no reason. It is the most common
+/// failure this feature has and the only one with no words attached, because
+/// the words would have to come from a machine that is not running.
+///
+/// A Service Worker is the only thing that can answer from the phone itself,
+/// and it needs a secure context, which is why this arrives with M3 and not
+/// before: plain HTTP on a LAN address cannot have one, self-signed does not
+/// count, and a private IP cannot be given a real certificate. Cloudflare's
+/// edge terminating TLS is what finally makes the origin secure.
+///
+/// ## What it deliberately does not cache
+///
+/// dsh. Not one byte of it. The only thing in the cache is the page below, and
+/// the only request that is ever answered from it is a *navigation* that failed
+/// — which is to say, the moment the browser was about to show a blank window.
+/// Everything else goes to the network untouched and fails exactly as it did
+/// before.
+///
+/// That is a deliberate refusal of what a service worker is usually for. dsh is
+/// an application this app does not own, served by a process it does not
+/// control, and caching its assets would mean a phone quietly running yesterday
+/// 's build against today's server, with no way for either end to notice. The
+/// white screen is worth fixing; a stale dsh is not worth risking to fix it.
+fn worker() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/javascript; charset=utf-8")
+        // Revalidated every time. A worker is the one file whose stale copy
+        // cannot be fixed by reloading, because the stale copy is what serves
+        // the reload.
+        .header(http::header::CACHE_CONTROL, "no-cache")
+        .body(
+            Full::new(Bytes::from(worker_script()))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("a script with a fixed shape is always buildable")
+}
+
+/// The worker itself, apart from the response around it, so that a test can
+/// read it: it is JavaScript written inside a Rust format string, which is two
+/// escaping rules stacked on each other, and a stray brace produces a file that
+/// registers, throws, and leaves the white screen exactly where it was.
+fn worker_script() -> String {
+    format!(
+        "const SHELL = '{OFFLINE}';\n\
+         const STORE = 'dsh-mobile-shell';\n\
+         self.addEventListener('install', (event) => {{\n\
+         \x20 self.skipWaiting();\n\
+         \x20 event.waitUntil(caches.open(STORE).then((cache) => cache.add(SHELL)));\n\
+         }});\n\
+         self.addEventListener('activate', (event) => {{\n\
+         \x20 event.waitUntil(self.clients.claim());\n\
+         }});\n\
+         self.addEventListener('fetch', (event) => {{\n\
+         \x20 if (event.request.mode !== 'navigate') return;\n\
+         \x20 event.respondWith(\n\
+         \x20   fetch(event.request).catch(() => caches.open(STORE)\n\
+         \x20     .then((cache) => cache.match(SHELL))\n\
+         \x20     .then((hit) => hit || Response.error()))\n\
+         \x20 );\n\
+         }});\n"
+    )
+}
+
+/// The page the worker keeps, for the morning the computer is off.
+///
+/// It says the one thing that is true and the one thing to do about it, and it
+/// has a button because a standalone window has no reload of its own. Nothing
+/// on it is fetched: it is being shown precisely because nothing can be.
+fn offline() -> Response<Body> {
+    let body = format!(
+        "<p>{}</p><p><button type=\"button\" onclick=\"location.reload()\">{}</button></p>",
+        escape(t!(
+            "连不上电脑上的 dsh。多半是那台电脑关机了、休眠了，或者 dsh desktop 没开着。\
+             等它起来之后，点下面重新试一次。",
+            "This phone cannot reach dsh on the computer. The usual reason is that the computer \
+             is off, asleep, or not running dsh desktop. Once it is back, try again."
+        )),
+        escape(t!("重新连接", "Try again")),
+    );
+
+    let mut response = shell(
+        StatusCode::OK,
+        t!("电脑现在连不上", "The computer is not answering"),
+        &body,
+    );
+    // 200, not an error status: this is a page the worker will be asked to
+    // cache, and `cache.add` refuses anything that is not ok — which would
+    // leave the install failing and the white screen exactly where it was.
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 /// The manifest, which is what Android reads. iOS has never read one for this —
@@ -958,6 +1159,66 @@ mod tests {
     #[test]
     fn a_redirect_that_is_not_a_handshake_sets_nothing() {
         assert!(!redirect("/", None, false).headers().contains_key(SET_COOKIE));
+    }
+
+    /// The worker is JavaScript written inside a Rust format string, which is
+    /// two escaping rules stacked on one another. A stray brace produces a file
+    /// that registers, throws, and leaves the white screen exactly where it was
+    /// — with nothing on this side to say so, because the failure is in a phone
+    /// this app cannot see.
+    #[test]
+    fn the_worker_script_is_balanced_javascript() {
+        let script = worker_script();
+
+        let mut depth = 0i32;
+        for character in script.chars() {
+            match character {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0, "a closing brace with nothing open");
+        }
+        assert_eq!(depth, 0, "unbalanced braces in:\n{script}");
+        assert!(!script.contains("{{"), "a doubled brace reached the output");
+
+        // The path is spelled once and used twice — put in the cache, taken
+        // back out of it — so a rename cannot leave the worker serving a page
+        // it never stored.
+        assert_eq!(script.matches(OFFLINE).count(), 1, "one spelling");
+        assert_eq!(script.matches("SHELL").count(), 3, "stored, then matched");
+        assert!(
+            script.contains("'navigate'"),
+            "navigations and nothing else"
+        );
+    }
+
+    /// The rule that keeps a tunnel's hostname from being a name anything on
+    /// the Wi-Fi can address this gateway by.
+    ///
+    /// Written as a function of the two facts rather than tested through the
+    /// listener, because the listener a test may bind is a loopback one — the
+    /// only peer it can ever be reached from is the peer this is about
+    /// admitting, and binding `0.0.0.0` in a test is what raises the Windows
+    /// firewall dialog on whoever ran `cargo test`.
+    #[test]
+    fn a_public_tunnel_takes_nothing_but_loopback() {
+        let lan: std::net::IpAddr = "192.168.1.9".parse().unwrap();
+        let far: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let local: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let six: std::net::IpAddr = "::1".parse().unwrap();
+
+        // The tunnel is up: only the `cloudflared` beside us may speak.
+        assert!(off_tunnel(true, lan));
+        assert!(off_tunnel(true, far));
+        assert!(!off_tunnel(true, local));
+        assert!(!off_tunnel(true, six));
+
+        // And on the LAN and the tailnet the phone dials this socket itself, so
+        // the same rule would refuse every device the feature exists for.
+        for peer in [lan, far, local, six] {
+            assert!(!off_tunnel(false, peer), "{peer} on a private channel");
+        }
     }
 
     /// A refusal says nothing at all, on purpose.

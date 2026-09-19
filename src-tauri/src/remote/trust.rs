@@ -29,6 +29,33 @@
 //!   the browser itself labelled cross-site is refused before its cookies are
 //!   even looked at.
 //!
+//! ## The fence is weaker while a public tunnel is up, and that is not a bug
+//!
+//! Worth writing down because it is not obvious and somebody will otherwise
+//! assume this still covers what it used to.
+//!
+//! What makes the `Host` check strong on the LAN is that the set it compares
+//! against is *this machine's physical addresses*. A page in a browser
+//! somewhere can put any name it likes in `Host`, and the set is what makes
+//! almost all of them wrong — which is also what guarantees that a request
+//! carrying `Host: 127.0.0.1` did not come from the phone, because loopback is
+//! deliberately not in the set.
+//!
+//! Raise a Cloudflare tunnel and the set gains a public hostname. Any process
+//! on this machine, and any page a browser on it is showing, can now construct
+//! a request carrying that `Host` and send it to the gateway — and at the
+//! socket layer it is indistinguishable from the `cloudflared` this app
+//! launched, because that also talks from loopback. What is left in front of
+//! dsh is the device cookie and the single-use nonce.
+//!
+//! Two things narrow it, and neither closes it. [`crate::remote::proxy`]
+//! refuses any peer that is not loopback while a public tunnel is up, so the
+//! attacker has to already be *on* this machine rather than merely on the same
+//! Wi-Fi. And the approval dialog is still a human. But defence in depth means
+//! the layers are counted honestly: on a public channel this one is thinner,
+//! and the answer to that is the guard around how long such a tunnel is
+//! allowed to stand, not a claim that the fence still catches it.
+//!
 //! [`RemoteTunnel::authorities`]: crate::remote::tunnel::RemoteTunnel::authorities
 
 use std::collections::HashMap;
@@ -230,6 +257,22 @@ impl Guesses {
     /// before getting it does not carry those two into their next pairing.
     pub fn right(&self, who: IpAddr) {
         self.runs.lock().unwrap().remove(&who);
+    }
+
+    /// Forget everybody. Called when the channel changes under the gateway.
+    ///
+    /// The addresses in here are only meaningful relative to a channel. On the
+    /// LAN they are the phones themselves; through a tunnel they are whatever
+    /// `CF-Connecting-IP` said, which is the whole internet. Carrying a run
+    /// across a switch would hold a phone's own address against it because
+    /// somebody on the far side of a tunnel once used the same one, and it
+    /// would keep an entry for an address that can no longer reach this
+    /// gateway at all.
+    ///
+    /// Not a way out of the limit: it takes stopping the tunnel to reach, and
+    /// whoever is being limited cannot do that.
+    pub fn forget_all(&self) {
+        self.runs.lock().unwrap().clear();
     }
 }
 
@@ -443,6 +486,23 @@ mod tests {
 
         assert!(guesses.blocked(phone()));
         assert!(!guesses.blocked(other()), "a second phone is unaffected");
+    }
+
+    /// A channel switch clears the whole table, because the addresses in it
+    /// stop meaning the same thing: on the LAN they are phones, through a
+    /// tunnel they are whatever the forwarded-for header said.
+    #[test]
+    fn changing_the_channel_forgets_everybody() {
+        let guesses = Guesses::default();
+        for _ in 0..GUESSES {
+            guesses.wrong(phone());
+            guesses.wrong(other());
+        }
+        assert!(guesses.blocked(phone()) && guesses.blocked(other()));
+
+        guesses.forget_all();
+        assert!(!guesses.blocked(phone()));
+        assert!(!guesses.blocked(other()));
     }
 
     /// A user who fumbled the code twice and then got it does not carry those

@@ -440,12 +440,31 @@ export function viewport(html) {
  * The three `apple-` tags are iOS's, which has never read a manifest for this.
  * `apple-mobile-web-app-capable` is what makes the home-screen window open
  * without Safari's chrome, and **it does not need HTTPS** — unlike a Service
- * Worker, which does, and which is why the offline half of a PWA is not here
- * and cannot be until a tunnel puts this behind TLS. The icon is a real fetch
- * of a real file rather than a screenshot of the page, which is what iOS falls
- * back to without it. `mobile-web-app-capable` is the standard spelling of the
- * first one; the Apple-prefixed name is deprecated and is still the only one
- * older iOS reads, so both go out.
+ * Worker, which does. The icon is a real fetch of a real file rather than a
+ * screenshot of the page, which is what iOS falls back to without it.
+ * `mobile-web-app-capable` is the standard spelling of the first one; the
+ * Apple-prefixed name is deprecated and is still the only one older iOS reads,
+ * so both go out.
+ *
+ * ## The worker, and its two guards
+ *
+ * The last tag registers `/dsh-mobile-sw.js`, which is what answers when the
+ * phone opens its home-screen icon and the computer is off — the failure that
+ * is otherwise a white screen with nothing on it. See the Rust side for what
+ * the worker does and, more to the point, what it refuses to cache.
+ *
+ * Two conditions, and both are load-bearing.
+ *
+ * `isSecureContext` is the browser's own answer to whether a worker may be
+ * registered at all. On the LAN and on the tailnet this gateway is plain HTTP,
+ * so it is false and the call is never made; over a Cloudflare tunnel it is
+ * true. Nothing here has to know which channel is up.
+ *
+ * `__dshRemoteCard` is the desktop's own webview, which runs the injected card
+ * script from `remote/card.rs` before any script on the page. Loopback *is* a
+ * secure context, so without this check the desktop window would register a
+ * worker for dsh's own origin — harmless but pointless, and one more thing
+ * caching a page nobody there will ever be shown.
  *
  * `black-translucent` is chosen over `default` deliberately. It is the one
  * value that lets dsh's own background run under the status bar, so a dark
@@ -475,7 +494,13 @@ export function homescreen(html) {
     '<link rel="apple-touch-icon" href="/dsh-mobile-icon.png">' +
     '<meta name="mobile-web-app-capable" content="yes">' +
     '<meta name="apple-mobile-web-app-capable" content="yes">' +
-    '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">';
+    '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">' +
+    '<script>(function(){' +
+    'if(window.__dshRemoteCard)return;' +
+    'if(!window.isSecureContext)return;' +
+    'if(!navigator.serviceWorker)return;' +
+    "navigator.serviceWorker.register('/dsh-mobile-sw.js').catch(function(){});" +
+    '})();</script>';
 
   // An index with no head is returned untouched: `replace` with no match
   // changes nothing, which is the right answer for a body this does not

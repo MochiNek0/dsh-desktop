@@ -1,11 +1,14 @@
 //! How the phone reaches the gateway, behind one interface so that it can stop
 //! being the local network later without anything above noticing.
 //!
-//! Two of these: [`LanTunnel`], which is `0.0.0.0` and the machine's own Wi-Fi
-//! address, and [`TailscaleTunnel`], which is the same socket at a `100.x`
-//! address that a phone off the Wi-Fi can still open. One is active at a time —
-//! see [`crate::remote::Remote::switch`] — and whichever it is, its `base_url`
-//! is the only authority on where the phone was sent.
+//! Three of these, in two files. [`LanTunnel`] is `0.0.0.0` and the machine's
+//! own Wi-Fi address; [`TailscaleTunnel`] is the same socket at a `100.x`
+//! address that a phone off the Wi-Fi can still open; and
+//! [`super::cloudflare::CloudflareTunnel`] — in a file of its own, because it
+//! launches a process and puts this machine on the internet — is a hostname
+//! anybody can resolve. One is active at a time (see
+//! [`crate::remote::Remote::switch`]) and whichever it is, its
+//! [`TunnelState::base_url`] is the only authority on where the phone was sent.
 //!
 //! The trait was here before the second implementation was, and not as
 //! decoration: two things above it would otherwise have "the LAN" written into
@@ -13,7 +16,7 @@
 //!
 //! The first is the QR code, which is a URL with a scheme in it. A Cloudflare
 //! tunnel hands back `https://…`, and a pairing URL assembled from an address
-//! and a hardcoded `http://` would be wrong the day that lands.
+//! and a hardcoded `http://` would have been wrong the day that landed.
 //!
 //! The second is the trust fence. [`crate::remote::trust`] has to know which
 //! `Host` values are this gateway's own, and that set is not a fact about the
@@ -21,15 +24,21 @@
 //! it is every local IPv4 plus the bound port; through a tunnel it is one
 //! hostname and no port at all. So the fence asks the tunnel rather than
 //! enumerating network cards itself, which is why [`RemoteTunnel::authorities`]
-//! is on the trait beside the three methods the specification names.
+//! is on the trait beside the methods the specification names.
+//!
+//! [`RemoteTunnel::public`] is the newest of them and the one that is not about
+//! reachability at all. Two of these channels can only be opened by somebody
+//! the user has already let onto a network; the third can be opened by anyone.
+//! Everything that treats those differently — the idle timer, the tray warning,
+//! the question at exit, the loopback-only rule in [`super::proxy`] — asks that
+//! one method, so that a fourth tunnel joins the guard by answering it rather
+//! than by being added to a list somewhere.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 
 use http::HeaderMap;
 
-/// Which channel the phone came in over. The rest are the Phase 3 entries of
-/// the evolution plan, and are not pretended to exist until something
-/// implements them.
+/// Which channel the phone came in over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TunnelType {
     /// The local network: bind `0.0.0.0`, hand out this machine's LAN address.
@@ -37,6 +46,14 @@ pub enum TunnelType {
     /// The tailnet: the same socket, at this machine's `100.x` address, reached
     /// by a device that has joined the same one. See [`TailscaleTunnel`].
     Tailscale,
+    /// A Cloudflare named tunnel: the user's own hostname, their own token, and
+    /// a `cloudflared` this app launches. See [`mod@super::cloudflare`].
+    Cloudflare,
+    /// The same binary with no account behind it, on a `trycloudflare.com`
+    /// hostname that lasts until the process stops. For trying the thing out;
+    /// see [`super::cloudflare::CloudflareTunnel`] for why it is not the one to
+    /// stay on.
+    CloudflareQuick,
 }
 
 impl TunnelType {
@@ -48,6 +65,8 @@ impl TunnelType {
         match self {
             Self::Lan => "lan",
             Self::Tailscale => "tailscale",
+            Self::Cloudflare => "cloudflare",
+            Self::CloudflareQuick => "cloudflare-quick",
         }
     }
 
@@ -57,6 +76,54 @@ impl TunnelType {
         match name {
             "lan" => Some(Self::Lan),
             "tailscale" => Some(Self::Tailscale),
+            "cloudflare" => Some(Self::Cloudflare),
+            "cloudflare-quick" => Some(Self::CloudflareQuick),
+            _ => None,
+        }
+    }
+
+    /// Whether raising this channel puts the machine on the public internet.
+    ///
+    /// The one property the rest of the app branches on without knowing which
+    /// tunnel it is talking to: the idle timer, the tray's standing warning,
+    /// the question at exit and the loopback-only rule in [`super::proxy`] all
+    /// read this. See [`RemoteTunnel::public`], which is where a tunnel answers
+    /// for itself; this is the same answer before one has been built.
+    pub fn public(self) -> bool {
+        matches!(self, Self::Cloudflare | Self::CloudflareQuick)
+    }
+}
+
+/// Where a tunnel is in coming up.
+///
+/// The LAN and the tailnet are `Running` or `Failed` by the time
+/// [`RemoteTunnel::start`] returns — they read an answer off this machine's own
+/// network cards and there is nothing to wait for. `Starting` exists for
+/// `cloudflared`, which is a process that has to reach Cloudflare's edge and
+/// register a connection before there is anywhere to send a phone, and which
+/// can fail several seconds after being asked to start.
+///
+/// So `start` does not block on any of that. It reports the failures it can
+/// know immediately — no binary, no token, no network card — and everything
+/// after that arrives here, where the card polls for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TunnelState {
+    /// Never started, or stopped again.
+    Stopped,
+    /// Asked to start, and not yet anywhere.
+    Starting,
+    /// Up, at this address.
+    Running { base_url: String },
+    /// It came up and then did not, or never came up. The string is for the
+    /// card, so it is a sentence in the user's language.
+    Failed(String),
+}
+
+impl TunnelState {
+    /// The address to send a phone to, when there is one.
+    pub fn base_url(&self) -> Option<&str> {
+        match self {
+            Self::Running { base_url } => Some(base_url),
             _ => None,
         }
     }
@@ -79,12 +146,13 @@ impl TunnelType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scheme {
     Http,
-    /// Nothing answers with this yet: neither of the two tunnels terminates
-    /// TLS, and the one that will is M3's. It is here because what the method
-    /// owes its caller is *which* scheme, not a yes-or-no about secureness —
-    /// a `bool` on the trait is the shape somebody eventually computes out of
-    /// a header.
-    #[allow(dead_code)]
+    /// What a Cloudflare tunnel answers, and the first thing in this app to do
+    /// so: the phone's browser spoke TLS to Cloudflare's edge, whatever this
+    /// listener then received on loopback. It is the whole reason the device
+    /// cookie can carry `Secure` at all — and, because a `Secure` origin is
+    /// also a secure context, the reason a Service Worker can be registered
+    /// there and the home-screen icon stops being a white page when this
+    /// computer is off. See [`super::proxy`].
     Https,
 }
 
@@ -97,17 +165,25 @@ impl Scheme {
 
 /// Why a tunnel could not be raised.
 ///
-/// One variant, because on the LAN there is one way to fail: a laptop with the
-/// Wi-Fi off has no address to publish and will not have one until it is back
-/// on. An enum rather than a unit type all the same — a tunnel that shells out
-/// to `cloudflared` has failures of its own to name, and this is the type they
-/// will be named in.
+/// Only the failures that are known *before* anything is running: no network
+/// card, no tailnet, no binary, no token. A tunnel that starts and then falls
+/// over reports that through [`TunnelState::Failed`] instead, because by then
+/// [`RemoteTunnel::start`] has long returned.
 #[derive(Debug)]
 pub enum TunnelError {
     /// Nothing on this machine is on a network a phone could reach.
     NoAddress,
     /// The tailnet was asked for and this machine is not on one.
     NoTailnet,
+    /// `cloudflared` is not on this machine, so there is nothing to launch.
+    /// Carries nothing: what to do about it is per-platform, and the card is
+    /// where that is spelled out.
+    NoCloudflared,
+    /// A named tunnel was asked for before a token and a hostname were given.
+    NoToken,
+    /// The tunnel process would not start at all — a binary that is not one, a
+    /// permission denied. Carries the operating system's own words.
+    WouldNotStart(String),
 }
 
 impl std::fmt::Display for TunnelError {
@@ -123,22 +199,65 @@ impl std::fmt::Display for TunnelError {
                 "No running Tailscale was found. Sign this computer and the phone into the same \
                  tailnet and come back, or switch to the local network."
             )),
+            Self::NoCloudflared => formatter.write_str(t!(
+                "这台电脑上没有找到 cloudflared。按下面的说明装好，再回到这里。",
+                "cloudflared was not found on this computer. Install it as described below \
+                 and come back."
+            )),
+            Self::NoToken => formatter.write_str(t!(
+                "还没有填 Cloudflare 隧道的 token 和域名。",
+                "The Cloudflare tunnel still needs a token and a hostname."
+            )),
+            Self::WouldNotStart(why) => write!(
+                formatter,
+                "{}{why}",
+                t!("cloudflared 启动失败：", "cloudflared would not start: ")
+            ),
         }
     }
 }
 
 /// A way for a phone to reach the gateway.
 pub trait RemoteTunnel: Send + Sync {
-    /// Raise the tunnel over a gateway already listening on `local_gateway_port`,
-    /// and answer with the base address a phone should be sent to —
-    /// `http://192.168.1.100:59000` today, `https://…` once there is a tunnel
-    /// that terminates TLS.
-    fn start(&mut self, local_gateway_port: u16) -> Result<String, TunnelError>;
+    /// Raise the tunnel over a gateway already listening on
+    /// `local_gateway_port`, and return without waiting for it to be up.
+    ///
+    /// The address a phone should be sent to comes out of [`state`] rather than
+    /// out of here, and that is the whole shape of this method. Two of the
+    /// three tunnels could perfectly well answer immediately — they read a
+    /// network card and are `Running` before this returns — but `cloudflared`
+    /// has to reach Cloudflare's edge and register a connection first, which
+    /// takes seconds and can fail after the fact. A `start` that blocked on
+    /// that would be a card with nothing on it for as long as it took, on the
+    /// one channel where something *should* be on it saying so.
+    ///
+    /// So `Err` here means only what could be known without trying: no network
+    /// card, no tailnet, no binary, no token. Everything else lands in
+    /// [`TunnelState::Failed`].
+    ///
+    /// [`state`]: RemoteTunnel::state
+    fn start(&mut self, local_gateway_port: u16) -> Result<(), TunnelError>;
 
     /// Take it down again.
     fn stop(&mut self) -> Result<(), TunnelError>;
 
+    /// Where it has got to. See [`TunnelState`].
+    fn state(&self) -> TunnelState;
+
     fn tunnel_type(&self) -> TunnelType;
+
+    /// Whether this channel puts the machine on the public internet.
+    ///
+    /// Four things read it, and all four are the specification's public
+    /// guard: the idle timer that takes the tunnel down on its own, the
+    /// standing warning in the tray, the question asked at exit, and the rule
+    /// in [`super::proxy`] that refuses any peer which is not loopback while a
+    /// tunnel is up. Forgetting a LAN gateway costs the user whoever else is
+    /// on their Wi-Fi; forgetting this one costs them the internet, and a dsh
+    /// session is a shell.
+    fn public(&self) -> bool {
+        self.tunnel_type().public()
+    }
 
     /// Which scheme the phone's browser used to get here. See [`Scheme`].
     fn scheme(&self) -> Scheme;
@@ -146,6 +265,14 @@ pub trait RemoteTunnel: Send + Sync {
     /// The phone's own address, out of whatever forwarded-for header this
     /// tunnel vouches for — and `None` when this tunnel has no proxy in front
     /// of it, in which case the socket's peer *is* the phone.
+    ///
+    /// `peer` is passed in rather than being the caller's business precisely
+    /// so that a tunnel can refuse to believe the header on a connection the
+    /// proxy did not open. This listener is bound to `0.0.0.0`, so "a request
+    /// arrived while the Cloudflare tunnel was the active channel" is not the
+    /// same statement as "a request arrived *through* it": a machine on the
+    /// same Wi-Fi can open the port directly and write whatever header it
+    /// likes. See [`super::cloudflare::CloudflareTunnel::client_ip`].
     ///
     /// Two things downstream are about which *device* is talking, and both go
     /// silently wrong the moment a reverse proxy lands in front of the
@@ -164,7 +291,7 @@ pub trait RemoteTunnel: Send + Sync {
     /// all — which is the whole reason this is a method on the tunnel instead
     /// of a function reading `X-Forwarded-For` wherever somebody needs an
     /// address.
-    fn client_ip(&self, headers: &HeaderMap) -> Option<IpAddr>;
+    fn client_ip(&self, headers: &HeaderMap, peer: IpAddr) -> Option<IpAddr>;
 
     /// The `Host` values a request arriving over this tunnel may legitimately
     /// carry, lowercased and with the port on them.
@@ -183,18 +310,32 @@ pub trait RemoteTunnel: Send + Sync {
 #[derive(Default)]
 pub struct LanTunnel {
     port: Option<u16>,
+    base: Option<String>,
 }
 
 impl RemoteTunnel for LanTunnel {
-    fn start(&mut self, local_gateway_port: u16) -> Result<String, TunnelError> {
+    fn start(&mut self, local_gateway_port: u16) -> Result<(), TunnelError> {
         let address = best_address().ok_or(TunnelError::NoAddress)?;
         self.port = Some(local_gateway_port);
-        Ok(format!("http://{address}:{local_gateway_port}"))
+        self.base = Some(format!("http://{address}:{local_gateway_port}"));
+        Ok(())
     }
 
     fn stop(&mut self) -> Result<(), TunnelError> {
         self.port = None;
+        self.base = None;
         Ok(())
+    }
+
+    /// Never `Starting`: the address was read off a network card before
+    /// [`RemoteTunnel::start`] returned, and there is nothing in flight.
+    fn state(&self) -> TunnelState {
+        match &self.base {
+            Some(base_url) => TunnelState::Running {
+                base_url: base_url.clone(),
+            },
+            None => TunnelState::Stopped,
+        }
     }
 
     fn tunnel_type(&self) -> TunnelType {
@@ -212,7 +353,7 @@ impl RemoteTunnel for LanTunnel {
     /// by the phone, and honouring it would let a device choose which address
     /// its wrong guesses are counted against — which is to say, opt out of the
     /// rate limit, or point it at somebody else's phone.
-    fn client_ip(&self, _headers: &HeaderMap) -> Option<IpAddr> {
+    fn client_ip(&self, _headers: &HeaderMap, _peer: IpAddr) -> Option<IpAddr> {
         None
     }
 
@@ -246,18 +387,30 @@ impl RemoteTunnel for LanTunnel {
 #[derive(Default)]
 pub struct TailscaleTunnel {
     port: Option<u16>,
+    base: Option<String>,
 }
 
 impl RemoteTunnel for TailscaleTunnel {
-    fn start(&mut self, local_gateway_port: u16) -> Result<String, TunnelError> {
+    fn start(&mut self, local_gateway_port: u16) -> Result<(), TunnelError> {
         let address = tailscale_address().ok_or(TunnelError::NoTailnet)?;
         self.port = Some(local_gateway_port);
-        Ok(format!("http://{address}:{local_gateway_port}"))
+        self.base = Some(format!("http://{address}:{local_gateway_port}"));
+        Ok(())
     }
 
     fn stop(&mut self) -> Result<(), TunnelError> {
         self.port = None;
+        self.base = None;
         Ok(())
+    }
+
+    fn state(&self) -> TunnelState {
+        match &self.base {
+            Some(base_url) => TunnelState::Running {
+                base_url: base_url.clone(),
+            },
+            None => TunnelState::Stopped,
+        }
     }
 
     fn tunnel_type(&self) -> TunnelType {
@@ -275,7 +428,7 @@ impl RemoteTunnel for TailscaleTunnel {
     /// Nothing, for the same reason as the LAN: the phone dials this socket
     /// directly over WireGuard, so the peer address already *is* the phone —
     /// its `100.x` one.
-    fn client_ip(&self, _headers: &HeaderMap) -> Option<IpAddr> {
+    fn client_ip(&self, _headers: &HeaderMap, _peer: IpAddr) -> Option<IpAddr> {
         None
     }
 
@@ -624,10 +777,12 @@ mod tests {
         assert!(tunnel.authorities().is_empty());
 
         match tunnel.start(59000) {
-            Ok(base) => {
+            Ok(()) => {
+                let base = tunnel.state().base_url().expect("running").to_string();
                 assert!(base.starts_with("http://100."), "{base} is a tailnet URL");
                 tunnel.stop().unwrap();
                 assert!(tunnel.authorities().is_empty());
+                assert_eq!(tunnel.state(), TunnelState::Stopped);
             }
             // No tailnet on this machine, which is the ordinary case in CI and
             // is not a failure of anything here.
@@ -671,17 +826,48 @@ mod tests {
         for name in ["x-forwarded-for", "cf-connecting-ip", "x-real-ip"] {
             headers.insert(name, "203.0.113.7".parse().unwrap());
         }
+        let peer: IpAddr = "192.168.1.9".parse().unwrap();
 
-        assert_eq!(LanTunnel::default().client_ip(&headers), None);
-        assert_eq!(TailscaleTunnel::default().client_ip(&headers), None);
+        assert_eq!(LanTunnel::default().client_ip(&headers, peer), None);
+        assert_eq!(TailscaleTunnel::default().client_ip(&headers, peer), None);
     }
 
-    /// And the one the cookie is built on. Neither of M2's tunnels terminates
-    /// TLS, and no header is allowed to say otherwise.
+    /// And the one the cookie is built on. Neither of the two direct tunnels
+    /// terminates TLS, and no header is allowed to say otherwise.
     #[test]
-    fn nothing_in_m2_claims_a_secure_scheme() {
+    fn neither_direct_tunnel_claims_a_secure_scheme() {
         assert!(!LanTunnel::default().scheme().secure());
         assert!(!TailscaleTunnel::default().scheme().secure());
         assert!(Scheme::Https.secure());
+    }
+
+    /// Which channels the public guard is about. Read before a tunnel exists —
+    /// by the card, and by the question asked at exit — so the two answers have
+    /// to be the same one.
+    #[test]
+    fn only_the_cloudflare_channels_are_public() {
+        assert!(!TunnelType::Lan.public());
+        assert!(!TunnelType::Tailscale.public());
+        assert!(TunnelType::Cloudflare.public());
+        assert!(TunnelType::CloudflareQuick.public());
+
+        assert!(!LanTunnel::default().public());
+        assert!(!TailscaleTunnel::default().public());
+    }
+
+    /// The names are what `desktop.json` holds and what the card's verbs carry,
+    /// so they round-trip or a stored channel silently becomes another one.
+    #[test]
+    fn every_channel_name_round_trips() {
+        for kind in [
+            TunnelType::Lan,
+            TunnelType::Tailscale,
+            TunnelType::Cloudflare,
+            TunnelType::CloudflareQuick,
+        ] {
+            assert_eq!(TunnelType::named(kind.name()), Some(kind), "{kind:?}");
+        }
+        assert_eq!(TunnelType::named("ngrok"), None);
+        assert_eq!(TunnelType::named(""), None);
     }
 }

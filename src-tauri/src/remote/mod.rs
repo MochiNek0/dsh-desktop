@@ -13,11 +13,17 @@
 //!                    └──▶ 127.0.0.1:<dsh>      dsh's own cookie, held here
 //! ```
 //!
-//! The five pieces, each its own file:
+//! The pieces, each its own file:
 //!
 //! - [`tunnel`] — how the phone reaches us, and which `Host` values that makes
-//!   legitimate. Two implementations, one active at a time; the interface is
-//!   what keeps the third from being a rewrite.
+//!   legitimate. One active at a time; the interface is what kept the third
+//!   from being a rewrite.
+//! - [`mod@cloudflare`] — that third one. It is apart from the others because it
+//!   launches a process and because it is the only channel that puts this
+//!   machine on the public internet, which is a thing with a guard around it:
+//!   an idle timer, a standing warning in the tray, a question at exit, and a
+//!   rule in [`proxy`] that will take nothing but a loopback peer while it is
+//!   up.
 //! - [`trust`] — the browser fence dsh has and this rewrite disarms, rebuilt on
 //!   the near side. Not optional; read the module.
 //! - [`session`] — the pairing nonce and the device cookie.
@@ -37,6 +43,7 @@
 //! about whether a human said yes — and why neither is skippable by the other.
 
 mod card;
+pub mod cloudflare;
 mod firewall;
 mod patch;
 mod proxy;
@@ -54,14 +61,15 @@ mod tests;
 /// [`TunnelType::name`].
 pub use tunnel::TunnelType;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, Url};
 
+use cloudflare::CloudflareTunnel;
 use session::SessionStore;
-use tunnel::{LanTunnel, RemoteTunnel, TailscaleTunnel};
+use tunnel::{LanTunnel, RemoteTunnel, TailscaleTunnel, TunnelState};
 use upstream::Upstream;
 
 /// How long the card waits before suggesting the firewall.
@@ -81,6 +89,39 @@ const SILENCE: Duration = Duration::from_secs(12);
 /// laptop lands on a new network — and short enough that it is never the thing
 /// a stale fence is blamed on.
 const AUTHORITIES_TTL: Duration = Duration::from_secs(1);
+
+/// How long a public tunnel may stand with nothing using it before it is taken
+/// down on its own.
+///
+/// Thirty minutes, and the reason this exists at all is the asymmetry between
+/// the channels. A LAN gateway left running overnight is reachable by whoever
+/// is on the same Wi-Fi; a Cloudflare tunnel left running overnight is
+/// reachable by the internet, and what is behind it is a shell on this machine.
+/// Forgetting to switch it off is the ordinary human failure, so the feature
+/// does not rely on nobody ever forgetting.
+///
+/// "Nothing using it" is both halves of the question, because either one alone
+/// is wrong: a phone sitting in a session holds a WebSocket open and sends no
+/// requests for hours, and a phone that has closed its tab leaves a device on
+/// the list forever. So it is *no live connection* and *no request* — see
+/// [`Shared::idle`].
+const PUBLIC_IDLE: Duration = Duration::from_secs(30 * 60);
+
+/// How often that is checked. A minute is far finer than the thing it is
+/// measuring and costs two atomic reads.
+const IDLE_TICK: Duration = Duration::from_secs(60);
+
+/// How long a tunnel may be [`TunnelState::Starting`] before the card stops
+/// waiting for it.
+///
+/// `cloudflared` takes a few seconds to register a connection on a good
+/// network, and rather longer on a bad one. Forty-five seconds is past the
+/// point where a user is still willing to watch, and the message that follows
+/// is better than a card that says "starting" forever.
+const STARTUP: Duration = Duration::from_secs(45);
+
+/// How often the card looks while a tunnel is coming up.
+const STARTUP_TICK: Duration = Duration::from_millis(300);
 
 /// Who decides whether a device that redeemed a nonce gets in.
 ///
@@ -142,6 +183,16 @@ pub struct Shared {
     /// How many connections the listener has accepted. Only ever compared
     /// against zero — see [`SILENCE`] — so nothing depends on it being exact.
     seen: AtomicU64,
+    /// How many WebSockets are open through the gateway right now.
+    ///
+    /// The only thing in this app that knows a device is *connected* rather
+    /// than merely paired. The device list is a record of who has been let in;
+    /// this is a count of who is holding a socket, which is what the idle timer
+    /// has to ask about — a phone in a session sends no HTTP requests for as
+    /// long as it is listening. See the WebSocket handover in [`proxy`].
+    live: AtomicU64,
+    /// When the last request arrived. See [`PUBLIC_IDLE`].
+    last: Mutex<Instant>,
 }
 
 impl Shared {
@@ -181,6 +232,44 @@ impl Shared {
         self.tunnel.lock().unwrap().scheme().secure()
     }
 
+    /// Where the active tunnel has got to. See [`TunnelState`].
+    fn state(&self) -> TunnelState {
+        self.tunnel.lock().unwrap().state()
+    }
+
+    /// Whether the active channel reaches the public internet.
+    /// See [`RemoteTunnel::public`].
+    fn public(&self) -> bool {
+        self.tunnel.lock().unwrap().public()
+    }
+
+    /// Whether the address this gateway is currently on is one worth adding to
+    /// a home screen.
+    ///
+    /// Everything but the quick Cloudflare tunnel, whose hostname lasts until
+    /// the process stops. An icon installed on one of those points at a name
+    /// that will not resolve tomorrow, and the failure is the browser's own
+    /// connection-refused page — reached before a line of this app runs, so
+    /// nothing here gets to explain it. An icon that cannot be repaired is
+    /// worse than no icon, which is the whole reason this question exists.
+    fn installable(&self) -> bool {
+        self.tunnel.lock().unwrap().tunnel_type() != TunnelType::CloudflareQuick
+    }
+
+    /// A request arrived. What the idle timer counts from.
+    fn touched(&self) {
+        *self.last.lock().unwrap() = Instant::now();
+    }
+
+    /// Whether nothing at all has used this gateway for `how_long`.
+    ///
+    /// Both halves, and neither is sufficient. A live WebSocket is a phone in
+    /// a session, which makes no requests while it waits for the agent to
+    /// think; a quiet stretch with no socket open is a gateway nobody is on.
+    fn idle(&self, how_long: Duration) -> bool {
+        self.live.load(Ordering::Relaxed) == 0 && self.last.lock().unwrap().elapsed() >= how_long
+    }
+
     /// Who is actually asking, as the active tunnel accounts for it.
     ///
     /// The socket's peer is the fallback and today it is also always the
@@ -192,7 +281,7 @@ impl Shared {
         self.tunnel
             .lock()
             .unwrap()
-            .client_ip(headers)
+            .client_ip(headers, peer.ip())
             .unwrap_or_else(|| peer.ip())
     }
 }
@@ -204,6 +293,21 @@ pub struct Remote {
     /// The nonce currently on the card, or `None` when no card is up. What
     /// makes a redraw possible without minting a second one.
     showing: Mutex<Option<Showing>>,
+    /// Whether a card is on screen at all.
+    ///
+    /// Not the same question as `showing`, and the difference is new in M3: a
+    /// tunnel that takes seconds to come up has a card with no nonce on it,
+    /// drawn and waiting. `showing` still means "there is a live nonce printed
+    /// on the card", which is what [`remint`] is about; this is what the
+    /// watchers ask before they redraw something the user has since closed.
+    card: AtomicBool,
+    /// Something to tell the user that did not come from what they just did —
+    /// the idle timer taking a public tunnel down, say. Shown once and cleared.
+    note: Mutex<Option<String>>,
+    /// Whether an idle watch is already running. See [`watch_idle`], which is
+    /// reached from every redraw of a running public tunnel and must start one
+    /// thread rather than one per draw.
+    idle_watch: AtomicBool,
     /// Asked once — it costs a second and a megabyte of text — and remembered.
     firewall: OnceLock<firewall::Firewall>,
 }
@@ -213,10 +317,18 @@ pub struct Remote {
 /// The one place a [`TunnelType`] becomes an implementation, so that the stored
 /// setting, the card's buttons and [`Remote::switch`] all agree on what the
 /// name means.
-fn raise(kind: TunnelType) -> Box<dyn RemoteTunnel> {
+///
+/// The handle is what the Cloudflare tunnels read their token, their hostname
+/// and the path to `cloudflared` out of. `None` is the test harness, where
+/// there is no app and the only tunnels raised are the two that need nothing
+/// from one.
+fn raise(app: Option<&AppHandle>, kind: TunnelType) -> Box<dyn RemoteTunnel> {
     match kind {
         TunnelType::Lan => Box::new(LanTunnel::default()),
         TunnelType::Tailscale => Box::new(TailscaleTunnel::default()),
+        TunnelType::Cloudflare | TunnelType::CloudflareQuick => {
+            Box::new(CloudflareTunnel::new(app, kind))
+        }
     }
 }
 
@@ -229,10 +341,14 @@ struct Showing {
 }
 
 /// The listener, while there is one.
+///
+/// Note what is *not* here any more: the address. It used to be kept beside the
+/// port and replaced whenever the channel moved, which made two things that had
+/// to agree about where the phone was being sent. Since M3 the tunnel can
+/// arrive at an address seconds after being asked to — and leave it again
+/// without anybody calling anything — so the tunnel's own
+/// [`RemoteTunnel::state`] is the single answer, and this is only the socket.
 struct Running {
-    /// `http://<address>:<port>`, as the tunnel published it. Replaced when the
-    /// channel changes under it; see [`Remote::switch`].
-    base: String,
     /// The port the socket is bound to, so that a new tunnel can be told to
     /// publish the listener that is already up rather than needing a new one.
     port: u16,
@@ -250,16 +366,21 @@ impl Remote {
         Self {
             shared: Arc::new(Shared {
                 store: SessionStore::persisted(&app),
+                tunnel: Mutex::new(raise(Some(&app), channel)),
                 approve: Approve::Desktop(app),
                 upstream: Upstream::default(),
-                tunnel: Mutex::new(raise(channel)),
                 authorities: Mutex::new(None),
                 guesses: trust::Guesses::default(),
                 exchange: tokio::sync::Mutex::new(()),
                 seen: AtomicU64::new(0),
+                live: AtomicU64::new(0),
+                last: Mutex::new(Instant::now()),
             }),
             running: Mutex::new(None),
             showing: Mutex::new(None),
+            card: AtomicBool::new(false),
+            note: Mutex::new(None),
+            idle_watch: AtomicBool::new(false),
             firewall: OnceLock::new(),
         }
     }
@@ -276,10 +397,31 @@ impl Remote {
     ///
     /// So: ask for the port last time ended on, and take whatever the OS gives
     /// if that one is spoken for.
-    fn start(&self) -> Result<String, String> {
+    ///
+    /// Answers `Ok` as soon as the tunnel has been *asked* to start, which is
+    /// not the same as its being up — see [`RemoteTunnel::start`]. The address
+    /// comes out of [`Shared::state`] when there is one, and the card is what
+    /// waits; see [`watch_startup`].
+    ///
+    /// Called a second time on a gateway that is already bound, this restarts
+    /// the tunnel if there is nothing behind it — which is the way back from a
+    /// Cloudflare token that was wrong, and from the idle timer having taken a
+    /// public tunnel down. A tunnel that is up, or on its way up, is left
+    /// alone.
+    fn start(&self) -> Result<(), String> {
         let mut running = self.running.lock().unwrap();
+
         if let Some(live) = running.as_ref() {
-            return Ok(live.base.clone());
+            let port = live.port;
+            let outcome = {
+                let mut tunnel = self.shared.tunnel.lock().unwrap();
+                match tunnel.state() {
+                    TunnelState::Running { .. } | TunnelState::Starting => Ok(()),
+                    _ => tunnel.start(port).map_err(|error| error.to_string()),
+                }
+            };
+            self.shared.forget_authorities();
+            return outcome;
         }
 
         let remembered = self
@@ -306,12 +448,14 @@ impl Remote {
         }
 
         // After the bind, because the tunnel is told which port to publish. A
-        // machine with no network fails here, with the socket already open —
-        // which is why nothing is recorded as running until this has succeeded.
-        let (base, over) = {
+        // machine with no network — or with no `cloudflared` — fails here, with
+        // the socket already open, which is why nothing is recorded as running
+        // until this has succeeded: the listener is dropped on the way out and
+        // the next attempt starts from a clean bind.
+        let over = {
             let mut tunnel = self.shared.tunnel.lock().unwrap();
-            let base = tunnel.start(port).map_err(|error| error.to_string())?;
-            (base, tunnel.tunnel_type())
+            tunnel.start(port).map_err(|error| error.to_string())?;
+            tunnel.tunnel_type()
         };
 
         // The set the fence holds is the old tunnel's, or an empty one from
@@ -320,18 +464,24 @@ impl Remote {
 
         // The one line this writes anywhere. A socket bound to every interface
         // on the machine is worth saying out loud, and the channel it is bound
-        // for is the part a later build will change.
-        eprintln!("dsh-desktop: the phone gateway is up at {base} over {over:?}");
+        // for is the part that changes. The address is not here: over a tunnel
+        // there is not one yet, and the line that reports it belongs to
+        // whichever tunnel arrives at one.
+        eprintln!("dsh-desktop: the phone gateway is listening on {port} over {over:?}");
 
         let (stop, stopped) = tokio::sync::oneshot::channel();
         tauri::async_runtime::spawn(proxy::serve(listener, self.shared.clone(), stopped));
 
+        // A fresh idle window: the clock this starts is what takes a public
+        // tunnel down again, and it must not be inherited from whenever the
+        // last request before this happened to arrive.
+        self.shared.touched();
+
         *running = Some(Running {
-            base: base.clone(),
             port,
             shutdown: Some(stop),
         });
-        Ok(base)
+        Ok(())
     }
 
     /// Move to another channel, on the socket that is already bound.
@@ -356,37 +506,61 @@ impl Remote {
     /// everything. That is the correct answer to "put me on a tailnet this
     /// machine is not on", and switching back undoes it.
     fn switch(&self, kind: TunnelType) -> Result<(), String> {
-        let mut running = self.running.lock().unwrap();
-        let mut tunnel = self.shared.tunnel.lock().unwrap();
+        let running = self.running.lock().unwrap();
+        let started = {
+            let mut tunnel = self.shared.tunnel.lock().unwrap();
 
-        let _ = tunnel.stop();
-        *tunnel = raise(kind);
+            // Stopped before it is replaced, and not merely dropped: a
+            // Cloudflare tunnel's `stop` kills a process and waits for it, and
+            // the one thing worse than a tunnel that will not start is two of
+            // them answering for the same machine.
+            let _ = tunnel.stop();
+            *tunnel = raise(self.shared.approve.app(), kind);
 
-        let started = running
-            .as_ref()
-            .map(|live| tunnel.start(live.port).map_err(|error| error.to_string()));
+            running
+                .as_ref()
+                .map(|live| tunnel.start(live.port).map_err(|error| error.to_string()))
+        };
 
-        drop(tunnel);
+        drop(running);
         self.shared.forget_authorities();
+        // The rate limiter's addresses only mean anything relative to a
+        // channel; see [`trust::Guesses::forget_all`].
+        self.shared.guesses.forget_all();
 
-        match started {
-            // Nothing is bound, so there is nothing to publish and nothing to
-            // repair: the next `start` raises this tunnel instead.
-            None => Ok(()),
-            Some(Ok(base)) => {
-                if let Some(live) = running.as_mut() {
-                    live.base = base;
-                }
-                Ok(())
-            }
-            Some(Err(why)) => Err(why),
-        }
+        // `None` is nothing bound, so there is nothing to publish and nothing
+        // to repair: the next `start` raises this tunnel instead.
+        started.unwrap_or(Ok(()))
     }
 
     /// Which channel is up right now, for the card to draw the switch in the
     /// position it is actually in.
     fn channel(&self) -> TunnelType {
         self.shared.tunnel.lock().unwrap().tunnel_type()
+    }
+
+    /// Take the tunnel down and leave the socket where it is.
+    ///
+    /// The public guard's actual lever, used by the idle timer and by the two
+    /// buttons that mean "stop being reachable from the internet". The listener
+    /// is deliberately left bound: what is dangerous is the tunnel, and with it
+    /// gone the fence holds no authorities and refuses everything anyway — so
+    /// tearing down the socket as well would buy nothing and would cost the
+    /// user a second firewall prompt when they switch back to the LAN.
+    ///
+    /// The channel is not changed. A user who took the tunnel down still has
+    /// Cloudflare selected, and the card offers to start it again; what keeps
+    /// the next launch from quietly raising it is [`resume`], which will not
+    /// raise a public channel at all.
+    fn halt(&self, why: Option<String>) {
+        let _ = self.shared.tunnel.lock().unwrap().stop();
+        self.shared.forget_authorities();
+        self.shared.guesses.forget_all();
+        // The nonce on the card is a URL at the address that has just stopped
+        // answering. Leaving it there would put a QR code on screen that sends
+        // a phone to nothing — and the card would go on looking live.
+        *self.showing.lock().unwrap() = None;
+        *self.note.lock().unwrap() = why;
     }
 
     /// Stop serving. Whether the devices go with it is the user's call.
@@ -418,6 +592,7 @@ impl Remote {
         }
 
         *self.showing.lock().unwrap() = None;
+        self.card.store(false, Ordering::Relaxed);
     }
 }
 
@@ -512,6 +687,19 @@ pub fn resume(app: &AppHandle) {
         if remote.shared.store.devices().is_empty() {
             return;
         }
+        // And the third gate, which is M3's: a channel that reaches the public
+        // internet is never raised without somebody asking for it in this
+        // session. Everything else here is about a phone still working
+        // tomorrow; putting this machine back on the internet because it was
+        // on it when the app last closed is a different promise, and not one
+        // the user made. The card is where it comes back up.
+        if remote.channel().public() {
+            eprintln!(
+                "dsh-desktop: not resuming the {} channel on its own; open the card to raise it",
+                remote.channel().name()
+            );
+            return;
+        }
 
         // Nowhere to report a failure to: there is no card up and the user did
         // not ask for anything. The line `start` prints is the record, and the
@@ -550,42 +738,294 @@ pub fn open(app: &AppHandle) {
     });
 }
 
-/// Put the card up on whatever the gateway's state now is: a fresh nonce over
-/// the address it is publishing, or the reason there is no address.
+/// The card's start button, on a channel that is not running.
 ///
-/// The two ways to arrive here are the titlebar button and a channel switch,
-/// and they want the same card — which is why the nonce is minted here rather
-/// than by whichever of them happened to run.
-fn present(app: &AppHandle, remote: &Remote, started: Result<String, String>) {
-    match started {
-        Ok(base) => {
+/// Reached three ways, all of them a public tunnel that is down while the
+/// gateway is not: a token that was wrong and has been fixed, a `cloudflared`
+/// that fell over, and the idle timer having done its job. See [`Remote::halt`]
+/// for why the socket is still there to start a tunnel on.
+pub fn start_channel(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Some(remote) = app.try_state::<Remote>() else {
+            return;
+        };
+
+        *remote.note.lock().unwrap() = None;
+        let started = remote.start();
+        present(&app, &remote, started);
+    });
+}
+
+/// Stop being reachable from the internet, now.
+///
+/// Both the card's button and the tray's item, which is the specification's
+/// "click straight through to switching it off" — the standing indicator is no
+/// use if acting on it means finding a card first. See [`Remote::halt`].
+pub fn stop_public(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Some(remote) = app.try_state::<Remote>() else {
+            return;
+        };
+
+        remote.halt(Some(
+            t!(
+                "公网通道已经关闭。这台电脑现在只能从这台机器自己的网络访问。",
+                "The public tunnel is off. This computer is only reachable from its own \
+                 network again."
+            )
+            .to_string(),
+        ));
+        redraw(&app, &remote, None);
+        crate::refresh_tray(&app);
+    });
+}
+
+/// The hostname this machine is answering on from the public internet, if it
+/// is answering on one.
+///
+/// Read by the tray, which draws the standing warning, and by the question at
+/// exit. `None` covers every ordinary case: the LAN, the tailnet, a public
+/// channel that is selected but not up, and no gateway at all.
+pub fn exposed(app: &AppHandle) -> Option<String> {
+    let remote = app.try_state::<Remote>()?;
+    if !remote.shared.public() {
+        return None;
+    }
+    let base = remote.shared.state().base_url()?.to_string();
+    Some(base.trim_start_matches("https://").to_string())
+}
+
+/// Put the card up on whatever the gateway's state now is: a fresh nonce over
+/// the address it is publishing, the fact that it is still coming up, or the
+/// reason there is no address.
+///
+/// The ways to arrive here are the titlebar button, a channel switch, the start
+/// button and the watcher below, and they all want the same card — which is why
+/// the nonce is minted here rather than by whichever of them happened to run.
+fn present(app: &AppHandle, remote: &Remote, started: Result<(), String>) {
+    remote.card.store(true, Ordering::Relaxed);
+
+    // The tunnel may have arrived somewhere new since the last draw, and the
+    // tray's standing warning is the one thing that has to be right whether or
+    // not anybody is looking at this card.
+    crate::refresh_tray(app);
+
+    let state = match started {
+        Ok(()) => remote.shared.state(),
+        // What could be known before anything was launched: no network card,
+        // no tailnet, no `cloudflared`, no token.
+        Err(why) => TunnelState::Failed(why),
+    };
+
+    match state {
+        TunnelState::Running { base_url } => {
             let minted = remote.shared.store.mint_pair();
             *remote.showing.lock().unwrap() = Some(Showing {
-                url: format!("{base}/?pair_token={}", minted.token),
+                url: format!("{base_url}/?pair_token={}", minted.token),
                 code: minted.code,
             });
             redraw(app, remote, None);
+
+            // Started here rather than beside the tunnel because this is the
+            // one place that knows a public tunnel has actually arrived
+            // somewhere — `start` returns before that is true.
+            if remote.shared.public() {
+                watch_idle(app);
+            }
         }
-        Err(why) => {
+        // No nonce yet, because there is nowhere to send anyone. The card goes
+        // up all the same, saying so — the alternative is a button that looks
+        // like it did nothing for the five seconds `cloudflared` takes.
+        TunnelState::Starting => {
             *remote.showing.lock().unwrap() = None;
-            card::show(
-                app,
-                &card::View {
-                    url: None,
-                    code: None,
-                    error: Some(why),
-                    // Still listed, and still paired: a channel that will not
-                    // start has not thrown anybody off, and the rows are what
-                    // say how much is waiting on the switch going back.
-                    devices: remote.shared.store.devices(),
-                    hint: None,
-                    channel: remote.channel(),
-                    style_patch: style::enabled(),
-                    forget_on_exit: crate::settings::forget_pairings_on_exit(app),
-                },
-            );
+            waiting(app, remote, None);
+            watch_startup(app);
+        }
+        TunnelState::Failed(why) => {
+            *remote.showing.lock().unwrap() = None;
+            waiting(app, remote, Some(why));
+        }
+        // Selected but not running: the idle timer, or the button that stops a
+        // public tunnel. `note` is what says which.
+        TunnelState::Stopped => {
+            *remote.showing.lock().unwrap() = None;
+            waiting(app, remote, None);
         }
     }
+}
+
+/// The card with no nonce on it: coming up, stopped, or broken.
+///
+/// The device list is still drawn, and still paired. A channel that will not
+/// start has thrown nobody off, and those rows are what say how much is waiting
+/// on it starting.
+fn waiting(app: &AppHandle, remote: &Remote, error: Option<String>) {
+    let channel = remote.channel();
+    let starting = matches!(remote.shared.state(), TunnelState::Starting);
+    // Read into a local rather than inline below: a guard taken inside a struct
+    // literal lives until the end of the whole statement, and the two calls
+    // beside it take the other two locks in this module.
+    let hint = remote.note.lock().unwrap().clone();
+
+    card::show(
+        app,
+        &card::View {
+            url: None,
+            code: None,
+            error,
+            starting,
+            devices: remote.shared.store.devices(),
+            hint,
+            channel,
+            setup: setup(app, remote, channel),
+            public: exposed(app),
+            style_patch: style::enabled(),
+            forget_on_exit: crate::settings::forget_pairings_on_exit(app),
+        },
+    );
+}
+
+/// What the Cloudflare panel on the card needs, or `None` on a channel that has
+/// nothing to configure.
+///
+/// Read off the disk rather than out of the tunnel. The tunnel holds the same
+/// three facts, but only behind the trait — and reaching through it would mean
+/// either a downcast or three more methods on an interface that four other
+/// things implement and do not have them.
+fn setup(app: &AppHandle, remote: &Remote, kind: TunnelType) -> Option<card::Setup> {
+    if !kind.public() {
+        return None;
+    }
+
+    Some(card::Setup {
+        install: cloudflare::binary(Some(app))
+            .is_none()
+            .then(cloudflare::install_hint),
+        hostname: crate::settings::cloudflare_hostname(app),
+        // The one number the dashboard's ingress rule has to carry. Stable
+        // across restarts since M1, which is what makes it worth printing.
+        origin: remote
+            .running
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|live| format!("http://localhost:{}", live.port)),
+        quick: kind == TunnelType::CloudflareQuick,
+    })
+}
+
+/// Watch a tunnel that is on its way up, and draw the card again when it gets
+/// somewhere.
+///
+/// Polling, and deliberately: the thing being waited on is a process reading
+/// its way to a connection, so the alternative is a channel threaded from a
+/// reader thread through a trait object and out to the window — for an event
+/// that happens once, seconds from now, on one of four channels.
+///
+/// Gives up at [`STARTUP`], and says so rather than leaving the word "starting"
+/// on screen. The tunnel is left where it is: `cloudflared` may still be
+/// retrying, and a user who watches it finally connect and presses the button
+/// again finds it already up.
+fn watch_startup(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let until = Instant::now() + STARTUP;
+
+        loop {
+            std::thread::sleep(STARTUP_TICK);
+
+            let Some(remote) = app.try_state::<Remote>() else {
+                return;
+            };
+            // The user closed the card. Putting it back up because a tunnel
+            // they stopped waiting for finally connected is the same mistake
+            // `remint` is written to avoid.
+            if !remote.card.load(Ordering::Relaxed) {
+                return;
+            }
+
+            if !matches!(remote.shared.state(), TunnelState::Starting) {
+                return present(&app, &remote, Ok(()));
+            }
+
+            if Instant::now() >= until {
+                return waiting(
+                    &app,
+                    &remote,
+                    Some(
+                        t!(
+                            "cloudflared 起了，但是一直没连上 Cloudflare。检查一下网络和 token，\
+                             或者先切回局域网。",
+                            "cloudflared started but has not reached Cloudflare. Check the \
+                             network and the token, or switch back to the local network."
+                        )
+                        .to_string(),
+                    ),
+                );
+            }
+        }
+    });
+}
+
+/// The idle timer: take a public tunnel down when nothing has used it for
+/// [`PUBLIC_IDLE`].
+///
+/// One thread for the life of the tunnel, started when a public channel is
+/// raised and ending as soon as the channel is no longer public or no longer
+/// running — so the LAN and the tailnet never have one of these at all, and
+/// there is never more than one per tunnel.
+///
+/// It reports itself. A tunnel that vanished without explanation is a phone
+/// that stops working for no reason anybody can see, which is worse than the
+/// exposure this is preventing.
+fn watch_idle(app: &AppHandle) {
+    let Some(remote) = app.try_state::<Remote>() else {
+        return;
+    };
+    // One at a time. Every redraw of a running public tunnel reaches here, and
+    // a thread per redraw would be a thread per device that connects.
+    if remote.idle_watch.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(IDLE_TICK);
+
+            let Some(remote) = app.try_state::<Remote>() else {
+                return;
+            };
+            // Switched away, stopped by hand, or fallen over on its own.
+            // Whatever happened, this watch is over; the next public tunnel
+            // that comes up starts another.
+            if !remote.shared.public() || remote.shared.state().base_url().is_none() {
+                remote.idle_watch.store(false, Ordering::Relaxed);
+                return;
+            }
+            if !remote.shared.idle(PUBLIC_IDLE) {
+                continue;
+            }
+
+            let minutes = PUBLIC_IDLE.as_secs() / 60;
+            eprintln!("dsh-desktop: stopping the public tunnel after {minutes} idle minutes");
+            remote.halt(Some(
+                t!(
+                    "{} 分钟没有设备连接，公网通道已经自动关闭。需要的话在这里重新打开。",
+                    "Nothing has used the public tunnel for {} minutes, so it has been \
+                     switched off. Start it again here when you need it.",
+                    minutes
+                )
+                .to_string(),
+            ));
+            redraw(&app, &remote, None);
+            crate::refresh_tray(&app);
+            remote.idle_watch.store(false, Ordering::Relaxed);
+            return;
+        }
+    });
 }
 
 /// The card's channel switch.
@@ -603,23 +1043,54 @@ pub fn channel(app: &AppHandle, kind: TunnelType) {
     }
 
     let waiting = remote.shared.store.devices().len();
-    if waiting == 0 {
+    if waiting == 0 && !kind.public() {
         return switch_to(app, kind);
+    }
+
+    // Two things to say and they stack: the pairings that will have to be
+    // redone, and — on the way to Cloudflare — what the channel actually is.
+    // The second one is not a formality. Every other channel in this app is
+    // reachable by people who are already somewhere the user let them be; this
+    // one is reachable by everyone, and what is behind it is a shell.
+    let mut body = String::new();
+    if kind.public() {
+        body.push_str(t!(
+            "Cloudflare 通道会把这台电脑放到公网上：拿到地址并且通过配对的设备，在任何网络下都能进来。\
+             而 dsh 会话等于这台机器上的一个终端。闲置 30 分钟会自动关闭，托盘里也会一直显示它开着。",
+            "The Cloudflare channel puts this computer on the public internet: a paired device \
+             with the address can reach it from any network at all. A dsh session is a terminal \
+             on this machine. It switches itself off after 30 idle minutes, and the tray says \
+             so for as long as it is up."
+        ));
+    }
+    if waiting > 0 {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&t!(
+            "换一个通道，手机看到的地址就变了，而配对是跟着地址走的：现在的 {} 台设备都要重新扫一次码。\
+             它们不会被吊销——换回来的话，原来的配对还在。",
+            "The phone reaches a different address over a different channel, and a pairing \
+             follows the address: all {} of the paired devices will have to scan again. \
+             Nothing is revoked — switch back and the old pairings still hold.",
+            waiting
+        ));
     }
 
     let app_for_answer = app.clone();
     crate::dialog::ask(
         app,
         crate::dialog::Ask {
-            title: t!("切换连接通道", "Change the channel").to_string(),
-            body: t!(
-                "换一个通道，手机看到的地址就变了，而配对是跟着地址走的：现在的 {} 台设备都要重新扫一次码。\
-                 它们不会被吊销——换回来的话，原来的配对还在。",
-                "The phone reaches a different address over a different channel, and a pairing \
-                 follows the address: all {} of the paired devices will have to scan again. \
-                 Nothing is revoked — switch back and the old pairings still hold.",
-                waiting
-            ),
+            title: if kind.public() {
+                t!(
+                    "把这台电脑放到公网上？",
+                    "Put this computer on the internet?"
+                )
+                .to_string()
+            } else {
+                t!("切换连接通道", "Change the channel").to_string()
+            },
+            body,
             choices: vec![
                 crate::dialog::Choice::new("keep", t!("取消", "Cancel")),
                 crate::dialog::Choice::primary("switch", t!("切换", "Switch")),
@@ -663,8 +1134,103 @@ fn switch_to(app: &AppHandle, kind: TunnelType) {
 pub fn close(app: &AppHandle) {
     if let Some(remote) = app.try_state::<Remote>() {
         *remote.showing.lock().unwrap() = None;
+        remote.card.store(false, Ordering::Relaxed);
+        // Read and gone: what it had to say was about something that already
+        // happened, and a card opened tomorrow should not still be reporting
+        // it.
+        *remote.note.lock().unwrap() = None;
     }
     card::hide(app);
+}
+
+/// The Cloudflare panel's save button: a token and a hostname, as typed.
+///
+/// Written down first and acted on second, and only acted on at all when
+/// Cloudflare is the channel the user is looking at — the same order
+/// [`switch_to`] uses, and for the same reason. Somebody filling this in from
+/// the tailnet is configuring the thing for later, not asking to be put on the
+/// internet now.
+pub fn cloudflare(app: &AppHandle, token: &str, hostname: &str) {
+    let app = app.clone();
+    let token = token.to_string();
+    let hostname = hostname.to_string();
+
+    std::thread::spawn(move || {
+        let Some(remote) = app.try_state::<Remote>() else {
+            return;
+        };
+
+        if let Err(why) = cloudflare::remember(&app, &token, &hostname) {
+            *remote.note.lock().unwrap() = None;
+            return waiting(&app, &remote, Some(why));
+        }
+
+        if remote.channel() != TunnelType::Cloudflare {
+            return waiting(&app, &remote, None);
+        }
+
+        // The tunnel in hand was built from the old token, so this is a switch
+        // to the channel it is already on: `switch` is what rebuilds it, and
+        // rebuilding is what reads the file that was just written.
+        *remote.note.lock().unwrap() = None;
+        let started = remote
+            .switch(TunnelType::Cloudflare)
+            .and_then(|()| remote.start());
+        present(&app, &remote, started);
+    });
+}
+
+/// The app is being asked to quit while a public tunnel is up.
+///
+/// `true` holds the exit open. A tunnel that is taken down silently at exit is
+/// the right outcome and the wrong way to reach it: the user cannot tell the
+/// difference between having switched it off and having left it on, and the
+/// next time they leave it on they will assume the same. So the question is
+/// put, once — the latch is what lets the answer through — and quitting is
+/// still one click away.
+///
+/// Only for the public channels. Closing the app on the LAN takes a socket down
+/// and nothing else, which nobody needs to be asked about.
+pub fn confirm_exit(app: &AppHandle) -> bool {
+    /// Set by the answer, so the `app.exit` it triggers is not asked again.
+    static LEAVING: AtomicBool = AtomicBool::new(false);
+
+    if LEAVING.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(host) = exposed(app) else {
+        return false;
+    };
+
+    // The window is very likely parked in the tray, and a dialog drawn into a
+    // hidden webview is a question nobody is shown and nobody answers.
+    crate::reveal(app);
+
+    let app_for_answer = app.clone();
+    crate::dialog::ask(
+        app,
+        crate::dialog::Ask {
+            title: t!("公网通道还开着", "The public tunnel is still up").to_string(),
+            body: t!(
+                "这台电脑现在能从公网通过 {} 访问。退出会把通道一起关掉——先确认一下这就是你想要的。",
+                "This computer is currently reachable from the internet at {}. Quitting takes \
+                 the tunnel down with it; this is the moment to be sure that is what you want.",
+                host
+            ),
+            choices: vec![
+                crate::dialog::Choice::new("stay", t!("留下", "Stay open")),
+                crate::dialog::Choice::primary("quit", t!("关闭通道并退出", "Close it and quit")),
+            ],
+            answered: Box::new(move |_app, id| {
+                if id == "quit" {
+                    LEAVING.store(true, Ordering::Relaxed);
+                    app_for_answer.exit(0);
+                }
+            }),
+        },
+    );
+
+    true
 }
 
 /// Throw one device off.
@@ -735,8 +1301,9 @@ fn remint(remote: &Remote) {
     }
 
     let minted = remote.shared.store.mint_pair();
-    let next = remote.running.lock().unwrap().as_ref().map(|live| Showing {
-        url: format!("{}/?pair_token={}", live.base, minted.token),
+    let base = remote.shared.state().base_url().map(str::to_string);
+    let next = base.map(|base| Showing {
+        url: format!("{base}/?pair_token={}", minted.token),
         code: minted.code,
     });
     *remote.showing.lock().unwrap() = next;
@@ -800,10 +1367,19 @@ fn paired(shared: &Shared) {
 /// catch up.
 fn redraw(app: &AppHandle, remote: &Remote, hint: Option<String>) {
     let Some(showing) = remote.showing.lock().unwrap().clone() else {
+        // No nonce. There may still be a card — a tunnel coming up, or one the
+        // idle timer just took down — and it is the thing with something new on
+        // it, so it is redrawn rather than left holding the last state.
+        if remote.card.load(Ordering::Relaxed) {
+            waiting(app, remote, None);
+        }
         return;
     };
 
-    let hint = hint.or_else(|| remote.firewall.get().copied().and_then(card::firewall_hint));
+    let hint = hint
+        .or_else(|| remote.note.lock().unwrap().clone())
+        .or_else(|| remote.firewall.get().copied().and_then(card::firewall_hint));
+    let channel = remote.channel();
 
     card::show(
         app,
@@ -811,9 +1387,12 @@ fn redraw(app: &AppHandle, remote: &Remote, hint: Option<String>) {
             url: Some(showing.url),
             code: Some(showing.code),
             error: None,
+            starting: false,
             devices: remote.shared.store.devices(),
             hint,
-            channel: remote.channel(),
+            channel,
+            setup: setup(app, remote, channel),
+            public: exposed(app),
             style_patch: style::enabled(),
             forget_on_exit: crate::settings::forget_pairings_on_exit(app),
         },

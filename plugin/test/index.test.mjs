@@ -333,8 +333,7 @@ import { MOBILE_CSS, TRANSPORT, apply, flag, homescreen, inject, override, rows,
   // iOS has never read a manifest for this: `apple-mobile-web-app-capable` is
   // what opens the home-screen window without Safari's chrome, and it is the
   // one that must not go missing. It needs no HTTPS, unlike the Service Worker
-  // that would make this a full PWA -- which is why the offline half is absent
-  // and this half is not.
+  // beside it.
   const out = homescreen('<html lang="en"><head><title>DeepSeek Harness</title></head><body></body></html>');
 
   assert.ok(out.includes('<link rel="manifest" href="/dsh-mobile-manifest.json">'), 'Android reads this one');
@@ -355,6 +354,32 @@ import { MOBILE_CSS, TRANSPORT, apply, flag, homescreen, inject, override, rows,
   assert.ok(out.includes('<title>DeepSeek Harness</title>'), 'nothing else is touched');
   assert.ok(out.indexOf('rel="manifest"') < out.indexOf('<title>'), 'and they land inside the head');
   console.log('ok  puts the home-screen tags on the index');
+}
+
+// --- the Service Worker registration, and both of its guards ---
+{
+  // What answers when the phone opens its home-screen icon and this computer
+  // is off -- the failure that is otherwise a blank white window with nothing
+  // in it at all. The registration is a script rather than a tag because both
+  // of the conditions below have to be asked at run time.
+  const out = homescreen('<html><head><title>x</title></head><body></body></html>');
+
+  assert.ok(out.includes("navigator.serviceWorker.register('/dsh-mobile-sw.js')"),
+    'the path the gateway answers');
+  assert.ok(out.includes('.catch(function(){})'),
+    'a registration that fails is not an error on dsh’s page');
+
+  // `isSecureContext`: over the LAN and the tailnet this gateway is plain
+  // HTTP, where a worker cannot be registered at all. Nothing here knows which
+  // channel is up, and nothing here has to.
+  assert.ok(out.includes('window.isSecureContext'), 'not attempted on a plain-HTTP origin');
+
+  // `__dshRemoteCard`: the desktop's own webview, which runs the injected card
+  // script before anything on the page. Loopback IS a secure context, so
+  // without this the desktop window would register a worker for dsh's origin.
+  assert.ok(out.includes('window.__dshRemoteCard'), 'not registered in the desktop window');
+
+  console.log('ok  registers the offline worker, and only where it can help');
 }
 
 // --- an index this does not recognise ---

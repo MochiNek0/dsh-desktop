@@ -229,6 +229,37 @@ pub fn set_channel(app: &AppHandle, kind: crate::remote::TunnelType) {
     write(app, CHANNEL_KEY, Value::String(kind.name().to_string()));
 }
 
+/// The hostname a Cloudflare named tunnel publishes — `dsh.example.com`, bare.
+///
+/// Here rather than beside the token, and that split is deliberate. A hostname
+/// is not a secret: it is the address the user's own phone is sent to, and
+/// somebody reading this file to find out where their computer is answering
+/// from should find it. The token that operates the tunnel is the half that
+/// does not belong in a hand-editable file; see
+/// [`mod@crate::remote::cloudflare`].
+const CLOUDFLARE_HOST_KEY: &str = "remoteCloudflareHostname";
+
+/// The configured hostname, or `None` when nobody has set one — and for an
+/// empty string, which is what a cleared field leaves behind and is the same
+/// thing as unset.
+pub fn cloudflare_hostname(app: &AppHandle) -> Option<String> {
+    read(app)
+        .get(CLOUDFLARE_HOST_KEY)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|host| !host.is_empty())
+}
+
+/// Write it down. Given already tidied — scheme and path stripped, lowercased —
+/// by the one caller that has the user's typing in its hand.
+pub fn set_cloudflare_hostname(app: &AppHandle, hostname: &str) {
+    write(
+        app,
+        CLOUDFLARE_HOST_KEY,
+        Value::String(hostname.to_string()),
+    );
+}
+
 /// The phones the gateway has let in, and the counter their ids come from.
 ///
 /// State, not a preference — the only thing in this file that is, so it is

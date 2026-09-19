@@ -46,18 +46,49 @@ pub struct View {
     /// rather type than scan. `None` exactly when `url` is.
     pub code: Option<String>,
     pub error: Option<String>,
+    /// The channel was asked to start and has not got anywhere yet. Only
+    /// `cloudflared` is ever this — the other two read a network card and are
+    /// up before the button has finished being pressed.
+    pub starting: bool,
     pub devices: Vec<Device>,
     /// A line under the code: the firewall warning, or the one about nothing
     /// having connected. `None` most of the time.
     pub hint: Option<String>,
     /// Which channel the phone is being told to come in over. Drawn as the
-    /// position of a two-way switch; see [`crate::remote::channel`].
+    /// position of a switch; see [`crate::remote::channel`].
     pub channel: super::TunnelType,
+    /// What the Cloudflare panel needs, on the channels that have one.
+    pub setup: Option<Setup>,
+    /// The hostname this machine is answering on from the public internet,
+    /// while it is answering on one. Drawn as a standing warning with the way
+    /// to switch it off beside it.
+    pub public: Option<String>,
     /// Whether the phone's stylesheet patch is on. See [`crate::remote::style`].
     pub style_patch: bool,
     /// Whether closing the app throws every paired phone off. See
     /// [`crate::settings::forget_pairings_on_exit`].
     pub forget_on_exit: bool,
+}
+
+/// What the Cloudflare channels put on the card in place of a QR code, until
+/// there is something to draw one from.
+///
+/// Three questions in order, and the card asks whichever one is still open: is
+/// the binary here, is the tunnel configured, and — once both are true — what
+/// the dashboard has to be pointed at.
+pub struct Setup {
+    /// How to install `cloudflared`, when it is not on this machine. `None`
+    /// once it is.
+    pub install: Option<String>,
+    /// The hostname already saved, to put back in the field. `None` when
+    /// nobody has configured one.
+    pub hostname: Option<String>,
+    /// `http://localhost:<port>`: the origin the dashboard's ingress rule has
+    /// to name, which is a thing this app knows and the user would otherwise
+    /// have to go looking for. `None` before the socket is bound.
+    pub origin: Option<String>,
+    /// The quick tunnel, whose hostname lasts until the process stops.
+    pub quick: bool,
 }
 
 /// Put the card up, or update the one already up.
@@ -66,8 +97,16 @@ pub fn show(app: &AppHandle, view: &View) {
         "url": view.url,
         "code": view.code,
         "error": view.error,
+        "starting": view.starting,
         "hint": view.hint,
         "channel": view.channel.name(),
+        "public": view.public,
+        "setup": view.setup.as_ref().map(|setup| serde_json::json!({
+            "install": setup.install,
+            "hostname": setup.hostname,
+            "origin": setup.origin,
+            "quick": setup.quick,
+        })),
         "stylePatch": view.style_patch,
         "forgetOnExit": view.forget_on_exit,
         "devices": view.devices.iter().map(|device| serde_json::json!({
@@ -111,10 +150,41 @@ fn text() -> serde_json::Value {
         "refresh": t!("换一个码", "New code"),
         "channelLan": t!("局域网", "Local network"),
         "channelTailscale": t!("Tailscale", "Tailscale"),
+        "channelCloudflare": t!("Cloudflare", "Cloudflare"),
+        "channelCloudflareQuick": t!("临时域名", "Temporary"),
         "channelWhy": t!(
-            "手机和电脑在同一个 Wi-Fi 下用局域网。手机在外面、走蜂窝网络，就用 Tailscale——两边登录同一个 tailnet 即可。",
+            "手机和电脑在同一个 Wi-Fi 下用局域网。手机在外面、走蜂窝网络，就用 Tailscale——两边登录同一个 tailnet 即可。\
+             有自己的域名就用 Cloudflare：它是唯一带 HTTPS 的一条，代价是这台电脑对整个公网开着。",
             "Use the local network when the phone is on the same Wi-Fi. Use Tailscale when it is \
-             not — on mobile data, say — with both signed into the same tailnet."
+             not — on mobile data, say — with both signed into the same tailnet. Cloudflare is \
+             for people with a domain of their own: the only channel with HTTPS on it, at the \
+             price of this computer answering the whole internet."
+        ),
+        "starting": t!("正在启动 cloudflared…", "Starting cloudflared…"),
+        "startChannel": t!("启动这条通道", "Start this channel"),
+        "publicOn": t!("这台电脑现在可以从公网访问：", "This computer is reachable from the internet at "),
+        "publicOff": t!("关闭公网通道", "Switch it off"),
+        "publicWhy": t!(
+            "闲置 30 分钟会自动关。托盘图标里也能直接关。",
+            "It switches itself off after 30 idle minutes, and the tray icon can close it too."
+        ),
+        "cfInstall": t!("先装 cloudflared", "cloudflared has to be installed first"),
+        "cfToken": t!("隧道 token", "Tunnel token"),
+        "cfHost": t!("域名", "Hostname"),
+        "cfSave": t!("保存并启动", "Save and start"),
+        "cfWhy": t!(
+            "在 Cloudflare Zero Trust 里建一个 Named Tunnel，把它的 token 和你给它的域名填在这里。\
+             控制台里那条 ingress 规则要指向下面这个地址：",
+            "Create a named tunnel in Cloudflare Zero Trust, then paste its token and the \
+             hostname you gave it here. The ingress rule in the dashboard has to point at:"
+        ),
+        "cfQuick": t!(
+            "临时域名不需要账号，但每次重启都会换一个：已配对的手机会全部失效，主屏幕图标也会指向一个不存在的地址。\
+             所以这条只用来试，不要留着用——它也不会发 PWA 清单。",
+            "A temporary hostname needs no account, and changes every time it starts: every \
+             paired phone is thrown off and the home-screen icon points at a name that no \
+             longer resolves. It is for trying the thing out, and it serves no web app \
+             manifest for that reason."
         ),
         "connected": t!("已连接 {} 台设备", "{} connected"),
         "since": t!("{} 起", "since {}"),
@@ -185,8 +255,8 @@ pub fn script() -> String {
   if (window.__dshRemoteCard) return;
   window.__dshRemoteCard = true;
 
-  var root = null, sheet, head, lede, chan, chanWhy, code, pin, link, status, list,
-      note, patch, keep, foot;
+  var root = null, sheet, head, lede, chan, chanWhy, warn, setup, code, pin, link,
+      status, list, note, patch, keep, foot;
   var TEXT = {{}};
 
   function signal(verb) {{
@@ -223,17 +293,44 @@ pub fn script() -> String {
       'background:var(--rc-bg);color:var(--rc-fg);box-shadow:var(--rc-shadow)}}' +
       '.dsh-rc-head{{margin:0 0 6px;font-size:16px;font-weight:600}}' +
       '.dsh-rc-lede{{margin:0 0 14px;color:var(--rc-muted)}}' +
-      // The channel switch: two segments in a trough, the active one lifted
-      // out of it. A pair of buttons rather than a radio group, because what a
-      // click starts is a question on a dialog and not a change to this box.
-      '.dsh-rc-chan{{display:flex;gap:4px;margin:0 0 7px;padding:3px;' +
+      // The channel switch: segments in a trough, the active one lifted out of
+      // it. Buttons rather than a radio group, because what a click starts is a
+      // question on a dialog and not a change to this box. Two rows of two
+      // rather than one row of four: the names are product names and cannot be
+      // shortened, and a segment that has to ellipsise is one nobody can read.
+      '.dsh-rc-chan{{display:flex;flex-wrap:wrap;gap:4px;margin:0 0 7px;padding:3px;' +
       'border-radius:10px;background:var(--rc-hover)}}' +
-      '.dsh-rc button.dsh-rc-tab{{flex:1;padding:6px 0;border-radius:7px;' +
-      'text-align:center;font-size:13px;color:var(--rc-muted)}}' +
+      '.dsh-rc button.dsh-rc-tab{{flex:1 1 calc(50% - 6px);min-width:0;padding:6px 0;' +
+      'border-radius:7px;text-align:center;font-size:13px;color:var(--rc-muted)}}' +
       '.dsh-rc button.dsh-rc-tab.on{{background:var(--rc-bg);color:var(--rc-fg);' +
       'box-shadow:0 1px 3px rgba(0,0,0,.14)}}' +
       '.dsh-rc-chan-why{{margin:0 0 14px;font-size:11px;line-height:1.5;' +
       'color:var(--rc-muted)}}' +
+      // The standing warning, for as long as this machine is on the internet.
+      // Red, bordered and above everything else on the card, because what it
+      // is reporting is not a setting — it is a door.
+      '.dsh-rc-warn{{margin:0 0 14px;padding:10px 12px;border-radius:8px;' +
+      'border:1px solid var(--rc-danger);color:var(--rc-danger);font-size:12px;' +
+      'line-height:1.55}}' +
+      '.dsh-rc-warn b{{font-weight:600;word-break:break-all;' +
+      'user-select:text;-webkit-user-select:text}}' +
+      '.dsh-rc-warn small{{display:block;margin:4px 0 0;opacity:.8}}' +
+      '.dsh-rc button.dsh-rc-stop{{margin:8px 0 0;padding:5px 10px;font-size:12px;' +
+      'color:var(--rc-danger);border:1px solid var(--rc-danger)}}' +
+      // The Cloudflare panel: what stands where the QR code will be until the
+      // binary is installed and the tunnel is configured.
+      '.dsh-rc-setup{{margin:0 0 14px;padding:12px;border-radius:10px;' +
+      'background:var(--rc-hover);font-size:12px;line-height:1.55;' +
+      'color:var(--rc-muted)}}' +
+      '.dsh-rc-setup code{{display:block;margin:6px 0 0;padding:6px 8px;' +
+      'border-radius:6px;background:var(--rc-bg);color:var(--rc-fg);' +
+      'font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;' +
+      'word-break:break-all;user-select:text;-webkit-user-select:text}}' +
+      '.dsh-rc-setup input{{display:block;width:100%;box-sizing:border-box;' +
+      'margin:8px 0 0;padding:7px 9px;border-radius:7px;border:1px solid var(--rc-line);' +
+      'background:var(--rc-bg);color:var(--rc-fg);font:12px/1.4 ui-monospace,' +
+      'SFMono-Regular,Menlo,Consolas,monospace}}' +
+      '.dsh-rc-setup button{{margin:9px 0 0}}' +
       // The code itself. A grid of cells rather than an image: nothing is
       // fetched, and the quiet zone is padding on the frame around it.
       '.dsh-rc-code{{display:grid;gap:0;width:236px;margin:0 auto 12px;' +
@@ -298,6 +395,8 @@ pub fn script() -> String {
     lede = make('p', 'dsh-rc-lede', sheet);
     chan = make('div', 'dsh-rc-chan', sheet);
     chanWhy = make('p', 'dsh-rc-chan-why', sheet);
+    warn = make('div', 'dsh-rc-warn', sheet);
+    setup = make('div', 'dsh-rc-setup', sheet);
     code = make('div', 'dsh-rc-code', sheet);
     pin = make('div', 'dsh-rc-pin', sheet);
     link = make('button', 'dsh-rc-link', sheet);
@@ -384,6 +483,88 @@ pub fn script() -> String {
     return node;
   }}
 
+  /** The standing warning, while this machine is answering the internet.
+   *
+   *  Drawn above the code rather than below it, and with the way to switch it
+   *  off inside it: the specification's requirement is a visible indication
+   *  that clicks straight through to closing, not a line of status text. */
+  function paintWarning(host) {{
+    warn.style.display = host ? 'block' : 'none';
+    if (!host) return;
+
+    warn.textContent = '';
+    var line = make('div', '', warn);
+    line.textContent = TEXT.publicOn || '';
+    make('b', '', line).textContent = host;
+    make('small', '', warn).textContent = TEXT.publicWhy || '';
+    button(warn, TEXT.publicOff || '', 'dsh-rc-stop', function () {{
+      signal('remote-public-off');
+    }});
+  }}
+
+  /** The Cloudflare panel, which is whichever of three things is still in the
+   *  way: no binary, no configuration, or a tunnel that is simply not running.
+   *
+   *  Only drawn on the channels that have one — `setup` arrives as null
+   *  everywhere else — so the LAN card is exactly the card it always was. */
+  function paintSetup(view) {{
+    var config = view.setup;
+    setup.style.display = config ? 'block' : 'none';
+    if (!config) return;
+
+    setup.textContent = '';
+
+    if (config.install) {{
+      make('b', '', setup).textContent = TEXT.cfInstall || '';
+      make('div', '', setup).textContent = config.install;
+      return;
+    }}
+
+    if (config.quick) {{
+      // Kept on screen even once it is up: what it says is not a step to get
+      // through, it is what this channel costs for as long as it is the one.
+      make('div', '', setup).textContent = TEXT.cfQuick || '';
+    }} else if (view.url) {{
+      // Configured and running. The form was a way in, not a panel, and
+      // leaving it above the QR code would push the thing people came for off
+      // the bottom of the card.
+      setup.style.display = 'none';
+      return;
+    }} else {{
+      make('div', '', setup).textContent = TEXT.cfWhy || '';
+      if (config.origin) make('code', '', setup).textContent = config.origin;
+
+      var token = make('input', '', setup);
+      // `password`, so that a token pasted in front of somebody is not read
+      // off the screen, and out of anything that screenshots this window.
+      token.type = 'password';
+      token.placeholder = TEXT.cfToken || '';
+      token.autocapitalize = 'off';
+      token.spellcheck = false;
+
+      var host = make('input', '', setup);
+      host.type = 'text';
+      host.placeholder = TEXT.cfHost || '';
+      host.value = config.hostname || '';
+      host.autocapitalize = 'off';
+      host.spellcheck = false;
+
+      button(setup, TEXT.cfSave || '', 'dsh-rc-quiet', function () {{
+        signal('remote-cloudflare?token=' + encodeURIComponent(token.value) +
+               '&host=' + encodeURIComponent(host.value));
+      }});
+    }}
+
+    // Configured, and not up. The one button that starts it — a tunnel the
+    // idle timer took down, or one whose token has just been corrected, has
+    // nowhere else to be started from.
+    if (!view.url && !view.starting) {{
+      button(setup, TEXT.startChannel || '', 'dsh-rc-quiet', function () {{
+        signal('remote-start');
+      }});
+    }}
+  }}
+
   /** The matrix, as cells. Rebuilt only when the URL changed: the card
    *  updates every time a device connects, and redrawing nine hundred
    *  elements to say the same thing would make the code flicker. */
@@ -446,7 +627,9 @@ pub fn script() -> String {
     // which reads them out of this script can see them.
     chan.textContent = '';
     [['lan', TEXT.channelLan, 'remote-channel?to=lan'],
-     ['tailscale', TEXT.channelTailscale, 'remote-channel?to=tailscale']]
+     ['tailscale', TEXT.channelTailscale, 'remote-channel?to=tailscale'],
+     ['cloudflare', TEXT.channelCloudflare, 'remote-channel?to=cloudflare'],
+     ['cloudflare-quick', TEXT.channelCloudflareQuick, 'remote-channel?to=cloudflare-quick']]
       .forEach(function (option) {{
         var on = view.channel === option[0];
         button(chan, option[1] || '', 'dsh-rc-tab' + (on ? ' on' : ''), function () {{
@@ -455,6 +638,8 @@ pub fn script() -> String {
       }});
     chanWhy.textContent = TEXT.channelWhy || '';
 
+    paintWarning(view.public);
+    paintSetup(view);
     paintCode(view.url || '');
 
     pin.style.display = view.code ? 'block' : 'none';
@@ -480,7 +665,9 @@ pub fn script() -> String {
     status.className = 'dsh-rc-status' + (view.error ? ' dsh-rc-bad' : '');
     status.textContent = view.error
       ? (TEXT.unavailable || '') + ' ' + view.error
-      : (count ? fill(TEXT.connected, count) : TEXT.waiting || '');
+      : view.starting
+        ? (TEXT.starting || '')
+        : (count ? fill(TEXT.connected, count) : TEXT.waiting || '');
 
     list.textContent = '';
     list.style.display = count ? 'block' : 'none';
@@ -932,6 +1119,11 @@ mod tests {
             "remote-refresh",
             "remote-channel?to=lan",
             "remote-channel?to=tailscale",
+            "remote-channel?to=cloudflare",
+            "remote-channel?to=cloudflare-quick",
+            "remote-start",
+            "remote-public-off",
+            "remote-cloudflare?token=",
             "remote-style?on=",
             "remote-forget?on=",
         ] {
@@ -946,12 +1138,23 @@ mod tests {
             ("dsh-window://remote-refresh", true),
             ("dsh-window://remote-channel?to=lan", true),
             ("dsh-window://remote-channel?to=tailscale", true),
+            ("dsh-window://remote-channel?to=cloudflare", true),
+            ("dsh-window://remote-channel?to=cloudflare-quick", true),
             // A channel this build has no implementation for names nothing to
             // switch to, and is dropped rather than defaulted: a switch that
             // silently lands somewhere else is worse than one that does
             // nothing.
-            ("dsh-window://remote-channel?to=cloudflare", false),
+            ("dsh-window://remote-channel?to=ngrok", false),
             ("dsh-window://remote-channel", false),
+            ("dsh-window://remote-start", true),
+            ("dsh-window://remote-public-off", true),
+            // Both halves or neither: half a configuration saves a hostname
+            // with no token behind it, which starts nothing and looks
+            // configured.
+            ("dsh-window://remote-cloudflare?token=t&host=h", true),
+            ("dsh-window://remote-cloudflare?token=t", false),
+            ("dsh-window://remote-cloudflare?host=h", false),
+            ("dsh-window://remote-cloudflare", false),
             // An id is the whole payload; without one there is nothing to kick.
             ("dsh-window://remote-kick", false),
             ("dsh-window://remote-kick?id=", false),

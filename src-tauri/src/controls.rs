@@ -116,6 +116,15 @@ pub enum Action {
     /// Move the gateway to another channel. Carries the one the card asked
     /// for, already resolved to something this build implements.
     RemoteChannel(crate::remote::TunnelType),
+    /// Start the channel that is already selected. The way back from a tunnel
+    /// that fell over, and from the idle timer having taken one down.
+    RemoteStart,
+    /// Stop being reachable from the public internet, now. Signalled from the
+    /// card and from the tray.
+    RemoteStopPublic,
+    /// The Cloudflare token and hostname, as typed into the card. Both halves
+    /// or the signal is dropped; see [`mod@crate::remote::cloudflare`].
+    RemoteCloudflare(String, String),
     /// The card was closed. The gateway stays up; the devices on it are still
     /// working.
     RemoteClose,
@@ -224,6 +233,26 @@ pub fn action(url: &Url) -> Option<Action> {
             .find_map(|(key, value)| (key == "to").then(|| value.into_owned()))
             .and_then(|name| crate::remote::TunnelType::named(&name))
             .map(Action::RemoteChannel),
+        "remote-start" => Some(Action::RemoteStart),
+        "remote-public-off" => Some(Action::RemoteStopPublic),
+        // The one verb on this channel carrying something that must not be
+        // written down anywhere. It reaches Rust the way every other button
+        // does — a navigation the handler cancels before the webview commits
+        // it — and from here it goes straight into a file only this user can
+        // read. Nothing on this path logs the URL, and this is the reason to
+        // keep it that way: see the note in `perform`.
+        "remote-cloudflare" => {
+            let mut token = None;
+            let mut host = None;
+            for (key, value) in url.query_pairs() {
+                match key.as_ref() {
+                    "token" => token = Some(value.into_owned()),
+                    "host" => host = Some(value.into_owned()),
+                    _ => {}
+                }
+            }
+            Some(Action::RemoteCloudflare(token?, host?))
+        }
         "remote-close" => Some(Action::RemoteClose),
         // The state, not a flip: a signal that went missing would otherwise
         // leave the box and the flag disagreeing until the next click.
@@ -353,6 +382,12 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::RemoteKickAll => return crate::remote::kick_all(app),
         Action::RemoteRefresh => return crate::remote::refresh(app),
         Action::RemoteChannel(kind) => return crate::remote::channel(app, kind),
+        Action::RemoteStart => return crate::remote::start_channel(app),
+        Action::RemoteStopPublic => return crate::remote::stop_public(app),
+        // Not logged, and not traced. See the parser for this verb.
+        Action::RemoteCloudflare(token, host) => {
+            return crate::remote::cloudflare(app, &token, &host)
+        }
         Action::RemoteClose => return crate::remote::close(app),
         Action::RemoteStyle(on) => return crate::remote::style(app, on),
         Action::RemoteForget(on) => return crate::remote::forget_on_exit(app, on),
