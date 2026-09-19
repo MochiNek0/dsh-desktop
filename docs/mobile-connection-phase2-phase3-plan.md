@@ -11,7 +11,9 @@
 | 公网限流「对来自同一 IP 的错误请求频控」 | 经 cloudflared 转发后，网关 accept 到的 peer address **恒为 `127.0.0.1`**。按它限流等于把全世界当一个 IP，合法手机会被攻击者的失败握手连坐拉黑 | 二.1 |
 | 授权弹窗显示「客户端信息：iPhone (IP: 192.168.x.x)」 | 同上，隧道下这里只会显示回环地址，二次确认失去判别依据 | 二.1 |
 | 「网关在通过 HTTPS 通道接收到握手时」追加 `Secure` | 网关收到的是 cloudflared 发来的**明文 HTTP**。唯一可靠判据是当前活跃通道的 `scheme()`，绝不能读 `X-Forwarded-Proto`（客户端可控） | 二.2 |
-| 通道热切换「无需重启，即时更新配对 URL」 | 会话 cookie 在签名 payload 里绑定了 hostname + port。切换通道 = **所有已配对设备静默 401**。Quick Tunnel 每次重启换域名，等于每次重启都要重新扫码 | 二.3 |
+| 通道热切换「无需重启，即时更新配对 URL」 | 切换通道 = **所有已配对设备失效**，因为 cookie 是按 host 作用域的，换了 host 手机根本不会带上它 | 二.3 |
+| （未提及） | **桌面 app 每次重启，已配对设备就全部失效**：签名密钥 mint 在内存里，设备列表也在内存里。`SESSION_TTL` 写着 30 天，但实际活不过一次重启 | 二.4 |
+| （未提及） | **网关每次启动换一个随机端口**（`mod.rs` bind 到 `0`）。对 PWA 是致命的：origin 含端口，换端口 = 主屏幕图标直接死链，连 401 都到不了 | 二.4、六 |
 | `RemoteTunnel::start()` 同步返回基地址 | 同章节又要求用 `tokio::process::Command` 拉起 cloudflared 并解析 stderr 等几秒。同步签名要么卡死 UI，要么在 tokio runtime 里 `block_on` 直接 panic | 一.1 |
 | Quick Tunnel 面向「普通用户、外网 5G」 | `*.trycloudflare.com` 在国内连通性不可靠；Cloudflare 官方声明 Quick Tunnel 不适合生产（无 SLA、无固定域名） | 四.1 |
 | Phase 2「PWA 沉浸全屏：完整支持」 | PWA 安装按 origin 绑定。Quick Tunnel 每次重启换域名 → 已添加到主屏幕的图标全部失效。PWA 只在**稳定域名**下成立 | 六 |
@@ -23,8 +25,9 @@
 
 1. **通道单例绑定**：`Shared.tunnel: Mutex<LanTunnel>` 硬编码了 LAN。
 2. **LAN 模式明文 HTTP**：同网段被动嗅探风险。**Phase 2 不解决这一条**——LAN 通道在可预见的将来都是明文 HTTP，`Secure` 标记只对 HTTPS 通道有意义。第一版把它写成「Phase 2 引入 HTTPS 隧道后必须完成安全加固」是误导。诚实的表述是：LAN 模式接受此风险，需要传输加密的用户应改用 Tailscale 或 Cloudflare 通道。
-3. **PWA 缺 Secure Context**：同上，随 HTTPS 通道一并解决，仅限稳定域名。
-4. **`authorities()` 在热路径上做系统调用**：`trust.rs` 每个请求都调它，而 `LanTunnel::authorities()` 每次都跑一遍 `if_addrs::get_if_addrs()`。重构时顺手加短 TTL 缓存，但要保留「笔记本换网后不重启也能更新」的语义。
+3. **PWA 缺 Secure Context**：同上，随 HTTPS 通道一并解决，仅限稳定 origin。
+4. **配对活不过一次重启**：网关端口每次启动随机（bind `0`），签名密钥与设备列表都只在内存里。三者合起来意味着关一次应用就要重新扫码，而 `SESSION_TTL` 写的是 30 天。这也是 PWA 在 LAN 模式下根本装不成的原因。见第二章第 4 节。
+5. **`authorities()` 在热路径上做系统调用**：`trust.rs` 每个请求都调它，而 `LanTunnel::authorities()` 每次都跑一遍 `if_addrs::get_if_addrs()`。重构时顺手加短 TTL 缓存，但要保留「笔记本换网后不重启也能更新」的语义。
 
 ---
 
@@ -99,9 +102,11 @@ pub trait RemoteTunnel: Send + Sync {
 
 ---
 
-# 二、三个横切问题（先于任何通道实现）
+# 二、横切问题（先于任何通道实现）
 
-这一章是第一版最大的空白。下面三条不属于任何单个通道，但任何一条做错，对应的通道就是不安全或不可用的。**建议在写 `TailscaleTunnel` / `CloudflareTunnel` 之前先把这三条落地并加测试。**
+这一章是第一版最大的空白。下面每一条都不属于任何单个通道，但任何一条做错，对应的通道就是不安全或不可用的。**建议在写 `TailscaleTunnel` / `CloudflareTunnel` 之前先把它们落地并加测试。**
+
+其中第 4 节（跨重启存活）和通道完全无关，现在就能做，而第六章的 PWA 整个压在它上面。
 
 ## 1. 手机的真实 IP
 
@@ -121,20 +126,65 @@ pub trait RemoteTunnel: Send + Sync {
 
 ## 3. 切换通道会让所有已配对设备失效
 
-这是产品行为问题，不是 bug，但第一版完全没提。会话 cookie 在确定性名称和签名 payload 里同时绑定了规范化 hostname 与 port，因此：
+这是产品行为问题，不是 bug，但第一版完全没提。
 
-- LAN → Cloudflare：authority 从 `192.168.1.100:59000` 变成 `xxx.example.com`，所有手机的 cookie 失效，表现为莫名其妙的 401 而不是「请重新扫码」。
+先说清楚原因，因为很容易归错。**不是**我们的 cookie 绑定了地址——`session.rs` 的 cookie 是 `v1.<id>.<issued>.<mac>`，签的只有 id 和签发时间，该模块开头还专门有一节说明地址是**故意不放进去**的，理由正是 Phase 2 的隧道。（绑定 hostname 与 port 的是 **dsh 自己的** cookie，见规格的事实核验表，而那个 cookie 从不离开网关进程。）
+
+真正的原因是浏览器：**cookie 按 host 作用域**。换了通道 host 就变了，手机根本不会把旧 cookie 带上来，网关看到的是一个没有凭证的请求。
+
+- LAN → Cloudflare：`192.168.1.100` → `xxx.example.com`，两个不同的 cookie jar，表现为莫名其妙的 401 而不是「请重新扫码」。
 - HTTPS → HTTP 回退：带 `Secure` 签发的 cookie 浏览器压根不会在 HTTP 上回发，同样静默失败。
-- Quick Tunnel 每次重启换域名：等于每次重启 DSH 都要重新扫码 + 重新点「允许」。
+- Quick Tunnel 每次重启换域名：等于每次重启都要重新扫码 + 重新点「允许」。
+
+顺带记一个反直觉的点，下一节要用到：**cookie 不按端口隔离**（RFC 6265 明说不提供端口隔离），所以单换端口、host 不变时，cookie 本身是活得下来的。
 
 **要定的产品行为**（建议取第一条）：
 
 1. 切换通道前，卡片明确提示「当前 N 台已连接设备需要重新扫码配对」，用户确认后再切。切换完成后卡片直接回到「等待扫码」状态。
-2. 或者让 session 绑定到设备指纹而非 authority。更好用，但等于放宽了 cookie 的绑定语义，要重新审一遍 DNS rebinding 的防御是否还成立——不建议在 Phase 2 做。
+2. 或者让 session 绑定到设备指纹而非 host。更好用，但要重新审一遍 DNS rebinding 的防御是否还成立——不建议在 Phase 2 做。
 
-无论取哪条，**401 必须能被手机端识别成「需要重新配对」并自动跳到配对提示页**，而不是一个裸的错误码。
+无论取哪条，**401 必须能被手机端识别成「需要重新配对」并跳到配对提示页**，而不是一个裸的错误码。
 
-## 4. 隧道开启期间，栅栏的强度是下降的
+## 4. 桌面 app 每次重启，已配对设备也全部失效
+
+比上一条更常见，而且第一版和 Phase 1 的实现都没把它当回事。**这一条是 PWA 能不能成立的前提**，所以要连着一起解决。
+
+先厘清三个 token，因为它们经常被混为一谈——**手机只见过其中一个**：
+
+| | 谁持有 | dsh 重启 | 桌面 app 重启 |
+| :--- | :--- | :--- | :--- |
+| dsh launch token | 网关（服务端） | 变了，网关自动重新 exchange，**手机无感** | 同样无感 |
+| `pair_token`（一次性 nonce，5 分钟） | 二维码 | 无关 | 无关 |
+| `dsh_mobile_session` | 手机 | **不受影响** | **全部作废** |
+
+第一列已经是对的，有测试守着：`remote::tests::a_dsh_that_restarted_is_reauthenticated_without_the_phone_noticing`。**所以「dsh 重启要重新扫码」是个误解**，dsh 怎么重启手机都无感。
+
+真正让人要重新扫码的是桌面 app 重启，三件事同时发生：
+
+1. **网关端口变了。** `remote::mod` 里 `bind` 到端口 `0`，OS 每次挑一个新的。
+2. **签名密钥变了。** `session.rs` 的 secret 是 "minted at startup and never written anywhere"——纯内存，重启即重新 mint，此前签的每一个 mac 都验不过。
+3. **设备列表清空。** 同样只在内存里。
+
+其中**第 1 条对 PWA 是致命的，而且和 cookie 无关**：PWA 的 origin 是 `scheme://host:port`，端口变了就是另一个 origin。主屏幕图标会直接连接被拒——不是 401、不是「请重新配对」，是一个浏览器错误页，用户没有任何线索知道该去扫码。
+
+还有第四种：DHCP 续租拿到不同的 LAN IP，host 变，同样是新 origin。
+
+### 要做的三件事
+
+1. **固定网关端口。** 第一次 bind 到 `0` 拿到端口后写进 `desktop.json`，之后优先复用，被占用才回落到 `0`。
+   - `mod.rs` 那句「Port `0`，所以 OS 来挑：没有别的东西需要提前知道这个号码」讲的是**不需要 dsh 提前知道端口**（方案 A 对方案 B 的优势），和端口是否跨重启稳定无关。固定端口不影响方案 A。
+   - 防火墙也不受影响：`firewall.rs` 的规则是**按程序**匹配的，不按端口。
+
+2. **持久化签名密钥与设备列表。** 密钥进 OS 凭据库（和 Cloudflare Token 同一个 `keyring`），设备列表进 `desktop.json`。
+   - 这才对得起 `SESSION_TTL`。那里写着 30 天，注释说 "a session that has to be re-paired every launch is one nobody would turn on"——**而当前实现恰恰就是每次启动都要重配**，那句注释是自我打脸的。
+   - **这是一次真实的安全模型变更，必须写进文档**：现在是「关掉应用等于全部作废」，改完是「30 天内一直有效，密钥落盘，能读到那份凭据的人就能伪造 cookie」。
+   - 配套：保留已有的 `revoke_all`（「断开全部 / 换锁」，它已经同时清列表并轮换密钥），并在设置里给偏执用户一个「退出时清除所有配对」的开关。
+
+3. **在 1 做完之前，LAN 模式不注入 PWA manifest。** 见第六章。
+
+---
+
+## 5. 隧道开启期间，栅栏的强度是下降的
 
 现在 `addresses()` 故意排除回环，正是为了保证「`Host: 127.0.0.1` 的请求一定不是手机发的」。隧道一开，authorities 里多了一个公网主机名，而**本机任何进程都可以构造一个 `Host: xxx.example.com` 的请求打到网关**——socket 层区分不出它和 cloudflared。
 
@@ -233,11 +283,18 @@ LAN 模式忘了关，风险限于同一个 Wi-Fi。公网隧道忘了关一整�
 
 ---
 
-# 六、PWA（仅限稳定域名）
+# 六、PWA（仅限稳定 origin）
 
-## 1. 前提
+## 1. 前提：origin 必须跨重启不变
 
-PWA 安装按 origin 绑定，所以只有 **Named Tunnel 的自有域名**或 **MagicDNS + `tailscale cert`** 下才成立。Quick Tunnel 下每次重启换域名，已添加到主屏幕的图标全部变死链——这种情况下**不注入 manifest**，免得用户装了一个第二天打不开的图标。
+PWA 安装按 **origin** 绑定，而 origin 是 `scheme://host:port` —— 三个部分都要稳定，第一版只看到了 host 那一个。
+
+所以有两道门槛，**都过了才注入 manifest**：
+
+1. **host 稳定**：Named Tunnel 的自有域名，或 MagicDNS + `tailscale cert`。Quick Tunnel 每次重启换域名，**不注入**。
+2. **port 稳定**：即第二章第 4 节那条固定网关端口。**在它做完之前，LAN 模式一律不注入**——网关现在每次启动都换随机端口，装出来的图标第二天就是死链。
+
+第二道门槛尤其容易漏，因为它在本地、看起来和「远程」无关。但装了一个打不开的图标，比没有图标糟得多：失败表现是浏览器的连接被拒页面，不是 401，用户拿不到任何「该去重新扫码」的提示。
 
 ## 2. 网关挂载
 
@@ -306,12 +363,13 @@ PWA 安装按 origin 绑定，所以只有 **Named Tunnel 的自有域名**或 *
 | | `src-tauri/src/remote/tunnel/tailscale.rs` | `100.64.0.0/10` 网段 + 接口名交叉验证 |
 | | `src-tauri/src/remote/tunnel/cloudflare.rs` | 子进程生命周期、stderr 捕获、Job Object |
 | **横切** | `src-tauri/src/remote/trust.rs` | 经 `client_ip()` 取真实地址；限流中间件 |
-| | `src-tauri/src/remote/session.rs` | `Secure` 标记（源为 `scheme()`）；切换通道时作废全部会话 |
+| | `src-tauri/src/remote/session.rs` | `Secure` 标记（源为 `scheme()`）；切换通道时作废全部会话；**密钥与设备列表持久化** |
 | | `src-tauri/src/remote/dialog.rs` | 授权弹窗显示真实客户端 IP |
+| **跨重启存活** | `src-tauri/src/remote/mod.rs` | **端口复用**：首次 bind `0`，之后复用记下的端口，被占用再回落 |
 | **公网守卫** | `src-tauri/src/remote/mod.rs` | 空闲自动停机、退出确认 |
-| **UI** | `src-tauri/src/remote/card.rs` | 通道切换、四态展示、关停入口 |
-| **配置** | `src-tauri/src/settings.rs` | `remote_tunnel_mode`；Token 走 `keyring` |
-| **PWA** | `plugin/lib/index.js` | manifest / apple-touch / 安装引导（仅稳定域名） |
+| **UI** | `src-tauri/src/remote/card.rs` | 通道切换、四态展示、关停入口；设置里的「退出时清除所有配对」 |
+| **配置** | `src-tauri/src/settings.rs` | `remote_tunnel_mode`、`remote_gateway_port`、设备列表；Token 与**签名密钥**走 `keyring` |
+| **PWA** | `plugin/lib/index.js` | manifest / apple-touch / 安装引导（host 与 port 都稳定时才注入） |
 | | `src-tauri/src/remote/static/` | 192 与 512 图标 |
 
 ---
@@ -329,6 +387,22 @@ PWA 安装按 origin 绑定，所以只有 **Named Tunnel 的自有域名**或 *
 3. 通道切换的会话作废 + 手机端 401 引导页。
    - **verify**：手动切换通道后，已配对手机刷新看到的是配对引导页，不是 401。
 
+## 里程碑 2.0b：跨重启存活（PWA 的前提）
+
+单列一个里程碑，因为第六章的 PWA 全部压在它上面，而它和任何新通道都无关——**可以现在就做，不必等 Tailscale**。
+
+1. 网关端口复用（首次 bind `0` 并记下，之后优先复用，被占用回落）。
+   - **verify**：重启桌面 app 三次，卡片上的端口不变。
+   - **verify**：先用 `nc` 占住该端口再启动，网关仍能起来（回落到新端口）且卡片显示的是新端口。
+2. 签名密钥与设备列表持久化。
+   - **verify**：配对一台手机 → 退出桌面 app → 重新启动 → 手机刷新，**不需要重新扫码**。
+   - **verify**：点「断开全部」后重启，该手机需要重新扫码（`revoke_all` 的语义没被持久化削弱）。
+   - **verify**：`SESSION_TTL` 过期后仍然要求重新配对。
+3. 「退出时清除所有配对」开关。
+   - **verify**：打开该开关后走一遍 1 的第一条 verify，结果反过来。
+
+> 这一步改变了安全模型——从「关掉应用等于全部作废」变成「30 天内有效，密钥落盘」。改动落地时要同步更新 `session.rs` 的模块文档，那里现在写的是密钥 "never written anywhere"。
+
 ## 里程碑 2.1：Tailscale + PWA 基础
 
 1. `TailscaleTunnel`（仅 `100.x`）。
@@ -336,7 +410,9 @@ PWA 安装按 origin 绑定，所以只有 **Named Tunnel 的自有域名**或 *
    - **verify**：退出 Tailscale 客户端后，卡片显示降级文案且不生成二维码。
 2. PWA 基础设施（manifest / 图标 / 注入 / `Secure` cookie）。
    - **verify**：Secure Context 下 `dsh_mobile_session` 带 `Secure`；非 Secure Context 下不带。
+   - **verify**：**2.0b 未完成时 LAN 模式不注入 manifest**；完成后才注入。
    - **verify**：iOS 上「添加到主屏幕」后从图标打开，落到配对引导页而不是 401（第六章第 4 节）。
+   - **verify**：装好 PWA → 重启桌面 app → 点主屏幕图标，能打开（这一条同时验了 2.0b 的第 1 项，也是整个 PWA 功能的验收点）。
 3. 卡片支持 LAN / Tailscale 切换。
 
 ## 里程碑 2.2：Cloudflare + 公网守卫
@@ -435,7 +511,10 @@ fragment 那一步是对的。但整个推理的前提是「手机端跑的是�
 ```text
 [ Phase 1 完成 ]
         │
-        ├─▶ 2.0  横切三件事（真实 IP / Secure 来源 / 切换失效）
+        ├─▶ 2.0  横切（真实 IP / Secure 来源 / 切换失效 / 栅栏强度）
+        │
+        ├─▶ 2.0b 跨重启存活（固定端口 + 密钥与设备列表落盘）
+        │        与通道无关，可与 2.0 并行；PWA 全压在它上面
         │
         ├─▶ 2.1  Tailscale（仅 100.x）+ PWA 基础
         │
