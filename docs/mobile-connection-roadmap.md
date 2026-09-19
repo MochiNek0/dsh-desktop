@@ -13,18 +13,27 @@ Phase 1 能扫码连上，但有三处让人不想日常使用：
 
 **1 和 2 是同一个因**：配对活不过一次重启，于是扫码从一次性动作变成了日常动作，而"日常"才让扫码本身的不顺手暴露出来。修掉 1，2 的大半会跟着消失。3 是另一件事，排在后面。
 
-**1 和 2 已经没了**——那就是 M1，四件事全部落地，外加交付之后补的两个洞（见 M1 末尾）。**3 也有了一半**：M2 把通道做成可切换的，并加上了 Tailscale，手机走蜂窝网络也能连上。剩下的是给没有 Tailscale 的人的那条路，以及 TLS——都在 M3。
+**1 和 2 已经没了**——那就是 M1，四件事全部落地，外加交付之后补的两个洞（见 M1 末尾）。**3 也没了**：M2 把通道做成可切换的并加上 Tailscale，M3 加上 Cloudflare，于是有自有域名的人也有了一条出局域网的路，而且是唯一带 TLS 的一条——顺带把「电脑关机时主屏幕图标一片白」这个从 M1 就欠着的洞补上了。
 
 ## 路线
 
 | | 内容 | 状态 |
 | :--- | :--- | :--- |
 | **M1** | 配对活过重启 + 重新配对入口 + 主屏幕图标 | **已完成**（`1b5d6fb`，及其后的两处修补） |
-| **M2** | 通道抽象 + 三个横切问题 + Tailscale | **已完成**（`8bc45ef`），三处偏离见文末 |
-| **M3** | Cloudflare Named Tunnel + 公网守卫 | 下一个，依赖 M2 |
-| 之后 | 自托管中继（第四个 `RemoteTunnel` 实现） | 依赖 M2 |
+| **M2** | 通道抽象 + 三个横切问题 + Tailscale | **已完成**（`8bc45ef`），三处偏离见该节末尾 |
+| **M3** | Cloudflare 隧道 + 公网守卫 + 离线壳 | **已完成**，偏离见该节末尾 |
+| 之后 | 自托管中继（第四个 `RemoteTunnel` 实现） | 依赖 M2 的抽象，未排期 |
 
-现在手机连接是这样一条路径：桌面 app 一启动网关就在，卡片上选局域网或 Tailscale，图标点下去直接进 dsh；凭证没了就在同一个页面里输六个字符，桌面弹框确认。还缺两件，都在 M3：**没有自有域名、又不想装 Tailscale 的人仍然出不了局域网**；以及**没有 TLS，所以没有 Service Worker，所以电脑关机时主屏幕图标是一片白**（见「躲不掉的坑」）。M2 按计划仍然是明文 HTTP，第二件它治不了。
+现在手机连接是这样一条路径：桌面 app 一启动网关就在（公网通道除外，见下），卡片上四选一，图标点下去直接进 dsh；凭证没了就在同一个页面里输六个字符，桌面弹框确认；电脑关机时主屏幕图标显示一页说明而不是白屏——前提是当时用的是 Cloudflare 通道，因为 Service Worker 要 secure context，而只有那一条有 TLS。
+
+四条通道各自在什么时候用：
+
+| 通道 | 什么时候 | 代价 |
+| :--- | :--- | :--- |
+| 局域网 | 手机和电脑同一个 Wi-Fi | 明文 HTTP；出了这个网就没了 |
+| Tailscale | 手机在外面，两边登录同一个 tailnet | 要装客户端；仍然是明文 HTTP（WireGuard 加密，但浏览器不认） |
+| Cloudflare | 有自己的域名，任何网络下都要能进 | 这台电脑对整个公网开着——所以有一整套守卫 |
+| 临时域名 | 只是想试试能不能跑通 | 每次重启换域名，已配对设备全废；不发 manifest |
 
 ---
 
@@ -193,6 +202,8 @@ Serve 与 Funnel 不是一回事：**Serve 是 tailnet 内 HTTPS，Funnel 是暴
 
 trait 只加了 `scheme()` 和 `client_ip()`——这两个今天就有消费者。
 
+（M3 把 `state()` 做了，但没做 async：`start()` 仍然是同步函数，只是不等结果。见 M3 的「偏离一」。）
+
 ### 二、切通道不吊销已配对设备
 
 计划里写的是「切完卡片回到等待扫码」，听起来像要清空设备列表。实际没有清，理由是**不清更好而且不花钱**：cookie 按 host 作用域是浏览器的行为，不是我们的吊销——换到 Tailscale 之后手机确实要重新配，但**换回局域网，原来那份配对还在**。清掉会把一个可逆的动作变成不可逆的。
@@ -218,13 +229,15 @@ trait 只加了 `scheme()` 和 `client_ip()`——这两个今天就有消费者
 
 ---
 
-# M3：Cloudflare Named Tunnel + 公网守卫
+# M3：Cloudflare Named Tunnel + 公网守卫（已完成）
 
 ## 只推 Named，Quick 标注为试用
 
 Quick Tunnel（`--url`）域名每次重启都变，**已配对设备与主屏幕图标全部失效**——等于把 M1 的成果抵消掉。加上 `*.trycloudflare.com` 在国内连通性不可靠、Cloudflare 官方声明其不适合生产（无 SLA、无固定域名），它只能是「快速试一下」。
 
 Named Tunnel（`--token` + 自有域名）域名稳定，PWA 成立，已配对设备跨重启存活。**Quick Tunnel 模式下不注入 manifest。**
+
+（落地时这一条换了个地方实现：不是「不注入」，而是网关对这四个路径一律 404。注入发生在 plugin 里，而 plugin 写的是 dsh 的 index——那份 HTML 桌面自己的 webview 也要吃，plugin 根本不知道当前是哪条通道。网关是唯一知道的人。离线壳的 worker 一并按这条处理：注册在一个明天就不存在的 origin 上，是纯粹的垃圾。）
 
 这也意味着：计划不应假装 Cloudflare 能覆盖「普通用户」。国内的广域网主线是 Tailscale 和自托管中继，Cloudflare 是给有自有域名的用户的选项。
 
@@ -254,12 +267,74 @@ LAN 模式忘了关，风险限于同一个 Wi-Fi。公网隧道忘了关一整�
 
 **隧道开启期间，信任栅栏的强度是下降的。** `addresses()` 只收在网的物理网卡地址，正是为了保证「`Host: 127.0.0.1` 的请求一定不是手机发的」。隧道一开，authorities 里多了一个公网主机名，而本机任何进程都可以构造一个带该 Host 的请求打到网关——socket 层区分不出它和 cloudflared。剩下的防线只有 cookie 和一次性 nonce。
 
-这不是 showstopper（纵深防御本来就是这么用的），但别让后来的人以为栅栏还兜着底。
+这不是 showstopper（纵深防御本来就是这么用的），但别让后来的人以为栅栏还兜着底。已经写进 `trust.rs` 的模块文档。
+
+落地时补了一道，把损失收窄了一点：**隧道开着期间，网关只接受 loopback 的 peer**。理由是那个前提——「能通过这条通道连上来的只可能是我们自己拉起的子进程」——在一个 bind 了 `0.0.0.0` 的 socket 上本来就是假的：同一个 Wi-Fi 上的机器可以直接打这个端口，并在 `Host` 里写上隧道的域名，而那正是栅栏刚刚决定要放行的名字。加上这条之后，攻击者必须已经在这台机器上，而不只是在同一个网里。这同时也是 `CF-Connecting-IP` 敢被采信的唯一理由（`cloudflare.rs::client_ip` 里再查一次，两处各自成立）。
+
+它没有把洞补上，只是把「同一个 Wi-Fi」排除掉了。本机进程照旧可以伪造，剩下的防线仍然只有 cookie、一次性 nonce 和人工确认——而针对这一点的答案是下面那套守卫，不是声称栅栏还管用。
 
 **verify**：kill 桌面进程后 `cloudflared` 不残留。
 **verify**：从两个不同公网 IP 打失败握手，只有超限的那个被拉黑；隧道重启后黑名单清空。
 **verify**：无设备连接 30 分钟后隧道自动停止且卡片说明原因。
 **verify**：`desktop.json` 里 grep 不到 token。
+
+## 顺带把白屏补掉
+
+这是 M1 就欠着的洞（见「躲不掉的坑」），一直等的就是一个 secure context，而 Cloudflare 的边缘终结 TLS 正好给了它。
+
+网关多发两个文件：`/dsh-mobile-sw.js` 和 `/dsh-mobile-offline`。Service Worker 只拦**导航请求**，只在 `fetch` 真的失败时（网络层失败，不是 4xx）拿缓存里那一页顶上。注册脚本由 plugin 注入，两道闸：`isSecureContext`（局域网和 Tailscale 都是明文，于是压根不注册）和 `window.__dshRemoteCard`（桌面自己那个 webview——loopback 也算 secure context，不挡住它就会给 dsh 自己的 origin 装一个没人会看的 worker）。
+
+**它刻意不缓存 dsh 的任何东西**。这是对「Service Worker 通常拿来干什么」的一次明确拒绝：dsh 是另一个进程提供的、这个 app 不拥有的应用，缓存它的资源等于让手机拿昨天的前端打今天的后端，而两边都察觉不到。白屏值得修，为了修白屏去赌一个陈旧的 dsh 不值得。
+
+**verify**：Cloudflare 通道下手机装好图标 → 关掉电脑 → 点图标，看到的是说明页而不是白屏，页面上的按钮能重试。
+**verify**：局域网通道下 `navigator.serviceWorker.getRegistrations()` 是空的（明文 origin 根本注册不了）。
+
+## 落地时的五处偏离
+
+### 一、`start()` 不是 async，只是「立刻返回」
+
+M2 把这条推给了 M3，落地时做的是：`start()` 仍然是同步函数，但不等结果——它只报「还没开始就能知道」的失败（没有网卡、没有 tailnet、没有 cloudflared、没有 token），其余全部走 `state()`。卡片每 300ms 问一次，最多 45 秒。
+
+不做 async trait 的理由是它在 `Box<dyn>` 后面要么引入 `async-trait` 这个依赖，要么写一堆 `Pin<Box<dyn Future>>`，而换来的东西恰好是零：真正要等的是一个正在读自己 stderr 的子进程，等待发生在另一个线程里，调用方要的只是「别卡住我」。
+
+### 二、Named Tunnel 的域名是用户填的，不是从日志里读的
+
+计划里写「实时读 stderr 捕获域名」，那是 Quick Tunnel 的行为。Named Tunnel 走 `--token`，ingress 规则在 Cloudflare 控制台里（remotely managed），`cloudflared` 自己既不知道也不打印公网域名，`--url` 传了也会被忽略。
+
+所以这条路是反过来的：**域名由用户填**（存 `desktop.json`，它不是秘密），stderr 只用来等一条 `Registered tunnel connection`。作为交换，卡片上直接印出控制台那条 ingress 要指向的地址——`http://localhost:<port>`，端口是 M1 固定下来的那个，这正是它值得被固定的又一个理由。
+
+### 三、`std::process` + 读取线程，不是 `tokio::process`
+
+树里已经有一套拉子进程的办法（`server.rs` 拉 `dsh web` 就是它）：`std::process::Command` + `group_leader` / `tethered` / Windows `Job`。M3 原样复用，包括那个 Job Object。多引一套 tokio 的进程 API 只会让树里有两种拉子进程的写法。
+
+日志按计划不原样落盘：只分类，不镜像；保留的最后一行会把 token 做**精确替换**（token 是我们手里的字符串，不用去猜它长什么样），失败时把这一行拼进卡片上的说明里。
+
+### 四、「切通道会清空限流黑名单」是顺手补的，不是计划里的
+
+计划的 verify 里有「隧道重启后黑名单清空」，但没说为什么。落地时发现理由比计划写的更强：**黑名单里的地址只在某一条通道下有意义**。局域网下那是手机自己，隧道下那是 `CF-Connecting-IP` 说的地址——整个公网。带着跨通道走，等于因为隧道另一端某人用过同一个地址就把用户自己的手机拉黑。所以 `switch` 和 `halt` 都会清。
+
+### 五、公网通道不会在启动时自动拉起
+
+M1 的 `resume()` 在启动时把网关拉回来，让已配对的手机第二天还能直接用。M3 给它加了第三道闸：**公网通道不算**。
+
+理由是这两件事是不同的承诺。「手机明天还能用」是一个承诺；「因为上次关 app 时这台电脑在公网上，这次开机就自动回到公网上」是另一个，用户没做过。所以存着的通道是 Cloudflare 时，`resume` 直接不动手，要等人打开卡片。这也让「关闭公网通道」这个按钮变得干净：它只停隧道、不改通道设置，因为下次启动本来就不会自动拉起来。
+
+### 对应的测试
+
+| verify | 落点 |
+| :--- | :--- |
+| 隧道开着时，局域网上的机器不能直连网关 | `proxy::tests::a_public_tunnel_takes_nothing_but_loopback` |
+| `CF-Connecting-IP` 只在 loopback 连接上采信 | `cloudflare::tests::the_forwarded_address_is_believed_only_from_loopback` |
+| `Secure` 只由 scheme 决定，两条通道各验一次 | `tests::the_cookie_is_secure_exactly_when_the_channel_is` |
+| 临时域名下不发 manifest / 图标 / worker / 离线页 | `tests::a_quick_tunnel_serves_nothing_worth_installing` |
+| Named Tunnel 下这四个都发，且权威是裸域名 | `tests::a_named_tunnel_publishes_the_home_screen_files` |
+| 闲置判定要同时看「无活连接」和「无请求」 | `tests::a_live_connection_is_not_an_idle_gateway` |
+| worker 脚本是合法 JS，且路径只拼写一次 | `proxy::tests::the_worker_script_is_balanced_javascript` |
+| token 不进任何日志行 | `cloudflare::tests::the_token_is_taken_out_of_anything_kept` |
+| 两种模式各自怎么知道自己起来了 | `cloudflare::tests::the_quick_hostname_is_read_off_the_banner`、`a_named_tunnel_waits_for_a_registered_connection` |
+| 切通道清空黑名单 | `trust::tests::changing_the_channel_forgets_everybody` |
+
+剩下的要在真机上验，因为它们要么需要一个 Cloudflare 账号，要么需要把电脑关掉：上面四条 verify 全部，加上 M2 遗留的两条（手机走蜂窝进 tailnet；退出 Tailscale 后卡片降级）。
 
 ---
 
@@ -280,13 +355,14 @@ LAN 模式忘了关，风险限于同一个 Wi-Fi。公网隧道忘了关一整�
 | 坑 | 说明 |
 | :--- | :--- |
 | **iOS 独立窗口有自己的 cookie jar** | 在 Safari 里配对成功 → 添加到主屏幕 → 从图标打开，是一个全新的未认证会话。所以 M1 的重新配对页不是锦上添花，是**首次安装流程的必经一步** |
-| **地址变了，我们一行代码都跑不到** | 端口变、DHCP 换 IP、切通道——图标指向死 origin，用户看到的是浏览器的「连接被拒」。**电脑关机、休眠、app 没运行，是同一类**，而且是日常最常撞到的那一种：iOS 独立窗口没有浏览器界面可显示，呈现出来就是一片白，没有任何提示。唯一的解是 Service Worker 缓存离线壳，而它要求 secure context，**LAN 明文 HTTP 下这条路是堵死的**（自签证书不算 secure context，私有 IP 也签不出真证书）。已决定不在这一轮治：**要等到 M3**——M2 也治不了，Tailscale 那一节明确不做 Serve HTTPS，`scheme()` 就是 `Http`；能终结 TLS 的是 M3 的 Named Tunnel（或者将来补上的 Tailscale Serve）。到那时再用离线壳一次性解决。「桌面 app 开着但没人点过按钮」那一半已经由 `remote::resume()` 修掉，见 M1 末尾 |
+| **地址变了，我们一行代码都跑不到** | 端口变、DHCP 换 IP、切通道——图标指向死 origin，用户看到的是浏览器的「连接被拒」。**电脑关机、休眠、app 没运行，是同一类**，而且是日常最常撞到的那一种：iOS 独立窗口没有浏览器界面可显示，呈现出来就是一片白，没有任何提示。唯一的解是 Service Worker 缓存离线壳，而它要求 secure context，**LAN 明文 HTTP 下这条路是堵死的**（自签证书不算 secure context，私有 IP 也签不出真证书）。**M3 把它治了一半**：Cloudflare 的边缘终结 TLS，于是那条通道下有 secure context，离线壳成立——见 M3 的「顺带把白屏补掉」。另一半治不了，而且大概永远治不了：局域网和 Tailscale 仍然是明文 HTTP，那两条通道下白屏依旧。「桌面 app 开着但没人点过按钮」那一半已经由 `remote::resume()` 修掉，见 M1 末尾 |
 | **跨 origin 的扫码解决不了图标** | 就算扫到了新地址，导航过去等于离开 PWA 的 scope，iOS 上会跳出 Safari，用户最后有两个图标。UI 上要说实话：扫码解决的是「我能连上」，不是「我的图标还能用」 |
 | **扫任意 QR 然后导航过去 = 开放重定向** | 若将来做页内扫码，必须校验形状（`http(s)://<host>[:<port>]/?pair_token=<32 hex>`）并**在跳转前把目标 host 显示给用户确认**，否则这是个很好用的钓鱼跳板 |
 
 # 明确不做
 
-- **Phase 2 不解决 LAN 明文 HTTP 的嗅探风险。** LAN 通道在可预见的将来都是明文 HTTP，`Secure` 只对 HTTPS 通道有意义。诚实的表述是：LAN 模式接受此风险，需要传输加密的用户改用 Tailscale 或 Cloudflare 通道。
+- **不解决 LAN 明文 HTTP 的嗅探风险。** LAN 通道在可预见的将来都是明文 HTTP，`Secure` 只对 HTTPS 通道有意义。诚实的表述是：LAN 模式接受此风险，需要传输加密的用户改用 Tailscale（WireGuard 在链路上加密，虽然浏览器仍然认为自己在明文里）或 Cloudflare 通道。
+- **不自动下载 cloudflared。** 见 M3。探测 PATH 和 app 数据目录，找不到就在卡片上给出该平台的安装命令，仅此而已。
 - **mDNS**（广播 `dsh-desktop.local`，host 与 IP 脱钩）。它是「DHCP 换 IP 导致 origin 变」的唯一治本解，iOS/macOS 原生支持、Android 参差。列为 M1 之后的可选项，不进这一轮。
 - **实时摄像头扫码**（`getUserMedia` 要 secure context）。想在页内扫码，回退方案是 `<input type="file" accept="image/*" capture="environment">` 加纯 JS 解码——普通表单控件，不受 secure context 限制。
 - **内网优先直连 + 自动故障转移。** `https://` 页面 fetch `http://192.168.x.x` 会被当作 active mixed content 直接阻断，连超时都等不到。可行的替代是顶层导航（丢页面状态）或干脆让用户手动选「我在家 / 我在外面」——难看但诚实。
