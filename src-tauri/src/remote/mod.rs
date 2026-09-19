@@ -331,6 +331,48 @@ pub fn shutdown(app: &AppHandle) {
     }
 }
 
+/// Launch: put the gateway back up for the phones that are still paired to it.
+///
+/// Persisting the pairing was only half of what "the phone still works
+/// tomorrow" needs. The other half is a socket: a device whose cookie survived
+/// the restart still has nowhere to send it until something binds the port, and
+/// until this, the only thing that ever did was the titlebar button. A phone
+/// opening its home-screen icon on a machine where nobody had pressed it got
+/// the browser's connection-refused page — reached before a line of this app
+/// runs, so not a page this app can explain. That is the failure the whole of
+/// M1 was written to remove, and it was still there.
+///
+/// Guarded on the device list, so nothing changes for anyone who has not used
+/// the feature: no port, no firewall prompt, nothing on the network. And
+/// guarded on the switch, because a user who asked for every phone to be
+/// dropped at exit did not ask for a door to be standing open at launch.
+///
+/// No nonce is minted and no card goes up. What this raises is the gateway, for
+/// devices that are already through the fence; anything new still comes in past
+/// a human at the desktop.
+pub fn resume(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Some(remote) = app.try_state::<Remote>() else {
+            return;
+        };
+
+        if crate::settings::forget_pairings_on_exit(&app) {
+            return;
+        }
+        if remote.shared.store.devices().is_empty() {
+            return;
+        }
+
+        // Nowhere to report a failure to: there is no card up and the user did
+        // not ask for anything. The line `start` prints is the record, and the
+        // card says why the next time it is opened.
+        if let Err(why) = remote.start() {
+            eprintln!("dsh-desktop: the phone gateway could not be resumed: {why}");
+        }
+    });
+}
+
 /// The titlebar button: raise the gateway if it is not up, mint a nonce, and
 /// put the card on screen.
 ///
@@ -408,19 +450,59 @@ pub fn kick_all(app: &AppHandle) {
     // The nonce on the card went with the rest of them, so the code on screen
     // is now one nothing will redeem. A fresh one, rather than a card that
     // looks live and is not.
-    let minted = remote.shared.store.mint_pair();
-    let next = remote
-        .running
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|live| Showing {
-            url: format!("{}/?pair_token={}", live.base, minted.token),
-            code: minted.code,
-        });
-    *remote.showing.lock().unwrap() = next;
-
+    remint(&remote);
     redraw(app, &remote, None);
+}
+
+/// The button under the six characters: throw away the nonce on the card and
+/// put a new one up.
+pub fn refresh(app: &AppHandle) {
+    let Some(remote) = app.try_state::<Remote>() else {
+        return;
+    };
+    remint(&remote);
+    redraw(app, &remote, None);
+}
+
+/// A nonce was just redeemed, and the card is still printing it.
+///
+/// The one on screen is spent the moment the phone reaches [`proxy::pair`] —
+/// before the dialog goes up, deliberately, so that a refusal cannot be retried
+/// — which leaves the card showing a QR and six characters that nothing will
+/// take. So the redraw that follows a handshake carries a new nonce, whatever
+/// the human goes on to answer.
+fn spent(shared: &Shared) {
+    let Some(app) = shared.approve.app() else {
+        return;
+    };
+    if let Some(remote) = app.try_state::<Remote>() {
+        remint(&remote);
+        redraw(app, &remote, None);
+    }
+}
+
+/// Mint a nonce and make it the one the card is showing.
+///
+/// Does nothing when no card is up. `showing` is what says whether there is
+/// one — see [`close`] — so filling it here would put a card back on screen
+/// that the user closed, which is what a phone pairing unobserved would
+/// otherwise do.
+///
+/// The nonce being replaced is not revoked: it is single-use and five minutes
+/// from expiring anyway, and [`SessionStore::mint_pair`] leaves outstanding
+/// ones alone on purpose — a camera already pointed at the old code is the case
+/// that would break.
+fn remint(remote: &Remote) {
+    if remote.showing.lock().unwrap().is_none() {
+        return;
+    }
+
+    let minted = remote.shared.store.mint_pair();
+    let next = remote.running.lock().unwrap().as_ref().map(|live| Showing {
+        url: format!("{}/?pair_token={}", live.base, minted.token),
+        code: minted.code,
+    });
+    *remote.showing.lock().unwrap() = next;
 }
 
 /// A phone redeemed a nonce and is waiting at the far end of a held-open

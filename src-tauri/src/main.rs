@@ -162,10 +162,13 @@ fn main() {
                 auth,
             };
             app.manage(session.clone());
-            // Nothing is bound and no port is open until the user asks for one;
-            // this is the state the button on the titlebar reaches. See
-            // [`remote`].
+            // Nothing is bound and no port is open for a machine that has never
+            // paired a phone; this is the state the button on the titlebar
+            // reaches. One that has goes straight back up — the pairing outlives
+            // the process now, and a pairing with no socket under it is a phone
+            // looking at a refused connection. See [`remote::resume`].
             app.manage(remote::Remote::new(app.handle().clone()));
+            remote::resume(app.handle());
 
             // Once a launch, and only for someone who has the patch switched
             // on, so that a fix for a newer dsh reaches them without waiting

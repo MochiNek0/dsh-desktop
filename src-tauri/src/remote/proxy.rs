@@ -260,6 +260,12 @@ async fn pair(
         };
     }
 
+    // Before the dialog, not after it: the nonce is gone either way, and the
+    // card would otherwise print a spent one for as long as the question stood
+    // open — a minute during which anyone reading it off the screen is reading
+    // something dead.
+    super::spent(&shared);
+
     let label = trust::label(header_named(&request, USER_AGENT.as_str()));
     let address = peer.ip().to_string();
 

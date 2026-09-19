@@ -104,6 +104,7 @@ fn text() -> serde_json::Value {
             "不方便扫码，就在手机上打开这个地址，把这六个字符输进去。",
             "Or open the address on the phone and type these six characters in."
         ),
+        "refresh": t!("换一个码", "New code"),
         "connected": t!("已连接 {} 台设备", "{} connected"),
         "since": t!("{} 起", "since {}"),
         "kick": t!("断开", "Disconnect"),
@@ -226,6 +227,7 @@ pub fn script() -> String {
       'user-select:text;-webkit-user-select:text}}' +
       '.dsh-rc-pin small{{display:block;margin:5px 0 0;font-size:11px;' +
       'line-height:1.5;color:var(--rc-muted)}}' +
+      '.dsh-rc-pin button{{margin:8px 0 0}}' +
       '.dsh-rc-status{{margin:0 0 10px;font-weight:500}}' +
       '.dsh-rc-list{{margin:0 0 14px;padding:0;list-style:none;' +
       'border-top:1px solid var(--rc-line)}}' +
@@ -419,6 +421,11 @@ pub fn script() -> String {
       pin.textContent = '';
       make('b', '', pin).textContent = view.code;
       make('small', '', pin).textContent = TEXT.codeWhy || '';
+      // Under the characters rather than in the footer, because what it
+      // replaces is the thing directly above it — the QR goes with it.
+      button(pin, TEXT.refresh || '', 'dsh-rc-quiet', function () {{
+        signal('remote-refresh');
+      }});
     }}
 
     link.style.display = view.url ? 'block' : 'none';
@@ -881,6 +888,7 @@ mod tests {
             "remote-close",
             "remote-kick?id=",
             "remote-kick-all",
+            "remote-refresh",
             "remote-style?on=",
             "remote-forget?on=",
         ] {
@@ -892,6 +900,7 @@ mod tests {
             ("dsh-window://remote-close", true),
             ("dsh-window://remote-kick?id=d1", true),
             ("dsh-window://remote-kick-all", true),
+            ("dsh-window://remote-refresh", true),
             // An id is the whole payload; without one there is nothing to kick.
             ("dsh-window://remote-kick", false),
             ("dsh-window://remote-kick?id=", false),

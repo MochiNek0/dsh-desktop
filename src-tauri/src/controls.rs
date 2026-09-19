@@ -111,6 +111,8 @@ pub enum Action {
     RemoteKick(String),
     /// Throw them all off and change the signing key.
     RemoteKickAll,
+    /// Replace the nonce on the card with a fresh one.
+    RemoteRefresh,
     /// The card was closed. The gateway stays up; the devices on it are still
     /// working.
     RemoteClose,
@@ -210,6 +212,7 @@ pub fn action(url: &Url) -> Option<Action> {
             .filter(|id| !id.is_empty())
             .map(Action::RemoteKick),
         "remote-kick-all" => Some(Action::RemoteKickAll),
+        "remote-refresh" => Some(Action::RemoteRefresh),
         "remote-close" => Some(Action::RemoteClose),
         // The state, not a flip: a signal that went missing would otherwise
         // leave the box and the flag disagreeing until the next click.
@@ -337,6 +340,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::Remote => return crate::remote::open(app),
         Action::RemoteKick(id) => return crate::remote::kick(app, &id),
         Action::RemoteKickAll => return crate::remote::kick_all(app),
+        Action::RemoteRefresh => return crate::remote::refresh(app),
         Action::RemoteClose => return crate::remote::close(app),
         Action::RemoteStyle(on) => return crate::remote::style(app, on),
         Action::RemoteForget(on) => return crate::remote::forget_on_exit(app, on),
