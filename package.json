@@ -20,7 +20,7 @@
     "desktop-client",
     "ai-coding-agent"
   ],
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",

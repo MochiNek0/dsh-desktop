@@ -12,7 +12,7 @@ A cross-platform desktop client for DeepSeek Harness (`dsh web`)
 [![Release](https://img.shields.io/github/v/release/MochiNek0/dsh-desktop?color=blue)](https://github.com/MochiNek0/dsh-desktop/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
 
 <br/>
 <br/>
@@ -79,4 +79,16 @@ npm run build   # production bundle, written to src-tauri/target/release/bundle/
 
 ## License
 
-[MIT](LICENSE)
+[GNU AGPL-3.0](LICENSE). Copyright © 2026 MochiNek0.
+
+This project was MIT; every release after this change is AGPL-3.0. With the
+mobile connection in it this app puts a machine that holds a full terminal
+session onto a network, and a relay is coming after that. The AGPL is here so
+that anything built on it — including anything offered to other people as a
+network service — has to hand its source back. **v0.1.19 and every release
+before it remain MIT**, and that grant cannot be withdrawn.
+
+`plugin/` — the dsh plugin `dsh-desktop-signal` — stays [MIT](plugin/LICENSE).
+It installs into your own dsh profile and sits in a `node_modules` beside
+packages that have nothing to do with this project, which is no place to put a
+copyleft.
