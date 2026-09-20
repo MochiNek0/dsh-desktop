@@ -152,13 +152,28 @@ fn text() -> serde_json::Value {
         "channelTailscale": t!("Tailscale", "Tailscale"),
         "channelCloudflare": t!("Cloudflare", "Cloudflare"),
         "channelCloudflareQuick": t!("临时域名", "Temporary"),
-        "channelWhy": t!(
-            "手机和电脑在同一个 Wi-Fi 下用局域网。手机在外面、走蜂窝网络，就用 Tailscale——两边登录同一个 tailnet 即可。\
-             有自己的域名就用 Cloudflare：它是唯一带 HTTPS 的一条，代价是这台电脑对整个公网开着。",
-            "Use the local network when the phone is on the same Wi-Fi. Use Tailscale when it is \
-             not — on mobile data, say — with both signed into the same tailnet. Cloudflare is \
-             for people with a domain of their own: the only channel with HTTPS on it, at the \
-             price of this computer answering the whole internet."
+        // One line per channel, and the card draws only the one that is
+        // selected. It used to be a single paragraph about all four, which is
+        // three answers to a question the reader has already answered — and
+        // four lines of grey text standing above the thing they came for.
+        "whyLan": t!(
+            "手机和电脑在同一个 Wi-Fi 下。最快的一条，不经过任何别人的服务器。",
+            "For a phone on the same Wi-Fi as this computer. The fastest of the four, and it \
+             goes through nobody else's servers."
+        ),
+        "whyTailscale": t!(
+            "手机在外面、走蜂窝网络也能连，两边登录同一个 tailnet 即可。",
+            "Reaches the phone anywhere, mobile data included, as long as both are signed into \
+             the same tailnet."
+        ),
+        "whyCloudflare": t!(
+            "用你自己的域名，四条里唯一带 HTTPS 的一条。代价是这台电脑对整个公网开着。",
+            "Your own hostname, and the only one of the four with HTTPS on it. The price is \
+             that this computer answers the whole internet."
+        ),
+        "whyQuick": t!(
+            "不需要账号，域名每次重启都换一个。",
+            "No account needed, and a different hostname every time it starts."
         ),
         "starting": t!("正在启动 cloudflared…", "Starting cloudflared…"),
         "startChannel": t!("启动这条通道", "Start this channel"),
@@ -288,11 +303,29 @@ pub fn script() -> String {
       '--rc-shadow:0 24px 64px rgba(0,0,0,.6),0 0 0 .5px rgba(255,255,255,.1)}}' +
       '.dsh-rc-shown{{display:flex}}' +
       '{corners}' +
-      '.dsh-rc-sheet{{width:min(380px,100%);max-height:100%;overflow:auto;' +
-      'box-sizing:border-box;padding:22px;border-radius:16px;' +
+      '.dsh-rc-sheet{{width:min(660px,100%);max-height:100%;overflow:auto;' +
+      'box-sizing:border-box;padding:24px 26px;border-radius:16px;' +
       'background:var(--rc-bg);color:var(--rc-fg);box-shadow:var(--rc-shadow)}}' +
       '.dsh-rc-head{{margin:0 0 6px;font-size:16px;font-weight:600}}' +
-      '.dsh-rc-lede{{margin:0 0 14px;color:var(--rc-muted)}}' +
+      '.dsh-rc-lede{{margin:0 0 18px;color:var(--rc-muted)}}' +
+      // Two columns: what the phone is pointed at on the left, everything
+      // about the channel it comes in over on the right. One column of nine
+      // blocks was taller than the window it sits in, which put the QR code —
+      // the one thing anybody opens this card for — behind a scroll.
+      '.dsh-rc-cols{{display:flex;align-items:flex-start;gap:26px}}' +
+      // Exactly the code's own width, so the column is the frame around it.
+      '.dsh-rc-left{{flex:0 0 230px;width:230px}}' +
+      '.dsh-rc-right{{flex:1 1 auto;min-width:0}}' +
+      // Nothing to point a phone at yet — starting, failed, or a Cloudflare
+      // tunnel still being configured. The left column would be 260px of
+      // white, so the card goes back to being the narrow one it was.
+      '.dsh-rc-sheet.dsh-rc-solo{{width:min(420px,100%)}}' +
+      '.dsh-rc-solo .dsh-rc-cols{{display:block}}' +
+      '.dsh-rc-solo .dsh-rc-left{{display:none}}' +
+      // And in a window too narrow to stand them side by side. The code keeps
+      // its own width; the column around it stops reserving one.
+      '@media (max-width:640px){{.dsh-rc-cols{{display:block}}' +
+      '.dsh-rc-left{{width:auto}}}}' +
       // The channel switch: segments in a trough, the active one lifted out of
       // it. Buttons rather than a radio group, because what a click starts is a
       // question on a dialog and not a change to this box. Two rows of two
@@ -304,12 +337,12 @@ pub fn script() -> String {
       'border-radius:7px;text-align:center;font-size:13px;color:var(--rc-muted)}}' +
       '.dsh-rc button.dsh-rc-tab.on{{background:var(--rc-bg);color:var(--rc-fg);' +
       'box-shadow:0 1px 3px rgba(0,0,0,.14)}}' +
-      '.dsh-rc-chan-why{{margin:0 0 14px;font-size:11px;line-height:1.5;' +
+      '.dsh-rc-chan-why{{margin:0 0 12px;font-size:11px;line-height:1.5;' +
       'color:var(--rc-muted)}}' +
       // The standing warning, for as long as this machine is on the internet.
       // Red, bordered and above everything else on the card, because what it
       // is reporting is not a setting — it is a door.
-      '.dsh-rc-warn{{margin:0 0 14px;padding:10px 12px;border-radius:8px;' +
+      '.dsh-rc-warn{{margin:0 0 12px;padding:9px 11px;border-radius:8px;' +
       'border:1px solid var(--rc-danger);color:var(--rc-danger);font-size:12px;' +
       'line-height:1.55}}' +
       '.dsh-rc-warn b{{font-weight:600;word-break:break-all;' +
@@ -319,7 +352,7 @@ pub fn script() -> String {
       'color:var(--rc-danger);border:1px solid var(--rc-danger)}}' +
       // The Cloudflare panel: what stands where the QR code will be until the
       // binary is installed and the tunnel is configured.
-      '.dsh-rc-setup{{margin:0 0 14px;padding:12px;border-radius:10px;' +
+      '.dsh-rc-setup{{margin:0 0 12px;padding:11px;border-radius:10px;' +
       'background:var(--rc-hover);font-size:12px;line-height:1.55;' +
       'color:var(--rc-muted)}}' +
       '.dsh-rc-setup code{{display:block;margin:6px 0 0;padding:6px 8px;' +
@@ -333,8 +366,8 @@ pub fn script() -> String {
       '.dsh-rc-setup button{{margin:9px 0 0}}' +
       // The code itself. A grid of cells rather than an image: nothing is
       // fetched, and the quiet zone is padding on the frame around it.
-      '.dsh-rc-code{{display:grid;gap:0;width:236px;margin:0 auto 12px;' +
-      'padding:12px;box-sizing:content-box;background:#fff;border-radius:10px}}' +
+      '.dsh-rc-code{{display:grid;gap:0;width:208px;margin:0 auto 11px;' +
+      'padding:11px;box-sizing:content-box;background:#fff;border-radius:10px}}' +
       '.dsh-rc-code i{{display:block;width:100%;padding-bottom:100%;' +
       'background:#fff}}' +
       '.dsh-rc-code i.on{{background:#000}}' +
@@ -348,10 +381,10 @@ pub fn script() -> String {
       '.dsh-rc-pin small{{display:block;margin:5px 0 0;font-size:11px;' +
       'line-height:1.5;color:var(--rc-muted)}}' +
       '.dsh-rc-pin button{{margin:8px 0 0}}' +
-      '.dsh-rc-status{{margin:0 0 10px;font-weight:500}}' +
-      '.dsh-rc-list{{margin:0 0 14px;padding:0;list-style:none;' +
+      '.dsh-rc-status{{margin:0 0 8px;font-weight:500}}' +
+      '.dsh-rc-list{{margin:0 0 12px;padding:0;list-style:none;' +
       'border-top:1px solid var(--rc-line)}}' +
-      '.dsh-rc-list li{{display:flex;align-items:center;gap:10px;padding:9px 0;' +
+      '.dsh-rc-list li{{display:flex;align-items:center;gap:10px;padding:8px 0;' +
       'border-bottom:1px solid var(--rc-line)}}' +
       '.dsh-rc-who{{flex:1;min-width:0}}' +
       '.dsh-rc-who b{{display:block;font-weight:500}}' +
@@ -359,7 +392,8 @@ pub fn script() -> String {
       '.dsh-rc-note{{margin:0 0 14px;padding:10px 12px;border-radius:8px;' +
       'background:var(--rc-hover);color:var(--rc-muted);font-size:13px}}' +
       '.dsh-rc-bad{{color:var(--rc-danger)}}' +
-      '.dsh-rc-foot{{display:flex;gap:8px;justify-content:flex-end;align-items:center}}' +
+      '.dsh-rc-foot{{display:flex;gap:8px;margin:6px 0 0;' +
+      'justify-content:flex-end;align-items:center}}' +
       '.dsh-rc button{{all:unset;box-sizing:border-box;padding:7px 14px;' +
       'border-radius:8px;cursor:pointer;font:inherit;font-weight:500;' +
       'color:var(--rc-fg);-webkit-appearance:none;appearance:none}}' +
@@ -380,7 +414,7 @@ pub fn script() -> String {
       '.dsh-rc button.dsh-rc-quiet{{padding:5px 10px;font-size:13px;' +
       'color:var(--rc-muted);border:1px solid var(--rc-line)}}' +
       '.dsh-rc-spacer{{flex:1}}' +
-      '.dsh-rc-patch{{display:flex;gap:9px;align-items:flex-start;margin:0 0 14px;' +
+      '.dsh-rc-patch{{display:flex;gap:9px;align-items:flex-start;margin:0 0 11px;' +
       'cursor:pointer;-webkit-user-select:none;user-select:none}}' +
       '.dsh-rc-patch input{{margin:2px 0 0;flex:0 0 auto;width:14px;height:14px;' +
       'accent-color:var(--rc-accent);cursor:pointer}}' +
@@ -393,19 +427,25 @@ pub fn script() -> String {
     sheet = make('div', 'dsh-rc-sheet', root);
     head = make('h2', 'dsh-rc-head', sheet);
     lede = make('p', 'dsh-rc-lede', sheet);
-    chan = make('div', 'dsh-rc-chan', sheet);
-    chanWhy = make('p', 'dsh-rc-chan-why', sheet);
-    warn = make('div', 'dsh-rc-warn', sheet);
-    setup = make('div', 'dsh-rc-setup', sheet);
-    code = make('div', 'dsh-rc-code', sheet);
-    pin = make('div', 'dsh-rc-pin', sheet);
-    link = make('button', 'dsh-rc-link', sheet);
+    var cols = make('div', 'dsh-rc-cols', sheet);
+    var left = make('div', 'dsh-rc-left', cols);
+    var right = make('div', 'dsh-rc-right', cols);
+    // Left: the three shapes of one nonce, in the order a phone meets them —
+    // point a camera at it, type it, or copy the address and send it over.
+    code = make('div', 'dsh-rc-code', left);
+    pin = make('div', 'dsh-rc-pin', left);
+    link = make('button', 'dsh-rc-link', left);
     link.type = 'button';
-    status = make('p', 'dsh-rc-status', sheet);
-    list = make('ul', 'dsh-rc-list', sheet);
-    note = make('p', 'dsh-rc-note', sheet);
-    patch = make('label', 'dsh-rc-patch', sheet);
-    keep = make('label', 'dsh-rc-patch', sheet);
+    // Right: which channel, what it costs, and who is on it.
+    chan = make('div', 'dsh-rc-chan', right);
+    chanWhy = make('p', 'dsh-rc-chan-why', right);
+    warn = make('div', 'dsh-rc-warn', right);
+    setup = make('div', 'dsh-rc-setup', right);
+    status = make('p', 'dsh-rc-status', right);
+    note = make('p', 'dsh-rc-note', right);
+    list = make('ul', 'dsh-rc-list', right);
+    patch = make('label', 'dsh-rc-patch', right);
+    keep = make('label', 'dsh-rc-patch', right);
     foot = make('div', 'dsh-rc-foot', sheet);
     document.body.appendChild(root);
 
@@ -636,7 +676,15 @@ pub fn script() -> String {
           if (!on) signal(option[2]);
         }});
       }});
-    chanWhy.textContent = TEXT.channelWhy || '';
+    chanWhy.textContent = {{
+      'lan': TEXT.whyLan,
+      'tailscale': TEXT.whyTailscale,
+      'cloudflare': TEXT.whyCloudflare,
+      'cloudflare-quick': TEXT.whyQuick
+    }}[view.channel] || '';
+
+    // See `.dsh-rc-solo`.
+    sheet.classList.toggle('dsh-rc-solo', !view.url);
 
     paintWarning(view.public);
     paintSetup(view);
@@ -1074,6 +1122,20 @@ fn encoder() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The payload half of the preview harness whose script half
+    /// `crate::dialog::tests::dumps_the_scripts` writes: every string this
+    /// card draws, in the language this build is running in.
+    ///
+    /// `cargo test -- --ignored dumps_the_card_text`.
+    #[test]
+    #[ignore]
+    fn dumps_the_card_text() {
+        let out = std::path::Path::new("../target/scripts");
+        std::fs::create_dir_all(out).expect("a writable target directory");
+        std::fs::write(out.join("remote-text.json"), text().to_string())
+            .expect("a written payload");
+    }
 
     /// Every brace in the card's body is doubled for `format!`, and one that is
     /// not is a syntax error this app would ship without noticing: the script is
