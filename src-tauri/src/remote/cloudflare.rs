@@ -9,23 +9,23 @@
 //! address has a guard, and neither belongs in a module about reading IP
 //! addresses off adapters.
 //!
-//! ## Named, and quick as a way of trying it
+//! ## Named only, and what the other mode was
 //!
-//! A **named tunnel** is the one to stay on: the user's own hostname, their own
-//! Cloudflare account, and a token this app stores. The hostname does not move,
-//! so a paired phone stays paired across restarts and the home-screen icon goes
-//! on pointing somewhere. That is the whole of what M1 bought, and it is the
-//! reason the other mode is not the default.
+//! A **named tunnel** is the whole of this file: the user's own hostname, their
+//! own Cloudflare account, and a token this app stores. The hostname does not
+//! move, so a paired phone stays paired across restarts and the home-screen
+//! icon goes on pointing somewhere. That is the whole of what M1 bought.
 //!
-//! A **quick tunnel** (`--url`, no account) is a `*.trycloudflare.com` hostname
-//! that lasts until the process stops. Every restart is a new origin: every
-//! paired device is thrown off by the browser, and the home-screen icon points
-//! at a name that no longer resolves. Cloudflare documents it as unsuitable for
-//! production and gives it no SLA. So it is here to answer "does this work at
-//! all on my machine" without an account — and while it is the active channel
-//! the gateway refuses to serve a manifest, because an installed icon on an
-//! address with hours to live is worse than no icon. See
-//! [`super::proxy`].
+//! There was a second mode beside it until it was taken out — a **quick
+//! tunnel** (`--url`, no account) on a `*.trycloudflare.com` hostname that
+//! lasted until the process stopped. It was there to answer "does this work at
+//! all on my machine" without an account, and it did not: the phone that
+//! scanned the code could not open what it was sent to. Even when it does, the
+//! next restart is a new origin — every paired device thrown off, the
+//! home-screen icon pointing at a name that no longer resolves — and Cloudflare
+//! documents the mode as unsuitable for production with no SLA behind it. So it
+//! is gone rather than labelled, and with it the rule that kept the gateway
+//! from serving a manifest while it was the active channel.
 //!
 //! ## What the token is, and where it lives
 //!
@@ -78,13 +78,11 @@ pub struct Account {
 
 /// A Cloudflare tunnel, in either of its two modes.
 pub struct CloudflareTunnel {
-    /// [`TunnelType::Cloudflare`] or [`TunnelType::CloudflareQuick`].
-    kind: TunnelType,
     /// Where `cloudflared` was found, or `None` on a machine without one.
     /// Resolved when the tunnel was built rather than when it is started, so
     /// that the card can say "install this" before anybody presses anything.
     binary: Option<PathBuf>,
-    /// `None` for the quick mode, and for a named tunnel nobody has configured.
+    /// `None` until somebody has configured one.
     account: Option<Account>,
     child: Option<std::process::Child>,
     /// Windows' backstop against an orphan. See [`crate::server::Job`].
@@ -109,14 +107,10 @@ impl CloudflareTunnel {
     /// moment it is started. That is what lets the card draw the Cloudflare
     /// panel — with the install text, or the two empty fields — without the
     /// user first pressing a button that cannot work.
-    pub fn new(app: Option<&AppHandle>, kind: TunnelType) -> Self {
+    pub fn new(app: Option<&AppHandle>) -> Self {
         Self {
-            kind,
             binary: binary(app),
-            account: match kind {
-                TunnelType::Cloudflare => app.and_then(account),
-                _ => None,
-            },
+            account: app.and_then(account),
             child: None,
             #[cfg(windows)]
             job: None,
@@ -129,12 +123,11 @@ impl CloudflareTunnel {
     /// For [`super::tests`], which drives the real listener end to end and
     /// needs a public channel to drive it on. Everything the gateway asks a
     /// tunnel — its type, its scheme, its authorities, whether it is public —
-    /// is answered out of these two fields, so a fake is the whole of what
-    /// those tests need and `cloudflared` is not.
+    /// is answered out of this one field, so a fake is the whole of what those
+    /// tests need and `cloudflared` is not.
     #[cfg(test)]
-    pub fn pretending(kind: TunnelType, hostname: &str) -> Self {
+    pub fn pretending(hostname: &str) -> Self {
         Self {
-            kind,
             binary: None,
             account: None,
             child: None,
@@ -166,13 +159,15 @@ impl CloudflareTunnel {
 }
 
 impl RemoteTunnel for CloudflareTunnel {
-    fn start(&mut self, local_gateway_port: u16) -> Result<(), TunnelError> {
+    /// The gateway's port is not passed on. A token-run tunnel is remotely
+    /// managed, so the origin it forwards to is the ingress rule in the
+    /// dashboard — which is why the card prints the port for the user to put
+    /// there. See the module docs.
+    fn start(&mut self, _local_gateway_port: u16) -> Result<(), TunnelError> {
         self.take_down();
 
         let binary = self.binary.clone().ok_or(TunnelError::NoCloudflared)?;
-        if self.kind == TunnelType::Cloudflare && self.account.is_none() {
-            return Err(TunnelError::NoToken);
-        }
+        let account = self.account.clone().ok_or(TunnelError::NoToken)?;
 
         let mut command = Command::new(binary);
         // `--no-autoupdate`: cloudflared replaces its own binary and restarts
@@ -180,20 +175,9 @@ impl RemoteTunnel for CloudflareTunnel {
         // is a tunnel that disappears mid-session. Updating it is the job of
         // whatever installed it.
         command.arg("--no-autoupdate");
-        match &self.account {
-            // Remotely managed: the ingress is in the dashboard, so there is no
-            // URL to pass. See the module docs.
-            Some(account) => {
-                command.args(["tunnel", "run", "--token", &account.token]);
-            }
-            None => {
-                command.args([
-                    "tunnel",
-                    "--url",
-                    &format!("http://127.0.0.1:{local_gateway_port}"),
-                ]);
-            }
-        }
+        // Remotely managed: the ingress is in the dashboard, so there is no URL
+        // to pass. See the module docs.
+        command.args(["tunnel", "run", "--token", &account.token]);
 
         // Nothing reads stdout, and a pipe nobody drains is a process that
         // blocks once it fills. stderr is where cloudflared logs.
@@ -216,12 +200,7 @@ impl RemoteTunnel for CloudflareTunnel {
 
         let state = Arc::new(Mutex::new(TunnelState::Starting));
         if let Some(stderr) = child.stderr.take() {
-            watch(
-                stderr,
-                state.clone(),
-                self.account.clone(),
-                self.kind == TunnelType::Cloudflare,
-            );
+            watch(stderr, state.clone(), account);
         }
 
         self.state = state;
@@ -243,7 +222,7 @@ impl RemoteTunnel for CloudflareTunnel {
     }
 
     fn tunnel_type(&self) -> TunnelType {
-        self.kind
+        TunnelType::Cloudflare
     }
 
     /// HTTPS, always, and not because anything here observed a handshake.
@@ -324,19 +303,13 @@ impl Drop for CloudflareTunnel {
 /// replaced by a placeholder, an exact substitution because the token is a
 /// string this app has in its hand — so that a failure can say something more
 /// useful than "it did not work".
-fn watch(
-    stderr: std::process::ChildStderr,
-    state: Arc<Mutex<TunnelState>>,
-    account: Option<Account>,
-    named: bool,
-) {
+fn watch(stderr: std::process::ChildStderr, state: Arc<Mutex<TunnelState>>, account: Account) {
     std::thread::spawn(move || {
-        let hostname = account.as_ref().map(|account| account.hostname.clone());
-        let token = account.map(|account| account.token);
+        let Account { token, hostname } = account;
         let mut last = String::new();
 
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if let Some(base_url) = up(&line, hostname.as_deref()) {
+            if let Some(base_url) = up(&line, &hostname) {
                 let mut held = state.lock().unwrap();
                 if !matches!(*held, TunnelState::Running { .. }) {
                     eprintln!("dsh-desktop: the cloudflare tunnel is up at {base_url}");
@@ -344,7 +317,7 @@ fn watch(
                 }
                 continue;
             }
-            last = redact(&line, token.as_deref());
+            last = redact(&line, Some(&token));
         }
 
         // EOF on stderr is `cloudflared` gone. Whether it ever came up decides
@@ -356,29 +329,23 @@ fn watch(
             return;
         }
         let was_up = matches!(*held, TunnelState::Running { .. });
-        *held = TunnelState::Failed(reason(was_up, named, &last));
+        *held = TunnelState::Failed(reason(was_up, &last));
         eprintln!("dsh-desktop: the cloudflare tunnel stopped");
     });
 }
 
 /// What to tell the user when the process ends.
-fn reason(was_up: bool, named: bool, last: &str) -> String {
+fn reason(was_up: bool, last: &str) -> String {
     let lede = if was_up {
         t!(
             "cloudflared 退出了，隧道已经断开。",
             "cloudflared exited, so the tunnel is down."
         )
-    } else if named {
+    } else {
         t!(
             "cloudflared 没能连上 Cloudflare。检查一下 token 是不是完整、这台电脑能不能上外网。",
             "cloudflared could not reach Cloudflare. Check that the token was pasted in full \
              and that this computer can reach the internet."
-        )
-    } else {
-        t!(
-            "cloudflared 没能建起临时隧道。多半是连不上 Cloudflare。",
-            "cloudflared could not raise a quick tunnel, which usually means it could not \
-             reach Cloudflare."
         )
     };
 
@@ -390,16 +357,11 @@ fn reason(was_up: bool, named: bool, last: &str) -> String {
 
 /// Whether this line means the tunnel is now carrying traffic, and where to.
 ///
-/// The two modes learn it differently, and only one of them learns it from the
-/// log. A quick tunnel is *given* its hostname by Cloudflare and prints it; a
-/// named tunnel's hostname was known before the process started — it is the one
-/// in the dashboard, which the user typed into this app — so what is waited for
-/// there is a registered connection, not an address.
-fn up(line: &str, hostname: Option<&str>) -> Option<String> {
-    match hostname {
-        Some(hostname) => registered(line).then(|| format!("https://{hostname}")),
-        None => quick_url(line),
-    }
+/// The hostname was known before the process started — it is the one in the
+/// dashboard, which the user typed into this app — so what is waited for in the
+/// log is a registered connection and not an address.
+fn up(line: &str, hostname: &str) -> Option<String> {
+    registered(line).then(|| format!("https://{hostname}"))
 }
 
 /// `INF Registered tunnel connection connIndex=0 …`, in whichever of the
@@ -407,24 +369,6 @@ fn up(line: &str, hostname: Option<&str>) -> Option<String> {
 fn registered(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("registered tunnel connection") || lower.contains("connection registered")
-}
-
-/// The `https://<something>.trycloudflare.com` out of the banner a quick tunnel
-/// prints, or `None` for every other line.
-///
-/// The suffix is checked rather than merely "an https URL": that banner is
-/// drawn in a box of `|` characters and sits among lines that carry Cloudflare
-/// documentation links, and publishing one of those as the gateway's address
-/// would send the phone to a help page.
-fn quick_url(line: &str) -> Option<String> {
-    let at = line.find("https://")?;
-    let rest = &line[at..];
-    let end = rest
-        .find(|character: char| character.is_whitespace() || character == '|' || character == '"')
-        .unwrap_or(rest.len());
-    let url = rest[..end].trim_end_matches('/');
-
-    url.ends_with(".trycloudflare.com").then(|| url.to_string())
 }
 
 /// Take the token out of a line before it is kept anywhere.
@@ -584,35 +528,11 @@ pub fn install_hint() -> String {
 mod tests {
     use super::*;
 
-    /// The banner a quick tunnel prints, and the lines around it that must not
-    /// be mistaken for it.
-    #[test]
-    fn the_quick_hostname_is_read_off_the_banner() {
-        assert_eq!(
-            quick_url("|  https://dull-mice-invent-softly.trycloudflare.com    |"),
-            Some("https://dull-mice-invent-softly.trycloudflare.com".to_string())
-        );
-        assert_eq!(
-            quick_url("INF +--- https://a-b-c.trycloudflare.com/ ---+"),
-            Some("https://a-b-c.trycloudflare.com".to_string())
-        );
-
-        // Every other https URL cloudflared prints, and it prints several.
-        for line in [
-            "INF Thank you for trying Cloudflare Tunnel.",
-            "see https://developers.cloudflare.com/cloudflare-one/ for docs",
-            "INF Requesting new quick Tunnel on trycloudflare.com...",
-            "https://dash.cloudflare.com/argotunnel",
-        ] {
-            assert_eq!(quick_url(line), None, "{line}");
-        }
-    }
-
-    /// A named tunnel's address was known before the process started, so what
-    /// the log is read for is a connection and not a hostname.
+    /// The tunnel's address was known before the process started, so what the
+    /// log is read for is a connection and not a hostname.
     #[test]
     fn a_named_tunnel_waits_for_a_registered_connection() {
-        let host = Some("dsh.example.com");
+        let host = "dsh.example.com";
 
         assert_eq!(
             up(
@@ -623,7 +543,9 @@ mod tests {
             Some("https://dsh.example.com".to_string())
         );
         assert_eq!(up("INF Starting tunnel tunnelID=abc", host), None);
-        // And it never reads a hostname out of the log, even one that is there.
+        // And no line is read for an address, however much one looks like one:
+        // cloudflared prints banners and documentation links, and the hostname
+        // this channel publishes is never taken from any of them.
         assert_eq!(up("|  https://x.trycloudflare.com  |", host), None);
     }
 
@@ -664,7 +586,6 @@ mod tests {
     #[test]
     fn a_tunnel_that_is_not_up_yet_trusts_nothing() {
         let tunnel = CloudflareTunnel {
-            kind: TunnelType::Cloudflare,
             binary: None,
             account: Some(Account {
                 token: "t".into(),
@@ -692,7 +613,7 @@ mod tests {
     /// to every interface — and must not get to name itself.
     #[test]
     fn the_forwarded_address_is_believed_only_from_loopback() {
-        let tunnel = CloudflareTunnel::new(None, TunnelType::CloudflareQuick);
+        let tunnel = CloudflareTunnel::new(None);
         let mut headers = HeaderMap::new();
         headers.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
 
@@ -722,7 +643,7 @@ mod tests {
     /// anything, and says which half of the problem it is.
     #[test]
     fn an_unconfigured_named_tunnel_will_not_start() {
-        let mut tunnel = CloudflareTunnel::new(None, TunnelType::Cloudflare);
+        let mut tunnel = CloudflareTunnel::new(None);
         tunnel.binary = Some(PathBuf::from("cloudflared"));
 
         assert!(matches!(tunnel.start(59000), Err(TunnelError::NoToken)));
@@ -733,7 +654,7 @@ mod tests {
     /// that is the failure with something to do about it.
     #[test]
     fn a_missing_binary_is_the_first_thing_reported() {
-        let mut tunnel = CloudflareTunnel::new(None, TunnelType::Cloudflare);
+        let mut tunnel = CloudflareTunnel::new(None);
         tunnel.binary = None;
 
         assert!(matches!(

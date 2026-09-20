@@ -49,11 +49,6 @@ pub enum TunnelType {
     /// A Cloudflare named tunnel: the user's own hostname, their own token, and
     /// a `cloudflared` this app launches. See [`mod@super::cloudflare`].
     Cloudflare,
-    /// The same binary with no account behind it, on a `trycloudflare.com`
-    /// hostname that lasts until the process stops. For trying the thing out;
-    /// see [`super::cloudflare::CloudflareTunnel`] for why it is not the one to
-    /// stay on.
-    CloudflareQuick,
 }
 
 impl TunnelType {
@@ -66,7 +61,6 @@ impl TunnelType {
             Self::Lan => "lan",
             Self::Tailscale => "tailscale",
             Self::Cloudflare => "cloudflare",
-            Self::CloudflareQuick => "cloudflare-quick",
         }
     }
 
@@ -77,7 +71,6 @@ impl TunnelType {
             "lan" => Some(Self::Lan),
             "tailscale" => Some(Self::Tailscale),
             "cloudflare" => Some(Self::Cloudflare),
-            "cloudflare-quick" => Some(Self::CloudflareQuick),
             _ => None,
         }
     }
@@ -90,7 +83,7 @@ impl TunnelType {
     /// read this. See [`RemoteTunnel::public`], which is where a tunnel answers
     /// for itself; this is the same answer before one has been built.
     pub fn public(self) -> bool {
-        matches!(self, Self::Cloudflare | Self::CloudflareQuick)
+        matches!(self, Self::Cloudflare)
     }
 }
 
@@ -841,15 +834,14 @@ mod tests {
         assert!(Scheme::Https.secure());
     }
 
-    /// Which channels the public guard is about. Read before a tunnel exists —
+    /// Which channel the public guard is about. Read before a tunnel exists —
     /// by the card, and by the question asked at exit — so the two answers have
     /// to be the same one.
     #[test]
-    fn only_the_cloudflare_channels_are_public() {
+    fn only_the_cloudflare_channel_is_public() {
         assert!(!TunnelType::Lan.public());
         assert!(!TunnelType::Tailscale.public());
         assert!(TunnelType::Cloudflare.public());
-        assert!(TunnelType::CloudflareQuick.public());
 
         assert!(!LanTunnel::default().public());
         assert!(!TailscaleTunnel::default().public());
@@ -863,11 +855,14 @@ mod tests {
             TunnelType::Lan,
             TunnelType::Tailscale,
             TunnelType::Cloudflare,
-            TunnelType::CloudflareQuick,
         ] {
             assert_eq!(TunnelType::named(kind.name()), Some(kind), "{kind:?}");
         }
         assert_eq!(TunnelType::named("ngrok"), None);
+        // The temporary `*.trycloudflare.com` channel this app used to offer.
+        // A `desktop.json` that still names it falls back to the LAN rather
+        // than to a channel that is no longer here; see `settings::channel`.
+        assert_eq!(TunnelType::named("cloudflare-quick"), None);
         assert_eq!(TunnelType::named(""), None);
     }
 }

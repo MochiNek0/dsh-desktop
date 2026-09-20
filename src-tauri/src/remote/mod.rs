@@ -243,19 +243,6 @@ impl Shared {
         self.tunnel.lock().unwrap().public()
     }
 
-    /// Whether the address this gateway is currently on is one worth adding to
-    /// a home screen.
-    ///
-    /// Everything but the quick Cloudflare tunnel, whose hostname lasts until
-    /// the process stops. An icon installed on one of those points at a name
-    /// that will not resolve tomorrow, and the failure is the browser's own
-    /// connection-refused page — reached before a line of this app runs, so
-    /// nothing here gets to explain it. An icon that cannot be repaired is
-    /// worse than no icon, which is the whole reason this question exists.
-    fn installable(&self) -> bool {
-        self.tunnel.lock().unwrap().tunnel_type() != TunnelType::CloudflareQuick
-    }
-
     /// A request arrived. What the idle timer counts from.
     fn touched(&self) {
         *self.last.lock().unwrap() = Instant::now();
@@ -326,9 +313,7 @@ fn raise(app: Option<&AppHandle>, kind: TunnelType) -> Box<dyn RemoteTunnel> {
     match kind {
         TunnelType::Lan => Box::new(LanTunnel::default()),
         TunnelType::Tailscale => Box::new(TailscaleTunnel::default()),
-        TunnelType::Cloudflare | TunnelType::CloudflareQuick => {
-            Box::new(CloudflareTunnel::new(app, kind))
-        }
+        TunnelType::Cloudflare => Box::new(CloudflareTunnel::new(app)),
     }
 }
 
@@ -892,7 +877,7 @@ fn waiting(app: &AppHandle, remote: &Remote, error: Option<String>) {
 ///
 /// Read off the disk rather than out of the tunnel. The tunnel holds the same
 /// three facts, but only behind the trait — and reaching through it would mean
-/// either a downcast or three more methods on an interface that four other
+/// either a downcast or three more methods on an interface that three other
 /// things implement and do not have them.
 fn setup(app: &AppHandle, remote: &Remote, kind: TunnelType) -> Option<card::Setup> {
     if !kind.public() {
@@ -912,7 +897,6 @@ fn setup(app: &AppHandle, remote: &Remote, kind: TunnelType) -> Option<card::Set
             .unwrap()
             .as_ref()
             .map(|live| format!("http://localhost:{}", live.port)),
-        quick: kind == TunnelType::CloudflareQuick,
     })
 }
 
@@ -922,7 +906,7 @@ fn setup(app: &AppHandle, remote: &Remote, kind: TunnelType) -> Option<card::Set
 /// Polling, and deliberately: the thing being waited on is a process reading
 /// its way to a connection, so the alternative is a channel threaded from a
 /// reader thread through a trait object and out to the window — for an event
-/// that happens once, seconds from now, on one of four channels.
+/// that happens once, seconds from now, on one of three channels.
 ///
 /// Gives up at [`STARTUP`], and says so rather than leaving the word "starting"
 /// on screen. The tunnel is left where it is: `cloudflared` may still be

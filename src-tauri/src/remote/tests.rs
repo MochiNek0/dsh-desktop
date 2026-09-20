@@ -768,43 +768,9 @@ fn the_offline_shell_is_served_without_a_session() {
     assert!(shell.body.contains("<html"), "{}", shell.body);
 }
 
-/// A `trycloudflare.com` hostname lasts until the process stops, so nothing on
-/// it is worth installing: an icon added today points at a name that will not
-/// resolve tomorrow, and the failure is the browser's own page, before a line
-/// of this app runs.
-///
-/// This is the specification's "no manifest under a quick tunnel", and it lands
-/// in the gateway rather than in the plugin that injects the `<link>`, because
-/// the gateway is the only party that knows which channel is up.
-#[test]
-fn a_quick_tunnel_serves_nothing_worth_installing() {
-    let Some(harness) = Harness::raise(true) else {
-        return;
-    };
-
-    let host = "abc-def.trycloudflare.com";
-    *harness.shared.tunnel.lock().unwrap() = Box::new(
-        super::cloudflare::CloudflareTunnel::pretending(super::TunnelType::CloudflareQuick, host),
-    );
-    harness.shared.forget_authorities();
-
-    for path in [
-        "/dsh-mobile-manifest.json",
-        "/dsh-mobile-icon.png",
-        "/dsh-mobile-sw.js",
-        "/dsh-mobile-offline",
-    ] {
-        let answer = harness.get(path, &[("Host", host)]);
-        assert_eq!(
-            answer.status, 404,
-            "{path} is not offered on a quick tunnel"
-        );
-    }
-}
-
-/// The named tunnel, by contrast, is exactly the address those files exist for:
-/// a hostname that outlives the process, on HTTPS — which is what finally makes
-/// a Service Worker registrable at all.
+/// The named tunnel is exactly the address those files exist for: a hostname
+/// that outlives the process, on HTTPS — which is what finally makes a Service
+/// Worker registrable at all.
 ///
 /// Incidentally the one test of the whole path with a tunnel-shaped authority
 /// under it: no port on the `Host`, and a fence that has to accept it anyway.
@@ -816,7 +782,7 @@ fn a_named_tunnel_publishes_the_home_screen_files() {
 
     let host = "dsh.example.com";
     *harness.shared.tunnel.lock().unwrap() = Box::new(
-        super::cloudflare::CloudflareTunnel::pretending(super::TunnelType::Cloudflare, host),
+        super::cloudflare::CloudflareTunnel::pretending(host),
     );
     harness.shared.forget_authorities();
 
@@ -863,7 +829,7 @@ fn the_cookie_is_secure_exactly_when_the_channel_is() {
 
     let host = "dsh.example.com";
     *harness.shared.tunnel.lock().unwrap() = Box::new(
-        super::cloudflare::CloudflareTunnel::pretending(super::TunnelType::Cloudflare, host),
+        super::cloudflare::CloudflareTunnel::pretending(host),
     );
     harness.shared.forget_authorities();
 

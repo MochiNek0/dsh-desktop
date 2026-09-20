@@ -683,20 +683,6 @@ fn moved() -> Response<Body> {
 /// phone that may be logged in today and expired tomorrow, and the moment it
 /// matters is the moment nothing can be authenticated against anything, because
 /// the computer is off.
-/// ## Why the quick tunnel gets none of them
-///
-/// A `*.trycloudflare.com` hostname lasts until `cloudflared` stops. An icon
-/// installed against one points, the next morning, at a name that no longer
-/// resolves — and a Service Worker registered on it is a registration for an
-/// origin nothing will ever visit again. So on that one channel these paths
-/// answer 404 rather than serving something whose whole value is that it
-/// survives a restart. See [`Shared::installable`].
-///
-/// This is the specification's "no manifest under a quick tunnel", landing here
-/// rather than in the plugin that injects the `<link>`: the tags go into dsh's
-/// index, which is served to the desktop's own webview as well and is composed
-/// by something with no idea which channel is up. The gateway is the only party
-/// that knows.
 fn homescreen(shared: &Shared, path: &str) -> Option<Response<Body>> {
     let known = matches!(
         path,
@@ -704,14 +690,6 @@ fn homescreen(shared: &Shared, path: &str) -> Option<Response<Body>> {
     );
     if !known {
         return None;
-    }
-    if !shared.installable() {
-        return Some(
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(empty())
-                .expect("a bare 404 is always buildable"),
-        );
     }
 
     Some(match path {

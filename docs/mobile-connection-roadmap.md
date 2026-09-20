@@ -24,16 +24,15 @@ Phase 1 能扫码连上，但有三处让人不想日常使用：
 | **M3** | Cloudflare 隧道 + 公网守卫 + 离线壳 | **已完成**，偏离见该节末尾 |
 | 之后 | 自托管中继（第四个 `RemoteTunnel` 实现） | 依赖 M2 的抽象，未排期 |
 
-现在手机连接是这样一条路径：桌面 app 一启动网关就在（公网通道除外，见下），卡片上四选一，图标点下去直接进 dsh；凭证没了就在同一个页面里输六个字符，桌面弹框确认；电脑关机时主屏幕图标显示一页说明而不是白屏——前提是当时用的是 Cloudflare 通道，因为 Service Worker 要 secure context，而只有那一条有 TLS。
+现在手机连接是这样一条路径：桌面 app 一启动网关就在（公网通道除外，见下），卡片上三选一，图标点下去直接进 dsh；凭证没了就在同一个页面里输六个字符，桌面弹框确认；电脑关机时主屏幕图标显示一页说明而不是白屏——前提是当时用的是 Cloudflare 通道，因为 Service Worker 要 secure context，而只有那一条有 TLS。
 
-四条通道各自在什么时候用：
+三条通道各自在什么时候用：
 
 | 通道 | 什么时候 | 代价 |
 | :--- | :--- | :--- |
 | 局域网 | 手机和电脑同一个 Wi-Fi | 明文 HTTP；出了这个网就没了 |
 | Tailscale | 手机在外面，两边登录同一个 tailnet | 要装客户端；仍然是明文 HTTP（WireGuard 加密，但浏览器不认） |
 | Cloudflare | 有自己的域名，任何网络下都要能进 | 这台电脑对整个公网开着——所以有一整套守卫 |
-| 临时域名 | 只是想试试能不能跑通 | 每次重启换域名，已配对设备全废；不发 manifest |
 
 ---
 
@@ -326,15 +325,24 @@ M1 的 `resume()` 在启动时把网关拉回来，让已配对的手机第二�
 | 隧道开着时，局域网上的机器不能直连网关 | `proxy::tests::a_public_tunnel_takes_nothing_but_loopback` |
 | `CF-Connecting-IP` 只在 loopback 连接上采信 | `cloudflare::tests::the_forwarded_address_is_believed_only_from_loopback` |
 | `Secure` 只由 scheme 决定，两条通道各验一次 | `tests::the_cookie_is_secure_exactly_when_the_channel_is` |
-| 临时域名下不发 manifest / 图标 / worker / 离线页 | `tests::a_quick_tunnel_serves_nothing_worth_installing` |
 | Named Tunnel 下这四个都发，且权威是裸域名 | `tests::a_named_tunnel_publishes_the_home_screen_files` |
 | 闲置判定要同时看「无活连接」和「无请求」 | `tests::a_live_connection_is_not_an_idle_gateway` |
 | worker 脚本是合法 JS，且路径只拼写一次 | `proxy::tests::the_worker_script_is_balanced_javascript` |
 | token 不进任何日志行 | `cloudflare::tests::the_token_is_taken_out_of_anything_kept` |
-| 两种模式各自怎么知道自己起来了 | `cloudflare::tests::the_quick_hostname_is_read_off_the_banner`、`a_named_tunnel_waits_for_a_registered_connection` |
+| 隧道怎么知道自己起来了 | `cloudflare::tests::a_named_tunnel_waits_for_a_registered_connection` |
 | 切通道清空黑名单 | `trust::tests::changing_the_channel_forgets_everybody` |
 
 剩下的要在真机上验，因为它们要么需要一个 Cloudflare 账号，要么需要把电脑关掉：上面四条 verify 全部，加上 M2 遗留的两条（手机走蜂窝进 tailnet；退出 Tailscale 后卡片降级）。
+
+## 交付之后：临时域名那条通道被去掉了
+
+真机上验的结果是它根本不通：手机扫完码打不开被送去的那个 `*.trycloudflare.com` 地址。于是这条通道整条删掉，而不是留着加一行警告——它本来的理由就只有「不用账号先试一下」，而一条试不通的试用通道是负数。
+
+删掉的不只是那个枚举分支：`installable()` 和网关对那四个主屏幕路径的 404 一起没了，因为它们存在的唯一理由是这条通道（见上面「只推 Named」那节的括号）。`cloudflared` 的 quick 模式解析（`--url`、从 banner 里读域名）也一并没了。
+
+**留在原地的那半个问题**：`*.trycloudflare.com` 连不上，多半意味着这台机器上的 `cloudflared` 根本没能和 Cloudflare 边缘建立连接——那 Named Tunnel 在同一台机器上也一样起不来。删掉临时域名没有修掉这件事，只是不再用一条注定失败的通道去撞它。真要查，看卡片上 `cloudflared` 退出时留下的那行。
+
+存着 `remoteChannel: "cloudflare-quick"` 的 `desktop.json` 不会让 app 起不来：不认识的通道名一律回落到局域网，`settings::channel` 本来就是这么写的，`tunnel::tests::every_channel_name_round_trips` 现在把这个名字钉成「不认识」。
 
 ---
 
