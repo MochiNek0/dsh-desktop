@@ -235,9 +235,19 @@ export function apply(ctx) {
  * one of its characters lands on its own line. It is not subtle; it is the
  * reason this file has a stylesheet in it.
  *
+ * The second is the sidebar, and it is the same shape of problem one level up.
+ * dsh's app frame is a three-track grid — sidebar, centre, right panel — whose
+ * first track is the sidebar's width. Below 1024px dsh collapses that track to a
+ * 56px rail on its own, which is right; what the toggle button then does is put
+ * it back to at least 264px *in the same grid*, so on a 390px phone the centre
+ * column is left with 110px and the conversation in it reflows into a ladder of
+ * broken rows. The widths are `computeColumns` in `@deepseek-ai/`
+ * `dsh-client-ui-layout`: the sidebar clamps to 264–420px and the centre gets
+ * whatever is left of the viewport.
+ *
  * Everything else dsh serves is fine. The chat screen, the trajectory, the model
  * list and the plugin inventory all ship their own narrow-width rules, and at
- * 390px they render correctly with nothing from here. This is one dialog.
+ * 390px they render correctly with nothing from here. These are two places.
  *
  * ## What it does
  *
@@ -246,6 +256,14 @@ export function apply(ctx) {
  * close button moves into the corner the title row leaves free. dsh's own dialog
  * width, padding, rounding and scrim are left alone, so it still looks like
  * dsh's dialog rather than like this app's idea of one.
+ *
+ * And lifts the sidebar out of the grid: its track goes to zero and the column
+ * is laid over the centre instead, so the conversation keeps the full width it
+ * had and the sidebar keeps the width it wanted. On a phone that is what a
+ * sidebar is — something opened, used once and closed again — and it is what
+ * every narrow-screen drawer does. Nothing here closes it, because a stylesheet
+ * cannot: it is closed with the same toggle that opened it, which sits inside
+ * the panel and is still on screen.
  *
  * ## Why the selectors look like that
  *
@@ -261,6 +279,19 @@ export function apply(ctx) {
  * source identifiers and change only when dsh renames the thing itself.
  * Verified to match exactly one element while the dialog is open, and none while
  * it is shut.
+ *
+ * The frame is anchored the same way and for a sharper reason: eight different
+ * packages dsh ships have a class ending in `_frame`, and only one of them has a
+ * `_sidebarCol` inside it, so `:has(> [class*="_sidebarCol"])` is what makes the
+ * selector mean the app frame and nothing else. Its state comes off
+ * `data-sidebar-collapsed`, which dsh writes on the element itself — an
+ * attribute rather than a class, so no hash is involved at all.
+ *
+ * Two declarations there carry `!important`, and they are the only two in this
+ * file. dsh solves the column widths in JavaScript and writes them as inline
+ * styles — `grid-template-columns` on the frame, `width` on the panel inside —
+ * and an inline declaration is beaten by nothing else. Both are re-stated on
+ * every render, so there is no version of this that wins by being more specific.
  *
  * ## Why the media queries
  *
@@ -349,6 +380,54 @@ const MOBILE_CSS = [
   '  top: 14px;',
   '  right: 14px;',
   '  z-index: 2;',
+  '}',
+
+  // The app frame, while the sidebar is open. dsh marks the other state with
+  // `data-sidebar-collapsed`, so this is the expanded one -- the 56px rail is
+  // dsh's own answer to a narrow screen and is left exactly as it is.
+  //
+  // The track the sidebar was holding goes to zero and the centre keeps the
+  // whole viewport. See the note on `!important` above: the value being
+  // overridden is an inline style dsh rewrites on every render.
+  '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed]) {',
+  '  grid-template-columns: 0 minmax(0, 1fr) 0 !important;',
+  '}',
+  // And the column is laid over the centre instead. The frame is already
+  // `position: relative`, so this is measured against the frame and not the
+  // page -- which is what keeps it right in the desktop window, where the frame
+  // is not the whole of the viewport.
+  '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed]) > [class*="_sidebarCol"] {',
+  '  position: absolute;',
+  '  top: 0;',
+  '  bottom: 0;',
+  '  left: 0;',
+  '  width: min(300px, 82vw);',
+  // Between two layers dsh already has: above its drag strip at 11, and below
+  // the overlay layer at 20 that dialogs render into. A sidebar over a dialog
+  // is the obvious way to get this wrong, and the settings dialog is opened
+  // from inside the sidebar.
+  '  z-index: 12;',
+  '  box-shadow: 0 0 24px rgba(0, 0, 0, .28);',
+  '}',
+  // The panel inside it is sized by dsh in px, to fit the track that is now
+  // zero wide; it takes the layer instead.
+  '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed]) > [class*="_sidebarCol"] > * {',
+  '  width: 100% !important;',
+  '}',
+  // The two columns still in the grid have to be told which track they are in.
+  // Taking the sidebar out of the flow would otherwise slide each of them one
+  // track to the left, into the zero-width one the sidebar just left -- and the
+  // centre, which is the whole point of this, would be the thing that vanished.
+  '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed]) > [class*="_centerCol"] {',
+  '  grid-column: 2;',
+  '}',
+  '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed]) > [class*="_rightbarCol"] {',
+  '  grid-column: 3;',
+  '}',
+  // And dsh's drag handle, which resizes a column that is no longer one. It is
+  // an 8px `col-resize` strip: nothing a finger was ever going to use.
+  '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed]) > [class*="_handle"] {',
+  '  display: none;',
   '}',
   '}',
 

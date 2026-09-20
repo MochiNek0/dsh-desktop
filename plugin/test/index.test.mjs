@@ -328,6 +328,50 @@ import { MOBILE_CSS, TRANSPORT, apply, flag, homescreen, inject, override, rows,
   console.log('ok  the stacked dialog keeps a live scroller');
 }
 
+// --- the sidebar covers the conversation rather than squeezing it ---
+{
+  const rule = (needle) => {
+    const at = MOBILE_CSS.indexOf(needle);
+    assert.notEqual(at, -1, `no rule for ${needle}`);
+    return MOBILE_CSS.slice(at, MOBILE_CSS.indexOf('}', at));
+  };
+  // Eight packages dsh ships have a class ending in `_frame`; one of them has a
+  // `_sidebarCol` in it. Without the `:has()` these rules would land on
+  // whichever of the other seven is on screen.
+  const frame = '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed])';
+  assert.ok(MOBILE_CSS.includes(frame), 'the frame is named by what is inside it');
+
+  // The track the sidebar was holding, which is what leaves the centre column
+  // 110px of a 390px phone.
+  assert.ok(rule(`${frame} {`).includes('grid-template-columns: 0 minmax(0, 1fr) 0 !important'),
+    'the sidebar stops being a column');
+  const layer = rule(`${frame} > [class*="_sidebarCol"] {`);
+  assert.ok(layer.includes('position: absolute'), 'and becomes a layer over the centre');
+  // dsh's own layers: the drag strip is 11 and the overlay layer dialogs render
+  // into is 20. A sidebar above that second one would cover the settings
+  // dialog, which is opened from inside the sidebar.
+  assert.ok(layer.includes('z-index: 12'), 'between the two layers dsh already has');
+
+  // The rule that is easy to leave out and impossible to see coming: with the
+  // sidebar out of the flow, auto-placement slides every remaining child one
+  // track to the left -- so the centre would land in the zero-width track the
+  // sidebar just left, and the conversation would be the thing that vanished.
+  assert.ok(rule(`${frame} > [class*="_centerCol"] {`).includes('grid-column: 2'),
+    'the centre stays in the track it was in');
+  assert.ok(rule(`${frame} > [class*="_rightbarCol"] {`).includes('grid-column: 3'));
+
+  // dsh writes both of these as inline styles and rewrites them on every
+  // render, so nothing wins here by being more specific. Two is the whole
+  // budget: a third would mean something is being fought that need not be.
+  assert.equal((MOBILE_CSS.match(/!important/g) || []).length, 2,
+    'only the two inline styles are overridden');
+
+  // The collapsed state is dsh's own answer to a narrow screen -- a 56px rail --
+  // and nothing here touches it.
+  assert.ok(!MOBILE_CSS.includes('[data-sidebar-collapsed] '), 'the rail is left alone');
+  console.log('ok  the open sidebar is laid over the conversation, not beside it');
+}
+
 // --- the home-screen tags ---
 {
   // iOS has never read a manifest for this: `apple-mobile-web-app-capable` is
