@@ -15,8 +15,13 @@
 # would find nothing to sync and would never fire again. The moment that
 # matters is someone pressing Publish, which is what `release: published` is.
 #
-# A beta does leave that workflow published, as a prerelease, and so does reach
-# `release: published`. The job below is where those are dropped.
+# A beta does leave that workflow published, as a prerelease — and still does
+# not arrive here. It is `tauri-action` that publishes it, with `GITHUB_TOKEN`,
+# and an event raised by that token starts no workflow run; v0.1.20-beta.0 went
+# public and this file did not run at all, not even to skip. A stable release
+# reaches us only because the Publish at the end of it is a person pressing a
+# button. The guard on the job below is therefore for the other way in — a
+# prerelease published by hand, which does raise the event.
 #
 # ── What has to be configured, once ────────────────────────────────────
 # In this repository's Settings → Secrets and variables → Actions:
