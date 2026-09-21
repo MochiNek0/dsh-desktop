@@ -257,13 +257,16 @@ export function apply(ctx) {
  * width, padding, rounding and scrim are left alone, so it still looks like
  * dsh's dialog rather than like this app's idea of one.
  *
- * And lifts the sidebar out of the grid: its track goes to zero and the column
- * is laid over the centre instead, so the conversation keeps the full width it
- * had and the sidebar keeps the width it wanted. On a phone that is what a
- * sidebar is — something opened, used once and closed again — and it is what
- * every narrow-screen drawer does. Nothing here closes it, because a stylesheet
- * cannot: it is closed with the same toggle that opened it, which sits inside
- * the panel and is still on screen.
+ * And lifts the sidebar out of the grid: its track is pinned to the same 56px
+ * the rail already holds when collapsed, and the column is laid over the
+ * centre instead of widening its own track. The conversation never resizes
+ * when the sidebar opens or closes — both states reserve the same 56px, so
+ * there is nothing for the centre column to react to — and the sidebar keeps
+ * the width it wanted anyway, because it is drawn as a layer, not sized by its
+ * track. On a phone that is what a sidebar is — something opened, used once and
+ * closed again — and it is what every narrow-screen drawer does. Nothing here
+ * closes it, because a stylesheet cannot: it is closed with the same toggle
+ * that opened it, which sits inside the panel and is still on screen.
  *
  * ## Why the selectors look like that
  *
@@ -386,11 +389,17 @@ const MOBILE_CSS = [
   // `data-sidebar-collapsed`, so this is the expanded one -- the 56px rail is
   // dsh's own answer to a narrow screen and is left exactly as it is.
   //
-  // The track the sidebar was holding goes to zero and the centre keeps the
-  // whole viewport. See the note on `!important` above: the value being
-  // overridden is an inline style dsh rewrites on every render.
+  // The track pins to that same 56px rather than the width dsh gave it for
+  // the expanded state, so the centre column is exactly the width it already
+  // has while collapsed -- opening the sidebar changes nothing about the
+  // grid, only what gets drawn over it. Zero would also keep the sidebar out
+  // of the centre's way, but it would make the centre column jump wider the
+  // instant the sidebar opens and narrower again the instant it closes,
+  // which is the shift this 56px is here to remove. See the note on
+  // `!important` above: the value being overridden is an inline style dsh
+  // rewrites on every render.
   '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed]) {',
-  '  grid-template-columns: 0 minmax(0, 1fr) 0 !important;',
+  '  grid-template-columns: 56px minmax(0, 1fr) 0 !important;',
   '}',
   // And the column is laid over the centre instead. The frame is already
   // `position: relative`, so this is measured against the frame and not the
@@ -410,14 +419,14 @@ const MOBILE_CSS = [
   '  box-shadow: 0 0 24px rgba(0, 0, 0, .28);',
   '}',
   // The panel inside it is sized by dsh in px, to fit the track that is now
-  // zero wide; it takes the layer instead.
+  // 56px wide; it takes the layer instead, wider than the track it sits in.
   '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed]) > [class*="_sidebarCol"] > * {',
   '  width: 100% !important;',
   '}',
   // The two columns still in the grid have to be told which track they are in.
   // Taking the sidebar out of the flow would otherwise slide each of them one
-  // track to the left, into the zero-width one the sidebar just left -- and the
-  // centre, which is the whole point of this, would be the thing that vanished.
+  // track to the left, into the 56px one the sidebar just left -- and the
+  // centre, which is the whole point of this, would be the thing that shrank.
   '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed]) > [class*="_centerCol"] {',
   '  grid-column: 2;',
   '}',

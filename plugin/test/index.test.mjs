@@ -341,10 +341,12 @@ import { MOBILE_CSS, TRANSPORT, apply, flag, homescreen, inject, override, rows,
   const frame = '[class*="_frame"]:has(> [class*="_sidebarCol"]):not([data-sidebar-collapsed])';
   assert.ok(MOBILE_CSS.includes(frame), 'the frame is named by what is inside it');
 
-  // The track the sidebar was holding, which is what leaves the centre column
-  // 110px of a 390px phone.
-  assert.ok(rule(`${frame} {`).includes('grid-template-columns: 0 minmax(0, 1fr) 0 !important'),
-    'the sidebar stops being a column');
+  // The track pins to 56px -- the same width dsh's own collapsed rail already
+  // uses below 1024px -- rather than to zero, so the centre column is the same
+  // width whether the sidebar is collapsed or open and does not resize when the
+  // sidebar is toggled.
+  assert.ok(rule(`${frame} {`).includes('grid-template-columns: 56px minmax(0, 1fr) 0 !important'),
+    "the sidebar's track matches the rail it already has when collapsed");
   const layer = rule(`${frame} > [class*="_sidebarCol"] {`);
   assert.ok(layer.includes('position: absolute'), 'and becomes a layer over the centre');
   // dsh's own layers: the drag strip is 11 and the overlay layer dialogs render
@@ -354,8 +356,8 @@ import { MOBILE_CSS, TRANSPORT, apply, flag, homescreen, inject, override, rows,
 
   // The rule that is easy to leave out and impossible to see coming: with the
   // sidebar out of the flow, auto-placement slides every remaining child one
-  // track to the left -- so the centre would land in the zero-width track the
-  // sidebar just left, and the conversation would be the thing that vanished.
+  // track to the left -- so the centre would land in the 56px track the
+  // sidebar just left, and the conversation would be the thing that shrank.
   assert.ok(rule(`${frame} > [class*="_centerCol"] {`).includes('grid-column: 2'),
     'the centre stays in the track it was in');
   assert.ok(rule(`${frame} > [class*="_rightbarCol"] {`).includes('grid-column: 3'));
