@@ -140,6 +140,25 @@ fn text() -> serde_json::Value {
             "Scan this with the phone's camera. The computer will ask you once more before letting it in."
         ),
         "waiting": t!("等待手机扫码…", "Waiting for a phone to scan…"),
+        // The one line that says the portal exists. Nothing else in the app
+        // does, and a page nobody knows about is a page nobody uses.
+        //
+        // It sells the second sentence, not the first: scanning from there is
+        // no easier than scanning with the system camera. What it buys is an
+        // entry whose own address never changes — which is the half of the
+        // dead-origin problem plain HTTP cannot fix on its own.
+        //
+        // Careful with what it promises. The portal does not survive this
+        // machine's address changing — the entry it saved is that address, and
+        // a new one still has to be scanned. What survives is the page: it
+        // opens, and says so, where a home-screen icon on a dead origin is a
+        // blank screen with nothing on it at all.
+        "portal": t!(
+            "也可以在手机上打开 dsh-desktop.cc.cd/go 扫这个码，以后从那一页直接进 —— 那一页的地址不会变，电脑关着也打得开。",
+            "Or open dsh-desktop.cc.cd/go on the phone and scan it from there. \
+             That page goes straight in next time, and its own address never \
+             changes — it opens even while this computer is off."
+        ),
         "codeWhy": t!(
             "不方便扫码，就在手机上打开这个地址，把这六个字符输进去。",
             "Or open the address on the phone and type these six characters in."
@@ -254,7 +273,7 @@ pub fn script() -> String {
   if (window.__dshRemoteCard) return;
   window.__dshRemoteCard = true;
 
-  var root = null, head, lede, chan, chanWhy, warn, setup, code, pin, link,
+  var root = null, head, lede, chan, chanWhy, warn, setup, code, portal, pin, link,
       status, list, note, patch, keep, foot;
   var TEXT = {{}};
 
@@ -356,6 +375,10 @@ pub fn script() -> String {
       // for it — and the code takes a visible moment to arrive on the one
       // channel that has to start a process first.
       '.dsh-rc-code.dsh-rc-wait{{height:208px;background:var(--rc-hover)}}' +
+      // Sits directly under the code, because it is another way to point a
+      // camera at that same code — not a fourth thing to do with the nonce.
+      '.dsh-rc-portal{{margin:-4px 0 12px;text-align:center;font-size:11px;' +
+      'line-height:1.5;color:var(--rc-muted)}}' +
       // The same nonce as the code above it, for the phone that cannot point a
       // camera at a screen it is not near. Monospace and spaced out because it
       // is read one character at a time and then typed.
@@ -417,7 +440,10 @@ pub fn script() -> String {
     var right = make('div', 'dsh-rc-right', cols);
     // Left: the three shapes of one nonce, in the order a phone meets them —
     // point a camera at it, type it, or copy the address and send it over.
+    // The portal line rides with the first of those: it is a different camera
+    // pointed at the same code, not a fourth shape.
     code = make('div', 'dsh-rc-code', left);
+    portal = make('div', 'dsh-rc-portal', left);
     pin = make('div', 'dsh-rc-pin', left);
     link = make('button', 'dsh-rc-link', left);
     link.type = 'button';
@@ -667,6 +693,11 @@ pub fn script() -> String {
     paintWarning(view.public);
     paintSetup(view);
     paintCode(view.url || '');
+
+    // Gated on the URL rather than on the code: with nowhere to send anyone,
+    // naming a page that would scan the code is naming a page that cannot help.
+    portal.style.display = view.url ? 'block' : 'none';
+    portal.textContent = TEXT.portal || '';
 
     pin.style.display = view.code ? 'block' : 'none';
     if (view.code) {{
