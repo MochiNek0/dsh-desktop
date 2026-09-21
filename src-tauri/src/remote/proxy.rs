@@ -157,6 +157,8 @@ async fn handle(
         header(&request, HOST),
         header(&request, ORIGIN),
         header_named(&request, "sec-fetch-site"),
+        header_named(&request, "sec-fetch-dest"),
+        header_named(&request, "referer"),
         &authorities,
     );
     if let Err(why) = refusal {
@@ -559,7 +561,7 @@ fn redirect(target: &str, cookie: Option<&str>, secure: bool) -> Response<Body> 
         response = response.header(
             SET_COOKIE,
             format!(
-                "{DEVICE_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Strict;                  Max-Age={COOKIE_MAX_AGE}{}",
+                "{DEVICE_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Lax;                  Max-Age={COOKIE_MAX_AGE}{}",
                 if secure { "; Secure" } else { "" }
             ),
         );
@@ -1104,9 +1106,23 @@ mod tests {
     }
 
     /// The cookie the phone is handed. Every attribute on it is load-bearing —
-    /// `HttpOnly` keeps it out of any script dsh loads, `SameSite=Strict` is the
-    /// second half of the cross-site defence, and the absence of `Secure` is
-    /// what makes it work at all over plain HTTP.
+    /// `HttpOnly` keeps it out of any script dsh loads, and the absence of
+    /// `Secure` is what makes it work at all over plain HTTP.
+    ///
+    /// `Lax` rather than `Strict`, and that one word is the whole reason the
+    /// portal at [`trust::PORTAL`] can send anyone here. `Strict` means the
+    /// browser attaches this to nothing a *different* site started — top-level
+    /// navigation included — so a phone arriving from the portal looked exactly
+    /// like a phone that had never paired, and got the six-character form every
+    /// single time. `Lax` widens that by exactly one case: a top-level GET
+    /// navigation. Cross-site `fetch`, XHR, iframes and form POSTs still carry
+    /// no cookie at all.
+    ///
+    /// There is no narrower setting. `SameSite` is a browser-side rule with
+    /// three values and no allowlist, so this cannot be granted to the portal
+    /// alone — the origin check that *is* scoped lives in
+    /// [`trust::provenance`], and the two are deliberately not the same
+    /// mechanism.
     #[test]
     fn the_device_cookie_goes_out_with_the_attributes_it_needs() {
         let response = redirect("/", Some("v1.d1.0.mac"), false);
@@ -1114,7 +1130,7 @@ mod tests {
 
         assert!(cookie.starts_with("dsh_mobile_session=v1.d1.0.mac;"));
         assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("SameSite=Lax"));
         assert!(cookie.contains("Path=/"));
         assert!(!cookie.contains("Secure"), "both of M2's tunnels are plain HTTP");
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -1131,7 +1147,7 @@ mod tests {
         let cookie = cookie.headers()[SET_COOKIE].to_str().unwrap();
 
         assert!(cookie.ends_with("; Secure"));
-        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("SameSite=Lax"));
     }
 
     #[test]

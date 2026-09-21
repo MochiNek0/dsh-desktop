@@ -24,10 +24,42 @@
 //!   defence — and why [`RemoteTunnel::authorities`] rather than a hardcoded
 //!   list.
 //! - **Cross-site requests.** Any page in the phone's browser can `fetch` at
-//!   the gateway, and the device cookie would ride along on it if the cookie
-//!   were not `SameSite=Strict`. It is, and this is the second belt: a request
-//!   the browser itself labelled cross-site is refused before its cookies are
-//!   even looked at.
+//!   the gateway, and the device cookie rides along on anything `SameSite=Lax`
+//!   lets through. Lax withholds it from `fetch`, XHR, iframes and form POSTs
+//!   on its own; this is the second belt, and it refuses such a request before
+//!   its cookies are even looked at.
+//!
+//! ## The one hole in the cross-site rule, and how narrow it is
+//!
+//! A top-level navigation from [`PORTAL`] is let through. It has to be: the
+//! portal exists so that a phone can get back into a gateway whose address it
+//! has already been told, and every navigation it makes is by definition
+//! cross-site. `SameSite=Lax` is the other half — see
+//! [`crate::remote::proxy::redirect`] — and the two together are one decision
+//! written twice, because a browser enforces one of them and this process the
+//! other.
+//!
+//! What the exception costs is bounded by what it requires. It is a `Referer`
+//! naming one of a fixed pair of origins, which no page can forge: a browser
+//! writes that header itself, and a page may suppress its own referrer but not
+//! claim somebody else's. It is `sec-fetch-dest: document`, so the gateway may
+//! be *navigated to* and still never embedded. And it grants nothing beyond
+//! arriving — the device cookie, the nonce and the desktop dialog are all still
+//! in front of the session.
+//!
+//! ## On a plain-HTTP channel none of this is consulted, and that matters
+//!
+//! `Sec-Fetch-*` are sent only to potentially trustworthy URLs. The LAN and
+//! Tailscale channels are plain HTTP over a non-loopback address, which is not
+//! one, so a phone talking to them sends no `sec-fetch-site` at all and the
+//! whole check above — refusal and exception alike — never runs. On those two
+//! channels the belt described here does not exist, and the `Host` check plus
+//! the cookie are what there is.
+//!
+//! So the allowlist bites on the Cloudflare channel and nowhere else. It is not
+//! written down as a defence of the LAN; it is written down so that raising a
+//! public tunnel does not silently open the gateway to a navigation from any
+//! page on the internet.
 //!
 //! ## The fence is weaker while a public tunnel is up, and that is not a bug
 //!
@@ -81,12 +113,20 @@ pub fn provenance(
     host: Option<&str>,
     origin: Option<&str>,
     fetch_site: Option<&str>,
+    fetch_dest: Option<&str>,
+    referer: Option<&str>,
     authorities: &[String],
 ) -> Result<(), Refusal> {
     // First, because it is the cheapest and because it is the only one of the
     // three the browser fills in on its own: a page cannot set it, and a client
     // that is not a browser does not send it at all.
-    if fetch_site.is_some_and(|site| site.eq_ignore_ascii_case("cross-site")) {
+    //
+    // The exception is the portal, and it is deliberately three conditions
+    // rather than one — see the module docs for what each buys.
+    if fetch_site.is_some_and(|site| site.eq_ignore_ascii_case("cross-site"))
+        && !(fetch_dest.is_some_and(|dest| dest.eq_ignore_ascii_case("document"))
+            && from_portal(referer))
+    {
         return Err("sec-fetch-site was cross-site");
     }
 
@@ -126,6 +166,51 @@ fn authority_of(origin: &str) -> Option<String> {
     // the path compared against a port.
     let authority = authority.split('/').next()?;
     (!authority.is_empty()).then(|| authority.to_ascii_lowercase())
+}
+
+/// The one host on the internet allowed to navigate a phone into this gateway.
+///
+/// The site in `dsh-desktop-site`, whose `/go/` page holds the addresses a
+/// phone has paired with and is the reason the cross-site rule has an exception
+/// at all. Hardcoded rather than configurable: a setting here is a setting that
+/// can be pointed somewhere else, and the value of a one-item allowlist is
+/// entirely in it being the item nobody can change.
+const PORTAL: &str = "dsh-desktop.cc.cd";
+
+/// Whether a `Referer` names the portal, or the dev server standing in for it.
+///
+/// The scheme is compared for the portal and not for localhost, and that
+/// asymmetry is the point. `https://dsh-desktop.cc.cd` is the only way that
+/// site is served, so a referrer claiming it over plain HTTP is claiming
+/// something that does not exist and is refused. A developer running the page
+/// at `http://localhost:5173` is the ordinary case, not an anomaly.
+///
+/// Absent is not trusted, and that costs nothing worth having: the exception
+/// this feeds only ever runs on a request the browser already labelled
+/// cross-site, and a browser that labels a request at all is a browser that
+/// sends a referrer when its policy allows one.
+fn from_portal(referer: Option<&str>) -> bool {
+    let Some(referer) = referer else {
+        return false;
+    };
+
+    // Split before the port rather than after the scheme: `user@host` in a
+    // referrer would otherwise let `https://dsh-desktop.cc.cd@evil.example/`
+    // read as the portal. Taken whole, it is one host and it is not this one.
+    let referer = referer.trim().to_ascii_lowercase();
+    let Some((scheme, rest)) = referer.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _port)| host);
+
+    match host {
+        PORTAL => scheme == "https",
+        "localhost" | "127.0.0.1" => true,
+        _ => false,
+    }
 }
 
 /// What to call a device on the desktop card.
@@ -299,6 +384,8 @@ mod tests {
             Some("192.168.1.100:59000"),
             None,
             Some("none"),
+            None,
+            None,
             &authorities()
         )
         .is_ok());
@@ -309,7 +396,15 @@ mod tests {
     /// gateway.
     #[test]
     fn any_address_of_this_machine_is_this_machine() {
-        assert!(provenance(Some("10.0.0.5:59000"), None, None, &authorities()).is_ok());
+        assert!(provenance(
+            Some("10.0.0.5:59000"),
+            None,
+            None,
+            None,
+            None,
+            &authorities()
+        )
+        .is_ok());
     }
 
     /// The rebinding case, which is the reason this module exists: the name
@@ -323,7 +418,7 @@ mod tests {
             "127.0.0.1:59000",
         ] {
             assert!(
-                provenance(Some(host), None, None, &authorities()).is_err(),
+                provenance(Some(host), None, None, None, None, &authorities()).is_err(),
                 "{host} must be refused"
             );
         }
@@ -333,8 +428,24 @@ mod tests {
     /// not this one.
     #[test]
     fn the_port_is_part_of_it() {
-        assert!(provenance(Some("192.168.1.100:3080"), None, None, &authorities()).is_err());
-        assert!(provenance(Some("192.168.1.100"), None, None, &authorities()).is_err());
+        assert!(provenance(
+            Some("192.168.1.100:3080"),
+            None,
+            None,
+            None,
+            None,
+            &authorities()
+        )
+        .is_err());
+        assert!(provenance(
+            Some("192.168.1.100"),
+            None,
+            None,
+            None,
+            None,
+            &authorities()
+        )
+        .is_err());
     }
 
     #[test]
@@ -343,6 +454,99 @@ mod tests {
             Some("192.168.1.100:59000"),
             Some("http://192.168.1.100:59000"),
             Some("cross-site"),
+            None,
+            None,
+            &authorities()
+        )
+        .is_err());
+    }
+
+    /// The exception: the portal sending a phone back to a gateway it has
+    /// already paired with. This is the request that used to be a 403 on the
+    /// Cloudflare channel, and it is the only cross-site shape that is not.
+    #[test]
+    fn the_portal_may_navigate_a_phone_in() {
+        for referer in [
+            "https://dsh-desktop.cc.cd/go/",
+            "https://dsh-desktop.cc.cd/",
+            "https://dsh-desktop.cc.cd/en/go/",
+            "http://localhost:5173/go/",
+            "http://127.0.0.1:4173/go/",
+        ] {
+            assert!(
+                provenance(
+                    Some("192.168.1.100:59000"),
+                    None,
+                    Some("cross-site"),
+                    Some("document"),
+                    Some(referer),
+                    &authorities()
+                )
+                .is_ok(),
+                "{referer} is the portal"
+            );
+        }
+    }
+
+    /// And every way of nearly being it. Each of these differs from the case
+    /// above in exactly one field, because one field is all an attacker needs
+    /// to get right for the exception to be worthless.
+    #[test]
+    fn nothing_else_gets_that_exception() {
+        let ok = |dest, referer| {
+            provenance(
+                Some("192.168.1.100:59000"),
+                None,
+                Some("cross-site"),
+                dest,
+                referer,
+                &authorities(),
+            )
+            .is_ok()
+        };
+
+        for referer in [
+            // Another site altogether.
+            "https://evil.example/go/",
+            // A name that merely starts or ends with the portal's.
+            "https://dsh-desktop.cc.cd.evil.example/",
+            "https://not-dsh-desktop.cc.cd/",
+            // Userinfo, which is the trick the host is parsed whole to survive.
+            "https://dsh-desktop.cc.cd@evil.example/",
+            // The portal over a scheme it is not served on.
+            "http://dsh-desktop.cc.cd/go/",
+            // Not a referrer at all.
+            "dsh-desktop.cc.cd",
+            "",
+        ] {
+            assert!(!ok(Some("document"), Some(referer)), "{referer} is not it");
+        }
+
+        // The portal, but asking to embed rather than to navigate. Being
+        // reachable by a link is not being framable by one.
+        for dest in ["iframe", "empty", "image", "script"] {
+            assert!(
+                !ok(Some(dest), Some("https://dsh-desktop.cc.cd/go/")),
+                "sec-fetch-dest: {dest} is not a navigation"
+            );
+        }
+
+        // And a cross-site request that says nothing about itself stays
+        // refused, which is what keeps the exception from being the default.
+        assert!(!ok(None, Some("https://dsh-desktop.cc.cd/go/")));
+        assert!(!ok(Some("document"), None));
+    }
+
+    /// The exception is only ever reached through the cross-site branch, so it
+    /// cannot become a way *around* the `Host` check.
+    #[test]
+    fn the_portal_cannot_vouch_for_an_address_this_machine_lacks() {
+        assert!(provenance(
+            Some("evil.example:59000"),
+            None,
+            Some("cross-site"),
+            Some("document"),
+            Some("https://dsh-desktop.cc.cd/go/"),
             &authorities()
         )
         .is_err());
@@ -358,6 +562,8 @@ mod tests {
                     Some("192.168.1.100:59000"),
                     None,
                     Some(site),
+                    None,
+                    None,
                     &authorities()
                 )
                 .is_ok(),
@@ -373,6 +579,8 @@ mod tests {
             host,
             Some("http://192.168.1.100:59000"),
             None,
+            None,
+            None,
             &authorities()
         )
         .is_ok());
@@ -385,7 +593,7 @@ mod tests {
             "",
         ] {
             assert!(
-                provenance(host, Some(origin), None, &authorities()).is_err(),
+                provenance(host, Some(origin), None, None, None, &authorities()).is_err(),
                 "Origin {origin} does not agree with the Host"
             );
         }
@@ -408,12 +616,12 @@ mod tests {
     /// gateway is shut rather than open in the moment before it is ready.
     #[test]
     fn nothing_is_trusted_before_a_tunnel_says_so() {
-        assert!(provenance(Some("192.168.1.100:59000"), None, None, &[]).is_err());
+        assert!(provenance(Some("192.168.1.100:59000"), None, None, None, None, &[]).is_err());
     }
 
     #[test]
     fn a_request_with_no_host_is_not_a_request_for_us() {
-        assert!(provenance(None, None, None, &authorities()).is_err());
+        assert!(provenance(None, None, None, None, None, &authorities()).is_err());
     }
 
     #[test]
