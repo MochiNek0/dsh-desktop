@@ -839,8 +839,23 @@ fn open_channel(app: &tauri::AppHandle) {
             return;
         }
 
+        // Written before the install rather than after it, because
+        // [`dsh::run`] reads it back to put `-Channel` on the script's command
+        // line. So a refusal has to put it back: npm can turn a switch down
+        // flat — a dependency range in the line being switched to that nothing
+        // published satisfies is enough — and a preference left naming a
+        // channel that was never installed has the app describing one line
+        // while running the other's dsh. The row would then offer the line the
+        // user is already on, and the way back to the one they asked for would
+        // be a switch away and a switch back.
+        //
+        // Only a refusal. An install the app quit out of was interrupted, not
+        // turned down, and leaving the answer recorded is what lets the next
+        // launch's update check carry the switch through.
         settings::set_dsh_channel(&app, wanted);
-        reinstall_dsh(&app, &session, &prefix, &installed);
+        if reinstall_dsh(&app, &session, &prefix, &installed) == dsh::Updated::Failed {
+            settings::set_dsh_channel(&app, current);
+        }
     });
 }
 
@@ -1169,14 +1184,22 @@ fn update_dsh(app: &tauri::AppHandle) {
 ///
 /// The caller owns the [`Busy`] guard and is already off the main thread, which
 /// is what makes it safe to block here for as long as npm takes.
+///
+/// The outcome travels back out for [`open_channel`], which has a preference
+/// riding on whether npm actually replaced anything; [`update_dsh`] has nothing
+/// to do with it and drops it.
 fn reinstall_dsh(
     app: &tauri::AppHandle,
     session: &Session,
     prefix: &std::path::Path,
     installed: &semver::Version,
-) {
+) -> dsh::Updated {
     let Some(window) = app.get_webview_window("main") else {
-        return;
+        // No window is no loading page to report onto and no dsh to take down,
+        // so npm never runs and nothing is replaced. Not `Quit`, which the
+        // caller reads as an install that was interrupted and may yet be
+        // finished: this one never started.
+        return dsh::Updated::Failed;
     };
 
     stop_server(app, session);
@@ -1206,13 +1229,16 @@ fn reinstall_dsh(
         }
     });
 
-    // False means the app is quitting and took npm down with it.
     let report = reporter(&session.splash, &window);
-    if !dsh::update(app, prefix, installed, &report) {
-        return;
+    let updated = dsh::update(app, prefix, installed, &report);
+    // The app is quitting and took npm down with it; there is nothing left to
+    // serve into.
+    if updated == dsh::Updated::Quit {
+        return updated;
     }
 
     start_serving(app, &window, session);
+    updated
 }
 
 /// Start `dsh web` and hand the window over to it. Blocks until it is serving or

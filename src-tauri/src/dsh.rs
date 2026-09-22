@@ -929,8 +929,9 @@ pub fn gate(app: &AppHandle, report: &Report) -> bool {
 
     // Nothing is running yet, so there is nothing to stop and nothing to restart
     // for: npm replaces the tree in place and the boot carries straight on into
-    // the new version.
-    update(app, prefix, &installed.version, report)
+    // the new version. A failed update is still a boot: the dsh that was here
+    // before it is the one this launch runs.
+    update(app, prefix, &installed.version, report) != Updated::Quit
 }
 
 /// What the window shows while this is waiting on npm, and `""` when the wait is
@@ -1006,9 +1007,28 @@ pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)>
     Some((prefix, installed.version))
 }
 
+/// How an [`update`] ended.
+///
+/// The three outcomes were one `bool` — `false` for "the app is quitting" and
+/// `true` for everything else, success and failure alike. That was enough for
+/// [`gate`], which only ever asks whether to carry on booting, and wrong for
+/// `open_channel` in `main.rs`, which has a preference to write down and must
+/// not write it down for an install that did not happen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Updated {
+    /// npm replaced the tree. The dsh in `prefix` is now the channel's.
+    Done,
+    /// Nothing was replaced. When npm ran, it failed and the user has been
+    /// told; the dsh on disk is the one that was already there, which is still
+    /// a working dsh, so the caller goes on to run it.
+    Failed,
+    /// Cut short because the app is quitting and took npm down with it. Nothing
+    /// to report, and by now nowhere left to report it.
+    Quit,
+}
+
 /// Replace the dsh in `prefix` with whatever the channel in use points at,
-/// reporting progress onto the loading page. `false` means the app quit while
-/// npm was still running.
+/// reporting progress onto the loading page.
 ///
 /// Which release that is, this does not decide: [`run`] puts `-Channel` on the
 /// command and the script resolves the tag behind it. Usually the newest there
@@ -1019,10 +1039,7 @@ pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)>
 /// The prefix is passed to the script rather than left to the npm it runs with:
 /// a dsh the user installed themselves lives in their own global prefix, and an
 /// npm of ours would default to a different one and install a second copy there.
-///
-/// Failure is reported here and answers `true` all the same — there is a working
-/// dsh on disk either way, which is the one the caller goes on to run.
-pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Report) -> bool {
+pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Report) -> Updated {
     let args = [
         OsStr::new("-Mode"),
         OsStr::new("update"),
@@ -1033,11 +1050,9 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
     match run(app, &args, report) {
         Ok(true) => {
             report("", -1.0);
-            true
+            Updated::Done
         }
-        // Cut short because the app is quitting. Nothing to report, and by now
-        // nowhere left to report it.
-        Ok(false) => false,
+        Ok(false) => Updated::Quit,
         Err(error) => {
             eprintln!("dsh-desktop: updating dsh failed: {error}");
             report("", -1.0);
@@ -1051,7 +1066,7 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
                     error
                 ),
             );
-            true
+            Updated::Failed
         }
     }
 }
