@@ -800,6 +800,26 @@ function Get-Registry([string] $Exe, [string] $Cli) {
     return ''
 }
 
+# What npm said about the install that just failed: its `code`, and the first
+# line of detail printed under it. Script scope for the same reason
+# `$script:fetched` has it -- the handler that fills them runs inside a pipeline
+# and has nowhere else to put an answer.
+$script:NpmCode = ''
+$script:NpmSaid = ''
+
+# The `code` values that mean npm reached the registry, read what it serves and
+# refused it: a version range nothing published satisfies, a dependency graph
+# that cannot be built. Those are verdicts on the package rather than on the
+# source, and the sources all serve the same metadata -- what is installed here
+# is a dist-tag and never a pinned version, so a mirror still catching up
+# resolves the tag to an older release and installs it rather than answering
+# ETARGET. Walking the rest of the list buys nothing but the user's time and
+# ends in a message about the network, which is the one thing that was working.
+#
+# `E404` is deliberately not on the list: that one says this registry does not
+# have the package at all, which is exactly what another registry can fix.
+$ResolutionErrors = @('ETARGET', 'ERESOLVE')
+
 # One `npm install -g`, from one registry, into `$Prefix` when one is given and
 # npm's own default when it is not. npm's http log is read as it goes: every
 # tarball that comes back moves the bar, which is the only progress signal npm
@@ -815,6 +835,8 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
     # Script scope, and reset here rather than left over: a retry against the
     # next registry starts its count from zero, the same as its bar does.
     $script:fetched = 0
+    $script:NpmCode = ''
+    $script:NpmSaid = ''
 
     # npm runs a dependency's `install` script through the shell, and the ones
     # that build something spell it `node ...` — resolved off PATH, not from the
@@ -833,6 +855,14 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
                 if ($line -match 'npm http (fetch GET 200|cache) ') {
                     $script:fetched++
                     Report ([Math]::Min($From + ($To - $From) * ($script:fetched / $PackageCount), $ProgressCeiling))
+                } elseif ($line -match '^npm (?:error|ERR!) code (\S+)') {
+                    # npm 10.6 and up spell it `npm error`; everything older
+                    # `npm ERR!`. The npm running this is the user's, so both.
+                    if (-not $script:NpmCode) { $script:NpmCode = $Matches[1] }
+                } elseif ((-not $script:NpmSaid) -and ($line -match '^npm (?:error|ERR!) (.+)$')) {
+                    # The first line under the code, which is the one that names
+                    # what npm could not find.
+                    $script:NpmSaid = $Matches[1].Trim()
                 }
             })
     } finally {
@@ -841,15 +871,49 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
 }
 
 # Install `Spec` through the fastest registry that works.
+#
+# `$false` with `$script:NpmCode` set means npm refused the install rather than
+# failed to reach anything. `Install-Failure` is what turns that into something
+# worth telling the user.
 function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [string] $Prefix, [double] $From, [double] $To) {
     foreach ($source in (Sort-Registries $Exe $Cli $From)) {
         if (Invoke-NpmInstall $Exe $Cli $Spec $Prefix $source $From $To) {
             Say "dsh 安装完成（$($source.Label)）。"
             return $true
         }
+        # npm read the registry and turned down what it found. See
+        # `$ResolutionErrors`: the rest of the list would turn it down the same
+        # way, so the walk stops here and the code travels out to be reported.
+        if ($ResolutionErrors -contains $script:NpmCode) {
+            Say "npm 拒绝了这次安装（$($script:NpmCode)），换一个源也是同样的结果，不再重试。"
+            return $false
+        }
         Say "从 $($source.Label) 安装失败，换下一个源重试。"
     }
     return $false
+}
+
+# What to tell the user when `Install-Package` gave up, given what it was trying
+# to do -- `$Whose`, a finished sentence.
+#
+# Every one of these messages used to end in a guess at the network, and that
+# guess is wrong every time npm failed on the package rather than on the
+# connection: the kind of wrong that sends someone into their proxy settings for
+# an afternoon. npm's own verdict replaces it when there is one.
+#
+# One line and no newlines in it: this ends up behind `::error ` on a single
+# line of the script's output, which is how `run` in `dsh.rs` reads it back.
+function Install-Failure([string] $Whose) {
+    if (-not $script:NpmCode) {
+        return "$Whose 已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。"
+    }
+
+    $said = $script:NpmSaid
+    if (-not $said) { $said = '（npm 没有说明原因）' }
+    if ($ResolutionErrors -contains $script:NpmCode) {
+        return "$Whose npm 报错 $($script:NpmCode)：$said 源是通的，装不上的是这个版本本身，换源或改代理都没有用。"
+    }
+    return "$Whose npm 报错 $($script:NpmCode)：$said"
 }
 
 # --------------------------------------------------------------------- path --
@@ -962,7 +1026,7 @@ function Update-All {
 
     Step '正在更新 dsh…' 0
     if (-not (Install-Package $node $cli "$Package@$Tag" $prefix 0 $ProgressCeiling)) {
-        Fail 'dsh 更新失败，默认源和几个备用镜像都没有成功。'
+        Fail (Install-Failure 'dsh 更新失败。')
     }
     Step 'dsh 更新完成。' 100
 }
@@ -1378,7 +1442,7 @@ function Install-DshInto {
 
     Step '正在下载 dsh，约 185 MB，请耐心等待…' 0
     if (-not (Install-Package $NodeExe $cli "$Package@$Tag" $prefix 0 $ProgressCeiling)) {
-        Fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
+        Fail (Install-Failure 'dsh 下载失败。')
     }
 
     Remove-Path ([string]$state['pathEntry'])
@@ -1420,7 +1484,7 @@ function Install-NodeAndDsh {
     $prefix = Get-ManagedPrefix $node
     Step '正在下载 dsh，约 185 MB，请耐心等待…' 36
     if (-not (Install-Package $node $cli "$Package@$Tag" $prefix 36 $ProgressCeiling)) {
-        Fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
+        Fail (Install-Failure 'dsh 下载失败。')
     }
 
     $state['dsh'] = 'managed'
