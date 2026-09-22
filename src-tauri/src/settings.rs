@@ -158,6 +158,117 @@ pub fn set_registry(app: &AppHandle, source: RegistrySource) {
     write(app, REGISTRY_KEY, Value::String(source.as_str().to_string()));
 }
 
+/// Which line of dsh releases this app installs and updates to.
+///
+/// npm publishes dsh under two tags that matter here. `latest` is the
+/// release-candidate line, which is what every install has always taken and
+/// what a machine that has never been asked still takes. `alpha` runs ahead of
+/// it, and is there for a user who wants what is being worked on now rather
+/// than what is being stabilised.
+///
+/// ## Alpha is not merely "newer"
+///
+/// The two lines are not a ladder with alpha on the higher rung. Work lands in
+/// alpha that may never reach a release candidate in the shape it landed in,
+/// and one of the things it is free to change is the format dsh writes its
+/// sessions in. A session written by an alpha is not a session an rc promises
+/// to be able to open, which makes going back the problem rather than going
+/// forward.
+///
+/// ## Why the two lines still share a home
+///
+/// The obvious answer to that is to give alpha a `$DSH_HOME` of its own, and it
+/// was tried. It does not hold. Only one dsh can be installed globally, so
+/// after a switch the `dsh` the user types in their own terminal is the alpha
+/// one — and nothing this app does reaches that terminal's environment, by an
+/// older decision this one is not going to overturn (see
+/// [`crate::dsh::terminal`]). That dsh resolves `$DSH_HOME` for itself, lands
+/// in the shared home, and writes there. So the separation held only for
+/// sessions started through this window, while the dialog was promising that
+/// the other home was untouched — a promise the first terminal the user opened
+/// would break.
+///
+/// A promise that cannot be kept is worse than none. So the channel moves which
+/// dsh is installed and nothing else: one home, one dsh, and a dialog that says
+/// what the risk is and where the directory to back up lives. See
+/// `channel_question` in `main.rs`, which is the whole of the mitigation.
+///
+/// ## Why the default is not `Option`
+///
+/// Unlike [`REGISTRY_KEY`], where "nobody has been asked" is a state worth
+/// telling apart from either answer, there is always a channel in use and the
+/// safe one is known. So a file with nothing in it, and a file holding a name
+/// this build does not recognise, both read as [`Channel::Rc`] — never as
+/// alpha. A preference that cannot be parsed must not be able to move anyone
+/// onto the line that writes sessions the other one cannot read.
+const DSH_CHANNEL_KEY: &str = "dshChannel";
+
+/// The line of dsh releases in use. See [`DSH_CHANNEL_KEY`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Channel {
+    /// The release candidates, published under npm's `latest`.
+    Rc,
+    /// The alpha line, published under npm's `alpha`.
+    Alpha,
+}
+
+/// What a machine nobody has asked is on, and what anything unreadable reads
+/// as.
+const DSH_CHANNEL_DEFAULT: Channel = Channel::Rc;
+
+impl Channel {
+    /// The spelling both installer scripts take for `-Channel`, and the one
+    /// stored in `desktop.json`. One function so the two can never drift, the
+    /// same way [`RegistrySource::as_str`] is one.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Rc => "rc",
+            Channel::Alpha => "alpha",
+        }
+    }
+
+    /// The npm dist-tag this channel installs from.
+    ///
+    /// Deliberately not the same string as [`Channel::as_str`]: the rc line is
+    /// published under `latest`, not under `rc`, and writing `rc` into an
+    /// `npm install -g @deepseek-ai/dsh@rc` would name a tag that does not
+    /// exist. The scripts hold the other half of this mapping and a test pins
+    /// the two together.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Channel::Rc => "latest",
+            Channel::Alpha => "alpha",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "rc" => Some(Channel::Rc),
+            "alpha" => Some(Channel::Alpha),
+            _ => None,
+        }
+    }
+}
+
+/// The channel in use. Anything unreadable is [`DSH_CHANNEL_DEFAULT`]; see
+/// [`DSH_CHANNEL_KEY`] for why this is not an `Option`.
+pub fn dsh_channel(app: &AppHandle) -> Channel {
+    read(app)
+        .get(DSH_CHANNEL_KEY)
+        .and_then(Value::as_str)
+        .and_then(Channel::parse)
+        .unwrap_or(DSH_CHANNEL_DEFAULT)
+}
+
+/// Write the channel the user switched to.
+pub fn set_dsh_channel(app: &AppHandle, channel: Channel) {
+    write(
+        app,
+        DSH_CHANNEL_KEY,
+        Value::String(channel.as_str().to_string()),
+    );
+}
+
 /// The port the phone gateway bound last time, so that it can ask for the same
 /// one again.
 ///
@@ -453,6 +564,54 @@ mod tests {
         assert_eq!(port(r#"{"remoteGatewayPort": 70000}"#), None);
         // The spelling of "you pick", which is already what `None` says.
         assert_eq!(port(r#"{"remoteGatewayPort": 0}"#), None);
+    }
+
+    /// The read half of [`super::dsh_channel`], mirrored the same way and with
+    /// the same warning as `parse` above.
+    fn channel(text: &str) -> super::Channel {
+        parse(text)
+            .get(super::DSH_CHANNEL_KEY)
+            .and_then(Value::as_str)
+            .and_then(super::Channel::parse)
+            .unwrap_or(super::DSH_CHANNEL_DEFAULT)
+    }
+
+    #[test]
+    fn reads_the_channel() {
+        assert_eq!(channel(r#"{"dshChannel": "rc"}"#), super::Channel::Rc);
+        assert_eq!(channel(r#"{"dshChannel": "alpha"}"#), super::Channel::Alpha);
+    }
+
+    /// Every unreadable file lands on rc, and none of them on alpha. This is
+    /// the one preference here where the fallback is a safety property rather
+    /// than a convenience: alpha writes sessions an rc need not be able to
+    /// open, so nothing but the word `alpha` may put anyone on it.
+    #[test]
+    fn nothing_unreadable_can_land_on_alpha() {
+        for text in [
+            "",
+            "{",
+            "null",
+            "[1, 2, 3]",
+            "{}",
+            r#"{"dshChannel": "beta"}"#,
+            r#"{"dshChannel": "ALPHA"}"#,
+            r#"{"dshChannel": true}"#,
+            r#"{"dshChannel": null}"#,
+        ] {
+            assert_eq!(channel(text), super::Channel::Rc, "for {text:?}");
+        }
+    }
+
+    /// The rc line is published under npm's `latest`, not under `rc`. Spelling
+    /// the stored name into an install would name a tag that does not exist,
+    /// so the two strings are deliberately different and this says so.
+    #[test]
+    fn the_stored_name_is_not_the_npm_tag() {
+        assert_eq!(super::Channel::Rc.as_str(), "rc");
+        assert_eq!(super::Channel::Rc.tag(), "latest");
+        assert_eq!(super::Channel::Alpha.as_str(), "alpha");
+        assert_eq!(super::Channel::Alpha.tag(), "alpha");
     }
 
     /// A key this build does not know about survives a write of one that it

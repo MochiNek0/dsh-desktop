@@ -155,6 +155,10 @@ pub enum Action {
     /// whose npm points somewhere of the user's own choosing; see
     /// [`crate::settings::RegistrySource`].
     Registry,
+    /// Move between the release candidates and the alpha line; see
+    /// [`crate::settings::Channel`]. The one row on the card that can end in an
+    /// install, which is why what it opens is a question and not a switch.
+    Channel,
     /// A choice in the runtime chooser; see [`crate::setup`]. The index is the
     /// Node's place in the list the chooser was given.
     SetupUse(usize),
@@ -182,6 +186,11 @@ pub enum Action {
     /// loading page's second button, offered on a dsh that would not come up;
     /// see [`crate::plugins::engage_safe`].
     SafeStart,
+    /// dsh's page saying its plugin boot stopped on a plugin; see
+    /// [`crate::plugins::stall_watch`]. Not a request for anything — the page
+    /// reporting a state this app has no other way to see — so what it leads to
+    /// is a question, and the user is the one who answers it.
+    PluginsStalled(String),
     /// Put them back and restart into them. The menu row that exists only while
     /// [`Action::SafeStart`] is in effect.
     SafeOff,
@@ -286,9 +295,11 @@ pub fn action(url: &Url) -> Option<Action> {
         "setup-quit" => Some(Action::SetupQuit),
         "runtime" => Some(Action::Runtime),
         "registry" => Some(Action::Registry),
+        "channel" => Some(Action::Channel),
         "terminal" => Some(Action::Terminal),
         "restart-dsh" => Some(Action::RestartDsh),
         "safe-start" => Some(Action::SafeStart),
+        "plugins-stalled" => Some(Action::PluginsStalled(said(url))),
         "safe-off" => Some(Action::SafeOff),
         // Not a request for anything: the page saying what it has already
         // done, so the chrome around it can catch up. See [`relabel`].
@@ -355,6 +366,17 @@ fn is_web_link(target: &str) -> bool {
     Url::parse(target).is_ok_and(|target| matches!(target.scheme(), "http" | "https" | "mailto"))
 }
 
+/// The `?said=` the stall report carries: the text of dsh's failure card, which
+/// is where the names of the plugins that did not come up are. Nothing is read
+/// out of it here — [`crate::plugins::blamed`] is what decides what it means,
+/// and an absent or empty one is simply a report with no names in it.
+fn said(url: &Url) -> String {
+    url.query_pairs()
+        .find(|(key, _)| key == "said")
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default()
+}
+
 /// The `?i=` a chooser verb carries: which Node in the list the user picked.
 /// `None` when it is missing or not a number, which leaves the verb to be
 /// ignored rather than acted on with a nonsense index.
@@ -417,8 +439,10 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::SetupQuit => return crate::setup::answered(crate::setup::Choice::Quit),
         Action::Runtime => return crate::open_runtime(app),
         Action::Registry => return crate::open_registry(app),
+        Action::Channel => return crate::open_channel(app),
         Action::RestartDsh => return crate::restart_dsh(app, false),
         Action::SafeStart => return crate::safe_start(app),
+        Action::PluginsStalled(said) => return crate::plugins_stalled(app, &said),
         Action::SafeOff => return crate::safe_off(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),
         Action::Signal(signal) => return crate::signal::act(app, signal),
@@ -514,10 +538,10 @@ pub fn sync_notify(app: &AppHandle) {
     let call = notify_call(
         crate::settings::notifications(app),
         crate::plugins::signalling(app),
-        if crate::plugins::safe(app) {
+        if crate::plugins::signal_set_aside(app) {
             t!(
-                "这次启动没有加载任何插件，「会话信号」也在内。用菜单里的「重新加载插件」装回来。",
-                "This launch loaded no plugins, Session signals included. Use “Load plugins again” in the menu to bring them back."
+                "「会话信号」这次被搁置了。用菜单里的「重新加载插件」装回来。",
+                "Session signals is one of the plugins set aside this launch. Use “Load plugins again” in the menu to bring it back."
             )
         } else {
             t!(
@@ -540,14 +564,37 @@ pub fn sync_notify(app: &AppHandle) {
 /// loading none of them today with nothing on screen saying so except a menu
 /// item that reads as an action rather than a state.
 pub fn sync_safe(app: &AppHandle) {
-    let call = safe_call(
-        crate::plugins::safe(app),
-        t!("插件未加载", "No plugins loaded"),
-        t!(
-            "这次启动没有加载任何插件。点它把插件装回 profile，并重启 dsh。",
-            "This launch loaded no plugins. This puts them back into the profile and restarts dsh."
-        ),
-    );
+    // Two launches to tell apart, because the label is a statement of fact and
+    // the partial one would otherwise be a false one: a repair aimed at a single
+    // plugin leaves the rest loading. The count rather than the names -- the
+    // label sits in the titlebar, and a list does not fit there; the names are
+    // in the hint, which is where there is room for them.
+    let aside = crate::plugins::set_aside(app);
+    let (label, hint) = if crate::plugins::partial(app) {
+        (
+            t!(
+                "已搁置 {} 个插件",
+                "{} plugin(s) set aside",
+                aside.len()
+            ),
+            t!(
+                "这次启动搁置了这些插件（{}），其余照常加载。点它把它们装回 profile，并重启 dsh。",
+                "These plugins are set aside this launch ({}); the rest loaded as usual. This puts them back into the profile and restarts dsh.",
+                aside.join(" ")
+            ),
+        )
+    } else {
+        (
+            t!("插件未加载", "No plugins loaded").to_string(),
+            t!(
+                "这次启动没有加载任何插件。点它把插件装回 profile，并重启 dsh。",
+                "This launch loaded no plugins. This puts them back into the profile and restarts dsh."
+            )
+            .to_string(),
+        )
+    };
+
+    let call = safe_call(crate::plugins::safe(app), &label, &hint);
     eval(app, &call);
 }
 
@@ -629,6 +676,9 @@ fn labels() -> String {
         ("settings-done", t!("关闭", "Close")),
         ("runtime", t!("运行环境…", "Runtime…")),
         ("registry", t!("安装源…", "Install source…")),
+        // "版本通道" rather than "测试版": the row is not a switch that turns a
+        // beta on, it is a choice between two lines that are both released.
+        ("channel", t!("版本通道…", "Release channel…")),
         ("check-app", t!("检查应用更新…", "Check for app updates…")),
         ("autostart", t!("开机自启动", "Start at login")),
         // Not "Notify when a turn finishes": the switch behind it gates every
@@ -668,6 +718,14 @@ fn notes() -> String {
             t!(
                 "dsh 从哪个 npm 源安装和更新。",
                 "The npm registry dsh is installed and updated from."
+            ),
+        ),
+        (
+            "channel",
+            t!(
+                "用稳定的 rc 版，还是跑在前面的 alpha 版。切之前先备份数据。",
+                "The steady rc line, or the alpha that runs ahead of it. \
+                 Back your data up before switching."
             ),
         ),
         (
@@ -984,6 +1042,9 @@ pub fn script() -> String {
     // Where dsh is fetched from, which is only ever a question on a machine
     // whose npm is pointed somewhere of the user's own; see `settings.rs`.
     {{ verb: 'registry' }},
+    // Which line of dsh releases, right below where they come from: the two
+    // rows are the same question asked about a source and about a version.
+    {{ verb: 'channel' }},
     {{ verb: 'autostart', check: true }},
     {{ verb: 'notify-turns', check: true }},
     // The way out that is visible. Escape and the scrim close it too, and
@@ -1902,7 +1963,7 @@ mod tests {
             .next()
             .expect("the script declares both lists");
 
-        for verb in ["runtime", "registry", "autostart", "notify-turns"] {
+        for verb in ["runtime", "registry", "channel", "autostart", "notify-turns"] {
             let row = format!("verb: '{verb}'");
             assert!(!menu.contains(&row), "{verb} is still drawn into the menu");
             assert!(script.contains(&row), "{verb} is on neither list");

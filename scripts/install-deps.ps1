@@ -87,6 +87,18 @@ param(
     [ValidateSet('', 'own', 'auto')]
     [string] $Registry = '',
 
+    # Which line of dsh releases to install: the release candidates, or the
+    # alpha that runs ahead of them. The app stores the answer and passes it on
+    # every mode that fetches -- see `settings.rs` and `run` in
+    # `src-tauri/src/dsh.rs`.
+    #
+    # `rc` is the default and is what an install with no flag has always taken.
+    # It has to stay that way: this script is also run by the installer hooks
+    # and by hand, and neither has a preference to read, so the absence of an
+    # answer must never be able to put anyone onto the alpha line.
+    [ValidateSet('rc', 'alpha')]
+    [string] $Channel = 'rc',
+
     # `uninstall` only. Node cannot go without dsh going too: dsh is a Node
     # program, and leaving it behind would leave a command that cannot run.
     [switch] $RemoveDsh,
@@ -109,6 +121,12 @@ if ($Progress) {
 }
 
 $Package = '@deepseek-ai/dsh'
+
+# The npm dist-tag `-Channel` names. Not the same word: the release candidates
+# are published under `latest`, not under `rc`, and `@deepseek-ai/dsh@rc` is a
+# tag that does not exist. `Channel::tag` in `src-tauri/src/settings.rs` holds
+# the other half of this mapping and a test pins the two together.
+$Tag = if ($Channel -eq 'alpha') { 'alpha' } else { 'latest' }
 
 # dsh forwards plugin installs to pnpm, so a machine running dsh ends up with one
 # too — installed on demand by `ensure_pnpm` in `plugins.rs`, into whichever
@@ -943,7 +961,7 @@ function Update-All {
     if (-not $prefix) { $prefix = [string] $state['prefix'] }
 
     Step '正在更新 dsh…' 0
-    if (-not (Install-Package $node $cli "$Package@latest" $prefix 0 $ProgressCeiling)) {
+    if (-not (Install-Package $node $cli "$Package@$Tag" $prefix 0 $ProgressCeiling)) {
         Fail 'dsh 更新失败，默认源和几个备用镜像都没有成功。'
     }
     Step 'dsh 更新完成。' 100
@@ -1359,7 +1377,7 @@ function Install-DshInto {
     Write-Marker $state
 
     Step '正在下载 dsh，约 185 MB，请耐心等待…' 0
-    if (-not (Install-Package $NodeExe $cli "$Package@latest" $prefix 0 $ProgressCeiling)) {
+    if (-not (Install-Package $NodeExe $cli "$Package@$Tag" $prefix 0 $ProgressCeiling)) {
         Fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
     }
 
@@ -1401,7 +1419,7 @@ function Install-NodeAndDsh {
     # *by* our Node and *into* theirs. See the note above `Get-ManagedPrefix`.
     $prefix = Get-ManagedPrefix $node
     Step '正在下载 dsh，约 185 MB，请耐心等待…' 36
-    if (-not (Install-Package $node $cli "$Package@latest" $prefix 36 $ProgressCeiling)) {
+    if (-not (Install-Package $node $cli "$Package@$Tag" $prefix 36 $ProgressCeiling)) {
         Fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
     }
 

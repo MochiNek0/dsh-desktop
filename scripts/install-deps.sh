@@ -43,6 +43,10 @@ MODE=''
 PREFIX=''
 NODE_EXE=''
 REGISTRY=''
+# The release line to install from. `rc` is what an install with no flag has
+# always taken, and has to stay the default: nothing but an explicit answer may
+# put anyone onto the alpha line. See `-Channel` below.
+CHANNEL='rc'
 REMOVE_DSH=0
 REMOVE_NODE=0
 PROGRESS=0
@@ -85,6 +89,18 @@ while [ $# -gt 0 ]; do
             esac
             shift 2
             ;;
+        # Which line of dsh releases to install: the release candidates, or the
+        # alpha that runs ahead of them. The app stores the answer and passes it
+        # on every mode that fetches -- see `settings.rs` and `run` in
+        # `src-tauri/src/dsh.rs`.
+        -Channel)
+            [ $# -ge 2 ] || { echo "-Channel 后面要跟 rc 或 alpha" >&2; exit 2; }
+            case $2 in
+                rc|alpha) CHANNEL=$2 ;;
+                *) echo "-Channel 只认 rc 或 alpha，收到的是：$2" >&2; exit 2 ;;
+            esac
+            shift 2
+            ;;
         -RemoveDsh) REMOVE_DSH=1; shift ;;
         -RemoveNode) REMOVE_NODE=1; shift ;;
         -Progress) PROGRESS=1; shift ;;
@@ -110,6 +126,12 @@ case "$MODE" in
 esac
 
 PACKAGE='@deepseek-ai/dsh'
+
+# The npm dist-tag `-Channel` names. Not the same word: the release candidates
+# are published under `latest`, not under `rc`, and `@deepseek-ai/dsh@rc` is a
+# tag that does not exist. `Channel::tag` in `src-tauri/src/settings.rs` holds
+# the other half of this mapping and a test pins the two together.
+if [ "$CHANNEL" = alpha ]; then TAG=alpha; else TAG=latest; fi
 
 # dsh forwards plugin installs to pnpm, so a machine running dsh ends up with one
 # too — installed on demand by `ensure_pnpm` in `plugins.rs`, into whichever
@@ -813,7 +835,7 @@ npm_install() {
     if [ -n "$registry" ]; then
         set -- "$@" "--registry=$registry"
     fi
-    set -- "$@" "$PACKAGE@latest"
+    set -- "$@" "$PACKAGE@$TAG"
 
     {
         # stdin off the null device, not inherited: the caller's loop is reading
