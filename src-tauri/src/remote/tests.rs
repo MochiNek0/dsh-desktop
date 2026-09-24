@@ -873,10 +873,48 @@ fn a_live_connection_is_not_an_idle_gateway() {
     harness.shared.live.fetch_sub(1, Ordering::Relaxed);
     assert!(harness.shared.idle(Duration::from_secs(60)));
 
-    // And a request is the other half: one that just arrived resets it, even a
-    // refused one — a tunnel taken down under a phone being turned away is a
-    // phone with no way left to find out why.
+    // And a request is the other half: one that just arrived resets it.
     harness.shared.touched();
+    assert!(!harness.shared.idle(Duration::from_secs(60)));
+}
+
+/// But only a request from somebody who is let in. Anything on the internet can
+/// reach a public tunnel's hostname, and if its refusals counted, a scanner
+/// knocking every few minutes would keep the tunnel up forever.
+#[test]
+fn only_a_paired_device_keeps_the_gateway_awake() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+    let asleep = || {
+        *harness.shared.last.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(3600);
+    };
+
+    asleep();
+    assert_eq!(harness.get("/", &[]).status, 401);
+    assert_eq!(
+        harness.get("/", &[("Origin", "https://evil.example")]).status,
+        403
+    );
+    assert_eq!(harness.get("/?pair_code=WRONG1", &[]).status, 401);
+    assert!(
+        harness.shared.idle(Duration::from_secs(60)),
+        "strangers kept the gateway awake"
+    );
+
+    // Pairing counts: the phone is waiting on the dialog.
+    let nonce = harness.nonce();
+    let cookie = harness
+        .get(&format!("/?pair_token={nonce}"), &[])
+        .device_cookie()
+        .expect("a device cookie");
+    assert!(!harness.shared.idle(Duration::from_secs(60)));
+
+    // And so does using it.
+    asleep();
+    let jar = format!("{}={cookie}", super::session::COOKIE);
+    assert_eq!(harness.get("/", &[("Cookie", &jar)]).status, 200);
     assert!(!harness.shared.idle(Duration::from_secs(60)));
 }
 
@@ -1075,6 +1113,89 @@ fn a_kicked_device_stops_getting_through() {
     harness.shared.store.revoke(&device.id);
 
     assert_eq!(harness.get("/", &[("Cookie", &jar)]).status, 401);
+}
+
+/// And a device kicked while it holds a WebSocket loses the socket too. It sends
+/// no request while it sits in a session, so the cookie check alone would never
+/// see it again.
+#[test]
+fn a_kicked_device_loses_its_open_websocket() {
+    for everyone in [false, true] {
+        let Some(harness) = Harness::raise(true) else {
+            return;
+        };
+
+        let nonce = harness.nonce();
+        let cookie = harness
+            .get(&format!("/?pair_token={nonce}"), &[])
+            .device_cookie()
+            .expect("a device cookie");
+
+        let (mut socket, mut reader) = websocket(&harness, &cookie);
+        socket.write_all(b"ping").unwrap();
+        let mut echoed = [0u8; 4];
+        reader.read_exact(&mut echoed).expect("the pipe is up");
+
+        if everyone {
+            harness.shared.store.revoke_all();
+        } else {
+            let device = harness.shared.store.devices().pop().expect("one device");
+            harness.shared.store.revoke(&device.id);
+        }
+
+        // Closed by the gateway: end of stream, or a reset, and never a
+        // timeout — a timeout is the socket still being open.
+        let mut rest = [0u8; 1];
+        match reader.read(&mut rest) {
+            Ok(0) => {}
+            Ok(_) => panic!("bytes after the kick"),
+            Err(error) => assert!(
+                !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ),
+                "the socket is still open after the kick (everyone: {everyone})"
+            ),
+        }
+        let _ = socket.write_all(b"after");
+    }
+}
+
+/// Open `/api/remote.mux` through the gateway, past the 101 and its headers.
+fn websocket(harness: &Harness, cookie: &str) -> (TcpStream, BufReader<TcpStream>) {
+    let mut socket = TcpStream::connect(harness.at).expect("the gateway is listening");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    socket
+        .write_all(
+            format!(
+                "GET /api/remote.mux HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 Cookie: {}={cookie}\r\n\
+                 Connection: Upgrade\r\n\
+                 Upgrade: websocket\r\n\
+                 Sec-WebSocket-Version: 13\r\n\
+                 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                harness.authority,
+                super::session::COOKIE,
+            )
+            .as_bytes(),
+        )
+        .expect("a written handshake");
+
+    let mut reader = BufReader::new(socket.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("a status line");
+    assert!(line.contains("101"), "the upgrade was not forwarded: {line}");
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header).expect("a header line");
+        if header.trim_end().is_empty() {
+            break;
+        }
+    }
+    (socket, reader)
 }
 
 /// With dsh gone there is nothing to forward to, and the phone is told that

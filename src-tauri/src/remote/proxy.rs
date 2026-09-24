@@ -137,13 +137,6 @@ async fn handle(
     peer: SocketAddr,
     request: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
-    // What the idle timer measures. Counted before the fence, because what it
-    // is asking is whether anything at all is using this gateway — a refused
-    // request is still a reason not to consider it abandoned, and a tunnel
-    // taken down under a phone that is being turned away is a phone with no
-    // way to find out why.
-    shared.touched();
-
     if off_tunnel(shared.public(), peer.ip()) {
         eprintln!("dsh-desktop: refused a direct connection from {peer} while a tunnel is up");
         return Ok(refused());
@@ -184,8 +177,10 @@ async fn handle(
         return Ok(response);
     }
 
-    let device =
-        cookie_value(&request, DEVICE_COOKIE).and_then(|value| shared.store.verify(&value));
+    let presented = cookie_value(&request, DEVICE_COOKIE);
+    let device = presented
+        .as_deref()
+        .and_then(|value| shared.store.verify(value));
 
     // A pairing URL from somebody who is already paired is a phone that scanned
     // the code twice, or typed one it did not need. Sending it to `/` costs
@@ -201,11 +196,18 @@ async fn handle(
         return Ok(pair(shared, peer, request, offer).await);
     }
 
-    if device.is_none() {
+    let (Some(_), Some(presented)) = (device, presented) else {
         return Ok(unauthenticated());
-    }
+    };
 
-    Ok(forward(shared, request).await)
+    // What the idle timer measures, and only from here on: a paired device
+    // using the gateway. Counted any earlier, anything on the internet that
+    // can reach the tunnel's hostname — a scanner collecting 403s every few
+    // minutes — would hold a public tunnel up forever. A phone being paired
+    // counts too, from the moment its nonce is spent; see [`pair`].
+    shared.touched();
+
+    Ok(forward(shared, request, presented).await)
 }
 
 /// How the phone offered the nonce: off the QR code, or typed by hand.
@@ -289,6 +291,10 @@ async fn pair(
         };
     }
 
+    // A phone at the dialog is a phone using this gateway, and the idle timer
+    // must not take the tunnel down while somebody walks to the computer.
+    shared.touched();
+
     // Before the dialog, not after it: the nonce is gone either way, and the
     // card would otherwise print a spent one for as long as the question stood
     // open — a minute during which anyone reading it off the screen is reading
@@ -328,7 +334,15 @@ async fn pair(
 }
 
 /// Hand the request to dsh and the answer back.
-async fn forward(shared: Arc<Shared>, mut request: Request<Incoming>) -> Response<Body> {
+///
+/// `device_cookie` is what the phone proved itself with. A WebSocket outlives
+/// the request that opened it, so [`join`] holds on to this and checks it again
+/// each time a device is kicked.
+async fn forward(
+    shared: Arc<Shared>,
+    mut request: Request<Incoming>,
+    device_cookie: String,
+) -> Response<Body> {
     let Some(authority) = shared.upstream.authority() else {
         return page(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -384,6 +398,7 @@ async fn forward(shared: Arc<Shared>, mut request: Request<Incoming>) -> Respons
         if let Some(downstream) = downstream {
             join(
                 shared.clone(),
+                device_cookie,
                 downstream,
                 hyper::upgrade::on(&mut response),
             );
@@ -400,11 +415,21 @@ async fn forward(shared: Arc<Shared>, mut request: Request<Incoming>) -> Respons
 /// or there is no socket on this side to take over. Both futures resolve once
 /// hyper has finished with their connections, which is after this function's
 /// caller has sent the response.
+///
+/// Copying is not the whole of it: a kicked device has to lose its socket as
+/// well as its cookie. The cookie is only checked when a request arrives, and
+/// a phone in a session sends none — so without this, kicking a phone off the
+/// card would leave it driving dsh for as long as it kept the page open.
 fn join(
     shared: Arc<Shared>,
+    device_cookie: String,
     downstream: hyper::upgrade::OnUpgrade,
     upstream_side: hyper::upgrade::OnUpgrade,
 ) {
+    // Subscribed before anything is awaited, so that a kick landing while the
+    // upgrade is still completing is not missed.
+    let mut revocations = shared.store.revocations();
+
     tokio::spawn(async move {
         let (Ok(phone), Ok(dsh)) = tokio::join!(downstream, upstream_side) else {
             return;
@@ -424,7 +449,21 @@ fn join(
         let mut dsh = TokioIo::new(dsh);
         // Ends when either side closes, which is the phone navigating away or
         // dsh going down. Nothing to do about either but stop copying.
-        let _ = tokio::io::copy_bidirectional(&mut phone, &mut dsh).await;
+        let copying = tokio::io::copy_bidirectional(&mut phone, &mut dsh);
+        tokio::pin!(copying);
+
+        // Checked once before waiting at all, for a kick between the request
+        // being verified and the socket being handed over. After that, again
+        // on every kick; returning drops both sockets, which closes them.
+        let mut allowed = shared.store.verify(&device_cookie).is_some();
+        while allowed {
+            tokio::select! {
+                _ = &mut copying => break,
+                changed = revocations.changed() => {
+                    allowed = changed.is_ok() && shared.store.verify(&device_cookie).is_some();
+                }
+            }
+        }
 
         shared
             .live

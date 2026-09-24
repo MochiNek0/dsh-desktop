@@ -169,6 +169,11 @@ pub struct SessionStore {
     /// the tests get, and what a machine whose key could not be written falls
     /// back to. See [`SessionStore::persisted`].
     save: Option<AppHandle>,
+    /// Bumped whenever a device is kicked. A cookie is only looked at when a
+    /// request arrives, and a WebSocket that is already open sends none — so
+    /// the gateway holds a receiver per socket and checks again when this
+    /// moves. See `proxy::join`.
+    revoked: tokio::sync::watch::Sender<u64>,
 }
 
 struct Inner {
@@ -241,6 +246,7 @@ impl SessionStore {
                 next,
             }),
             save: Some(app.clone()),
+            revoked: Default::default(),
         }
     }
 
@@ -381,6 +387,13 @@ impl SessionStore {
         };
 
         self.remember(state);
+        self.revoked.send_modify(|count| *count += 1);
+    }
+
+    /// Told each time a device is kicked. What an open WebSocket waits on, since
+    /// it will never present its cookie again.
+    pub fn revocations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revoked.subscribe()
     }
 
     /// Kick everything and change the locks.
@@ -411,6 +424,7 @@ impl SessionStore {
         }
 
         self.remember(state);
+        self.revoked.send_modify(|count| *count += 1);
     }
 }
 
@@ -934,6 +948,7 @@ mod tests {
                 next,
             }),
             save: None,
+            revoked: Default::default(),
         };
 
         assert!(after.verify(&cookie).is_some());
