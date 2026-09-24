@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MOBILE_CSS, TRANSPORT, apply, flag, homescreen, inject, override, rows, viewport } from '../lib/index.js';
+import { MOBILE_CSS, TRANSPORT, apply, downloaded, flag, homescreen, inject, override, rows, viewport } from '../lib/index.js';
 
 // --- the tag itself ---
 {
@@ -218,6 +218,17 @@ import { MOBILE_CSS, TRANSPORT, apply, flag, homescreen, inject, override, rows,
       assert.equal(rows()[1].text, MOBILE_CSS, why);
     }
     console.log("ok  a stylesheet of the user's own replaces the built-in");
+
+    // The desktop's download is a file of its own, so it can never overwrite
+    // the user's: it stands in for the built-in, and theirs still wins.
+    assert.equal(downloaded(), join(home, '.dsh-desktop', 'mobile-patch.css'));
+    rmSync(override());
+    const fetched = '@media (max-width: 560px) { .y { color: blue } }';
+    writeFileSync(downloaded(), fetched);
+    assert.equal(rows()[1].text, fetched, 'the download replaces the built-in');
+    writeFileSync(override(), mine);
+    assert.equal(rows()[1].text, mine, "and the user's own replaces the download");
+    console.log("ok  a downloaded stylesheet never displaces the user's");
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previous;

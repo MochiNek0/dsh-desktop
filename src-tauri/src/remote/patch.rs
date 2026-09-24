@@ -5,8 +5,9 @@
 //! inside the binary means every fix for a newer dsh costs a release, an
 //! installer, and a download from everyone who wants it — for a stylesheet.
 //! This is the way out: a signed stylesheet published next to the app's own
-//! updates, fetched here, written to the file the plugin already prefers over
-//! its built-in copy. See [`super::style::sheet`].
+//! updates, fetched here, written to a file the plugin prefers over its
+//! built-in copy — but not over a stylesheet of the user's own. See
+//! [`super::style::downloaded`].
 //!
 //! ## Why the desktop fetches it and not the phone
 //!
@@ -94,7 +95,7 @@ pub fn refresh(app: &AppHandle, loud: bool) {
     }
 
     let dsh = crate::dsh::current(app).map(|install| install.version.to_string());
-    let sheet = super::style::sheet();
+    let sheet = super::style::downloaded();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let told = fetch(MANIFEST, dsh.as_deref(), &sheet).await;
@@ -567,5 +568,10 @@ mod tests {
         .unwrap();
         assert!(plugin.contains("'mobile.css'"), "the plugin moved its name");
         assert!(super::super::style::sheet().ends_with("mobile.css"));
+        assert!(
+            plugin.contains("'mobile-patch.css'"),
+            "the plugin moved the download's name"
+        );
+        assert!(super::super::style::downloaded().ends_with("mobile-patch.css"));
     }
 }

@@ -51,10 +51,25 @@ const NOTE: &str = "dsh-desktop: while this file exists, the phone gets a small 
 /// `plugin/lib/index.js`, and a disagreement is silent — the app would write a
 /// stylesheet nobody reads. `the_names_are_the_ones_the_plugin_looks_for` holds
 /// the pair together.
+///
+/// Only the test needs the path now: this file is the user's, and the app
+/// never writes it. See [`downloaded`].
+#[cfg(test)]
 pub(super) fn sheet() -> PathBuf {
     crate::plugins::dsh_home()
         .join(".dsh-desktop")
         .join("mobile.css")
+}
+
+/// Where [`super::patch`] keeps the stylesheet it downloads.
+///
+/// Not [`sheet`]: that file is the user's, and a download written over it would
+/// throw away whatever they put there. The plugin reads this one only when the
+/// user has none — `downloaded()` in `plugin/lib/index.js` spells the same name.
+pub(super) fn downloaded() -> PathBuf {
+    crate::plugins::dsh_home()
+        .join(".dsh-desktop")
+        .join("mobile-patch.css")
 }
 
 /// The flag's path.

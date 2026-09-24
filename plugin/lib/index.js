@@ -157,6 +157,19 @@ export function override() {
 }
 
 /**
+ * Where the desktop app keeps the signed stylesheet it downloads for the dsh
+ * that is running (`remote/patch.rs`).
+ *
+ * A file of its own rather than `override()`, because that one is the user's:
+ * a download written there would replace whatever they had put in it, on the
+ * next launch and without asking. So the user's file wins when both exist, and
+ * this one only stands in for the built-in stylesheet.
+ */
+export function downloaded() {
+  return join(desktop(), 'mobile-patch.css');
+}
+
+/**
  * The directory the desktop half and this one both mean.
  *
  * `$DSH_HOME` is dsh's own variable, read the same way on both sides, with the
@@ -171,7 +184,8 @@ function desktop() {
 }
 
 /**
- * The stylesheet to inject: the user's, if they left one, else the built-in.
+ * The stylesheet to inject: the user's, if they left one, else the one the
+ * desktop downloaded, else the built-in.
  *
  * Unreadable, blank, or carrying a `</style` all fall back rather than fail. The
  * row is inlined into a `<style>` element, so that last one would close the
@@ -180,14 +194,16 @@ function desktop() {
  * hand-edited, and pasting a `<style>…</style>` block into it is an easy slip.
  */
 function sheet() {
-  let own;
-  try {
-    own = readFileSync(override(), 'utf8');
-  } catch {
-    return MOBILE_CSS;
+  for (const path of [override(), downloaded()]) {
+    let own;
+    try {
+      own = readFileSync(path, 'utf8');
+    } catch {
+      continue;
+    }
+    if (own.trim().length > 0 && !/<\/style/i.test(own)) return own;
   }
-  if (own.trim().length === 0 || /<\/style/i.test(own)) return MOBILE_CSS;
-  return own;
+  return MOBILE_CSS;
 }
 
 /**
