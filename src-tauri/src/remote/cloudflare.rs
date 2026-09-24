@@ -177,7 +177,14 @@ impl RemoteTunnel for CloudflareTunnel {
         command.arg("--no-autoupdate");
         // Remotely managed: the ingress is in the dashboard, so there is no URL
         // to pass. See the module docs.
-        command.args(["tunnel", "run", "--token", &account.token]);
+        command.args(["tunnel", "run"]);
+        // In the environment, not on the command line. `--token` reads
+        // `TUNNEL_TOKEN` when it is not given, and a process's arguments are
+        // readable by every user on the machine — `ps`, Task Manager's command
+        // line column, `/proc/<pid>/cmdline` — which would undo the 0600 the
+        // token file is written with. The environment is readable only by
+        // this user.
+        command.env("TUNNEL_TOKEN", &account.token);
 
         // Nothing reads stdout, and a pipe nobody drains is a process that
         // blocks once it fills. stderr is where cloudflared logs.
