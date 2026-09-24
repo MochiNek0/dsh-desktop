@@ -1016,16 +1016,156 @@ fn with_bundles(raw: &str, names: &[String]) -> Result<String, String> {
 /// something to say and says it as a JSON array of names.
 const SAFE: &str = "safe-mode.json";
 
-/// Whether this launch runs on dsh's own bundles alone.
+/// Whether this launch has any plugin set aside.
+///
+/// Not "runs on dsh's own bundles alone", which is what it meant while the only
+/// safe mode was the total one. A repair aimed at the one plugin that broke the
+/// boot leaves the others loading and is still safe mode: the record exists, the
+/// chrome says so, and leaving puts them back. [`partial`] is what tells the two
+/// apart for anything that has to word a sentence about it.
 pub fn safe(app: &AppHandle) -> bool {
     marker(app, SAFE).is_some_and(|path| path.exists())
 }
 
+/// The verb the page below reports a stalled boot with; see
+/// [`crate::controls::Action::PluginsStalled`].
+const STALLED: &str = "plugins-stalled";
+
+/// Watch dsh's page for a boot that stopped on a plugin, and say so.
+///
+/// ## The failure this exists for
+///
+/// dsh's web boot audits every loader entry once the loader has settled, and an
+/// entry still pending on a service it declared in `inject` is a boot failure:
+/// the audit throws, and the whole window becomes a "Failed to load plugins"
+/// card. Nothing of the user's session loads. `plugin/lib/client.js` documents
+/// this from the other side — it is why the bundled plugin injects nothing at
+/// its entry — and a third-party plugin that does declare one hits it as soon
+/// as a dsh turns up without that service, which is what the alpha line is for.
+///
+/// Every other way this app finds out that something is wrong is the server
+/// process dying, and none of them fires here. `dsh web` started, reported
+/// ready and is serving; the boot that failed is in the document it served. So
+/// the rescue this app already has — take the plugins off the stack, restart
+/// into the panel — was reachable from the loading page and from nowhere else,
+/// at the one moment the user most needs it.
+///
+/// ## Why these two attributes
+///
+/// The overlay carries `data-dsh-boot` from the moment it is attached, and the
+/// spinner inside it `data-dsh-boot-spinner`. On the failure path the card's
+/// children are replaced by the wordmark and the failure block, which takes the
+/// spinner out of the document; every non-failure render puts it back. So an
+/// overlay present with no spinner under it is a boot that has stopped, and it
+/// has stopped because it threw.
+///
+/// Both are `data-` attributes, which is the whole reason they are what this
+/// reads. The card's classes are CSS-module names that the bundler rewrites
+/// every build, and its text is a sentence that can be reworded or translated;
+/// a `data-` attribute in a minified bundle is a hook somebody put there on
+/// purpose. Nothing here is guaranteed across dsh versions — but of what is on
+/// offer this is the part most likely to still be true, and a watcher that
+/// stops matching goes quiet rather than firing wrongly.
+pub fn stall_watch() -> String {
+    format!(
+        r#"(function () {{
+  var told = false;
+
+  function look() {{
+    if (told) return;
+    var boot = document.querySelector('[data-dsh-boot]');
+    // An overlay with no spinner under it. Never true on the way up: the card
+    // is built with the spinner in it before the overlay is attached to
+    // anything, so there is no moment where one is in the document without the
+    // other.
+    if (boot === null || boot.querySelector('[data-dsh-boot-spinner]') !== null) return;
+    told = true;
+
+    // The card names what did not come up. Not parsed here -- the app
+    // intersects this against the plugins it knows are installed, so the
+    // wording is not something this depends on, and nothing sent from a page
+    // can name a plugin that is not there. See `blamed`.
+    var said = (boot.textContent || '').slice(0, {limit});
+    window.location.href =
+      '{scheme}://{verb}?said=' + encodeURIComponent(said);
+  }}
+
+  // The audit runs after the loader settles, which is well after the document
+  // has finished loading -- so this cannot be a single look at page load. The
+  // observer is the whole mechanism and the look beside it is only for a
+  // document that arrived already failed.
+  function arm() {{
+    if (!document.documentElement) return false;
+    new MutationObserver(look).observe(document.documentElement, {{
+      childList: true,
+      subtree: true,
+    }});
+    look();
+    return true;
+  }}
+
+  // The guard is the whole reason this is a function. An initialization script
+  // runs when the document is created and before anything is parsed into it,
+  // and on WebView2 that is early enough for there to be no root element yet --
+  // `observe(null)` throws, and a watcher that throws on the way up is one that
+  // never runs on any page. `auth::shield` carries the same fallback for the
+  // same reason.
+  if (!arm()) {{
+    document.addEventListener('readystatechange', function again() {{
+      if (arm()) document.removeEventListener('readystatechange', again, true);
+    }}, true);
+  }}
+}})();"#,
+        scheme = crate::controls::SCHEME,
+        verb = STALLED,
+        limit = SAID_LIMIT,
+    )
+}
+
+/// How much of the failure card travels back with the report.
+///
+/// Enough for the names and nothing like enough to be a way of pushing a large
+/// payload through the navigation channel. What is read out of it is only ever
+/// plugin names this app already knows; see [`blamed`].
+const SAID_LIMIT: usize = 2000;
+
+/// Which installed plugins the stalled boot named.
+///
+/// The page sends the card's text and this decides what it meant, by looking
+/// for the names of the plugins actually on the layer stack. That direction is
+/// deliberate and does two jobs at once. It does not depend on how dsh words
+/// the failure -- a rewrite, a translation or a new format still contains the
+/// name -- and it cannot be talked into blaming something that is not there,
+/// which matters because `dsh-window://` is reachable from any page that runs
+/// script.
+///
+/// Empty when nothing matched, which is a real answer and not a failure: a boot
+/// that failed on dsh's own bundles, or on something with no name in it, is one
+/// this app has nothing specific to say about.
+pub fn blamed(app: &AppHandle, said: &str) -> Vec<String> {
+    named_in(installed_bundles(&profile_manifest(app)), said)
+}
+
+/// The deciding half of [`blamed`], without the profile a test cannot read.
+fn named_in(installed: Vec<String>, said: &str) -> Vec<String> {
+    installed
+        .into_iter()
+        .filter(|name| said.contains(name.as_str()))
+        .collect()
+}
+
 /// Whether safe mode has anything to offer, which is the question the loading
 /// page's rescue button is drawn on. Not offered on a profile with no plugins
-/// in it, where it would promise a repair it cannot make.
+/// left on the stack, where it would promise a repair it cannot make.
+///
+/// Note what this deliberately does not ask: whether safe mode is already on.
+/// It used to, and that was right while the only safe mode was the total one --
+/// being in it meant there was nothing left to take off, which is the same
+/// answer this gives now by looking at the stack. With a partial one there can
+/// be four plugins still loading and a second of them breaking the boot, and
+/// that user is owed the offer as much as the first.
 pub fn rescuable(app: &AppHandle) -> bool {
-    !safe(app) && !installed_bundles(&profile_manifest(app)).is_empty()
+    !installed_bundles(&profile_manifest(app)).is_empty()
 }
 
 /// The layer stack minus dsh's own; see [`IN_BOX`]. Everything left got there
@@ -1038,7 +1178,7 @@ fn installed_bundles(manifest: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// Take every installed plugin off the layer stack, and remember what went.
+/// Take `wanted` off the layer stack, and remember that they went.
 ///
 /// Run on the way into safe mode and again before every start for as long as it
 /// lasts, because it does not stay done. dsh reconciles the stack against the
@@ -1052,15 +1192,18 @@ fn installed_bundles(manifest: &serde_json::Value) -> Vec<String> {
 /// is a launch that tries again and gets the same answer. A stack stripped with
 /// no record of what came off it is a set of plugins nothing will ever put
 /// back.
-pub fn engage_safe(app: &AppHandle) -> Result<Vec<String>, String> {
-    let taken = installed_bundles(&profile_manifest(app));
-
-    let mut record = disabled(app);
-    for name in &taken {
-        if !record.contains(name) {
-            record.push(name.clone());
-        }
-    }
+///
+/// What is recorded is `wanted` and not what actually came off. The two differ
+/// exactly when a name is already off the stack — a second call, or a profile
+/// between `dsh plugin remove` and the reconcile that follows it — and in that
+/// case the name still has to be in the record, or nothing will ever put it
+/// back.
+fn engage(app: &AppHandle, wanted: &[String]) -> Result<Vec<String>, String> {
+    let (taken, record) = engagement(
+        installed_bundles(&profile_manifest(app)),
+        disabled(app),
+        wanted,
+    );
 
     // Always, even when nothing came off: this is also the write that creates
     // the record on the way in, and a profile can be between `dsh plugin
@@ -1072,6 +1215,72 @@ pub fn engage_safe(app: &AppHandle) -> Result<Vec<String>, String> {
         forget_bundles(app, &taken)?;
     }
     Ok(taken)
+}
+
+/// What [`engage`] decides, without the profile it decides it about: the
+/// plugins to take off the stack, and the record to write.
+fn engagement(
+    on_stack: Vec<String>,
+    mut record: Vec<String>,
+    wanted: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let taken: Vec<String> = on_stack
+        .into_iter()
+        .filter(|name| wanted.contains(name))
+        .collect();
+
+    for name in wanted {
+        if !record.contains(name) {
+            record.push(name.clone());
+        }
+    }
+
+    (taken, record)
+}
+
+/// Take every installed plugin off the layer stack. The blunt way in, which is
+/// what the loading page's rescue button and the stall dialog's fallback ask
+/// for: nothing is known about which plugin is at fault, so all of them go.
+pub fn engage_safe(app: &AppHandle) -> Result<Vec<String>, String> {
+    engage(app, &installed_bundles(&profile_manifest(app)))
+}
+
+/// Take only these off, and leave the rest loading.
+///
+/// What the stall dialog asks for when dsh's card named a plugin this app can
+/// recognise. The user keeps working with everything else, which is the whole
+/// difference between a repair and an outage — and the named plugin is the one
+/// that already was not loading, so nothing is lost by setting it aside.
+pub fn engage_only(app: &AppHandle, names: &[String]) -> Result<Vec<String>, String> {
+    engage(app, names)
+}
+
+/// Put the record back into effect, whatever it holds.
+///
+/// The every-start call, and it has to be this one rather than [`engage_safe`]:
+/// with a record naming some of the plugins rather than all of them, a start
+/// that re-engaged *everything* would quietly widen a repair the user asked for
+/// into the outage they were spared. The record is what they agreed to.
+pub fn engage_recorded(app: &AppHandle) -> Result<Vec<String>, String> {
+    engage(app, &disabled(app))
+}
+
+/// The plugins currently set aside, in the order they went.
+///
+/// For the sentences the chrome draws: what is true of this launch is "these
+/// are not loading", and how many there are is the difference between saying so
+/// and saying no plugins loaded at all.
+pub fn set_aside(app: &AppHandle) -> Vec<String> {
+    disabled(app)
+}
+
+/// Whether some plugins are set aside and others are still loading.
+///
+/// The question every safe-mode sentence now has to ask before it says
+/// anything: "no plugins loaded" is a lie on a launch that set one aside and
+/// kept four.
+pub fn partial(app: &AppHandle) -> bool {
+    safe(app) && !installed_bundles(&profile_manifest(app)).is_empty()
 }
 
 /// Put the plugins back, and leave safe mode.
@@ -1160,14 +1369,34 @@ pub const SIGNAL: &str = "dsh-desktop-signal";
 /// what is "already installed" — those two answers agreeing is the whole
 /// point, since the panel is where a user goes to change this one.
 ///
-/// Safe mode answers no whatever the manifest says, and is asked first because
-/// it outranks the manifest: the plugin is still installed in there, and it is
-/// off the layer stack, so dsh is not running it. This app's own plugin is not
-/// exempt from a safe launch — a rescue that kept one bundle loaded because the
-/// app that offered the rescue wrote it would be a rescue that cannot clear the
-/// app's own plugin of causing the thing it is rescuing from.
+/// The layer stack and not [`safe`], which is what this used to ask. The two
+/// agreed while the only safe mode was the total one — being in it meant every
+/// plugin was off the stack, this app's own included. They stop agreeing the
+/// moment a repair can be aimed at one plugin: on a launch that set another
+/// plugin aside, ours is still on the stack and dsh is still running it, and a
+/// greyed-out row would be telling the user something untrue about a feature
+/// that is working.
+///
+/// This app's own plugin is still not exempt from a *total* safe launch, which
+/// is the property the old spelling was there for — a rescue that kept one
+/// bundle loaded because the app that offered the rescue wrote it could not
+/// clear the app's own plugin of causing the thing it is rescuing from. It
+/// falls out of the stack check rather than being stated: a total safe launch
+/// takes ours off with the rest.
+/// Whether this app's own plugin is one of the ones set aside.
+///
+/// Only the notify row's sentence needs this, and it needs it because the two
+/// reasons that row can be unavailable now read differently: a plugin that is
+/// installed and set aside is brought back from the menu, and one that is not
+/// installed at all is installed from the panel. Telling the second user to
+/// "load plugins again" sends them looking for something that is not there.
+pub fn signal_set_aside(app: &AppHandle) -> bool {
+    set_aside(app).iter().any(|name| name == SIGNAL)
+}
+
 pub fn signalling(app: &AppHandle) -> bool {
-    !safe(app) && installed_in(&profile_manifest(app)).contains(SIGNAL)
+    let manifest = profile_manifest(app);
+    installed_in(&manifest).contains(SIGNAL) && bundles_in(&manifest).iter().any(|on| on == SIGNAL)
 }
 
 /// Put [`SIGNAL`] in, once, on the first launch that finds it missing — and
@@ -1313,7 +1542,7 @@ pub fn profile_dir(app: &AppHandle) -> PathBuf {
     dsh_home().join("profiles").join(PROFILE)
 }
 
-fn dsh_home() -> PathBuf {
+pub(crate) fn dsh_home() -> PathBuf {
     if let Some(home) = std::env::var_os("DSH_HOME") {
         return PathBuf::from(home);
     }
@@ -2520,11 +2749,177 @@ mod tests {
     use super::{
         dependencies_in, holdings, installed_bundles, is_package_spec, local_spec, parse,
         parse_outdated, pnpm_blamed, pnpm_codes, pnpm_stuck, requested, spec_name,
-        stale_bundles, sweep, wanted_gone, with_bundles, without_bundles, Outcome, BUNDLED,
-        IN_BOX, PRESETS, RELEASE_AGE, SIGNAL,
+        engagement, named_in, stale_bundles, stall_watch, sweep, wanted_gone, with_bundles,
+        without_bundles, Outcome, BUNDLED, IN_BOX, PRESETS, RELEASE_AGE, SIGNAL, STALLED,
     };
+
+    /// A repair aimed at one plugin takes that one off and leaves the rest
+    /// where they are. This is the whole of what "set aside only the named one"
+    /// means to the profile.
+    #[test]
+    fn a_targeted_repair_takes_off_only_what_it_named() {
+        let (taken, record) = engagement(
+            names(&["dshmarket", "dsh-web-search-free", "dsh-vendor-login"]),
+            Vec::new(),
+            &names(&["dsh-web-search-free"]),
+        );
+
+        assert_eq!(taken, names(&["dsh-web-search-free"]));
+        assert_eq!(record, names(&["dsh-web-search-free"]));
+    }
+
+    /// The record holds what was asked for, not what happened to be on the
+    /// stack at the time. A name already off it -- a second call, or a profile
+    /// caught between a remove and the reconcile that follows -- still has to
+    /// be recorded, or nothing will ever put it back.
+    #[test]
+    fn the_record_keeps_a_name_that_was_already_off_the_stack() {
+        let (taken, record) = engagement(
+            names(&["dshmarket"]),
+            Vec::new(),
+            &names(&["dsh-web-search-free"]),
+        );
+
+        assert!(taken.is_empty());
+        assert_eq!(record, names(&["dsh-web-search-free"]));
+    }
+
+    /// Replaying the record is what every start does while safe mode lasts. It
+    /// must not widen: a launch that took everything off again would undo a
+    /// repair the user aimed at one plugin and hand them the outage they were
+    /// spared.
+    #[test]
+    fn replaying_the_record_does_not_widen_a_targeted_repair() {
+        let record = names(&["dsh-web-search-free"]);
+        // dsh put the others back when it reconciled after the last pnpm run,
+        // which is the state this call exists for.
+        let on_stack = names(&["dshmarket", "dsh-web-search-free", "dsh-vendor-login"]);
+
+        let (taken, kept) = engagement(on_stack, record.clone(), &record);
+
+        assert_eq!(taken, names(&["dsh-web-search-free"]));
+        assert_eq!(kept, record, "the record grew on a replay");
+    }
+
+    /// The record accumulates across repairs rather than being replaced, so a
+    /// second plugin set aside later does not free the first.
+    #[test]
+    fn a_second_repair_keeps_the_first_one_recorded() {
+        let (taken, record) = engagement(
+            names(&["dshmarket", "dsh-vendor-login"]),
+            names(&["dsh-web-search-free"]),
+            &names(&["dshmarket"]),
+        );
+
+        assert_eq!(taken, names(&["dshmarket"]));
+        assert_eq!(record, names(&["dsh-web-search-free", "dshmarket"]));
+    }
+
+    fn names(all: &[&str]) -> Vec<String> {
+        all.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// The card's text, read the way the stall report reads it: by looking for
+    /// the plugins that are actually installed rather than by parsing dsh's
+    /// sentence. Both shapes the boot page produces carry the name.
+    #[test]
+    fn the_stalled_card_names_the_plugin_that_did_not_come_up() {
+        let installed = names(&["dsh-web-search-free", "dshmarket", "dsh-vendor-login"]);
+
+        // What the audit throws, verbatim.
+        let thrown = "HARNESSFailed to load pluginsweb boot: 1 entry did not activate
+                      dsh-web-search-free: pending (waiting for service: settingsScope)";
+        assert_eq!(
+            named_in(installed.clone(), thrown),
+            names(&["dsh-web-search-free"])
+        );
+
+        // The other path: an entry the loader marked failed, which the card
+        // lists as a bare name.
+        assert_eq!(
+            named_in(installed.clone(), "HARNESSFailed to load pluginsdshmarket"),
+            names(&["dshmarket"])
+        );
+
+        // More than one is a real answer, and so is none: a boot that stopped
+        // on dsh's own bundles has nothing here to blame.
+        assert_eq!(
+            named_in(installed.clone(), "dshmarket dsh-vendor-login").len(),
+            2
+        );
+        assert!(named_in(installed, "Failed to load plugins").is_empty());
+    }
+
+    /// The channel is reachable from any page that runs script, so what comes
+    /// back off it decides nothing on its own. A name that is not installed is
+    /// not a plugin this app will offer to do anything about, however the page
+    /// spells it.
+    #[test]
+    fn a_page_cannot_blame_a_plugin_that_is_not_installed() {
+        let installed = names(&["dshmarket"]);
+
+        for said in [
+            "dsh-web-search-free: pending",
+            "../../etc/passwd",
+            "@deepseek-ai/dsh-base",
+            "",
+        ] {
+            assert!(named_in(installed.clone(), said).is_empty(), "for {said:?}");
+        }
+    }
     use std::path::{Path, PathBuf};
     use tauri::Url;
+
+    /// The watcher is one end of three couplings it cannot check at runtime,
+    /// and this is where each of them is written down.
+    ///
+    /// The two `data-` attributes are dsh's, and the test cannot reach dsh to
+    /// confirm them — what it pins is that this side still reads *those two*
+    /// and not a class name or a sentence, which is the property that makes the
+    /// watcher survive a dsh redesign. The comment above `stall_watch` says
+    /// where they come from.
+    #[test]
+    fn the_watcher_reads_the_attributes_dshs_boot_page_marks_itself_with() {
+        let script = stall_watch();
+
+        assert!(script.contains("[data-dsh-boot]"), "the overlay is not looked for");
+        assert!(
+            script.contains("[data-dsh-boot-spinner]"),
+            "the spinner is not looked for, so a boot still running reads as a failed one"
+        );
+
+        // Neither of the two things that do not survive a dsh build: the card's
+        // classes are rewritten by the bundler, and its text can be reworded or
+        // translated.
+        assert!(
+            !script.contains("Failed to load plugins"),
+            "the watcher matches dsh's wording, which is not ours to depend on"
+        );
+        assert!(!script.contains("className") && !script.contains("classList"));
+
+        // Fired once. A boot page renders more than once on the way down --
+        // every `setState` calls `render` -- and a verb sent per render would
+        // be a dialog per render.
+        assert!(script.contains("told"), "the watcher has no latch");
+    }
+
+    /// The other end of the channel: the verb the page sends has to be one the
+    /// navigation handler turns into an action. A rename on either side alone
+    /// is a report that silently goes nowhere.
+    #[test]
+    fn the_verb_the_watcher_sends_is_one_the_window_acts_on() {
+        let sent = format!("{}://{}", crate::controls::SCHEME, STALLED);
+        assert!(stall_watch().contains(&sent), "the script sends something else");
+
+        let url = Url::parse(&sent).expect("a verb that parses");
+        assert!(
+            matches!(
+                crate::controls::action(&url),
+                Some(crate::controls::Action::PluginsStalled(_))
+            ),
+            "{sent} is not a verb the window recognises"
+        );
+    }
 
     /// Verbatim from `dsh plugin --profile web outdated --no-table` on a real
     /// profile, trailing line and all: pnpm exits 1 when it found something, so

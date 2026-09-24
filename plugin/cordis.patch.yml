@@ -1,17 +1,66 @@
 # dsh bundle patch for dsh-desktop-signal.
 #
-# One insert and nothing else. This plugin overrides no seam and repoints
-# nothing: its host half is empty, and its client half only reads services dsh
-# may provide (`sessions`, `uiSession`) and reports what it sees to the desktop
-# shell. It requires neither — see the note at the top of `lib/client.js` on
-# what an entry that waits does to dsh's web boot. Installing it adds a
-# listener; removing it drops the layer and dsh is exactly as it was.
+# Two entries: the insert that makes this a profile layer at all, and one
+# disable that is a real change to dsh's behaviour rather than an addition to
+# it. The second is new, and the note below is why it is worth its cost.
 #
-# The insert is what makes it a profile layer at all. `dsh plugin add`
-# reconciles `dsh.profile.bundles` by installed state, and a dependency joins
-# the layer stack only when its manifest declares `dsh.bundle.patch` — without
-# this file the package installs as a plain dependency, warns once, and never
-# loads.
+# ## The insert
+#
+# `dsh plugin add` reconciles `dsh.profile.bundles` by installed state, and a
+# dependency joins the layer stack only when its manifest declares
+# `dsh.bundle.patch` — without this file the package installs as a plain
+# dependency, warns once, and never loads. So the insert is not optional
+# scaffolding; it is the thing that gets the plugin loaded.
+#
+# ## Pinning the directory picker to `browse`
+#
+# dsh composes the directory-picker seam through
+# `@deepseek-ai/dsh-host-directory-picker-auto`, which resolves once at boot:
+#
+#     if (facts.bindHost !== "127.0.0.1") return "browse";
+#     if (facts.ssh) return "browse";
+#     if (platform === "darwin" || platform === "win32") return "native";
+#
+# The first line is the one that would have saved us, and it cannot fire here.
+# This app's whole security posture is that dsh stays on loopback and our own
+# gateway faces the phone (see `docs/mobile-connection-spec.md`, 铁律 #2), so
+# `bindHost` is always `127.0.0.1` and the resolver has no way to learn that
+# anything is in front of it. On Windows and macOS it therefore always answers
+# `native`, and a phone that taps "choose a folder" opens an OS dialog on the
+# desktop's screen — where nobody is standing.
+#
+# dsh's own composition says what to do about that: "Mount -native or -browse
+# directly in an overlay to pin the interaction" (`dsh-web-app`'s
+# `cordis.patch.yml`). Which is this: disable the adaptive row, mount the
+# `browse` pair directly.
+#
+# ## What it costs
+#
+# The seam is a host service, resolved once per boot, with no per-client
+# dimension — one process cannot serve `native` to the desktop webview and
+# `browse` to a phone. So this is not a mobile-only change however it is
+# described: **the desktop loses the native OS folder picker too**, for every
+# user, whether or not they ever pair a phone.
+#
+# That is accepted rather than overlooked. The in-app browser works everywhere
+# and the native one works in one place, and a picker that opens on the wrong
+# machine is a dead end with no error message. If it ever needs to be
+# conditional, the seam it would go through is `dsh web --patch`: the desktop
+# knows at launch whether remote access is on, and could apply this overlay
+# only then, at the price of restarting dsh when the user toggles it.
+#
+# The two packages below are resolved by name out of the profile's hoisted
+# `node_modules` (`nodeLinker: hoisted`), where `dsh-web-app` already puts
+# them. They are named in this plugin's `peerDependencies` as well, because
+# `directory-picker-auto` says every composition that pins an interaction owes
+# that declaration — and because a silent resolution failure here looks like a
+# picker that simply stopped working.
+- id: directory-picker
+  disabled: true
 - insert:
+    - id: directory-picker-browse-backend
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: directory-picker-browse-surface
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
     - id: desktop-signal
       name: 'dsh-desktop-signal'

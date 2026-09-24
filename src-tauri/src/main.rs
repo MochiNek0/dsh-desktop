@@ -15,6 +15,7 @@ mod memory;
 mod notify;
 mod panel;
 mod plugins;
+mod remote;
 mod server;
 mod settings;
 mod setup;
@@ -161,6 +162,20 @@ fn main() {
                 auth,
             };
             app.manage(session.clone());
+            // Nothing is bound and no port is open for a machine that has never
+            // paired a phone; this is the state the button on the titlebar
+            // reaches. One that has goes straight back up — the pairing outlives
+            // the process now, and a pairing with no socket under it is a phone
+            // looking at a refused connection. See [`remote::resume`].
+            app.manage(remote::Remote::new(app.handle().clone()));
+            remote::resume(app.handle());
+
+            // Once a launch, and only for someone who has the patch switched
+            // on, so that a fix for a newer dsh reaches them without waiting
+            // for a release of this app. Quiet: they did not ask for it, and
+            // the stylesheet already on disk is what the phone uses meanwhile.
+            // See [`remote::refresh_patch`].
+            remote::refresh_patch(app.handle(), false);
 
             build_tray(app.handle())?;
 
@@ -171,14 +186,30 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("failed to build the dsh desktop app");
 
-    app.run(move |_handle, event| {
-        if let tauri::RunEvent::Exit = event {
+    app.run(move |handle, event| match event {
+        // Asked to quit while this machine is answering the internet. The
+        // tunnel would come down here anyway — that is what `Exit` below does —
+        // but coming down silently is what makes it the same experience as
+        // having remembered to switch it off, which is how a user learns that
+        // leaving it on costs nothing. See `remote::confirm_exit`.
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            if remote::confirm_exit(handle) {
+                api.prevent_exit();
+            }
+        }
+        tauri::RunEvent::Exit => {
             dsh::stop();
             plugins::stop();
+            // Before the server, because what this takes down is a socket bound
+            // to every interface on the machine — and, on a public channel, a
+            // `cloudflared` holding a connection to Cloudflare's edge. See
+            // `remote::shutdown`.
+            remote::shutdown(handle);
             if let Some(child) = server.lock().unwrap().as_mut() {
                 child.stop();
             }
         }
+        _ => {}
     });
 }
 
@@ -250,6 +281,10 @@ fn build_window(
         .initialization_script(setup::script())
         // The app's own dialogs, in place of the window manager's; see `dialog`.
         .initialization_script(dialog::script())
+        // The pairing card: a QR code and who is on it. Drawn over dsh's page
+        // like the plugin panel, and for the same reason — that is where the
+        // user is looking. See `remote`.
+        .initialization_script(remote::script())
         // Which language the pages pick their own strings out of; see `i18n`.
         .initialization_script(format!(
             "window.__DSH_LANG__ = {:?};",
@@ -262,6 +297,10 @@ fn build_window(
             "window.__DSH_VERSION__ = {:?};",
             env!("CARGO_PKG_VERSION")
         ))
+        // Watches dsh's own boot for the one failure this app cannot see any
+        // other way: the server serving a page whose plugins did not load. See
+        // `plugins::stall_watch`.
+        .initialization_script(plugins::stall_watch())
         // Over dsh's refusal, for the moment between it loading and `auth`
         // getting the window past it. Document start is as early as there is,
         // and the reason the exchange itself cannot run here is that the token
@@ -396,7 +435,65 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     )?;
     let quit = MenuItem::with_id(app, "quit", t!("退出 dsh", "Quit dsh"), true, None::<&str>)?;
 
-    Menu::with_items(app, &[&show, &quit])
+    // The standing indication the specification asks for, and the third and
+    // fourth items this menu has ever had. They are here rather than only on
+    // the card because the card is a thing you have to go and open: a tunnel
+    // that is still up at midnight is exactly the tunnel nobody is looking at
+    // a card about.
+    //
+    // Two rows, not one: the hostname is what makes the warning concrete, and
+    // a row that says what is happening and a row that ends it are different
+    // clicks. The first is disabled — it is a label, and a label you can press
+    // is a button that does nothing.
+    let Some(host) = remote::exposed(app) else {
+        return Menu::with_items(app, &[&show, &quit]);
+    };
+
+    let warning = MenuItem::with_id(
+        app,
+        "public-host",
+        t!("⚠ 公网可访问：{}", "⚠ On the internet at {}", host),
+        false,
+        None::<&str>,
+    )?;
+    let close = MenuItem::with_id(
+        app,
+        "public-off",
+        t!("关闭公网通道", "Switch the public tunnel off"),
+        true,
+        None::<&str>,
+    )?;
+
+    Menu::with_items(app, &[&warning, &close, &show, &quit])
+}
+
+/// Draw the tray again, because what it says may have changed.
+///
+/// Called from [`remote`] whenever a tunnel arrives somewhere or leaves it. A
+/// menu cannot be relabelled in place — see [`tray_menu`] — so this is the same
+/// rebuild [`switch_language`] does, for the same reason.
+pub(crate) fn refresh_tray(app: &tauri::AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY) else {
+        return;
+    };
+
+    match tray_menu(app) {
+        Ok(menu) => {
+            let _ = tray.set_menu(Some(menu));
+        }
+        Err(error) => eprintln!("dsh-desktop: could not redraw the tray menu: {error}"),
+    }
+
+    // The tooltip is the half that shows without a click, which on Windows is
+    // the half a user actually meets.
+    let _ = tray.set_tooltip(Some(match remote::exposed(app) {
+        Some(host) => t!(
+            "dsh desktop — 公网可访问：{}",
+            "dsh desktop — on the internet at {}",
+            host
+        ),
+        None => "dsh desktop".to_string(),
+    }));
 }
 
 /// Follow dsh into the language it has just been switched to.
@@ -467,6 +564,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             "show" => reveal(app),
             // Exits the run loop, which stops the dsh server on the way out.
             "quit" => app.exit(0),
+            "public-off" => remote::stop_public(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -638,6 +736,227 @@ fn open_registry(app: &tauri::AppHandle) {
             settings::set_registry(&app, source);
         }
     });
+}
+
+/// Move dsh between the release candidates and the alpha line.
+///
+/// The one row on the settings card that can end in an install, so it holds the
+/// same [`Busy`] guard [`update_dsh`] does and ends in the same
+/// [`reinstall_dsh`] — the difference is only what was agreed to. See
+/// [`settings::Channel`] for what the two lines are, and why the app does not
+/// try to keep their data apart.
+///
+/// On its own thread: the lookup waits on npm, the question waits on the user,
+/// and the install runs for minutes.
+fn open_channel(app: &tauri::AppHandle) {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        dsh::note(
+            app,
+            t!("请稍等", "One moment"),
+            t!(
+                "dsh 正在启动或更新中，等它忙完再试。",
+                "dsh is starting or updating; try again once it has finished."
+            ),
+        );
+        return;
+    }
+
+    let session = app.state::<Session>().inner().clone();
+    let app = app.clone();
+
+    std::thread::spawn(move || {
+        let _busy = Busy;
+
+        // A registry away, and the menu has just closed over a window with
+        // nothing to show for the click yet.
+        let saying = |text: &str| controls::busy(&app, text);
+        saying(t!("正在查询 dsh 的版本…", "Looking up dsh's versions…"));
+        let found = dsh::tags(&app);
+        let installable = dsh::installable(&app);
+        saying("");
+
+        let Some(tags) = found else {
+            dsh::note(
+                &app,
+                t!("查不到版本", "The versions could not be looked up"),
+                t!(
+                    "无法查询 dsh 的版本，通常是网络或代理的问题。",
+                    "dsh's versions could not be looked up, which is usually the \
+                     network or a proxy."
+                ),
+            );
+            return;
+        };
+
+        // Asked before the question is put rather than after it is answered: an
+        // agreement this cannot act on is worse than saying so up front.
+        let Some((prefix, installed)) = installable else {
+            dsh::note(
+                &app,
+                t!("不能从这里切换", "This cannot be switched from here"),
+                &t!(
+                    "这台机器上的 dsh 不在本应用能写的目录里，或者还没装好。\n\n\
+                     要换一条线，请自己在终端里执行：\n\nnpm install -g {}@alpha",
+                    "The dsh on this machine is not in a directory this app may \
+                     write to, or is not installed yet.\n\nTo change lines, run it \
+                     yourself in a terminal:\n\nnpm install -g {}@alpha",
+                    dsh::PACKAGE
+                ),
+            );
+            return;
+        };
+
+        let current = settings::dsh_channel(&app);
+        let wanted = match current {
+            settings::Channel::Rc => settings::Channel::Alpha,
+            settings::Channel::Alpha => settings::Channel::Rc,
+        };
+
+        // The one state with nothing to ask: on rc, with an alpha that is not
+        // ahead. Told rather than drawn as a row greyed out on the card — the
+        // card would have to know the answer before it could grey anything out,
+        // and that answer is a registry away.
+        if current == settings::Channel::Rc && !tags.alpha_is_ahead() {
+            dsh::note(
+                &app,
+                t!("现在不能切到 alpha", "Alpha is not ahead right now"),
+                &t!(
+                    "rc 是 {}，alpha 是 {}。\n\n\
+                     alpha 没有跑在 rc 前面，切过去等于装一个更旧的 dsh，\
+                     所以现在不让切。等 alpha 发出比 rc 新的版本再来。",
+                    "The rc line is at {}, the alpha line at {}.\n\n\
+                     Alpha is not ahead of rc, so switching would install an older \
+                     dsh than the one you have. Come back once alpha has published \
+                     something newer than rc.",
+                    tags.rc,
+                    alpha_or_none(&tags)
+                ),
+            );
+            return;
+        }
+
+        if !agreed(&app, &tags, wanted) {
+            return;
+        }
+
+        // Written before the install rather than after it, because
+        // [`dsh::run`] reads it back to put `-Channel` on the script's command
+        // line. So a refusal has to put it back: npm can turn a switch down
+        // flat — a dependency range in the line being switched to that nothing
+        // published satisfies is enough — and a preference left naming a
+        // channel that was never installed has the app describing one line
+        // while running the other's dsh. The row would then offer the line the
+        // user is already on, and the way back to the one they asked for would
+        // be a switch away and a switch back.
+        //
+        // Only a refusal. An install the app quit out of was interrupted, not
+        // turned down, and leaving the answer recorded is what lets the next
+        // launch's update check carry the switch through.
+        settings::set_dsh_channel(&app, wanted);
+        if reinstall_dsh(&app, &session, &prefix, &installed) == dsh::Updated::Failed {
+            settings::set_dsh_channel(&app, current);
+        }
+    });
+}
+
+/// `alpha` as the dialogs say it: the version, or that there is no such release
+/// at all. A package with no `alpha` tag is not an error, and should not be
+/// printed as a blank.
+fn alpha_or_none(tags: &dsh::Tags) -> String {
+    match &tags.alpha {
+        Some(alpha) => alpha.to_string(),
+        None => t!("还没有", "not published yet").to_string(),
+    }
+}
+
+/// Put the question and wait for it.
+///
+/// Blocking, like every other dialog that decides what happens next.
+fn agreed(app: &tauri::AppHandle, tags: &dsh::Tags, wanted: settings::Channel) -> bool {
+    let (title, body, go) = channel_question(tags, wanted, &plugins::dsh_home());
+
+    dialog::confirm(
+        app,
+        dialog::Ask {
+            title,
+            body,
+            choices: vec![
+                dialog::Choice::new("cancel", t!("取消", "Cancel")),
+                dialog::Choice::primary("switch", go),
+            ],
+            // Replaced by `confirm`; it is the channel send that answers.
+            answered: Box::new(|_, _| {}),
+        },
+        "switch",
+    )
+}
+
+/// The words of the question, which are the whole of what the user has to
+/// decide on — so they say what changes, what it costs, and what is left alone.
+///
+/// A function of its own, taking the home rather than resolving it, so that
+/// `the_switch_says_what_it_costs` can read the finished text without a machine
+/// to read it off.
+///
+/// The one thing this text must not do is promise isolation. Both lines run out
+/// of the same `$DSH_HOME` and the app installs one dsh globally, so the
+/// honest thing to say is what the risk is and where the directory to copy is —
+/// not that going back is free. See [`settings::Channel`].
+fn channel_question(
+    tags: &dsh::Tags,
+    wanted: settings::Channel,
+    home: &std::path::Path,
+) -> (String, String, String) {
+    if wanted == settings::Channel::Alpha {
+        (
+            t!("切到 alpha 版？", "Switch to the alpha line?").to_string(),
+            t!(
+                "alpha 现在是 {}，rc 是 {}。\n\n\
+                 alpha 会改还没定下来的东西，其中包括 dsh 存会话的格式。\
+                 alpha 打开过的会话，切回 rc 之后不保证还能用。\n\n\
+                 两条线用的是同一个数据目录：\n{}\n\n\
+                 切之前请自己把这个目录备份一份。切回 rc 随时可以，\
+                 但已经被 alpha 改过的数据，只有你的备份能还原——\
+                 本应用不会替你留副本。\n\n\
+                 还有一点：全局只装得下一个 dsh，切过去之后，\
+                 你自己在终端里敲的 dsh 也是 alpha。",
+                "Alpha is at {}, and rc at {}.\n\n\
+                 Alpha changes things that are not settled yet, and one of them is \
+                 the format dsh writes its sessions in. A session alpha has opened \
+                 is not one rc promises to be able to read afterwards.\n\n\
+                 Both lines use the same home:\n{}\n\n\
+                 Back that directory up yourself before switching. You can return \
+                 to rc whenever you like, but anything alpha has already rewritten \
+                 is restorable only from your own copy — this app does not keep \
+                 one.\n\n\
+                 One more thing: only one dsh can be installed globally, so after \
+                 this the dsh you type in your own terminal is the alpha one too.",
+                alpha_or_none(tags),
+                tags.rc,
+                home.display()
+            ),
+            t!("已备份，切到 alpha", "I have a backup; switch").to_string(),
+        )
+    } else {
+        (
+            t!("切回 rc 版？", "Switch back to rc?").to_string(),
+            t!(
+                "现在在 alpha {}，rc 是 {}。\n\n\
+                 切回去会把 dsh 换成 rc，数据目录不变：\n{}\n\n\
+                 你在 alpha 期间写下的东西都还在那里，但 rc 不保证每一条都还能打开。\
+                 真打不开，就用你切去 alpha 之前的备份还原。",
+                "You are on alpha {}, and rc is at {}.\n\n\
+                 Switching back replaces dsh with rc. The home does not change:\n{}\n\n\
+                 Everything you wrote while on alpha is still in it, but rc does not \
+                 promise to be able to open all of it. If something will not open, \
+                 restore the backup you took before switching to alpha.",
+                alpha_or_none(tags),
+                tags.rc,
+                home.display()
+            ),
+            t!("切回 rc", "Switch back to rc").to_string(),
+        )
+    }
 }
 
 /// Take the setup panel down; see `setup`.
@@ -850,45 +1169,76 @@ fn update_dsh(app: &tauri::AppHandle) {
         let Some((prefix, installed)) = dsh::requested(&app, &saying) else {
             return;
         };
-        let Some(window) = app.get_webview_window("main") else {
-            return;
-        };
 
-        stop_server(&session);
-        // Back to queueing until the loading page below has loaded; the reports
-        // that follow would otherwise be evaluated into the outgoing document.
-        session.splash.rearm();
-
-        let handle = app.clone();
-        let back = window.clone();
-        // Recorded by the first page load, which is long over: the click that got
-        // here came from a menu drawn by the page that replaced it.
-        let home = session.home.read().unwrap().clone();
-        let _ = app.run_on_main_thread(move || {
-            // The window may well be hidden in the tray, which is no place for
-            // an update the user is waiting on.
-            reveal(&handle);
-            match home {
-                Some(home) => {
-                    if let Err(error) = back.navigate(home) {
-                        eprintln!("dsh-desktop: could not return to the loading page: {error}");
-                    }
-                }
-                None => eprintln!(
-                    "dsh-desktop: the loading page's address is not known yet; \
-                     the update has nowhere to report progress"
-                ),
-            }
-        });
-
-        // False means the app is quitting and took npm down with it.
-        let report = reporter(&session.splash, &window);
-        if !dsh::update(&app, &prefix, &installed, &report) {
-            return;
-        }
-
-        start_serving(&app, &window, &session);
+        reinstall_dsh(&app, &session, &prefix, &installed);
     });
+}
+
+/// Take dsh down, put another one in its place, and start serving again.
+///
+/// The half of [`update_dsh`] that runs once something has been agreed to, and
+/// the reason it is a function of its own: [`open_channel`] agrees to a
+/// different thing — a release line rather than a version — and then needs
+/// exactly this. Which version npm fetches is not decided here at all; that is
+/// `-Channel` and the tag behind it, which [`dsh::run`] puts on the command.
+///
+/// The caller owns the [`Busy`] guard and is already off the main thread, which
+/// is what makes it safe to block here for as long as npm takes.
+///
+/// The outcome travels back out for [`open_channel`], which has a preference
+/// riding on whether npm actually replaced anything; [`update_dsh`] has nothing
+/// to do with it and drops it.
+fn reinstall_dsh(
+    app: &tauri::AppHandle,
+    session: &Session,
+    prefix: &std::path::Path,
+    installed: &semver::Version,
+) -> dsh::Updated {
+    let Some(window) = app.get_webview_window("main") else {
+        // No window is no loading page to report onto and no dsh to take down,
+        // so npm never runs and nothing is replaced. Not `Quit`, which the
+        // caller reads as an install that was interrupted and may yet be
+        // finished: this one never started.
+        return dsh::Updated::Failed;
+    };
+
+    stop_server(app, session);
+    // Back to queueing until the loading page below has loaded; the reports
+    // that follow would otherwise be evaluated into the outgoing document.
+    session.splash.rearm();
+
+    let handle = app.clone();
+    let back = window.clone();
+    // Recorded by the first page load, which is long over: the click that got
+    // here came from a menu drawn by the page that replaced it.
+    let home = session.home.read().unwrap().clone();
+    let _ = app.run_on_main_thread(move || {
+        // The window may well be hidden in the tray, which is no place for
+        // an update the user is waiting on.
+        reveal(&handle);
+        match home {
+            Some(home) => {
+                if let Err(error) = back.navigate(home) {
+                    eprintln!("dsh-desktop: could not return to the loading page: {error}");
+                }
+            }
+            None => eprintln!(
+                "dsh-desktop: the loading page's address is not known yet; \
+                 the update has nowhere to report progress"
+            ),
+        }
+    });
+
+    let report = reporter(&session.splash, &window);
+    let updated = dsh::update(app, prefix, installed, &report);
+    // The app is quitting and took npm down with it; there is nothing left to
+    // serve into.
+    if updated == dsh::Updated::Quit {
+        return updated;
+    }
+
+    start_serving(app, &window, session);
+    updated
 }
 
 /// Start `dsh web` and hand the window over to it. Blocks until it is serving or
@@ -910,10 +1260,14 @@ fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Sessi
     // And again on every start for as long as safe mode lasts, rather than only
     // on the way into it: dsh reconciles the layer stack after any plugin change
     // pnpm completes, which puts back every plugin the user did not remove. See
-    // [`plugins::engage_safe`].
+    // [`plugins::engage`].
+    //
+    // The recorded set and not every plugin: a launch that widened a repair
+    // aimed at one plugin into an outage across all of them would be undoing
+    // the user's answer on their behalf.
     let safe = plugins::safe(app);
     if safe {
-        if let Err(why) = plugins::engage_safe(app) {
+        if let Err(why) = plugins::engage_recorded(app) {
             eprintln!("dsh-desktop: could not keep the plugins off the layer stack: {why}");
         }
     }
@@ -922,14 +1276,28 @@ fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Sessi
         window,
         &if safe {
             // Ahead of the repair line below, and not joined to it: a launch
-            // with no plugins on it is the larger fact about this start, and
-            // residue cleared out of a stack nothing is being loaded off is not
-            // news until the plugins come back.
-            t!(
-                "正在启动 dsh：插件都不加载。",
-                "Starting dsh with no plugins loaded."
-            )
-            .to_string()
+            // with plugins set aside is the larger fact about this start, and
+            // residue cleared out of a stack is not news beside it.
+            //
+            // Which sentence depends on whether anything is still loading. The
+            // total one has to stay available -- the rescue button and the
+            // stall dialog's fallback both still take every plugin off -- and
+            // on that launch "these are not loading" listing all of them reads
+            // worse than saying so plainly.
+            let aside = plugins::set_aside(app);
+            if plugins::partial(app) {
+                t!(
+                    "正在启动 dsh：这些插件不加载（{}）。",
+                    "Starting dsh; these plugins are set aside ({}).",
+                    aside.join(" ")
+                )
+            } else {
+                t!(
+                    "正在启动 dsh：插件都不加载。",
+                    "Starting dsh with no plugins loaded."
+                )
+                .to_string()
+            }
         } else if cleared.is_empty() {
             t!("正在启动 dsh…", "Starting dsh…").to_string()
         } else {
@@ -990,7 +1358,7 @@ fn reporter<'a>(splash: &'a Splash, window: &'a WebviewWindow) -> impl Fn(&str, 
 /// about to see it exit, and this is what tells it the exit was asked for. Moved
 /// before the child is killed, so there is no window in which the watcher could
 /// read the old number.
-fn stop_server(session: &Session) {
+fn stop_server(app: &tauri::AppHandle, session: &Session) {
     session.epoch.fetch_add(1, Ordering::SeqCst);
 
     if let Some(mut running) = session.server.lock().unwrap().take() {
@@ -999,6 +1367,9 @@ fn stop_server(session: &Session) {
     // The dsh page went with it, so nothing may be treated as ours until a new
     // server says otherwise.
     *session.origin.write().unwrap() = None;
+    // And a phone on the gateway is told dsh stopped, rather than being handed
+    // whatever a connection to a closed port looks like. See `remote`.
+    remote::dsh_gone(app);
 }
 
 /// Wait for the running server to exit, start it again where that is worth
@@ -1166,6 +1537,11 @@ fn attempt(
             let same = session.origin.read().unwrap().as_deref() == Some(origin.as_str());
             *session.origin.write().unwrap() = Some(origin);
 
+            // The restart path, and the one the gateway would otherwise get
+            // wrong: same port, new process, new token, and the cookie the
+            // gateway is holding is now worth nothing. See `remote::upstream`.
+            remote::dsh_ready(app, &url);
+
             // Only when the port moved. On the same one the page is already
             // pointed at a server that is back, and reloading it would throw
             // away the very thing staying put is for.
@@ -1221,6 +1597,7 @@ fn served_port(origin: &Origin) -> Option<u16> {
 /// dsh again has stopped being worth trying.
 fn give_up(window: &WebviewWindow, session: &Session, output: &str) {
     *session.origin.write().unwrap() = None;
+    remote::dsh_gone(window.app_handle());
     session.splash.rearm();
 
     let handle = window.app_handle().clone();
@@ -1300,7 +1677,7 @@ fn restart_dsh(app: &tauri::AppHandle, into_plugins: bool) {
 
         // Down first: a server still serving has to stop before a fresh one
         // starts, and from the retry button there is nothing to stop.
-        stop_server(&session);
+        stop_server(&app, &session);
 
         // The dsh page died with the server above; only the loading page can
         // show a start's progress, so back there the way an update goes back.
@@ -1342,6 +1719,131 @@ fn restart_dsh(app: &tauri::AppHandle, into_plugins: bool) {
 /// causes: `dsh web` composes that stack before it binds a port, so a bundle
 /// that throws on the way up is an app with no page to open the plugin list
 /// from. See [`plugins::engage_safe`] for what is moved and how it comes back.
+/// dsh's page says its plugin boot stopped; offer the rescue.
+///
+/// See [`plugins::stall_watch`] for what was detected and why nothing else here
+/// could detect it. This is the only path to safe mode that does not start from
+/// a dsh that failed to serve — the server is up and fine, and the window is
+/// showing dsh's "Failed to load plugins" card.
+///
+/// A question rather than a repair. Taking every plugin off the stack is a
+/// visible change to the user's profile, and the one thing this app is sure of
+/// is what the page looks like, not which plugin did it — [`safe_start`] is a
+/// way to get to the panel and find out, not a diagnosis.
+///
+/// Silent when there is nothing to offer: a profile whose only plugins are
+/// dsh's own is one safe mode cannot repair, and the card on screen is then
+/// about something this app has no answer for.
+///
+/// On its own thread, like every other dialog here: [`dialog::confirm`] blocks
+/// until the click comes back on the main thread, and this is reached from the
+/// navigation handler, which runs on it.
+fn plugins_stalled(app: &tauri::AppHandle, said: &str) {
+    if !plugins::rescuable(app) {
+        return;
+    }
+
+    let blamed = plugins::blamed(app, said);
+    let app = app.clone();
+
+    std::thread::spawn(move || {
+        // Naming a plugin and setting every plugin aside are the same answer
+        // asked two different ways, so the button says which one this is.
+        let go = if blamed.is_empty() {
+            t!("停用所有插件并重启", "Restart with no plugins")
+        } else {
+            t!("停用它并重启", "Set it aside and restart")
+        };
+
+        let agreed = dialog::confirm(
+            &app,
+            dialog::Ask {
+                title: t!("插件没能加载", "The plugins did not load").to_string(),
+                body: stall_question(&blamed),
+                choices: vec![
+                    dialog::Choice::new("stay", t!("先不管", "Leave it")),
+                    dialog::Choice::primary("safe", go),
+                ],
+                // Replaced by `confirm`; it is the channel send that answers.
+                answered: Box::new(|_, _| {}),
+            },
+            "safe",
+        );
+
+        if !agreed {
+            return;
+        }
+
+        if blamed.is_empty() {
+            safe_start(&app);
+        } else {
+            safe_start_only(&app, &blamed);
+        }
+    });
+}
+
+/// What the stall dialog says, which depends on whether the card named anything
+/// this app recognises.
+///
+/// Naming the culprit is most of the value: the user is looking at a window
+/// that says nothing but "Failed to load plugins", and the difference between
+/// that and a plugin's name is the difference between a mystery and one line in
+/// the panel to undo. It is also what makes the repair worth offering at all —
+/// with a name, only that plugin goes and the rest keep working; without one
+/// there is nothing to aim at and every plugin has to come off.
+fn stall_question(blamed: &[String]) -> String {
+    if blamed.is_empty() {
+        return t!(
+            "dsh 起来了，但它的插件里有没能激活的，于是整个页面停在了那张卡片上。
+
+             卡片上没有报出是哪一个，所以只能先把插件全部停用再启动一次，             进去之后在插件面板里排查。其余的插件会记下来，退出安全模式时装回去。",
+            "dsh started, but a plugin never activated, and that leaves the whole              page on that card.
+
+The card did not name one this app recognises, so              the only repair left is to start again with every plugin set aside and              work it out from the plugin panel. They are written down and go back on              when you leave safe mode."
+        )
+        .to_string();
+    }
+
+    t!(
+        "dsh 起来了，但这个插件没能激活，于是整个页面停在了那张卡片上：
+
+{}
+
+         这不是 dsh 本身的问题，是这个插件要的东西这个版本没有。
+
+         可以只把它停用再启动一次，别的插件照常加载。它本来就没在工作，         所以停掉它不会少什么。之后在插件面板里更新或卸载它；         想把它装回来，用菜单里的「重新加载插件」。",
+        "dsh started, but this plugin never activated, and that leaves the whole          page on that card:
+
+{}
+
+This is not dsh itself — it is that plugin          asking for something this version does not have.
+
+The app can start          again with just that one set aside, and everything else loading as          usual. It was not working anyway, so nothing is lost by it. You can then          update or remove it from the plugin panel; “Load plugins again” in the          menu puts it back.",
+        blamed.join("
+")
+    )
+}
+
+/// Set aside only the plugins that were named, and start again.
+///
+/// [`safe_start`] aimed at something: the same two steps, over a list rather
+/// than over everything. The failure is worded the same way because it is the
+/// same failure — a profile whose plugin list will not change.
+fn safe_start_only(app: &tauri::AppHandle, names: &[String]) {
+    match plugins::engage_only(app, names) {
+        Ok(_) => restart_dsh(app, true),
+        Err(why) => dsh::note(
+            app,
+            t!("没能停用插件", "Could not set the plugins aside"),
+            &t!(
+                "profile 的插件列表改不动，所以没有启动：{}",
+                "The profile's plugin list could not be changed, so nothing was started: {}",
+                why
+            ),
+        ),
+    }
+}
+
 fn safe_start(app: &tauri::AppHandle) {
     match plugins::engage_safe(app) {
         Ok(_) => restart_dsh(app, true),
@@ -1487,7 +1989,7 @@ where
             return;
         };
 
-        stop_server(&session);
+        stop_server(&app, &session);
 
         let log = |line: &str| session.splash.plugin_log(&window, line);
         match work(&app, &log) {
@@ -1698,6 +2200,11 @@ fn serve(
                 };
 
                 *origin.write().unwrap() = Some(url.origin().ascii_serialization());
+                // The token on this URL is what the phone gateway exchanges for
+                // a dsh session of its own, and it belongs to this dsh process
+                // rather than to this launch — so every URL dsh prints has to
+                // reach `remote`, not just the first. See `remote::upstream`.
+                remote::dsh_ready(window.app_handle(), &url);
                 splash.status(window, t!("正在打开界面…", "Opening the interface…"));
 
                 // Before the navigation rather than after it: the header this
@@ -1916,5 +2423,60 @@ impl Splash {
         } else {
             state.pending.push(js);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::settings::Channel;
+    use semver::Version;
+
+    fn tags(rc: &str, alpha: &str) -> crate::dsh::Tags {
+        crate::dsh::Tags {
+            rc: Version::parse(rc).unwrap(),
+            alpha: Some(Version::parse(alpha).unwrap()),
+        }
+    }
+
+    /// The switch to alpha is not reversible by anything this app does — one
+    /// home, one globally installed dsh — so the dialog is the whole of the
+    /// mitigation, and every part of it has to be there. A version of this text
+    /// that quietly loses the backup line is a version that has gone back to
+    /// promising something it cannot deliver.
+    #[test]
+    fn the_switch_says_what_it_costs() {
+        let (_, body, go) = super::channel_question(
+            &tags("0.1.5-rc.2", "0.1.7-alpha.1"),
+            Channel::Alpha,
+            std::path::Path::new("/home/someone/.dsh"),
+        );
+
+        // Both versions, so the user knows what they are trading.
+        assert!(body.contains("0.1.7-alpha.1") && body.contains("0.1.5-rc.2"));
+        // The directory to copy, spelled out. Telling someone to back up
+        // without saying what is the same as not telling them.
+        assert!(body.contains("/home/someone/.dsh"));
+        // That it is on them, and that the app keeps nothing.
+        assert!(body.contains("备份") || body.to_lowercase().contains("back"));
+        // That their own terminal changes under them too, which is the thing
+        // nobody expects.
+        assert!(body.contains("终端") || body.contains("terminal"));
+        // And that the button is not an innocent one.
+        assert!(go.contains("备份") || go.to_lowercase().contains("backup"));
+    }
+
+    /// Going back says where the data is and does not pretend rc can read all
+    /// of it. It must not claim an untouched copy is waiting, because there is
+    /// none.
+    #[test]
+    fn going_back_does_not_promise_an_untouched_home() {
+        let (_, body, _) = super::channel_question(
+            &tags("0.1.5-rc.2", "0.1.7-alpha.1"),
+            Channel::Rc,
+            std::path::Path::new("/home/someone/.dsh"),
+        );
+
+        assert!(body.contains("/home/someone/.dsh"));
+        assert!(body.contains("不保证") || body.contains("does not"));
     }
 }

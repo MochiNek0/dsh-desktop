@@ -4,3 +4,11 @@
 # exactly that on checkout, so the one file it matters for is pinned.
 *.sh text eol=lf
 .githooks/* text eol=lf
+
+# The stylesheet-patch test fixtures are signed bytes: `patch-sheet.sig.b64` is
+# a minisign signature over `patch-sheet.css` exactly as it is here. A checkout
+# that turned those newlines into CRLF would make the signature fail to verify,
+# which is the signature working correctly on the wrong question.
+src-tauri/tests/patch-sheet.css -text
+src-tauri/tests/patch-sheet.sig.b64 -text
+src-tauri/tests/patch-key.pub.b64 -text

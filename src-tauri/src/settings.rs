@@ -158,6 +158,277 @@ pub fn set_registry(app: &AppHandle, source: RegistrySource) {
     write(app, REGISTRY_KEY, Value::String(source.as_str().to_string()));
 }
 
+/// Which line of dsh releases this app installs and updates to.
+///
+/// npm publishes dsh under two tags that matter here. `latest` is the
+/// release-candidate line, which is what every install has always taken and
+/// what a machine that has never been asked still takes. `alpha` runs ahead of
+/// it, and is there for a user who wants what is being worked on now rather
+/// than what is being stabilised.
+///
+/// ## Alpha is not merely "newer"
+///
+/// The two lines are not a ladder with alpha on the higher rung. Work lands in
+/// alpha that may never reach a release candidate in the shape it landed in,
+/// and one of the things it is free to change is the format dsh writes its
+/// sessions in. A session written by an alpha is not a session an rc promises
+/// to be able to open, which makes going back the problem rather than going
+/// forward.
+///
+/// ## Why the two lines still share a home
+///
+/// The obvious answer to that is to give alpha a `$DSH_HOME` of its own, and it
+/// was tried. It does not hold. Only one dsh can be installed globally, so
+/// after a switch the `dsh` the user types in their own terminal is the alpha
+/// one — and nothing this app does reaches that terminal's environment, by an
+/// older decision this one is not going to overturn (see
+/// [`crate::dsh::terminal`]). That dsh resolves `$DSH_HOME` for itself, lands
+/// in the shared home, and writes there. So the separation held only for
+/// sessions started through this window, while the dialog was promising that
+/// the other home was untouched — a promise the first terminal the user opened
+/// would break.
+///
+/// A promise that cannot be kept is worse than none. So the channel moves which
+/// dsh is installed and nothing else: one home, one dsh, and a dialog that says
+/// what the risk is and where the directory to back up lives. See
+/// `channel_question` in `main.rs`, which is the whole of the mitigation.
+///
+/// ## Why the default is not `Option`
+///
+/// Unlike [`REGISTRY_KEY`], where "nobody has been asked" is a state worth
+/// telling apart from either answer, there is always a channel in use and the
+/// safe one is known. So a file with nothing in it, and a file holding a name
+/// this build does not recognise, both read as [`Channel::Rc`] — never as
+/// alpha. A preference that cannot be parsed must not be able to move anyone
+/// onto the line that writes sessions the other one cannot read.
+const DSH_CHANNEL_KEY: &str = "dshChannel";
+
+/// The line of dsh releases in use. See [`DSH_CHANNEL_KEY`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Channel {
+    /// The release candidates, published under npm's `latest`.
+    Rc,
+    /// The alpha line, published under npm's `alpha`.
+    Alpha,
+}
+
+/// What a machine nobody has asked is on, and what anything unreadable reads
+/// as.
+const DSH_CHANNEL_DEFAULT: Channel = Channel::Rc;
+
+impl Channel {
+    /// The spelling both installer scripts take for `-Channel`, and the one
+    /// stored in `desktop.json`. One function so the two can never drift, the
+    /// same way [`RegistrySource::as_str`] is one.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Rc => "rc",
+            Channel::Alpha => "alpha",
+        }
+    }
+
+    /// The npm dist-tag this channel installs from.
+    ///
+    /// Deliberately not the same string as [`Channel::as_str`]: the rc line is
+    /// published under `latest`, not under `rc`, and writing `rc` into an
+    /// `npm install -g @deepseek-ai/dsh@rc` would name a tag that does not
+    /// exist. The scripts hold the other half of this mapping and a test pins
+    /// the two together.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Channel::Rc => "latest",
+            Channel::Alpha => "alpha",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "rc" => Some(Channel::Rc),
+            "alpha" => Some(Channel::Alpha),
+            _ => None,
+        }
+    }
+}
+
+/// The channel in use. Anything unreadable is [`DSH_CHANNEL_DEFAULT`]; see
+/// [`DSH_CHANNEL_KEY`] for why this is not an `Option`.
+pub fn dsh_channel(app: &AppHandle) -> Channel {
+    read(app)
+        .get(DSH_CHANNEL_KEY)
+        .and_then(Value::as_str)
+        .and_then(Channel::parse)
+        .unwrap_or(DSH_CHANNEL_DEFAULT)
+}
+
+/// Write the channel the user switched to.
+pub fn set_dsh_channel(app: &AppHandle, channel: Channel) {
+    write(
+        app,
+        DSH_CHANNEL_KEY,
+        Value::String(channel.as_str().to_string()),
+    );
+}
+
+/// The port the phone gateway bound last time, so that it can ask for the same
+/// one again.
+///
+/// The gateway binds port `0` and lets the operating system pick — nothing else
+/// needs to know the number in advance, which is the whole advantage of the
+/// forwarding method [`crate::remote`] uses. But "nobody needs to know it in
+/// advance" is not the same as "it may change", and the phone at the other end
+/// is the thing that does not get a say: a browser's notion of a site is
+/// `scheme://host:port`, so a new port every launch is a new site every launch.
+/// A cookie issued to the old one is not sent to the new one, and an icon
+/// added to a home screen points at a port nothing is listening on — which
+/// fails as the browser's own connection-refused page, before a single line of
+/// ours runs, so there is nowhere to put "scan the code again".
+///
+/// Hence: remembered, asked for, and not insisted on. Something else holding
+/// the port is not an error — the gateway falls back to `0` and writes down
+/// whatever it got, which is the same state a first launch is in.
+///
+/// The firewall rule is not affected either way: [`crate::remote::firewall`]
+/// matches on the program, not the port.
+const GATEWAY_PORT_KEY: &str = "remoteGatewayPort";
+
+/// The remembered port, or `None` on the first launch — and on any file that
+/// holds something that is not a port.
+///
+/// `0` reads as `None` rather than as itself. It is the spelling of "you pick",
+/// so a file containing it is a file asking for exactly what `None` already
+/// means, and treating it as a port to request would be asking the OS to pick
+/// and then recording that it was asked.
+pub fn gateway_port(app: &AppHandle) -> Option<u16> {
+    read(app)
+        .get(GATEWAY_PORT_KEY)
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+}
+
+/// Remember the port the gateway is actually on.
+///
+/// Called with what the listener reports rather than with what was asked for,
+/// so the fallback path records the port it fell back to.
+pub fn set_gateway_port(app: &AppHandle, port: u16) {
+    write(app, GATEWAY_PORT_KEY, Value::from(port));
+}
+
+/// Which channel the phone reaches this machine over.
+///
+/// Stored by name rather than by number, because the number is an enum
+/// discriminant and this file outlives the build that wrote it; see
+/// [`crate::remote::TunnelType::name`].
+const CHANNEL_KEY: &str = "remoteChannel";
+
+/// The channel to raise, defaulting to the local network.
+///
+/// A name this build does not recognise falls back to the default rather than
+/// refusing to start: the gateway on the LAN is always a usable answer, and a
+/// settings file written by a newer version is not a reason to have no phone
+/// connection at all.
+pub fn channel(app: &AppHandle) -> crate::remote::TunnelType {
+    read(app)
+        .get(CHANNEL_KEY)
+        .and_then(Value::as_str)
+        .and_then(crate::remote::TunnelType::named)
+        .unwrap_or(crate::remote::TunnelType::Lan)
+}
+
+/// Remember the channel the user switched to.
+pub fn set_channel(app: &AppHandle, kind: crate::remote::TunnelType) {
+    write(app, CHANNEL_KEY, Value::String(kind.name().to_string()));
+}
+
+/// The hostname a Cloudflare named tunnel publishes — `dsh.example.com`, bare.
+///
+/// Here rather than beside the token, and that split is deliberate. A hostname
+/// is not a secret: it is the address the user's own phone is sent to, and
+/// somebody reading this file to find out where their computer is answering
+/// from should find it. The token that operates the tunnel is the half that
+/// does not belong in a hand-editable file; see
+/// [`mod@crate::remote::cloudflare`].
+const CLOUDFLARE_HOST_KEY: &str = "remoteCloudflareHostname";
+
+/// The configured hostname, or `None` when nobody has set one — and for an
+/// empty string, which is what a cleared field leaves behind and is the same
+/// thing as unset.
+pub fn cloudflare_hostname(app: &AppHandle) -> Option<String> {
+    read(app)
+        .get(CLOUDFLARE_HOST_KEY)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|host| !host.is_empty())
+}
+
+/// Write it down. Given already tidied — scheme and path stripped, lowercased —
+/// by the one caller that has the user's typing in its hand.
+pub fn set_cloudflare_hostname(app: &AppHandle, hostname: &str) {
+    write(
+        app,
+        CLOUDFLARE_HOST_KEY,
+        Value::String(hostname.to_string()),
+    );
+}
+
+/// The phones the gateway has let in, and the counter their ids come from.
+///
+/// State, not a preference — the only thing in this file that is, so it is
+/// worth saying why it is here rather than in a file of its own. It is small,
+/// it is this app's alone, it has to survive exactly as long as the other keys
+/// here do, and it wants the same forgiveness: a device list that fails to
+/// parse should cost the user a re-scan, not a launch. A second file with a
+/// second reader, a second corruption story and a second thing to clean up on
+/// uninstall would buy nothing for that.
+///
+/// The shape is [`crate::remote::session`]'s, and stays there — this file
+/// stores the value without reading into it, the way it stores the others.
+/// What does *not* go in here is the key those devices' cookies are signed
+/// with: see that module for where that lives and why it is not this file.
+const PAIRING_KEY: &str = "remotePairing";
+
+/// What was written last time, whatever shape it is in.
+///
+/// Handed back unread. A document this build cannot make sense of is the
+/// caller's problem to shrug at, and [`crate::remote::session`] does.
+pub fn pairing(app: &AppHandle) -> Option<Value> {
+    read(app).get(PAIRING_KEY).cloned()
+}
+
+/// Write the device list back. Called on every change to it — a device let in,
+/// one kicked, all of them kicked.
+pub fn set_pairing(app: &AppHandle, state: Value) {
+    write(app, PAIRING_KEY, state);
+}
+
+/// Whether closing the app should throw every paired phone off.
+///
+/// Off by default, because the feature exists so that the phone in a pocket
+/// still works tomorrow morning, and a pairing that ends when the window closes
+/// is one that has to be redone before every single use.
+///
+/// It is here for the user who reads [`crate::remote::session`]'s module docs
+/// and does not like what they say: with the switch off there is a key on this
+/// disk that signs cookies into a shell, and the honest answer to someone who
+/// would rather that key not outlive the session is a switch, not an argument.
+const FORGET_ON_EXIT_KEY: &str = "remoteForgetPairingsOnExit";
+
+const FORGET_ON_EXIT_DEFAULT: bool = false;
+
+/// Read the switch. Any problem reading it is the default.
+pub fn forget_pairings_on_exit(app: &AppHandle) -> bool {
+    read(app)
+        .get(FORGET_ON_EXIT_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(FORGET_ON_EXIT_DEFAULT)
+}
+
+/// Set it to what the box on the card now shows — the state, not a flip. See
+/// [`crate::controls::Action::RemoteForget`].
+pub fn set_forget_pairings_on_exit(app: &AppHandle, on: bool) {
+    write(app, FORGET_ON_EXIT_KEY, Value::Bool(on));
+}
+
 /// The whole document, or an empty one. Never `Err`: see the module docs.
 fn read(app: &AppHandle) -> Map<String, Value> {
     let Some(path) = file(app) else {
@@ -262,6 +533,85 @@ mod tests {
     #[test]
     fn defaults_to_notifying() {
         const { assert!(super::NOTIFY_DEFAULT) };
+    }
+
+    /// The read half of [`super::gateway_port`], mirrored the same way and with
+    /// the same warning as `parse` above.
+    fn port(text: &str) -> Option<u16> {
+        parse(text)
+            .get(super::GATEWAY_PORT_KEY)
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+    }
+
+    #[test]
+    fn reads_the_remembered_port() {
+        assert_eq!(port(r#"{"remoteGatewayPort": 59123}"#), Some(59123));
+    }
+
+    /// Nothing recorded, or something recorded that is not a port a listener
+    /// could be asked for. All one answer: let the operating system pick, which
+    /// is what a first launch does anyway.
+    #[test]
+    fn anything_that_is_not_a_port_means_let_the_os_pick() {
+        assert_eq!(port("{}"), None);
+        assert_eq!(port("{"), None);
+        assert_eq!(port(r#"{"remoteGatewayPort": "59123"}"#), None);
+        assert_eq!(port(r#"{"remoteGatewayPort": -1}"#), None);
+        // Past what a port number can be — a file written by something else,
+        // or by hand.
+        assert_eq!(port(r#"{"remoteGatewayPort": 70000}"#), None);
+        // The spelling of "you pick", which is already what `None` says.
+        assert_eq!(port(r#"{"remoteGatewayPort": 0}"#), None);
+    }
+
+    /// The read half of [`super::dsh_channel`], mirrored the same way and with
+    /// the same warning as `parse` above.
+    fn channel(text: &str) -> super::Channel {
+        parse(text)
+            .get(super::DSH_CHANNEL_KEY)
+            .and_then(Value::as_str)
+            .and_then(super::Channel::parse)
+            .unwrap_or(super::DSH_CHANNEL_DEFAULT)
+    }
+
+    #[test]
+    fn reads_the_channel() {
+        assert_eq!(channel(r#"{"dshChannel": "rc"}"#), super::Channel::Rc);
+        assert_eq!(channel(r#"{"dshChannel": "alpha"}"#), super::Channel::Alpha);
+    }
+
+    /// Every unreadable file lands on rc, and none of them on alpha. This is
+    /// the one preference here where the fallback is a safety property rather
+    /// than a convenience: alpha writes sessions an rc need not be able to
+    /// open, so nothing but the word `alpha` may put anyone on it.
+    #[test]
+    fn nothing_unreadable_can_land_on_alpha() {
+        for text in [
+            "",
+            "{",
+            "null",
+            "[1, 2, 3]",
+            "{}",
+            r#"{"dshChannel": "beta"}"#,
+            r#"{"dshChannel": "ALPHA"}"#,
+            r#"{"dshChannel": true}"#,
+            r#"{"dshChannel": null}"#,
+        ] {
+            assert_eq!(channel(text), super::Channel::Rc, "for {text:?}");
+        }
+    }
+
+    /// The rc line is published under npm's `latest`, not under `rc`. Spelling
+    /// the stored name into an install would name a tag that does not exist,
+    /// so the two strings are deliberately different and this says so.
+    #[test]
+    fn the_stored_name_is_not_the_npm_tag() {
+        assert_eq!(super::Channel::Rc.as_str(), "rc");
+        assert_eq!(super::Channel::Rc.tag(), "latest");
+        assert_eq!(super::Channel::Alpha.as_str(), "alpha");
+        assert_eq!(super::Channel::Alpha.tag(), "alpha");
     }
 
     /// A key this build does not know about survives a write of one that it

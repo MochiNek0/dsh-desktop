@@ -104,6 +104,36 @@ pub enum Action {
     /// dsh switched language under a document that is not going to load
     /// again; see [`relabel`]. Carries the tag `<html lang>` moved to.
     Locale(String),
+    /// Open the pairing card: a QR code for a phone to scan. See
+    /// [`crate::remote`].
+    Remote,
+    /// Throw one paired device off. Carries the id the card drew it under.
+    RemoteKick(String),
+    /// Throw them all off and change the signing key.
+    RemoteKickAll,
+    /// Replace the nonce on the card with a fresh one.
+    RemoteRefresh,
+    /// Move the gateway to another channel. Carries the one the card asked
+    /// for, already resolved to something this build implements.
+    RemoteChannel(crate::remote::TunnelType),
+    /// Start the channel that is already selected. The way back from a tunnel
+    /// that fell over, and from the idle timer having taken one down.
+    RemoteStart,
+    /// Stop being reachable from the public internet, now. Signalled from the
+    /// card and from the tray.
+    RemoteStopPublic,
+    /// The Cloudflare token and hostname, as typed into the card. Both halves
+    /// or the signal is dropped; see [`mod@crate::remote::cloudflare`].
+    RemoteCloudflare(String, String),
+    /// The card was closed. The gateway stays up; the devices on it are still
+    /// working.
+    RemoteClose,
+    /// The stylesheet-patch box on the card was ticked or unticked. Carries the
+    /// state it is now in, not a request to flip.
+    RemoteStyle(bool),
+    /// The forget-on-exit box on the card was ticked or unticked. Same shape,
+    /// and for the same reason.
+    RemoteForget(bool),
     /// Open the plugin panel on the loading page.
     Plugins,
     /// Install what was ticked in it, and whatever was typed into its box.
@@ -125,6 +155,10 @@ pub enum Action {
     /// whose npm points somewhere of the user's own choosing; see
     /// [`crate::settings::RegistrySource`].
     Registry,
+    /// Move between the release candidates and the alpha line; see
+    /// [`crate::settings::Channel`]. The one row on the card that can end in an
+    /// install, which is why what it opens is a question and not a switch.
+    Channel,
     /// A choice in the runtime chooser; see [`crate::setup`]. The index is the
     /// Node's place in the list the chooser was given.
     SetupUse(usize),
@@ -152,6 +186,11 @@ pub enum Action {
     /// loading page's second button, offered on a dsh that would not come up;
     /// see [`crate::plugins::engage_safe`].
     SafeStart,
+    /// dsh's page saying its plugin boot stopped on a plugin; see
+    /// [`crate::plugins::stall_watch`]. Not a request for anything — the page
+    /// reporting a state this app has no other way to see — so what it leads to
+    /// is a question, and the user is the one who answers it.
+    PluginsStalled(String),
     /// Put them back and restart into them. The menu row that exists only while
     /// [`Action::SafeStart`] is in effect.
     SafeOff,
@@ -184,6 +223,56 @@ pub fn action(url: &Url) -> Option<Action> {
         "autostart" => Some(Action::Autostart),
         "notify-turns" => Some(Action::NotifyTurns),
         "quit" => Some(Action::Quit),
+        "remote" => Some(Action::Remote),
+        // The id is the store's own handle for a device, and it is checked by
+        // being looked for: a forged one names no row and revokes nothing. See
+        // [`crate::remote::session::SessionStore::revoke`].
+        "remote-kick" => url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "id").then(|| value.into_owned()))
+            .filter(|id| !id.is_empty())
+            .map(Action::RemoteKick),
+        "remote-kick-all" => Some(Action::RemoteKickAll),
+        "remote-refresh" => Some(Action::RemoteRefresh),
+        // Parsed into the enum here rather than carried as a string: a name
+        // this build does not implement is not a channel, and the place to
+        // find that out is before anything acts on it.
+        "remote-channel" => url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "to").then(|| value.into_owned()))
+            .and_then(|name| crate::remote::TunnelType::named(&name))
+            .map(Action::RemoteChannel),
+        "remote-start" => Some(Action::RemoteStart),
+        "remote-public-off" => Some(Action::RemoteStopPublic),
+        // The one verb on this channel carrying something that must not be
+        // written down anywhere. It reaches Rust the way every other button
+        // does — a navigation the handler cancels before the webview commits
+        // it — and from here it goes straight into a file only this user can
+        // read. Nothing on this path logs the URL, and this is the reason to
+        // keep it that way: see the note in `perform`.
+        "remote-cloudflare" => {
+            let mut token = None;
+            let mut host = None;
+            for (key, value) in url.query_pairs() {
+                match key.as_ref() {
+                    "token" => token = Some(value.into_owned()),
+                    "host" => host = Some(value.into_owned()),
+                    _ => {}
+                }
+            }
+            Some(Action::RemoteCloudflare(token?, host?))
+        }
+        "remote-close" => Some(Action::RemoteClose),
+        // The state, not a flip: a signal that went missing would otherwise
+        // leave the box and the flag disagreeing until the next click.
+        "remote-style" => url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "on").then(|| value == "1"))
+            .map(Action::RemoteStyle),
+        "remote-forget" => url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "on").then(|| value == "1"))
+            .map(Action::RemoteForget),
         "plugins" => Some(Action::Plugins),
         "plugins-install" => {
             let (ids, spec) = crate::plugins::requested(url);
@@ -206,9 +295,11 @@ pub fn action(url: &Url) -> Option<Action> {
         "setup-quit" => Some(Action::SetupQuit),
         "runtime" => Some(Action::Runtime),
         "registry" => Some(Action::Registry),
+        "channel" => Some(Action::Channel),
         "terminal" => Some(Action::Terminal),
         "restart-dsh" => Some(Action::RestartDsh),
         "safe-start" => Some(Action::SafeStart),
+        "plugins-stalled" => Some(Action::PluginsStalled(said(url))),
         "safe-off" => Some(Action::SafeOff),
         // Not a request for anything: the page saying what it has already
         // done, so the chrome around it can catch up. See [`relabel`].
@@ -275,6 +366,17 @@ fn is_web_link(target: &str) -> bool {
     Url::parse(target).is_ok_and(|target| matches!(target.scheme(), "http" | "https" | "mailto"))
 }
 
+/// The `?said=` the stall report carries: the text of dsh's failure card, which
+/// is where the names of the plugins that did not come up are. Nothing is read
+/// out of it here — [`crate::plugins::blamed`] is what decides what it means,
+/// and an absent or empty one is simply a report with no names in it.
+fn said(url: &Url) -> String {
+    url.query_pairs()
+        .find(|(key, _)| key == "said")
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default()
+}
+
 /// The `?i=` a chooser verb carries: which Node in the list the user picked.
 /// `None` when it is missing or not a number, which leaves the verb to be
 /// ignored rather than acted on with a nonsense index.
@@ -297,6 +399,20 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::Autostart => return crate::toggle_autostart(app),
         Action::NotifyTurns => return crate::toggle_notify_turns(app),
         Action::Quit => return crate::quit(app),
+        Action::Remote => return crate::remote::open(app),
+        Action::RemoteKick(id) => return crate::remote::kick(app, &id),
+        Action::RemoteKickAll => return crate::remote::kick_all(app),
+        Action::RemoteRefresh => return crate::remote::refresh(app),
+        Action::RemoteChannel(kind) => return crate::remote::channel(app, kind),
+        Action::RemoteStart => return crate::remote::start_channel(app),
+        Action::RemoteStopPublic => return crate::remote::stop_public(app),
+        // Not logged, and not traced. See the parser for this verb.
+        Action::RemoteCloudflare(token, host) => {
+            return crate::remote::cloudflare(app, &token, &host)
+        }
+        Action::RemoteClose => return crate::remote::close(app),
+        Action::RemoteStyle(on) => return crate::remote::style(app, on),
+        Action::RemoteForget(on) => return crate::remote::forget_on_exit(app, on),
         Action::Locale(tag) => return crate::switch_language(app, &tag),
         Action::Plugins => return crate::open_plugins(app),
         Action::PluginsInstall(ids, spec) => return crate::install_plugins(app, ids, spec),
@@ -323,8 +439,10 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::SetupQuit => return crate::setup::answered(crate::setup::Choice::Quit),
         Action::Runtime => return crate::open_runtime(app),
         Action::Registry => return crate::open_registry(app),
+        Action::Channel => return crate::open_channel(app),
         Action::RestartDsh => return crate::restart_dsh(app, false),
         Action::SafeStart => return crate::safe_start(app),
+        Action::PluginsStalled(said) => return crate::plugins_stalled(app, &said),
         Action::SafeOff => return crate::safe_off(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),
         Action::Signal(signal) => return crate::signal::act(app, signal),
@@ -420,10 +538,10 @@ pub fn sync_notify(app: &AppHandle) {
     let call = notify_call(
         crate::settings::notifications(app),
         crate::plugins::signalling(app),
-        if crate::plugins::safe(app) {
+        if crate::plugins::signal_set_aside(app) {
             t!(
-                "这次启动没有加载任何插件，「会话信号」也在内。用菜单里的「重新加载插件」装回来。",
-                "This launch loaded no plugins, Session signals included. Use “Load plugins again” in the menu to bring them back."
+                "「会话信号」这次被搁置了。用菜单里的「重新加载插件」装回来。",
+                "Session signals is one of the plugins set aside this launch. Use “Load plugins again” in the menu to bring it back."
             )
         } else {
             t!(
@@ -446,14 +564,37 @@ pub fn sync_notify(app: &AppHandle) {
 /// loading none of them today with nothing on screen saying so except a menu
 /// item that reads as an action rather than a state.
 pub fn sync_safe(app: &AppHandle) {
-    let call = safe_call(
-        crate::plugins::safe(app),
-        t!("插件未加载", "No plugins loaded"),
-        t!(
-            "这次启动没有加载任何插件。点它把插件装回 profile，并重启 dsh。",
-            "This launch loaded no plugins. This puts them back into the profile and restarts dsh."
-        ),
-    );
+    // Two launches to tell apart, because the label is a statement of fact and
+    // the partial one would otherwise be a false one: a repair aimed at a single
+    // plugin leaves the rest loading. The count rather than the names -- the
+    // label sits in the titlebar, and a list does not fit there; the names are
+    // in the hint, which is where there is room for them.
+    let aside = crate::plugins::set_aside(app);
+    let (label, hint) = if crate::plugins::partial(app) {
+        (
+            t!(
+                "已搁置 {} 个插件",
+                "{} plugin(s) set aside",
+                aside.len()
+            ),
+            t!(
+                "这次启动搁置了这些插件（{}），其余照常加载。点它把它们装回 profile，并重启 dsh。",
+                "These plugins are set aside this launch ({}); the rest loaded as usual. This puts them back into the profile and restarts dsh.",
+                aside.join(" ")
+            ),
+        )
+    } else {
+        (
+            t!("插件未加载", "No plugins loaded").to_string(),
+            t!(
+                "这次启动没有加载任何插件。点它把插件装回 profile，并重启 dsh。",
+                "This launch loaded no plugins. This puts them back into the profile and restarts dsh."
+            )
+            .to_string(),
+        )
+    };
+
+    let call = safe_call(crate::plugins::safe(app), &label, &hint);
     eval(app, &call);
 }
 
@@ -515,6 +656,11 @@ pub(crate) fn eval(app: &AppHandle, call: &str) {
 /// whole titlebar with it.
 fn labels() -> String {
     let labels = [
+        // Not a menu row: the one button beside the menu, whose label is its
+        // tooltip. It is here because this is where the app's two languages
+        // live, and a string drawn in the titlebar is no more exempt from that
+        // than a row in the panel below it.
+        ("remote", t!("手机连接…", "Connect a phone…")),
         ("plugins", t!("插件…", "Plugins…")),
         ("terminal", t!("打开终端", "Open a terminal")),
         ("restart-dsh", t!("重启 dsh", "Restart dsh")),
@@ -530,6 +676,9 @@ fn labels() -> String {
         ("settings-done", t!("关闭", "Close")),
         ("runtime", t!("运行环境…", "Runtime…")),
         ("registry", t!("安装源…", "Install source…")),
+        // "版本通道" rather than "测试版": the row is not a switch that turns a
+        // beta on, it is a choice between two lines that are both released.
+        ("channel", t!("版本通道…", "Release channel…")),
         ("check-app", t!("检查应用更新…", "Check for app updates…")),
         ("autostart", t!("开机自启动", "Start at login")),
         // Not "Notify when a turn finishes": the switch behind it gates every
@@ -569,6 +718,14 @@ fn notes() -> String {
             t!(
                 "dsh 从哪个 npm 源安装和更新。",
                 "The npm registry dsh is installed and updated from."
+            ),
+        ),
+        (
+            "channel",
+            t!(
+                "用稳定的 rc 版，还是跑在前面的 alpha 版。切之前先备份数据。",
+                "The steady rc line, or the alpha that runs ahead of it. \
+                 Back your data up before switching."
             ),
         ),
         (
@@ -673,6 +830,8 @@ pub(crate) fn lucide() -> &'static str {
       '6l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/>',
     user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>' +
       '<circle cx="12" cy="7" r="4"/>',
+    smartphone: '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/>' +
+      '<path d="M12 18h.01"/>',
     package: '<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0' +
       '-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/>' +
       '<path d="M12 22V12"/><polyline points="3.29 7 12 12 20.71 7"/>' +
@@ -883,6 +1042,9 @@ pub fn script() -> String {
     // Where dsh is fetched from, which is only ever a question on a machine
     // whose npm is pointed somewhere of the user's own; see `settings.rs`.
     {{ verb: 'registry' }},
+    // Which line of dsh releases, right below where they come from: the two
+    // rows are the same question asked about a source and about a version.
+    {{ verb: 'channel' }},
     {{ verb: 'autostart', check: true }},
     {{ verb: 'notify-turns', check: true }},
     // The way out that is visible. Escape and the scrim close it too, and
@@ -896,6 +1058,16 @@ pub fn script() -> String {
   // dots and were drawn two pixels wider than them, so the one thing in the
   // bar that is not a window control was the largest thing in it.
   var MENU_GLYPH = lucide('menu', 12);
+
+  // The one button in the bar that is not a window control and not the menu.
+  // It sits to the menu's right because that is the only other place in this
+  // strip that is reliably empty, and it is a button rather than a menu row
+  // because what it opens is a thing you do — see `remote`.
+  //
+  // Written with a `verb:` the way the menu's rows are, so that the label check
+  // in controls.rs's tests counts it like the rest of them.
+  var PHONE = {{ verb: 'remote' }};
+  var PHONE_GLYPH = lucide('smartphone', 13);
 
 
   // On every row of the settings card that opens something else. It was a `›`
@@ -1062,6 +1234,10 @@ pub fn script() -> String {
       '.dsh-wc button.dsh-wc-menu:hover,.dsh-wc button.dsh-wc-menu.dsh-wc-shown{{' +
       'background:var(--dsh-wc-hover);color:var(--dsh-wc-fg-hi)}}' +
       '.dsh-wc button.dsh-wc-menu:active{{filter:none}}' +
+      // Beside the menu rather than away from it: the gap before the menu is
+      // there to keep the magnification off the green dot, and there is no dot
+      // on this side to keep clear of.
+      '.dsh-wc button.dsh-wc-phone{{margin-left:2px}}' +
       // The panel. `visibility` rather than `display` so the fade has something
       // to fade, with its own transition delayed until the opacity is done.
       '.dsh-wc-pop{{position:absolute;top:calc(100% - 3px);left:0;min-width:184px;' +
@@ -1251,6 +1427,19 @@ pub fn script() -> String {
     opener.className = 'dsh-wc-menu';
     opener.innerHTML = MENU_GLYPH;
     bar.appendChild(opener);
+
+    // ------------------------------------------------------------ the phone --
+
+    var phone = document.createElement('button');
+    phone.type = 'button';
+    phone.className = 'dsh-wc-menu dsh-wc-phone';
+    phone.innerHTML = PHONE_GLYPH;
+    phone.title = LABELS[PHONE.verb] || '';
+    phone.setAttribute('aria-label', phone.title);
+    phone.addEventListener('click', function () {{
+      signal(PHONE.verb);
+    }});
+    bar.appendChild(phone);
 
     var safe = document.createElement('div');
     safe.className = 'dsh-wc-safe';
@@ -1774,7 +1963,7 @@ mod tests {
             .next()
             .expect("the script declares both lists");
 
-        for verb in ["runtime", "registry", "autostart", "notify-turns"] {
+        for verb in ["runtime", "registry", "channel", "autostart", "notify-turns"] {
             let row = format!("verb: '{verb}'");
             assert!(!menu.contains(&row), "{verb} is still drawn into the menu");
             assert!(script.contains(&row), "{verb} is on neither list");

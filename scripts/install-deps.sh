@@ -43,6 +43,10 @@ MODE=''
 PREFIX=''
 NODE_EXE=''
 REGISTRY=''
+# The release line to install from. `rc` is what an install with no flag has
+# always taken, and has to stay the default: nothing but an explicit answer may
+# put anyone onto the alpha line. See `-Channel` below.
+CHANNEL='rc'
 REMOVE_DSH=0
 REMOVE_NODE=0
 PROGRESS=0
@@ -85,6 +89,18 @@ while [ $# -gt 0 ]; do
             esac
             shift 2
             ;;
+        # Which line of dsh releases to install: the release candidates, or the
+        # alpha that runs ahead of them. The app stores the answer and passes it
+        # on every mode that fetches -- see `settings.rs` and `run` in
+        # `src-tauri/src/dsh.rs`.
+        -Channel)
+            [ $# -ge 2 ] || { echo "-Channel 后面要跟 rc 或 alpha" >&2; exit 2; }
+            case $2 in
+                rc|alpha) CHANNEL=$2 ;;
+                *) echo "-Channel 只认 rc 或 alpha，收到的是：$2" >&2; exit 2 ;;
+            esac
+            shift 2
+            ;;
         -RemoveDsh) REMOVE_DSH=1; shift ;;
         -RemoveNode) REMOVE_NODE=1; shift ;;
         -Progress) PROGRESS=1; shift ;;
@@ -110,6 +126,12 @@ case "$MODE" in
 esac
 
 PACKAGE='@deepseek-ai/dsh'
+
+# The npm dist-tag `-Channel` names. Not the same word: the release candidates
+# are published under `latest`, not under `rc`, and `@deepseek-ai/dsh@rc` is a
+# tag that does not exist. `Channel::tag` in `src-tauri/src/settings.rs` holds
+# the other half of this mapping and a test pins the two together.
+if [ "$CHANNEL" = alpha ]; then TAG=alpha; else TAG=latest; fi
 
 # dsh forwards plugin installs to pnpm, so a machine running dsh ends up with one
 # too — installed on demand by `ensure_pnpm` in `plugins.rs`, into whichever
@@ -791,6 +813,26 @@ find_prefix() {
     printf '%s' "$APP_DIR/npm"
 }
 
+# What npm said about the install that just failed: its `code`, and the first
+# line of detail printed under it. Files rather than variables for the same
+# reason the exit code is one -- the reader below is the tail of a pipeline, so
+# a shell of its own, and nothing it sets survives it.
+NPM_CODE_FILE="$APP_DIR/.npm-code"
+NPM_SAID_FILE="$APP_DIR/.npm-said"
+
+# The `code` values that mean npm reached the registry, read what it serves and
+# refused it: a version range nothing published satisfies, a dependency graph
+# that cannot be built. Those are verdicts on the package rather than on the
+# source, and the sources all serve the same metadata -- what is installed here
+# is a dist-tag and never a pinned version, so a mirror still catching up
+# resolves the tag to an older release and installs it rather than answering
+# ETARGET. Walking the rest of the list buys nothing but the user's time and
+# ends in a message about the network, which is the one thing that was working.
+#
+# `E404` is deliberately not on the list: that one says this registry does not
+# have the package at all, which is exactly what another registry can fix.
+RESOLUTION_ERRORS='ETARGET ERESOLVE'
+
 # One `npm install -g`, from one registry. npm's http log is read as it goes:
 # every tarball that comes back moves the bar, which is the only progress signal
 # npm offers that means anything.
@@ -807,13 +849,13 @@ npm_install() {
 
     code_file="$APP_DIR/.npm-exit"
     mkdir -p "$APP_DIR"
-    rm -f "$code_file"
+    rm -f "$code_file" "$NPM_CODE_FILE" "$NPM_SAID_FILE"
 
     set -- "$cli" install -g --prefix "$prefix" --no-audit --no-fund --loglevel=http
     if [ -n "$registry" ]; then
         set -- "$@" "--registry=$registry"
     fi
-    set -- "$@" "$PACKAGE@latest"
+    set -- "$@" "$PACKAGE@$TAG"
 
     {
         # stdin off the null device, not inherited: the caller's loop is reading
@@ -844,6 +886,22 @@ npm_install() {
                     fi
                     report "$percent"
                     ;;
+                # npm 10.6 and up spell it `npm error`; everything older
+                # `npm ERR!`. The npm running this is the user's, so both. The
+                # code comes first in npm's output, which is why its two
+                # patterns sit above the ones that take the line under it.
+                'npm error code '*)
+                    [ -f "$NPM_CODE_FILE" ] || printf '%s\n' "${line#npm error code }" > "$NPM_CODE_FILE"
+                    ;;
+                'npm ERR! code '*)
+                    [ -f "$NPM_CODE_FILE" ] || printf '%s\n' "${line#npm ERR! code }" > "$NPM_CODE_FILE"
+                    ;;
+                'npm error '*)
+                    [ -f "$NPM_SAID_FILE" ] || printf '%s\n' "${line#npm error }" > "$NPM_SAID_FILE"
+                    ;;
+                'npm ERR! '*)
+                    [ -f "$NPM_SAID_FILE" ] || printf '%s\n' "${line#npm ERR! }" > "$NPM_SAID_FILE"
+                    ;;
             esac
         done
     }
@@ -854,6 +912,10 @@ npm_install() {
 }
 
 # Install through the fastest registry that works.
+#
+# Non-zero with `$NPM_CODE_FILE` written means npm refused the install rather
+# than failed to reach anything. `install_failure` is what turns that into
+# something worth telling the user.
 install_package() {
     node=$1
     cli=$2
@@ -873,12 +935,53 @@ install_package() {
             say "dsh 安装完成（$label）。"
             return 0
         fi
+
+        # npm read the registry and turned down what it found. See
+        # `$RESOLUTION_ERRORS`: the rest of the list would turn it down the same
+        # way, so the walk stops here and the code travels out to be reported.
+        code=$(cat "$NPM_CODE_FILE" 2>/dev/null)
+        if [ -n "$code" ]; then
+            case " $RESOLUTION_ERRORS " in
+                *" $code "*)
+                    say "npm 拒绝了这次安装（$code），换一个源也是同样的结果，不再重试。"
+                    return 1
+                    ;;
+            esac
+        fi
         say "从 $label 安装失败，换下一个源重试。"
     done <<SOURCES
 $sources
 SOURCES
 
     return 1
+}
+
+# What to tell the user when `install_package` gave up, given what it was trying
+# to do -- `$1`, a finished sentence.
+#
+# Every one of these messages used to end in a guess at the network, and that
+# guess is wrong every time npm failed on the package rather than on the
+# connection: the kind of wrong that sends someone into their proxy settings for
+# an afternoon. npm's own verdict replaces it when there is one.
+#
+# One line and no newlines in it: this ends up behind `::error ` on a single
+# line of the script's output, which is how `run` in `dsh.rs` reads it back.
+install_failure() {
+    code=$(cat "$NPM_CODE_FILE" 2>/dev/null)
+    if [ -z "$code" ]; then
+        printf '%s 已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。' "$1"
+        return 0
+    fi
+
+    said=$(cat "$NPM_SAID_FILE" 2>/dev/null)
+    [ -n "$said" ] || said='（npm 没有说明原因）'
+    case " $RESOLUTION_ERRORS " in
+        *" $code "*)
+            printf '%s npm 报错 %s：%s 源是通的，装不上的是这个版本本身，换源或改代理都没有用。' "$1" "$code" "$said"
+            return 0
+            ;;
+    esac
+    printf '%s npm 报错 %s：%s' "$1" "$code" "$said"
 }
 
 # ---------------------------------------------------------------------- path --
@@ -998,7 +1101,7 @@ update_all() {
 
     step '正在更新 dsh…' 0
     if ! install_package "$node" "$cli" "$prefix" 0 "$PROGRESS_CEILING"; then
-        fail 'dsh 更新失败，默认源和几个备用镜像都没有成功。'
+        fail "$(install_failure 'dsh 更新失败。')"
     fi
     step 'dsh 更新完成。' 100
 }
@@ -1422,7 +1525,7 @@ install_dsh_into() {
 
     step '正在下载 dsh，约 185 MB，请耐心等待…' 0
     if ! install_package "$NODE_EXE" "$cli" "$prefix" 0 "$PROGRESS_CEILING"; then
-        fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
+        fail "$(install_failure 'dsh 下载失败。')"
     fi
 
     remove_path
@@ -1456,7 +1559,7 @@ install_node_and_dsh() {
     prefix=$(find_prefix "$node" "$cli")
     step '正在下载 dsh，约 185 MB，请耐心等待…' 36
     if ! install_package "$node" "$cli" "$prefix" 36 "$PROGRESS_CEILING"; then
-        fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
+        fail "$(install_failure 'dsh 下载失败。')"
     fi
 
     M_DSH=managed

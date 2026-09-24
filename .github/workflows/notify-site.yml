@@ -9,11 +9,19 @@
 # that push.
 #
 # ── Why this is not a step in release.yml ───────────────────────────────
-# That workflow only ever creates a *draft* release, on purpose. The site's
+# A stable release leaves that workflow as a *draft*, on purpose. The site's
 # sync script ignores drafts and prereleases — as it should, since the updater
 # endpoint points at `releases/latest` — so a dispatch sent from the bundle job
 # would find nothing to sync and would never fire again. The moment that
 # matters is someone pressing Publish, which is what `release: published` is.
+#
+# A beta does leave that workflow published, as a prerelease — and still does
+# not arrive here. It is `tauri-action` that publishes it, with `GITHUB_TOKEN`,
+# and an event raised by that token starts no workflow run; v0.1.20-beta.0 went
+# public and this file did not run at all, not even to skip. A stable release
+# reaches us only because the Publish at the end of it is a person pressing a
+# button. The guard on the job below is therefore for the other way in — a
+# prerelease published by hand, which does raise the event.
 #
 # ── What has to be configured, once ────────────────────────────────────
 # In this repository's Settings → Secrets and variables → Actions:
@@ -52,6 +60,11 @@ permissions: {}
 
 jobs:
   dispatch:
+    # A prerelease is a beta, and the site's sync script passes over those, so
+    # the dispatch would buy a rebuild that changes nothing on the page. On a
+    # run started by hand there is no release in the event at all, which leaves
+    # this true and keeps the re-send working.
+    if: github.event.release.prerelease != true
     runs-on: ubuntu-latest
     steps:
       - name: ask the site to resync
