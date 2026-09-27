@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn reads_what_an_approval_is_about() {
         let Some(Signal::Wait { tool, reason, .. }) = read(
-            "event=wait&session=s1&kind=approval&key=k1             &tool=bash&reason=It%20wants%20to%20delete%20build%2F.",
+            "event=wait&session=s1&kind=approval&key=k1&tool=bash&reason=It%20wants%20to%20delete%20build%2F.",
         ) else {
             panic!("a wait");
         };

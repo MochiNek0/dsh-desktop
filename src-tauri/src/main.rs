@@ -1794,33 +1794,36 @@ fn plugins_stalled(app: &tauri::AppHandle, said: &str) {
 fn stall_question(blamed: &[String]) -> String {
     if blamed.is_empty() {
         return t!(
-            "dsh 起来了，但它的插件里有没能激活的，于是整个页面停在了那张卡片上。
-
-             卡片上没有报出是哪一个，所以只能先把插件全部停用再启动一次，             进去之后在插件面板里排查。其余的插件会记下来，退出安全模式时装回去。",
-            "dsh started, but a plugin never activated, and that leaves the whole              page on that card.
-
-The card did not name one this app recognises, so              the only repair left is to start again with every plugin set aside and              work it out from the plugin panel. They are written down and go back on              when you leave safe mode."
+            "dsh 起来了，但它的插件里有没能激活的，于是整个页面停在了那张卡片上。\n\n\
+             卡片上没有报出是哪一个，所以只能先把插件全部停用再启动一次，\
+             进去之后在插件面板里排查。其余的插件会记下来，退出安全模式时装回去。",
+            "dsh started, but a plugin never activated, and that leaves the whole \
+             page on that card.\n\n\
+             The card did not name one this app recognises, so the only repair \
+             left is to start again with every plugin set aside and work it out \
+             from the plugin panel. They are written down and go back on when \
+             you leave safe mode."
         )
         .to_string();
     }
 
     t!(
-        "dsh 起来了，但这个插件没能激活，于是整个页面停在了那张卡片上：
-
-{}
-
-         这不是 dsh 本身的问题，是这个插件要的东西这个版本没有。
-
-         可以只把它停用再启动一次，别的插件照常加载。它本来就没在工作，         所以停掉它不会少什么。之后在插件面板里更新或卸载它；         想把它装回来，用菜单里的「重新加载插件」。",
-        "dsh started, but this plugin never activated, and that leaves the whole          page on that card:
-
-{}
-
-This is not dsh itself — it is that plugin          asking for something this version does not have.
-
-The app can start          again with just that one set aside, and everything else loading as          usual. It was not working anyway, so nothing is lost by it. You can then          update or remove it from the plugin panel; “Load plugins again” in the          menu puts it back.",
-        blamed.join("
-")
+        "dsh 起来了，但这个插件没能激活，于是整个页面停在了那张卡片上：\n\n\
+         {}\n\n\
+         这不是 dsh 本身的问题，是这个插件要的东西这个版本没有。\n\n\
+         可以只把它停用再启动一次，别的插件照常加载。它本来就没在工作，\
+         所以停掉它不会少什么。之后在插件面板里更新或卸载它；\
+         想把它装回来，用菜单里的「重新加载插件」。",
+        "dsh started, but this plugin never activated, and that leaves the whole \
+         page on that card:\n\n\
+         {}\n\n\
+         This is not dsh itself — it is that plugin asking for something this \
+         version does not have.\n\n\
+         The app can start again with just that one set aside, and everything \
+         else loading as usual. It was not working anyway, so nothing is lost \
+         by it. You can then update or remove it from the plugin panel; \
+         “Load plugins again” in the menu puts it back.",
+        blamed.join("\n")
     )
 }
 

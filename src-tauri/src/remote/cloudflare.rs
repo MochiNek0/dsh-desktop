@@ -96,6 +96,9 @@ pub struct CloudflareTunnel {
     /// and a shared one would let it write a `Failed` from the old process over
     /// the `Starting` of the new one.
     state: Arc<Mutex<TunnelState>>,
+    /// Told when `cloudflared` exits on its own, which nothing the user did is
+    /// waiting to redraw. `None` in the tests. See [`super::fell`].
+    app: Option<AppHandle>,
 }
 
 impl CloudflareTunnel {
@@ -115,6 +118,7 @@ impl CloudflareTunnel {
             #[cfg(windows)]
             job: None,
             state: Arc::new(Mutex::new(TunnelState::Stopped)),
+            app: app.cloned(),
         }
     }
 
@@ -136,6 +140,7 @@ impl CloudflareTunnel {
             state: Arc::new(Mutex::new(TunnelState::Running {
                 base_url: format!("https://{hostname}"),
             })),
+            app: None,
         }
     }
 
@@ -145,6 +150,9 @@ impl CloudflareTunnel {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        // Before the kill, so that the reader sees a stop it was asked for and
+        // not a process that fell over. See [`watch`].
+        *self.state.lock().unwrap() = TunnelState::Stopped;
         let _ = child.kill();
         // Waited for, not abandoned: on Windows the job object below is only
         // released once every process in it is gone, and on Unix an unreaped
@@ -207,7 +215,7 @@ impl RemoteTunnel for CloudflareTunnel {
 
         let state = Arc::new(Mutex::new(TunnelState::Starting));
         if let Some(stderr) = child.stderr.take() {
-            watch(stderr, state.clone(), account);
+            watch(stderr, state.clone(), account, self.app.clone());
         }
 
         self.state = state;
@@ -310,7 +318,12 @@ impl Drop for CloudflareTunnel {
 /// replaced by a placeholder, an exact substitution because the token is a
 /// string this app has in its hand — so that a failure can say something more
 /// useful than "it did not work".
-fn watch(stderr: std::process::ChildStderr, state: Arc<Mutex<TunnelState>>, account: Account) {
+fn watch(
+    stderr: std::process::ChildStderr,
+    state: Arc<Mutex<TunnelState>>,
+    account: Account,
+    app: Option<AppHandle>,
+) {
     std::thread::spawn(move || {
         let Account { token, hostname } = account;
         let mut last = String::new();
@@ -337,7 +350,12 @@ fn watch(stderr: std::process::ChildStderr, state: Arc<Mutex<TunnelState>>, acco
         }
         let was_up = matches!(*held, TunnelState::Running { .. });
         *held = TunnelState::Failed(reason(was_up, &last));
+        drop(held);
         eprintln!("dsh-desktop: the cloudflare tunnel stopped");
+
+        if let Some(app) = app {
+            super::fell(&app);
+        }
     });
 }
 
@@ -602,6 +620,7 @@ mod tests {
             #[cfg(windows)]
             job: None,
             state: Arc::new(Mutex::new(TunnelState::Starting)),
+            app: None,
         };
 
         assert!(tunnel.authorities().is_empty());

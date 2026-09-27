@@ -604,7 +604,8 @@ fn redirect(target: &str, cookie: Option<&str>, secure: bool) -> Response<Body> 
         response = response.header(
             SET_COOKIE,
             format!(
-                "{DEVICE_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Lax;                  Max-Age={COOKIE_MAX_AGE}{}",
+                "{DEVICE_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Lax; \
+                 Max-Age={COOKIE_MAX_AGE}{}",
                 if secure { "; Secure" } else { "" }
             ),
         );
@@ -688,8 +689,11 @@ fn moved() -> Response<Body> {
             "This computer moved to another channel"
         ),
         t!(
-            "手机用的还是原来的地址，而电脑现在从另一个通道对外，配对是跟着地址走的。             回到电脑上打开「手机连接」，扫一下新的二维码——换回原来的通道，这个地址就又能用了。",
-            "The phone is still on the old address, and this computer now publishes another              one; a pairing follows the address. Open Connect a phone on the computer and scan              the new code — or switch the channel back, and this address works again."
+            "手机用的还是原来的地址，而电脑现在从另一个通道对外，配对是跟着地址走的。\
+             回到电脑上打开「手机连接」，扫一下新的二维码——换回原来的通道，这个地址就又能用了。",
+            "The phone is still on the old address, and this computer now publishes another \
+             one; a pairing follows the address. Open Connect a phone on the computer and scan \
+             the new code — or switch the channel back, and this address works again."
         ),
     )
 }

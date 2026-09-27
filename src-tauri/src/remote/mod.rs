@@ -797,6 +797,23 @@ pub fn stop_public(app: &AppHandle) {
     });
 }
 
+/// `cloudflared` exited without being asked to.
+///
+/// Nothing the user did is waiting on a redraw, so without this the tray goes
+/// on saying the machine is on the internet, and an open card goes on showing a
+/// QR code for a tunnel that is gone. Redrawn through [`present`], which puts
+/// the reason on the card and refreshes the tray on the way.
+fn fell(app: &AppHandle) {
+    let Some(remote) = app.try_state::<Remote>() else {
+        return;
+    };
+    if remote.card.load(Ordering::Relaxed) {
+        present(app, &remote, Ok(()));
+    } else {
+        crate::refresh_tray(app);
+    }
+}
+
 /// The hostname this machine is answering on from the public internet, if it
 /// is answering on one.
 ///

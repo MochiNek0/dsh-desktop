@@ -272,7 +272,8 @@ fn stage_bundled(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     let source = bundled(app, name).ok_or_else(|| {
         t!(
             "{} 应该随这个应用一起装上的，但它不在安装目录里。重新安装一次应用能把它带回来。",
-            "{} ships inside this app, and it is not in the installation directory.              Reinstalling the app puts it back.",
+            "{} ships inside this app, and it is not in the installation directory. \
+             Reinstalling the app puts it back.",
             name
         )
     })?;
