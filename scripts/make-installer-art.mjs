@@ -21,9 +21,10 @@
 // bundle has them — and directly as `node scripts/make-installer-art.mjs`.
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { inflateSync } from "node:zlib";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { readPng } from "./png.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const out = join(root, "src-tauri", "installer");
@@ -109,78 +110,6 @@ function glow(image, cx, cy, radius, colour, strength) {
   }
 }
 
-/**
- * The app icon, decoded.
- *
- * The whale is drawn once, in `src-tauri/icons`, and that is the copy used
- * here: its colours, its antialiasing and its proportions, rather than a second
- * whale transcribed into this file that would drift from it the moment the icon
- * changed. `icon.png` is the largest of them, so scaling it down loses nothing.
- *
- * Just enough PNG for the files in that directory: 8-bit truecolour with or
- * without alpha, uncompressed row filters, no interlacing. Anything else throws
- * rather than drawing something wrong.
- */
-function readPng(path) {
-  const buffer = readFileSync(path);
-  let at = 8;
-  let width = 0;
-  let height = 0;
-  let channels = 0;
-  const parts = [];
-
-  while (at < buffer.length) {
-    const length = buffer.readUInt32BE(at);
-    const type = buffer.toString("ascii", at + 4, at + 8);
-    const body = buffer.subarray(at + 8, at + 8 + length);
-
-    if (type === "IHDR") {
-      width = body.readUInt32BE(0);
-      height = body.readUInt32BE(4);
-      const depth = body[8];
-      const colour = body[9];
-      if (depth !== 8 || (colour !== 2 && colour !== 6)) {
-        throw new Error(`${path}: unsupported PNG (depth ${depth}, colour ${colour})`);
-      }
-      if (body[12] !== 0) throw new Error(`${path}: interlaced PNG`);
-      channels = colour === 6 ? 4 : 3;
-    } else if (type === "IDAT") {
-      parts.push(body);
-    } else if (type === "IEND") {
-      break;
-    }
-    at += 12 + length;
-  }
-
-  const raw = inflateSync(Buffer.concat(parts));
-  const stride = width * channels;
-  const pixels = Buffer.alloc(height * stride);
-
-  // Undo the per-row filters; see the PNG specification, section 9.
-  for (let y = 0; y < height; y++) {
-    const filter = raw[y * (stride + 1)];
-    const line = raw.subarray(y * (stride + 1) + 1, y * (stride + 1) + 1 + stride);
-    for (let x = 0; x < stride; x++) {
-      const a = x >= channels ? pixels[y * stride + x - channels] : 0;
-      const b = y > 0 ? pixels[(y - 1) * stride + x] : 0;
-      const c = x >= channels && y > 0 ? pixels[(y - 1) * stride + x - channels] : 0;
-      let value = line[x];
-      if (filter === 1) value += a;
-      else if (filter === 2) value += b;
-      else if (filter === 3) value += (a + b) >> 1;
-      else if (filter === 4) {
-        const p = a + b - c;
-        const pa = Math.abs(p - a);
-        const pb = Math.abs(p - b);
-        const pc = Math.abs(p - c);
-        value += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
-      }
-      pixels[y * stride + x] = value & 0xff;
-    }
-  }
-
-  return { width, height, channels, pixels };
-}
 
 /**
  * Draw the icon into `image`, `size` pixels square.

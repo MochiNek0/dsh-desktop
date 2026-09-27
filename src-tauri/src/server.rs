@@ -29,7 +29,7 @@ use std::os::unix::process::CommandExt;
 
 /// Keeps a spawned process off the console it would otherwise pop up.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// How many output lines to keep around for the failure message.
 const TAIL_LINES: usize = 30;
@@ -393,6 +393,13 @@ pub struct Job(windows_sys::Win32::Foundation::HANDLE);
 // created it, so moving it into the `Server` another thread may drop is fine.
 #[cfg(windows)]
 unsafe impl Send for Job {}
+
+// SAFETY: and sharing a reference is safe for the same reason plus one more —
+// the handle is never dereferenced and never handed out, so a `&Job` gives a
+// thread access to nothing at all. `CloudflareTunnel` holds one behind the
+// `Sync` bound on `RemoteTunnel`; see `remote::cloudflare`.
+#[cfg(windows)]
+unsafe impl Sync for Job {}
 
 #[cfg(windows)]
 impl Job {

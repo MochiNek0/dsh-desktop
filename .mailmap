@@ -1,0 +1,15 @@
+# One person, two accounts. The repository is MochiNek0's, so that identity is
+# the canonical one and the other maps onto it.
+#
+# This is here for a reason beyond a tidy `git shortlog`. The app is AGPL-3.0
+# (see LICENSE), and a relicence is only the copyright holders' to make -- so
+# "every commit in this history is by one person" is a claim someone may need
+# to check, and a log that appears to list two contributors is the thing that
+# would make them doubt it. Mapped by email alone, so it holds for commits
+# under either display name.
+#
+# `GitHub <noreply@github.com>` is deliberately not mapped: it is the committer
+# on merges made through the web UI, not an author, and rewriting it would
+# hide who actually pressed the button.
+
+MochiNek0 <mochinekoiiiiii@gmail.com> <bill.zhu@vibe.us>

@@ -13,7 +13,7 @@ DeepSeek Harness (`dsh web`) 的跨平台桌面客户端
 ![QQ 群](https://img.shields.io/badge/QQ群-1125671315-12B7F5?logo=tencentqq&logoColor=white)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
 
 <br/>
 <br/>
@@ -85,4 +85,8 @@ npm run build   # 构建发布包，输出至 src-tauri/target/release/bundle/
 
 ## 许可证
 
-[MIT](LICENSE)
+本项目采用 [GNU AGPL-3.0](LICENSE)。Copyright © 2026 MochiNek0。
+
+本项目此前采用 MIT，自本次变更后的版本起改为 AGPL-3.0。原因是加入手机远程连接之后，这个应用能把一台有完整终端执行权的机器接到网络上，将来还会有中继。AGPL 的用意是，任何人基于它改出来的版本——包括作为网络服务提供给别人的那种——也必须把源码交出来。**v0.1.19 及更早的已发布版本仍然是 MIT**，那份授权不可撤销。
+
+`plugin/`（dsh 插件 `dsh-desktop-signal`）单独保留 [MIT](plugin/LICENSE)。它会装进你自己的 dsh profile，和一堆与本项目无关的包躺在同一个 `node_modules` 里，不该把 copyleft 传染给那边。

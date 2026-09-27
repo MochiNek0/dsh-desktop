@@ -6,6 +6,23 @@
 # updater endpoint points at `releases/latest`, which a published release starts
 # serving to every installed copy the moment it appears.
 #
+# ── Betas ───────────────────────────────────────────────────────────────
+# A tag carrying a prerelease suffix — `v0.1.20-beta.1` — takes the other path:
+# it is published straight away, as a GitHub *prerelease*. That is safe for the
+# same reason the draft is necessary. `releases/latest` resolves to the newest
+# release that is neither a draft nor a prerelease, so a prerelease is invisible
+# to every installed copy and there is nothing for a look to catch; drafting one
+# would only hide it from the testers it exists for, since a draft is visible to
+# collaborators and to no one else.
+#
+# Nothing has to carry a beta machine back to stable, either. The updater
+# compares with semver, and semver puts `0.1.20-beta.1` above `0.1.19` and below
+# `0.1.20`: such a machine is offered nothing while the feed still says 0.1.19,
+# and rejoins the stable channel by itself the day 0.1.20 is published.
+#
+#   npm version prerelease --preid beta   # 0.1.19 -> 0.1.20-beta.0, then .1, …
+#   npm version patch                     # -> 0.1.20, the stable one
+#
 # What has to be configured for this to work, once, in the repository's
 # Settings → Secrets and variables → Actions:
 #
@@ -245,7 +262,11 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: dsh desktop ${{ github.ref_name }}
-          releaseDraft: true
+          # A `-` in a tag is a semver prerelease suffix and nothing else — the
+          # stable tags are `v0.1.19`. See the note at the top for why a beta is
+          # published where a stable release is drafted.
+          releaseDraft: ${{ !contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
           # Merged across the matrix, so the file the updater fetches carries an
           # entry for every platform rather than whichever job finished last.
           includeUpdaterJson: true

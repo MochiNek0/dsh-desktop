@@ -1,0 +1,26 @@
+# What the dev watcher must not restart the app over.
+#
+# `beforeDevCommand` is `npm run bundle:runtime`, and that script writes into
+# two directories inside this one: `resources/`, where the bootstrap scripts and
+# the client plugin are staged, and `installer/`, where the NSIS bitmaps are
+# drawn. Both are rewritten unconditionally on every run — a copy rather than a
+# comparison, deliberately, so that a stale copy of the thing that installs
+# everything else cannot happen.
+#
+# The watcher sees those writes as source changes and rebuilds. So `npm run dev`
+# opened the app, then closed it and opened it again, once per staged directory,
+# every single time. `tauri build` never did, because nothing is watching there
+# — which is what made this look like an app bug rather than a watcher one.
+#
+# The rule these two share is the one to apply to anything added later: they are
+# build output that happens to live under `src-tauri/`, and both are in
+# `.gitignore` for exactly that reason. Generated output does not belong to the
+# watcher. Source that is staged *into* these directories — `scripts/` and
+# `plugin/` at the repository root — is outside `src-tauri/` and was never
+# watched to begin with, so nothing is lost here: editing either one still means
+# re-running `npm run dev`, as it always did.
+#
+# `target/` and `gen/` are not listed. The CLI ignores those on its own.
+
+resources/
+installer/

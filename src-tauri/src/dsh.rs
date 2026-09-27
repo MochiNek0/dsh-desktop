@@ -47,16 +47,16 @@
 //! [`terminal`] for what the user gets instead of a PATH entry.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use semver::Version;
 use tauri::{AppHandle, Manager};
 
-use crate::settings::RegistrySource;
+use crate::settings::{Channel, RegistrySource};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -64,7 +64,7 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The package the whole thing is about.
-const PACKAGE: &str = "@deepseek-ai/dsh";
+pub(crate) const PACKAGE: &str = "@deepseek-ai/dsh";
 
 /// The names npm's shims go by, most specific first: the `.cmd` wrapper npm
 /// writes on Windows, then the bare name it uses everywhere else.
@@ -929,8 +929,9 @@ pub fn gate(app: &AppHandle, report: &Report) -> bool {
 
     // Nothing is running yet, so there is nothing to stop and nothing to restart
     // for: npm replaces the tree in place and the boot carries straight on into
-    // the new version.
-    update(app, prefix, &installed.version, report)
+    // the new version. A failed update is still a boot: the dsh that was here
+    // before it is the one this launch runs.
+    update(app, prefix, &installed.version, report) != Updated::Quit
 }
 
 /// What the window shows while this is waiting on npm, and `""` when the wait is
@@ -957,13 +958,31 @@ pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)>
     saying("");
 
     let Some((installed, latest)) = found else {
-        note(
+        // Nothing installs itself any more — a restart only brings the chooser
+        // back — so the way out is the chooser, one click from here.
+        let answering = app.clone();
+        crate::dialog::ask(
             app,
-            t!("找不到 dsh", "No dsh found"),
-            t!(
-                "这台机器上还没有装好的 dsh。重启应用会再装一次。",
-                "There is no working dsh on this machine. Restarting the app installs one."
-            ),
+            crate::dialog::Ask {
+                title: t!("找不到 dsh", "No dsh found").to_string(),
+                body: t!(
+                    "这台机器上还没有能用的 dsh。在「运行环境」里可以一键装好。",
+                    "There is no working dsh on this machine. The runtime panel can set one up in one click."
+                )
+                .to_string(),
+                choices: vec![
+                    crate::dialog::Choice::new("cancel", t!("取消", "Cancel")),
+                    crate::dialog::Choice::primary(
+                        "runtime",
+                        t!("打开运行环境", "Open the runtime panel"),
+                    ),
+                ],
+                answered: Box::new(move |_, id| {
+                    if id == "runtime" {
+                        crate::open_runtime(&answering);
+                    }
+                }),
+            },
         );
         return None;
     };
@@ -1006,16 +1025,39 @@ pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)>
     Some((prefix, installed.version))
 }
 
-/// Replace the dsh in `prefix` with the newest release, reporting progress onto
-/// the loading page. `false` means the app quit while npm was still running.
+/// How an [`update`] ended.
+///
+/// The three outcomes were one `bool` — `false` for "the app is quitting" and
+/// `true` for everything else, success and failure alike. That was enough for
+/// [`gate`], which only ever asks whether to carry on booting, and wrong for
+/// `open_channel` in `main.rs`, which has a preference to write down and must
+/// not write it down for an install that did not happen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Updated {
+    /// npm replaced the tree. The dsh in `prefix` is now the channel's.
+    Done,
+    /// Nothing was replaced. When npm ran, it failed and the user has been
+    /// told; the dsh on disk is the one that was already there, which is still
+    /// a working dsh, so the caller goes on to run it.
+    Failed,
+    /// Cut short because the app is quitting and took npm down with it. Nothing
+    /// to report, and by now nowhere left to report it.
+    Quit,
+}
+
+/// Replace the dsh in `prefix` with whatever the channel in use points at,
+/// reporting progress onto the loading page.
+///
+/// Which release that is, this does not decide: [`run`] puts `-Channel` on the
+/// command and the script resolves the tag behind it. Usually the newest there
+/// is, and on a channel switch deliberately not — switching back to the release
+/// candidates from an alpha that is ahead of them installs an older dsh, which
+/// is the whole of what going back means.
 ///
 /// The prefix is passed to the script rather than left to the npm it runs with:
 /// a dsh the user installed themselves lives in their own global prefix, and an
 /// npm of ours would default to a different one and install a second copy there.
-///
-/// Failure is reported here and answers `true` all the same — there is a working
-/// dsh on disk either way, which is the one the caller goes on to run.
-pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Report) -> bool {
+pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Report) -> Updated {
     let args = [
         OsStr::new("-Mode"),
         OsStr::new("update"),
@@ -1026,15 +1068,13 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
     match run(app, &args, report) {
         Ok(true) => {
             report("", -1.0);
-            true
+            Updated::Done
         }
-        // Cut short because the app is quitting. Nothing to report, and by now
-        // nowhere left to report it.
-        Ok(false) => false,
+        Ok(false) => Updated::Quit,
         Err(error) => {
             eprintln!("dsh-desktop: updating dsh failed: {error}");
             report("", -1.0);
-            note(
+            failed(
                 app,
                 t!("dsh 更新失败", "Updating dsh failed"),
                 &t!(
@@ -1043,8 +1083,9 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
                     installed,
                     error
                 ),
+                &error,
             );
-            true
+            Updated::Failed
         }
     }
 }
@@ -1056,15 +1097,19 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
 /// this, and everything else it prints is npm's own log, which goes to stderr
 /// for whoever is watching the app from a console.
 pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<bool, String> {
-    let script = script(app).ok_or_else(|| format!("找不到安装脚本 {SCRIPT}"))?;
+    let script = script(app).ok_or_else(|| {
+        t!("找不到安装脚本 {}", "the install script {} is missing", SCRIPT)
+    })?;
+
+    // Whether this run is going to reach a registry at all -- see `FETCHES`.
+    // The chooser's `list` and `switch` install nothing, so neither the question
+    // below nor the channel beside it means anything to them.
+    let fetching =
+        mode_of(args).is_some_and(|mode| FETCHES.iter().any(|fetches| OsStr::new(fetches) == mode));
 
     // Before the spawn and not inside it: this can put a dialog up, and the
-    // question is about the install that is being started here. Only for a mode
-    // that fetches -- see `FETCHES` -- so the chooser's `list`, which runs on
-    // every launch that finds no dsh, never asks anything.
-    let source = mode_of(args)
-        .filter(|mode| FETCHES.iter().any(|fetches| OsStr::new(fetches) == *mode))
-        .and_then(|_| registry_source(app));
+    // question is about the install that is being started here.
+    let source = fetching.then(|| registry_source(app)).flatten();
 
     let mut command = interpreter(&script);
     command
@@ -1072,12 +1117,29 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
         // Turns the plain log into `::` lines and switches stdout to UTF-8,
         // which is what the reader below expects.
         .arg("-Progress")
+        // The language the loading page is in, so what the script says onto it
+        // is too. The scripts default to Chinese, which is what the uninstaller
+        // and a run by hand have always had.
+        .arg("-Lang")
+        .arg(crate::i18n::tag())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        // Kept now, for the log: a PowerShell exception or a shell error lands
+        // here and nowhere else.
+        .stderr(Stdio::piped());
 
     if let Some(source) = source {
         command.arg("-Registry").arg(source.as_str());
+    }
+
+    // Which release line the install takes. Passed on every fetching mode
+    // rather than only on a switch, so that a user on alpha stays on it through
+    // an ordinary update and a fresh `install-dsh` — the script defaults to rc,
+    // and a missing flag here would quietly move them back.
+    if fetching {
+        command
+            .arg("-Channel")
+            .arg(crate::settings::dsh_channel(app).as_str());
     }
 
     #[cfg(windows)]
@@ -1105,6 +1167,19 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
         .take()
         .ok_or(t!("无法读取脚本输出", "the script's output cannot be read"))?;
 
+    // Everything the script says, both streams, for the failure dialog to hand
+    // over. Without it a failed install on someone else's machine is one
+    // sentence and nothing behind it.
+    let log = Arc::new(Mutex::new(open_log(app, args)));
+    if let Some(stderr) = child.stderr.take() {
+        let log = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                logged(&log, &format!("[stderr] {line}"));
+            }
+        });
+    }
+
     #[cfg(windows)]
     let job = crate::server::Job::hold(&child);
 
@@ -1123,6 +1198,7 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
     let mut failure = None;
     let mut percent = -1.0;
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        logged(&log, &line);
         if let Some(text) = line.strip_prefix("::status ") {
             report(text, percent);
         } else if let Some(reported) = line.strip_prefix("::progress ") {
@@ -1162,7 +1238,170 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
     if status.success() {
         Ok(true)
     } else {
-        Err(failure.unwrap_or_else(|| format!("脚本退出码 {status}")))
+        let failure = failure
+            .unwrap_or_else(|| t!("脚本退出码 {}", "the script exited with {}", status));
+        logged(&log, &format!("-- failed: {failure}"));
+        Err(match hint(&failure) {
+            Some(hint) => format!("{failure}\n\n{hint}"),
+            None => failure,
+        })
+    }
+}
+
+/// Where the last bootstrap run's whole output is kept: one file, replaced by
+/// the next run, because the run that matters is always the one that just
+/// failed.
+pub fn log_path(app: &AppHandle) -> Option<PathBuf> {
+    Some(app_dir(app)?.join("logs").join("bootstrap.log"))
+}
+
+/// Start the log for one run, with what a bug report asks first. `None` is a
+/// log that could not be written, which costs the report and nothing else.
+fn open_log(app: &AppHandle, args: &[&OsStr]) -> Option<std::fs::File> {
+    let path = log_path(app)?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let mut file = std::fs::File::create(&path).ok()?;
+
+    let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+    let _ = writeln!(file, "{}", about(app));
+    let _ = writeln!(file, "{SCRIPT} {}", args.join(" "));
+    Some(file)
+}
+
+fn logged(log: &Mutex<Option<std::fs::File>>, line: &str) {
+    if let Ok(mut log) = log.lock() {
+        if let Some(file) = log.as_mut() {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+/// The app, its version and the platform, as one line.
+fn about(app: &AppHandle) -> String {
+    format!(
+        "dsh desktop {} · {} {}",
+        app.package_info().version,
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// What to paste into an issue or the QQ group when an install failed: the
+/// app and platform, the message the user saw, and the end of the log.
+pub fn diagnostics(app: &AppHandle, message: &str) -> String {
+    let log = log_path(app).and_then(|path| std::fs::read_to_string(path).ok());
+    report_text(&about(app), message, log.as_deref())
+}
+
+/// The assembling half of [`diagnostics`], without the app a test cannot build.
+fn report_text(about: &str, message: &str, log: Option<&str>) -> String {
+    /// Enough for npm's error block and the lines that led to it, and short
+    /// enough to paste into a chat.
+    const TAIL: usize = 60;
+
+    let mut text = format!("{about}\n\n{message}\n");
+    if let Some(log) = log {
+        let lines: Vec<&str> = log.lines().collect();
+        let tail = &lines[lines.len().saturating_sub(TAIL)..];
+        text.push_str("\n--- bootstrap.log ---\n");
+        text.push_str(&tail.join("\n"));
+    }
+    text
+}
+
+/// A failed install, said with a way to hand it on: the log opened in the file
+/// manager, and the diagnostics copied for a chat or an issue.
+pub fn failed(app: &AppHandle, title: &str, body: &str, message: &str) {
+    let answering = app.clone();
+    crate::dialog::ask(
+        app,
+        crate::dialog::Ask {
+            title: title.to_string(),
+            body: body.to_string(),
+            choices: vec![
+                crate::dialog::Choice::new("logs", t!("打开日志", "Open the log")),
+                crate::dialog::Choice::copy(
+                    "copy",
+                    t!("复制诊断信息", "Copy diagnostics"),
+                    diagnostics(app, message),
+                ),
+                crate::dialog::Choice::primary("ok", t!("知道了", "OK")),
+            ],
+            answered: Box::new(move |_, id| {
+                if id == "logs" {
+                    open_logs(&answering);
+                }
+            }),
+        },
+    );
+}
+
+/// Show the log directory in the file manager.
+pub fn open_logs(app: &AppHandle) {
+    use tauri_plugin_opener::OpenerExt;
+
+    let Some(dir) = log_path(app).and_then(|path| path.parent().map(Path::to_path_buf)) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Err(error) = app.opener().open_path(dir.to_string_lossy(), None::<&str>) {
+        eprintln!("dsh-desktop: could not open the log directory: {error}");
+    }
+}
+
+/// What to try next, for the npm failures a first install actually meets.
+///
+/// Read off the code npm printed, which the scripts carry into the message.
+/// `None` for everything else: the message already says what npm said, and a
+/// guess added to it is the kind of wrong that sends someone into their proxy
+/// settings for an afternoon.
+fn hint(message: &str) -> Option<&'static str> {
+    let has = |codes: &[&str]| codes.iter().any(|code| message.contains(code));
+
+    if has(&["ENOSPC"]) {
+        Some(t!(
+            "磁盘空间不足。清理出至少 1 GB 空间后再试。",
+            "The disk is full. Free up at least 1 GB and try again."
+        ))
+    } else if has(&["EPERM", "EBUSY"]) {
+        Some(t!(
+            "文件被占用或被拦截。常见原因是杀毒软件正在扫描刚下载的文件，或者还有一个 dsh / node 在运行。关掉它们，或暂时放行本应用后再试。",
+            "A file was locked or blocked, usually by antivirus scanning what was just downloaded, or by a dsh or node still running. Close them, or let this app through, and try again."
+        ))
+    } else if has(&["EACCES"]) {
+        Some(t!(
+            "没有写入权限：npm 的全局目录只有管理员能写。换成「安装新的 Node」，它会装在应用自己的目录里，不需要管理员权限。",
+            "No permission to write: npm's global directory needs administrator rights. Use \"Install a fresh Node\" instead, which goes into the app's own directory and needs none."
+        ))
+    } else if has(&[
+        "SELF_SIGNED_CERT_IN_CHAIN",
+        "UNABLE_TO_GET_ISSUER_CERT",
+        "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+        "CERT_HAS_EXPIRED",
+    ]) {
+        Some(t!(
+            "证书校验失败，通常是公司网络或代理/抓包软件替换了证书。换一个网络，或关掉代理软件后再试。",
+            "A certificate check failed, usually because a company network or a proxy tool is replacing certificates. Try another network, or turn the proxy off."
+        ))
+    } else if has(&[
+        "ETIMEDOUT",
+        "ESOCKETTIMEDOUT",
+        "ECONNRESET",
+        "ECONNREFUSED",
+        "ENOTFOUND",
+        "EAI_AGAIN",
+    ]) {
+        Some(t!(
+            "网络连接失败。检查网络是否正常；开着代理或 VPN 的话，试试关掉或换个节点再试。",
+            "The network connection failed. Check you are online; if a proxy or VPN is on, try turning it off or switching servers."
+        ))
+    } else if has(&["EINTEGRITY"]) {
+        Some(t!(
+            "下载的文件校验失败，多半是镜像的缓存坏了。稍后再试，或在菜单的「安装源…」里换一个源。",
+            "A download failed its checksum, most likely a mirror's stale cache. Try again later, or pick another source under \"Install source…\"."
+        ))
+    } else {
+        None
     }
 }
 
@@ -1175,16 +1414,90 @@ pub fn stop() {
     }
 }
 
+/// What each of dsh's release lines currently points at.
+///
+/// Both in one answer because the two are only ever interesting together: the
+/// update check needs the one the user is on, and the channel dialog needs both
+/// to decide whether alpha may be chosen at all. One `npm view` also means one
+/// trip to a registry that may be slow, rather than two.
+pub struct Tags {
+    /// npm's `latest`: the release-candidate line.
+    pub rc: Version,
+    /// npm's `alpha`, when the package has one. A package that has never
+    /// published an alpha has no such tag, and that is not an error.
+    pub alpha: Option<Version>,
+}
+
+impl Tags {
+    /// Whether alpha may be switched to.
+    ///
+    /// Only when it is genuinely ahead. An `alpha` tag that has fallen behind
+    /// the release candidates is one nobody should be moved onto: it is older
+    /// code, and taking it would mean installing a *downgrade* and then sitting
+    /// on a line that is not going anywhere. Equal counts as not ahead — the
+    /// same code under two names is not a reason to move a user's sessions into
+    /// a second home.
+    ///
+    /// This gates the choice, not the staying. A user already on alpha whom the
+    /// release candidates have since overtaken keeps tracking alpha, and the
+    /// dialog is where they are told rc has gone past and offered the way back.
+    pub fn alpha_is_ahead(&self) -> bool {
+        self.alpha.as_ref().is_some_and(|alpha| *alpha > self.rc)
+    }
+
+    /// What the channel in use resolves to.
+    ///
+    /// A channel whose tag the registry does not have falls back to rc, which
+    /// is the only other thing there is to compare against. That answer never
+    /// causes a downgrade on its own: every caller goes on to check it against
+    /// what is installed, and anything ahead of it fails that check.
+    pub fn on(&self, channel: Channel) -> Version {
+        match channel {
+            Channel::Rc => self.rc.clone(),
+            Channel::Alpha => self.alpha.clone().unwrap_or_else(|| self.rc.clone()),
+        }
+    }
+}
+
 /// `npm view` rather than a request of our own: it reads the user's `.npmrc`,
 /// so a private registry or a corporate proxy keeps working.
 ///
 /// Given [`CHECK_TIMEOUT`] to answer, because this one is on the path to the
 /// window. npm has no timeout of its own worth the name — behind a proxy that
 /// black-holes the connection it will sit there for minutes.
-fn latest(app: &AppHandle) -> Option<Version> {
+///
+/// `dist-tags --json` rather than `version`, which is the same request with the
+/// rest of the answer thrown away. A registry that answers with something this
+/// cannot read — a mirror serving an error page, a proxy serving a login form —
+/// is a registry that could not be asked, and reads as `None` the same way a
+/// timeout does.
+pub fn tags(app: &AppHandle) -> Option<Tags> {
     let mut npm = npm(app)?;
-    npm.args(["view", PACKAGE, "version"]);
-    Version::parse(&printed(npm, CHECK_TIMEOUT)?).ok()
+    npm.args(["view", PACKAGE, "dist-tags", "--json"]);
+    read_tags(&printed(npm, CHECK_TIMEOUT)?)
+}
+
+/// The parsing half of [`tags`], without the npm a test cannot run.
+fn read_tags(printed: &str) -> Option<Tags> {
+    let document: serde_json::Value = serde_json::from_str(printed).ok()?;
+    let tag = |name: &str| {
+        document
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| Version::parse(text).ok())
+    };
+
+    Some(Tags {
+        // No `latest` is a package this app cannot install at all, so there is
+        // nothing to answer with.
+        rc: tag(Channel::Rc.tag())?,
+        alpha: tag(Channel::Alpha.tag()),
+    })
+}
+
+/// What the channel in use currently points at, for the two update paths.
+fn latest(app: &AppHandle) -> Option<Version> {
+    Some(tags(app)?.on(crate::settings::dsh_channel(app)))
 }
 
 /// npm, run through Node rather than its shell shim, so there is no console
@@ -1352,9 +1665,42 @@ pub fn registry_source(app: &AppHandle) -> Option<RegistrySource> {
     }
 
     let configured = configured_registry(app)?;
+
+    // A public mirror is not a registry of the user's own: it is what every
+    // tutorial for a Chinese network says to set, and the question below —
+    // "a private mirror or a company proxy is usually there for a reason" —
+    // means nothing to someone who pasted that line once. The measured list
+    // already has the same mirrors in it, so it is taken without asking. Not
+    // written down, so pointing npm at a private registry later still asks.
+    if is_public_mirror(&configured) {
+        return Some(RegistrySource::Auto);
+    }
+
     let source = choose_registry(app, &configured)?;
     crate::settings::set_registry(app, source);
     Some(source)
+}
+
+/// The public mirrors the scripts race, and the dead Taobao address older
+/// tutorials still hand out — which fails every install it is left in charge
+/// of, so racing past it is the only thing that works on those machines.
+///
+/// Scheme-less and without a trailing slash, for [`is_public_mirror`].
+const PUBLIC_MIRRORS: &[&str] = &[
+    "registry.npmmirror.com",
+    "mirrors.cloud.tencent.com/npm",
+    "mirrors.huaweicloud.com/repository/npm",
+    "registry.npm.taobao.org",
+];
+
+/// Whether `registry` is one of [`PUBLIC_MIRRORS`], however it was spelled.
+fn is_public_mirror(registry: &str) -> bool {
+    let bare = registry.trim().trim_end_matches('/').to_ascii_lowercase();
+    let bare = bare
+        .strip_prefix("https://")
+        .or_else(|| bare.strip_prefix("http://"))
+        .unwrap_or(&bare);
+    PUBLIC_MIRRORS.contains(&bare)
 }
 
 /// The question itself. Also what the menu item calls to change the answer.
@@ -1476,24 +1822,43 @@ fn confirm(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
 /// goes in the message instead, for the user to run against whatever they
 /// actually installed it with.
 fn tell(app: &AppHandle, installed: &Version, latest: &Version) {
-    note(
+    // The channel's tag rather than a bare `@latest`: on the alpha line that
+    // command would quietly move the user back onto the release candidates.
+    let command = update_command(crate::settings::dsh_channel(app));
+    crate::dialog::ask(
         app,
-        t!("dsh 有可用更新", "A dsh update is available"),
-        &t!(
-            "dsh 有新版本 {}（当前 {}）。\n\n\
-             这份 dsh 不在应用能写的 npm 全局目录里（比如用版本管理器装的，\
-             或者装在只有管理员能写的地方），应用不会去改动它。要更新的话，\
-             用你当初安装它的方式，在终端里执行：\n\nnpm install -g {}@latest",
-            "dsh {} is available (this machine has {}).\n\n\
-             This dsh is not in an npm global directory the app can write to — a \
-             version manager put it there, or it needs administrator rights — so \
-             the app will not touch it. To update it, use whatever you installed \
-             it with:\n\nnpm install -g {}@latest",
-            latest,
-            installed,
-            PACKAGE
-        ),
+        crate::dialog::Ask {
+            title: t!("dsh 有可用更新", "A dsh update is available").to_string(),
+            body: t!(
+                "dsh 有新版本 {}（当前 {}）。\n\n\
+                 这份 dsh 不在应用能写的 npm 全局目录里（比如用版本管理器装的，\
+                 或者装在只有管理员能写的地方），应用不会去改动它。要更新的话，\
+                 复制下面这行命令，在终端里执行：\n\n{}",
+                "dsh {} is available (this machine has {}).\n\n\
+                 This dsh is not in an npm global directory the app can write to — a \
+                 version manager put it there, or it needs administrator rights — so \
+                 the app will not touch it. To update it, copy this command and run \
+                 it in a terminal:\n\n{}",
+                latest,
+                installed,
+                command
+            ),
+            choices: vec![
+                crate::dialog::Choice::copy(
+                    "copy",
+                    t!("复制命令", "Copy the command"),
+                    command.clone(),
+                ),
+                crate::dialog::Choice::primary("ok", t!("知道了", "OK")),
+            ],
+            answered: Box::new(|_, _| {}),
+        },
     );
+}
+
+/// The command [`tell`] hands over, on the release line the user is on.
+fn update_command(channel: Channel) -> String {
+    format!("npm install -g {PACKAGE}@{}", channel.tag())
 }
 
 /// The version the user turned down. Re-asking on every launch for a download
@@ -1567,6 +1932,19 @@ pub fn resources(app: &AppHandle) -> Option<PathBuf> {
     Some(simplified(app.path().resource_dir().ok()?).join("resources"))
 }
 
+/// Where a channel switch would install, and what is installed there now.
+///
+/// `None` for the two cases a switch cannot do anything about: no dsh on the
+/// machine at all, and a dsh in a directory this app may not write — a
+/// system-wide prefix, a package manager's. Asked before the question is put,
+/// because a dialog whose answer cannot be acted on is worse than the note that
+/// replaces it.
+pub fn installable(app: &AppHandle) -> Option<(PathBuf, Version)> {
+    let installed = current(app)?;
+    let prefix = updatable(&installed)?.to_path_buf();
+    Some((prefix, installed.version))
+}
+
 /// The bootstrap script for this platform. Both are staged into `resources/` by
 /// `scripts/bundle-runtime.mjs` and shipped by the bundler; they take the same
 /// arguments and print the same `::` lines.
@@ -1623,6 +2001,12 @@ pub fn note(app: &AppHandle, title: &str, detail: &str) {
 /// And dsh shells out to `node` again for workers and plugin tooling, which
 /// should reach the same one the app is running it with, not whichever one a
 /// version manager happens to have active.
+///
+/// `DSH_HOME` is deliberately not here. Which home dsh uses is dsh's own
+/// answer, read off the environment the user gave it, and the release channels
+/// do not change that: both lines share the one home. Setting it here would
+/// have meant the app's children and the user's own terminal disagreeing about
+/// where the sessions are, which is worse than either answer alone.
 ///
 /// Every caller is starting a program off the host rather than out of this
 /// bundle, which is the other half of the same question — so [`unbundle`] runs
@@ -1844,7 +2228,8 @@ mod tests {
         node_version, package_root, prefix_of, present, resolve, shim_dir, writable, DSH, FETCHES,
         NODE_MINIMUM, PACKAGE, PUBLIC_REGISTRY,
     };
-    use crate::settings::RegistrySource;
+    use crate::settings::{Channel, RegistrySource};
+    use semver::Version;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
@@ -1938,6 +2323,158 @@ mod tests {
             let script = String::from_utf8_lossy(&script);
             assert!(script.contains(&literal), "{path} does not say {literal}");
         }
+    }
+
+    /// `-Channel` is spelled in three places, the same way `-Registry` is, and
+    /// with one extra trap: the word this side stores is not the word npm knows
+    /// the tag by. `rc` is stored and passed, `latest` is installed. Both halves
+    /// are read back out of the scripts rather than trusted to stay in step.
+    #[test]
+    fn both_scripts_take_the_channel_values_this_one_sends() {
+        let sh = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/install-deps.sh"
+        ))
+        .expect("a readable bootstrap script");
+        let sh = String::from_utf8_lossy(&sh);
+
+        let ps1 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/install-deps.ps1"
+        ))
+        .expect("a readable bootstrap script");
+        let ps1 = String::from_utf8_lossy(&ps1);
+
+        // The one line in each that decides what is accepted.
+        assert!(
+            sh.contains("rc|alpha) CHANNEL=$2 ;;"),
+            "install-deps.sh does not accept rc and alpha"
+        );
+        assert!(
+            ps1.contains("[ValidateSet('rc', 'alpha')]"),
+            "install-deps.ps1 does not accept rc and alpha"
+        );
+
+        // And the line in each that turns the channel into the npm tag. The rc
+        // line is published under `latest`; a script that installed `@rc` would
+        // name a tag that does not exist and fail every install.
+        assert!(
+            sh.contains("if [ \"$CHANNEL\" = alpha ]; then TAG=alpha; else TAG=latest; fi"),
+            "install-deps.sh does not map the channel onto an npm tag"
+        );
+        assert!(
+            ps1.contains("$Tag = if ($Channel -eq 'alpha') { 'alpha' } else { 'latest' }"),
+            "install-deps.ps1 does not map the channel onto an npm tag"
+        );
+
+        // Nothing installs a bare `@latest` any more: a call site left behind
+        // would quietly ignore the channel and put an rc on an alpha machine.
+        assert!(
+            !sh.contains("@latest\"") && !ps1.contains("@latest\""),
+            "a bootstrap script still installs the latest tag regardless of the channel"
+        );
+
+        for channel in [Channel::Rc, Channel::Alpha] {
+            let spelling = channel.as_str();
+            assert!(
+                sh.contains(spelling) && ps1.contains(spelling),
+                "a bootstrap script does not know the channel {spelling}"
+            );
+        }
+    }
+
+    /// The default both scripts fall back to when nothing passes `-Channel` —
+    /// the installer hooks, and a run by hand. It has to be the release
+    /// candidates: an absent answer must never be able to put a machine onto
+    /// the line that writes sessions the other one cannot read.
+    #[test]
+    fn a_script_run_with_no_channel_installs_the_release_candidates() {
+        let sh = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/install-deps.sh"
+        ))
+        .expect("a readable bootstrap script");
+        let sh = String::from_utf8_lossy(&sh);
+
+        let ps1 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/install-deps.ps1"
+        ))
+        .expect("a readable bootstrap script");
+        let ps1 = String::from_utf8_lossy(&ps1);
+
+        assert!(sh.contains("CHANNEL='rc'"), "install-deps.sh defaults elsewhere");
+        assert!(
+            ps1.contains("[string] $Channel = 'rc',"),
+            "install-deps.ps1 defaults elsewhere"
+        );
+    }
+
+    /// What `npm view … dist-tags --json` answers with, read the way the
+    /// channel dialog reads it.
+    #[test]
+    fn reads_the_dist_tags() {
+        let tags = super::read_tags(
+            r#"{"latest":"0.1.5-rc.2","alpha":"0.1.7-alpha.1","next":"0.1.5-rc.3"}"#,
+        )
+        .expect("a readable answer");
+
+        assert_eq!(tags.rc, Version::parse("0.1.5-rc.2").unwrap());
+        assert_eq!(tags.alpha, Some(Version::parse("0.1.7-alpha.1").unwrap()));
+        // `next` is a tag this app has no opinion about and does not read.
+        assert!(tags.alpha_is_ahead());
+    }
+
+    /// A package with no alpha, and every way the answer can be unusable. None
+    /// of them is an error worth a dialog — but none of them may offer alpha
+    /// either.
+    #[test]
+    fn an_unreadable_answer_never_offers_alpha() {
+        let none = super::read_tags(r#"{"latest":"0.1.5-rc.2"}"#).expect("a readable answer");
+        assert_eq!(none.alpha, None);
+        assert!(!none.alpha_is_ahead());
+        // Nothing to fall back to but rc, which is what the caller compares
+        // against what is installed.
+        assert_eq!(none.on(Channel::Alpha), none.rc);
+
+        for text in [
+            "",
+            "{",
+            "null",
+            "[1, 2, 3]",
+            "{}",
+            // A mirror serving an error page, or a proxy serving a login form.
+            "<!doctype html>",
+            // Present, and not a version.
+            r#"{"latest":"main"}"#,
+            // No `latest` at all is a package this app cannot install.
+            r#"{"alpha":"0.1.7-alpha.1"}"#,
+        ] {
+            assert!(super::read_tags(text).is_none(), "for {text:?}");
+        }
+    }
+
+    /// Alpha is offered only while it is genuinely ahead. Behind and level both
+    /// read the same: not a reason to move anyone's sessions into a second
+    /// home.
+    #[test]
+    fn alpha_has_to_be_ahead_to_be_offered() {
+        let ahead = |rc: &str, alpha: &str| {
+            super::Tags {
+                rc: Version::parse(rc).unwrap(),
+                alpha: Some(Version::parse(alpha).unwrap()),
+            }
+            .alpha_is_ahead()
+        };
+
+        assert!(ahead("0.1.5-rc.2", "0.1.7-alpha.1"));
+        // Released past the alpha: the alpha line is the older code now.
+        assert!(!ahead("0.1.8-rc.1", "0.1.7-alpha.1"));
+        // The same core version, where semver puts `alpha` before `rc`.
+        assert!(!ahead("0.1.5-rc.3", "0.1.5-alpha.2"));
+        assert!(ahead("0.1.5-alpha.2", "0.1.5-rc.3"));
+        // Level, which is the same code under two names.
+        assert!(!ahead("0.1.7-alpha.1", "0.1.7-alpha.1"));
     }
 
     /// `-Registry` is spelled in three places: here, and the option parser in
@@ -2440,6 +2977,114 @@ mod tests {
         assert_eq!(
             package_root(&scratch.at("nothing-here")),
             scratch.at("nothing-here").join("node_modules")
+        );
+    }
+
+    /// The codes a first install actually fails with each get a next step, and
+    /// a failure nobody has a hint for gets none rather than a guess.
+    #[test]
+    fn a_known_npm_code_comes_with_something_to_try() {
+        for code in [
+            "ENOSPC",
+            "EPERM",
+            "EBUSY",
+            "EACCES",
+            "SELF_SIGNED_CERT_IN_CHAIN",
+            "ETIMEDOUT",
+            "ECONNRESET",
+            "ENOTFOUND",
+            "EINTEGRITY",
+        ] {
+            let message = format!("dsh 下载失败。 npm 报错 {code}：something");
+            assert!(super::hint(&message).is_some(), "no hint for {code}");
+        }
+
+        assert!(super::hint("dsh 下载失败。 npm 报错 ETARGET：No matching version").is_none());
+        assert!(super::hint("脚本退出码 1").is_none());
+    }
+
+    /// The mirrors every Chinese tutorial hands out are not asked about, however
+    /// they were typed; anything else still is.
+    #[test]
+    fn a_public_mirror_is_not_a_registry_of_ones_own() {
+        assert!(super::is_public_mirror("https://registry.npmmirror.com/"));
+        assert!(super::is_public_mirror("https://registry.npmmirror.com"));
+        assert!(super::is_public_mirror("http://REGISTRY.NPMMIRROR.COM/"));
+        assert!(super::is_public_mirror("https://registry.npm.taobao.org"));
+        assert!(super::is_public_mirror("https://mirrors.cloud.tencent.com/npm/"));
+
+        assert!(!super::is_public_mirror("https://npm.corp.example.com/"));
+        assert!(!super::is_public_mirror("https://registry.npmmirror.com.evil.example/"));
+        assert!(!super::is_public_mirror("https://mirrors.cloud.tencent.com/"));
+    }
+
+    /// The live mirrors on that list are the ones the scripts race. A mirror
+    /// dropped from the scripts and left here would be a registry the app
+    /// declines to ask about and then never measures.
+    #[test]
+    fn the_public_mirrors_are_the_ones_the_scripts_race() {
+        for path in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.ps1"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.sh"),
+        ] {
+            let script = std::fs::read(path).expect("a readable bootstrap script");
+            let script = String::from_utf8_lossy(&script);
+            for mirror in super::PUBLIC_MIRRORS
+                .iter()
+                .filter(|mirror| !mirror.contains("taobao"))
+            {
+                assert!(
+                    script.contains(&format!("https://{mirror}/")),
+                    "{path} does not race {mirror}"
+                );
+            }
+        }
+    }
+
+    /// `-Lang` carries `i18n::tag`, and both scripts have to take both of its
+    /// answers — one they refused would fail every install in that language.
+    #[test]
+    fn both_scripts_take_the_languages_this_one_sends() {
+        let read = |path: &str| {
+            let bytes = std::fs::read(path).expect("a readable bootstrap script");
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let ps1 = read(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.ps1"));
+        let sh = read(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.sh"));
+
+        assert!(ps1.contains("[ValidateSet('zh', 'en')]"));
+        assert!(ps1.contains("[string] $Lang = 'zh'"));
+        assert!(sh.contains("zh|en) UI_LANG=$2 ;;"));
+        assert!(sh.contains("UI_LANG='zh'"));
+    }
+
+    /// What gets pasted into a chat: who, what failed, and the end of the log —
+    /// the end, because npm's error block is the last thing it prints.
+    #[test]
+    fn diagnostics_carry_the_message_and_the_end_of_the_log() {
+        let log: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        let text = super::report_text("dsh desktop 1.0 · windows x86_64", "it broke", Some(&log));
+
+        assert!(text.starts_with("dsh desktop 1.0 · windows x86_64\n\nit broke\n"));
+        assert!(text.contains("line 100"));
+        assert!(text.contains("line 41"));
+        assert!(!text.contains("line 40\n"));
+
+        let bare = super::report_text("about", "it broke", None);
+        assert!(!bare.contains("bootstrap.log"));
+    }
+
+    /// The command handed over for a dsh the app cannot update keeps the user
+    /// on their release line.
+    #[test]
+    fn the_update_command_follows_the_channel() {
+        assert_eq!(
+            super::update_command(Channel::Rc),
+            "npm install -g @deepseek-ai/dsh@latest"
+        );
+        assert_eq!(
+            super::update_command(Channel::Alpha),
+            "npm install -g @deepseek-ai/dsh@alpha"
         );
     }
 }

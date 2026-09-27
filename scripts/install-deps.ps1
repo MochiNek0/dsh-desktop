@@ -87,13 +87,32 @@ param(
     [ValidateSet('', 'own', 'auto')]
     [string] $Registry = '',
 
+    # Which line of dsh releases to install: the release candidates, or the
+    # alpha that runs ahead of them. The app stores the answer and passes it on
+    # every mode that fetches -- see `settings.rs` and `run` in
+    # `src-tauri/src/dsh.rs`.
+    #
+    # `rc` is the default and is what an install with no flag has always taken.
+    # It has to stay that way: this script is also run by the installer hooks
+    # and by hand, and neither has a preference to read, so the absence of an
+    # answer must never be able to put anyone onto the alpha line.
+    [ValidateSet('rc', 'alpha')]
+    [string] $Channel = 'rc',
+
     # `uninstall` only. Node cannot go without dsh going too: dsh is a Node
     # program, and leaving it behind would leave a command that cannot run.
     [switch] $RemoveDsh,
     [switch] $RemoveNode,
 
     # Emit machine-readable progress alongside the human log, in UTF-8.
-    [switch] $Progress
+    [switch] $Progress,
+
+    # The language of what reaches the window: the status line and the error.
+    # The app passes the one its own page is in; see `run` in
+    # `src-tauri/src/dsh.rs`. Chinese without it, which is what the uninstaller
+    # and a run by hand have always had. The log stays Chinese either way.
+    [ValidateSet('zh', 'en')]
+    [string] $Lang = 'zh'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -109,6 +128,19 @@ if ($Progress) {
 }
 
 $Package = '@deepseek-ai/dsh'
+
+# One sentence in the language `-Lang` names, Chinese first, the way `t!` in the
+# app is written. Defined this early because the registry labels below use it.
+function T([string] $Zh, [string] $En) {
+    if ($Lang -eq 'en') { return $En }
+    return $Zh
+}
+
+# The npm dist-tag `-Channel` names. Not the same word: the release candidates
+# are published under `latest`, not under `rc`, and `@deepseek-ai/dsh@rc` is a
+# tag that does not exist. `Channel::tag` in `src-tauri/src/settings.rs` holds
+# the other half of this mapping and a test pins the two together.
+$Tag = if ($Channel -eq 'alpha') { 'alpha' } else { 'latest' }
 
 # dsh forwards plugin installs to pnpm, so a machine running dsh ends up with one
 # too — installed on demand by `ensure_pnpm` in `plugins.rs`, into whichever
@@ -175,10 +207,10 @@ $NodeMirrors = @(
 # `npm.aliyun.com` does not resolve. npmmirror below is the Alibaba-run mirror
 # that succeeded it.
 $Registries = @(
-    @{ Label = '默认源'; Url = $null }
+    @{ Label = (T '默认源' 'default registry'); Url = $null }
     @{ Label = 'npmmirror'; Url = 'https://registry.npmmirror.com/' }
-    @{ Label = '腾讯云'; Url = 'https://mirrors.cloud.tencent.com/npm/' }
-    @{ Label = '华为云'; Url = 'https://mirrors.huaweicloud.com/repository/npm/' }
+    @{ Label = (T '腾讯云' 'Tencent Cloud'); Url = 'https://mirrors.cloud.tencent.com/npm/' }
+    @{ Label = (T '华为云' 'Huawei Cloud'); Url = 'https://mirrors.huaweicloud.com/repository/npm/' }
 )
 
 # What `$null` above resolves to when npm is left to itself and has nothing
@@ -244,7 +276,7 @@ function Report([double] $Percent) {
 }
 
 function Fail([string] $Text) {
-    Say "错误：$Text"
+    Say ((T '错误：' 'Error: ') + $Text)
     if ($Progress) { Write-Host "::error $Text" }
     exit 1
 }
@@ -441,7 +473,7 @@ function Format-Speed([double] $BytesPerSecond) {
 # never answered at the back — still there, because a mirror that refuses a probe
 # can be the one that ends up serving the file.
 function Sort-Mirrors([string] $Name) {
-    Step '正在测试 Node 镜像的速度…' 0
+    Step (T '正在测试 Node 镜像的速度…' 'Measuring the Node mirrors…') 0
 
     # `Order` is what keeps mirrors that measured the same — the ones that
     # measured nothing at all, usually — in the order they are declared above.
@@ -455,7 +487,7 @@ function Sort-Mirrors([string] $Name) {
         # Named as it is measured, not only once it has answered. Four probes at
         # up to `$ProbeTimeout` each is half a minute in which one unchanging
         # line and a bar that has not moved are indistinguishable from a hang.
-        Step "正在测试 $where…" 0
+        Step (T "正在测试 $where…" "Measuring $where…") 0
         $speed = Measure-Mirror "$mirror/v$NodeVersion/$Name.zip"
         if ($null -eq $speed) {
             Say "$where：太慢或连不上"
@@ -505,10 +537,10 @@ function Sort-Registries([string] $Exe, [string] $Cli, [double] $At) {
     $sources = $Registries
     if ($configured) {
         Say "按你的选择，这次不使用 .npmrc 里的源（$configured）。"
-        $sources = @(@{ Label = 'npm 官方'; Url = $PublicRegistry }) + $Registries[1..($Registries.Count - 1)]
+        $sources = @(@{ Label = (T 'npm 官方' 'npm public registry'); Url = $PublicRegistry }) + $Registries[1..($Registries.Count - 1)]
     }
 
-    Step '正在测试各个源的速度…' $At
+    Step (T '正在测试各个源的速度…' 'Measuring the registries…') $At
 
     $order = 0
     $timed = foreach ($source in $sources) {
@@ -517,7 +549,7 @@ function Sort-Registries([string] $Exe, [string] $Cli, [double] $At) {
         $url = if ($source.Url) { $source.Url } else { $PublicRegistry }
         # See `Sort-Mirrors`. This is the round an `install-dsh` waits on, and
         # `$At` is 0 there, so without this it is a bar pinned at zero.
-        Step "正在测试 $($source.Label)…" $At
+        Step (T "正在测试 $($source.Label)…" "Measuring $($source.Label)…") $At
         $seconds = Measure-Source $url
         if ($null -eq $seconds) {
             Say "$($source.Label)：太慢或连不上"
@@ -641,10 +673,10 @@ function Install-Node {
             $zip = Join-Path $scratch "$name.zip"
 
             try {
-                Step "正在下载 Node $NodeVersion（$([Uri]::new($mirror).Host)）…" 0
+                Step (T "正在下载 Node $NodeVersion（$([Uri]::new($mirror).Host)）…" "Downloading Node $NodeVersion ($([Uri]::new($mirror).Host))…") 0
                 Fetch "$base/$name.zip" $zip 0 30
 
-                Step '正在校验 Node…' 32
+                Step (T '正在校验 Node…' 'Verifying Node…') 32
                 $sums = Join-Path $scratch 'SHASUMS256.txt'
                 Fetch "$base/SHASUMS256.txt" $sums 32 33
 
@@ -659,7 +691,7 @@ function Install-Node {
                     throw '下载的 Node 校验和不匹配'
                 }
 
-                Step '正在解压 Node…' 35
+                Step (T '正在解压 Node…' 'Unpacking Node…') 35
                 # System32's bsdtar reads zips and is several times faster than
                 # Expand-Archive on an archive of this many small files. Named
                 # outright because a bare `tar` finds Git for Windows' GNU tar
@@ -684,7 +716,7 @@ function Install-Node {
         }
 
         if (-not $installed) {
-            Fail "无法下载 Node $NodeVersion。已尝试 nodejs.org 和几个国内镜像，都没有成功，通常是网络或代理的问题。"
+            Fail (T "无法下载 Node $NodeVersion。已尝试 nodejs.org 和几个国内镜像，都没有成功，通常是网络或代理的问题。" "Node $NodeVersion could not be downloaded. nodejs.org and several mirrors in China were tried and none worked, which is usually the network or a proxy.")
         }
     } finally {
         Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
@@ -782,6 +814,26 @@ function Get-Registry([string] $Exe, [string] $Cli) {
     return ''
 }
 
+# What npm said about the install that just failed: its `code`, and the first
+# line of detail printed under it. Script scope for the same reason
+# `$script:fetched` has it -- the handler that fills them runs inside a pipeline
+# and has nowhere else to put an answer.
+$script:NpmCode = ''
+$script:NpmSaid = ''
+
+# The `code` values that mean npm reached the registry, read what it serves and
+# refused it: a version range nothing published satisfies, a dependency graph
+# that cannot be built. Those are verdicts on the package rather than on the
+# source, and the sources all serve the same metadata -- what is installed here
+# is a dist-tag and never a pinned version, so a mirror still catching up
+# resolves the tag to an older release and installs it rather than answering
+# ETARGET. Walking the rest of the list buys nothing but the user's time and
+# ends in a message about the network, which is the one thing that was working.
+#
+# `E404` is deliberately not on the list: that one says this registry does not
+# have the package at all, which is exactly what another registry can fix.
+$ResolutionErrors = @('ETARGET', 'ERESOLVE')
+
 # One `npm install -g`, from one registry, into `$Prefix` when one is given and
 # npm's own default when it is not. npm's http log is read as it goes: every
 # tarball that comes back moves the bar, which is the only progress signal npm
@@ -792,11 +844,13 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
     if ($Source.Url) { $arguments += "--registry=$($Source.Url)" }
     $arguments += $Spec
 
-    Step "正在安装 dsh（$($Source.Label)）…" $From
+    Step (T "正在安装 dsh（$($Source.Label)）…" "Installing dsh ($($Source.Label))…") $From
 
     # Script scope, and reset here rather than left over: a retry against the
     # next registry starts its count from zero, the same as its bar does.
     $script:fetched = 0
+    $script:NpmCode = ''
+    $script:NpmSaid = ''
 
     # npm runs a dependency's `install` script through the shell, and the ones
     # that build something spell it `node ...` — resolved off PATH, not from the
@@ -815,6 +869,14 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
                 if ($line -match 'npm http (fetch GET 200|cache) ') {
                     $script:fetched++
                     Report ([Math]::Min($From + ($To - $From) * ($script:fetched / $PackageCount), $ProgressCeiling))
+                } elseif ($line -match '^npm (?:error|ERR!) code (\S+)') {
+                    # npm 10.6 and up spell it `npm error`; everything older
+                    # `npm ERR!`. The npm running this is the user's, so both.
+                    if (-not $script:NpmCode) { $script:NpmCode = $Matches[1] }
+                } elseif ((-not $script:NpmSaid) -and ($line -match '^npm (?:error|ERR!) (.+)$')) {
+                    # The first line under the code, which is the one that names
+                    # what npm could not find.
+                    $script:NpmSaid = $Matches[1].Trim()
                 }
             })
     } finally {
@@ -823,15 +885,49 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
 }
 
 # Install `Spec` through the fastest registry that works.
+#
+# `$false` with `$script:NpmCode` set means npm refused the install rather than
+# failed to reach anything. `Install-Failure` is what turns that into something
+# worth telling the user.
 function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [string] $Prefix, [double] $From, [double] $To) {
     foreach ($source in (Sort-Registries $Exe $Cli $From)) {
         if (Invoke-NpmInstall $Exe $Cli $Spec $Prefix $source $From $To) {
             Say "dsh 安装完成（$($source.Label)）。"
             return $true
         }
+        # npm read the registry and turned down what it found. See
+        # `$ResolutionErrors`: the rest of the list would turn it down the same
+        # way, so the walk stops here and the code travels out to be reported.
+        if ($ResolutionErrors -contains $script:NpmCode) {
+            Say "npm 拒绝了这次安装（$($script:NpmCode)），换一个源也是同样的结果，不再重试。"
+            return $false
+        }
         Say "从 $($source.Label) 安装失败，换下一个源重试。"
     }
     return $false
+}
+
+# What to tell the user when `Install-Package` gave up, given what it was trying
+# to do -- `$Whose`, a finished sentence.
+#
+# Every one of these messages used to end in a guess at the network, and that
+# guess is wrong every time npm failed on the package rather than on the
+# connection: the kind of wrong that sends someone into their proxy settings for
+# an afternoon. npm's own verdict replaces it when there is one.
+#
+# One line and no newlines in it: this ends up behind `::error ` on a single
+# line of the script's output, which is how `run` in `dsh.rs` reads it back.
+function Install-Failure([string] $Whose) {
+    if (-not $script:NpmCode) {
+        return (T "$Whose 已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。" "$Whose The default registry and the npmmirror, Tencent Cloud and Huawei Cloud mirrors were all tried and none worked, which is usually the network or a proxy.")
+    }
+
+    $said = $script:NpmSaid
+    if (-not $said) { $said = (T '（npm 没有说明原因）' '(npm gave no reason)') }
+    if ($ResolutionErrors -contains $script:NpmCode) {
+        return (T "$Whose npm 报错 $($script:NpmCode)：$said 源是通的，装不上的是这个版本本身，换源或改代理都没有用。" "$Whose npm failed with $($script:NpmCode): $said The registry answered; it is this version itself that cannot be installed, so another source or proxy will not help.")
+    }
+    return (T "$Whose npm 报错 $($script:NpmCode)：$said" "$Whose npm failed with $($script:NpmCode): $said")
 }
 
 # --------------------------------------------------------------------- path --
@@ -930,9 +1026,9 @@ function Update-All {
     $cli = $state['npmCli']
     if (-not ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli))) {
         $node = Find-AnyNode
-        if (-not $node) { Fail '这台机器上找不到 Node，无法更新 dsh。' }
+        if (-not $node) { Fail (T '这台机器上找不到 Node，无法更新 dsh。' 'No Node was found on this machine, so dsh cannot be updated.') }
         $cli = Find-Npm $node
-        if (-not $cli) { Fail "这个 Node 旁边没有 npm（$node）。" }
+        if (-not $cli) { Fail (T "这个 Node 旁边没有 npm（$node）。" "There is no npm beside this Node ($node).") }
         Say "用 $node 更新 dsh。"
     }
 
@@ -942,11 +1038,11 @@ function Update-All {
     $prefix = $Prefix
     if (-not $prefix) { $prefix = [string] $state['prefix'] }
 
-    Step '正在更新 dsh…' 0
-    if (-not (Install-Package $node $cli "$Package@latest" $prefix 0 $ProgressCeiling)) {
-        Fail 'dsh 更新失败，默认源和几个备用镜像都没有成功。'
+    Step (T '正在更新 dsh…' 'Updating dsh…') 0
+    if (-not (Install-Package $node $cli "$Package@$Tag" $prefix 0 $ProgressCeiling)) {
+        Fail (Install-Failure (T 'dsh 更新失败。' 'Updating dsh failed.'))
     }
-    Step 'dsh 更新完成。' 100
+    Step (T 'dsh 更新完成。' 'dsh updated.') 100
 }
 
 # The npm global prefix a dsh lives in, for `npm uninstall -g --prefix` to
@@ -1283,8 +1379,8 @@ function List-Nodes {
 # and never reads this; the marker is what makes a Node they picked but have not
 # switched to reachable at all. See `search_path` in `dsh.rs`.
 function Switch-Node {
-    if (-not $NodeExe) { Fail 'switch 需要 -NodeExe。' }
-    if (-not (Test-Path -LiteralPath $NodeExe)) { Fail "找不到指定的 Node：$NodeExe" }
+    if (-not $NodeExe) { Fail (T 'switch 需要 -NodeExe。' 'switch needs -NodeExe.') }
+    if (-not (Test-Path -LiteralPath $NodeExe)) { Fail (T "找不到指定的 Node：$NodeExe" "The chosen Node is not there: $NodeExe") }
 
     # The floor, checked here and not only in the panel that offered the button.
     # A dsh already installed into a Node below it still cannot run: dsh's direct
@@ -1293,15 +1389,15 @@ function Switch-Node {
     # marker the app then boots from, and the failure would surface as a dsh that
     # will not start rather than as the version problem it is.
     if (-not (Test-NodeVersion $NodeExe)) {
-        Fail "这个 Node 的版本低于 dsh 需要的 $NodeMinimum，无法用它运行 dsh。"
+        Fail (T "这个 Node 的版本低于 dsh 需要的 $NodeMinimum，无法用它运行 dsh。" "This Node is older than the $NodeMinimum dsh needs, so it cannot run dsh.")
     }
 
     $cli = Find-Npm $NodeExe
-    if (-not $cli) { Fail "这个 Node 旁边没有 npm（$NodeExe）。" }
+    if (-not $cli) { Fail (T "这个 Node 旁边没有 npm（$NodeExe）。" "There is no npm beside this Node ($NodeExe).") }
     $prefix = Get-NodePrefix $NodeExe $cli
     $manifest = Join-Path $prefix "node_modules\$Package\package.json"
     if (-not (Test-Path -LiteralPath $manifest)) {
-        Fail "这个 Node 里没有安装 dsh（$prefix），无法直接切换。"
+        Fail (T "这个 Node 里没有安装 dsh（$prefix），无法直接切换。" "This Node has no dsh installed ($prefix), so there is nothing to switch to.")
     }
 
     $state = Read-Marker
@@ -1335,8 +1431,8 @@ function Switch-Node {
 # terminal now share one dsh, and if it is not, the marker is what lets the app
 # reach it anyway.
 function Install-DshInto {
-    if (-not $NodeExe) { Fail 'install-dsh 需要 -NodeExe。' }
-    if (-not (Test-Path -LiteralPath $NodeExe)) { Fail "找不到指定的 Node：$NodeExe" }
+    if (-not $NodeExe) { Fail (T 'install-dsh 需要 -NodeExe。' 'install-dsh needs -NodeExe.') }
+    if (-not (Test-Path -LiteralPath $NodeExe)) { Fail (T "找不到指定的 Node：$NodeExe" "The chosen Node is not there: $NodeExe") }
 
     # The floor, checked here and not only in the panel that offered the button.
     # A dsh already installed into a Node below it still cannot run: dsh's direct
@@ -1345,11 +1441,11 @@ function Install-DshInto {
     # marker the app then boots from, and the failure would surface as a dsh that
     # will not start rather than as the version problem it is.
     if (-not (Test-NodeVersion $NodeExe)) {
-        Fail "这个 Node 的版本低于 dsh 需要的 $NodeMinimum，无法用它运行 dsh。"
+        Fail (T "这个 Node 的版本低于 dsh 需要的 $NodeMinimum，无法用它运行 dsh。" "This Node is older than the $NodeMinimum dsh needs, so it cannot run dsh.")
     }
 
     $cli = Find-Npm $NodeExe
-    if (-not $cli) { Fail "这个 Node 旁边没有 npm（$NodeExe），无法安装 dsh。" }
+    if (-not $cli) { Fail (T "这个 Node 旁边没有 npm（$NodeExe），无法安装 dsh。" "There is no npm beside this Node ($NodeExe), so dsh cannot be installed into it.") }
     $prefix = Get-NodePrefix $NodeExe $cli
 
     $state = Read-Marker
@@ -1358,9 +1454,9 @@ function Install-DshInto {
     if (-not $state.ContainsKey('node')) { $state['node'] = 'system' }
     Write-Marker $state
 
-    Step '正在下载 dsh，约 185 MB，请耐心等待…' 0
-    if (-not (Install-Package $NodeExe $cli "$Package@latest" $prefix 0 $ProgressCeiling)) {
-        Fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
+    Step (T '正在下载 dsh，约 185 MB，请耐心等待…' 'Downloading dsh, about 185 MB. This takes a while…') 0
+    if (-not (Install-Package $NodeExe $cli "$Package@$Tag" $prefix 0 $ProgressCeiling)) {
+        Fail (Install-Failure (T 'dsh 下载失败。' 'Downloading dsh failed.'))
     }
 
     Remove-Path ([string]$state['pathEntry'])
@@ -1369,7 +1465,7 @@ function Install-DshInto {
     $state['dsh'] = 'managed'
     $state['prefix'] = $prefix
     Write-Marker $state
-    Step 'dsh 安装完成。' 100
+    Step (T 'dsh 安装完成。' 'dsh is installed.') 100
 }
 
 # The no-Node-at-all case: download one of ours, then install dsh into it. This
@@ -1388,7 +1484,7 @@ function Install-NodeAndDsh {
     Say "没有可用的 Node，正在为你安装 Node $NodeVersion。"
     $node = Install-Node
     $cli = Find-Npm $node
-    if (-not $cli) { Fail "这个 Node 旁边没有 npm（$node）。" }
+    if (-not $cli) { Fail (T "这个 Node 旁边没有 npm（$node）。" "There is no npm beside this Node ($node).") }
 
     $state['nodeExe'] = $node
     $state['npmCli'] = $cli
@@ -1400,15 +1496,15 @@ function Install-NodeAndDsh {
     # on a machine running nvm that is nvm's own tree, so dsh would be installed
     # *by* our Node and *into* theirs. See the note above `Get-ManagedPrefix`.
     $prefix = Get-ManagedPrefix $node
-    Step '正在下载 dsh，约 185 MB，请耐心等待…' 36
-    if (-not (Install-Package $node $cli "$Package@latest" $prefix 36 $ProgressCeiling)) {
-        Fail 'dsh 下载失败。已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。'
+    Step (T '正在下载 dsh，约 185 MB，请耐心等待…' 'Downloading dsh, about 185 MB. This takes a while…') 36
+    if (-not (Install-Package $node $cli "$Package@$Tag" $prefix 36 $ProgressCeiling)) {
+        Fail (Install-Failure (T 'dsh 下载失败。' 'Downloading dsh failed.'))
     }
 
     $state['dsh'] = 'managed'
     $state['prefix'] = $prefix
     Write-Marker $state
-    Step 'dsh 安装完成。' 100
+    Step (T 'dsh 安装完成。' 'dsh is installed.') 100
 }
 
 # Take dsh out of one Node the user named, and nothing else.
@@ -1417,19 +1513,19 @@ function Install-NodeAndDsh {
 # can reach is the one the app recorded; a machine can have one in every Node it
 # has, and the panel lists them all.
 function Uninstall-DshFrom {
-    if (-not $NodeExe) { Fail 'uninstall-dsh 需要 -NodeExe。' }
-    if (-not (Test-Path -LiteralPath $NodeExe)) { Fail "找不到指定的 Node：$NodeExe" }
+    if (-not $NodeExe) { Fail (T 'uninstall-dsh 需要 -NodeExe。' 'uninstall-dsh needs -NodeExe.') }
+    if (-not (Test-Path -LiteralPath $NodeExe)) { Fail (T "找不到指定的 Node：$NodeExe" "The chosen Node is not there: $NodeExe") }
 
     $cli = Find-Npm $NodeExe
-    if (-not $cli) { Fail "这个 Node 旁边没有 npm（$NodeExe）。" }
+    if (-not $cli) { Fail (T "这个 Node 旁边没有 npm（$NodeExe）。" "There is no npm beside this Node ($NodeExe).") }
     $prefix = Get-NodePrefix $NodeExe $cli
 
     $manifest = Join-Path $prefix "node_modules\$Package\package.json"
     if (-not (Test-Path -LiteralPath $manifest)) {
-        Fail "这个 Node 里没有安装 dsh（$prefix）。"
+        Fail (T "这个 Node 里没有安装 dsh（$prefix）。" "This Node has no dsh installed ($prefix).")
     }
 
-    Step "正在卸载 dsh（$prefix）…" 0
+    Step (T "正在卸载 dsh（$prefix）…" "Uninstalling dsh ($prefix)…") 0
     Invoke-Native $NodeExe @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null | Out-Null
 
     # And the pnpm that came with it, where that pnpm is ours. Nothing else in
@@ -1438,7 +1534,7 @@ function Uninstall-DshFrom {
     # marker file and is left exactly where it is — the same rule `Uninstall-All`
     # applies to a dsh the app merely adopted.
     if (Test-OwnPnpm $prefix) {
-        Step "正在卸载 pnpm（$prefix）…" 60
+        Step (T "正在卸载 pnpm（$prefix）…" "Uninstalling pnpm ($prefix)…") 60
         Invoke-Native $NodeExe @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Pnpm) $null | Out-Null
         Remove-Item -LiteralPath (Join-Path $prefix $PnpmMark) -Force -ErrorAction SilentlyContinue
     }
@@ -1451,7 +1547,7 @@ function Uninstall-DshFrom {
         $state.Remove('dsh')
         Write-Marker $state
     }
-    Step 'dsh 已卸载。' 100
+    Step (T 'dsh 已卸载。' 'dsh is uninstalled.') 100
 }
 
 # Delete the Node this script unpacked, and the dsh inside it.
@@ -1461,10 +1557,10 @@ function Uninstall-DshFrom {
 # this mode or any other.
 function Remove-ManagedNode {
     if (-not (Test-Path -LiteralPath $NodeDir)) {
-        Fail '本应用没有安装过 Node。'
+        Fail (T '本应用没有安装过 Node。' 'This app has not installed a Node.')
     }
 
-    Step '正在删除应用安装的 Node 和 dsh…' 0
+    Step (T '正在删除应用安装的 Node 和 dsh…' 'Deleting the Node and dsh the app installed…') 0
     Remove-Item -LiteralPath $NodeDir -Recurse -Force -ErrorAction SilentlyContinue
 
     # The marker is only wiped when it was describing the Node that just went.
@@ -1477,7 +1573,7 @@ function Remove-ManagedNode {
         Remove-Path ([string]$state['pathEntry'])
         Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
     }
-    Step '已删除。' 100
+    Step (T '已删除。' 'Deleted.') 100
 }
 
 # Delete one version a version manager installed, and whatever is inside it —
@@ -1496,22 +1592,22 @@ function Remove-ManagedNode {
 # this script unpacked, which has a mode of its own that also clears the marker
 # and the PATH entry that came with it.
 function Remove-Node {
-    if (-not $NodeExe) { Fail 'delete-node 需要 -NodeExe。' }
+    if (-not $NodeExe) { Fail (T 'delete-node 需要 -NodeExe。' 'delete-node needs -NodeExe.') }
     if ($NodeExe.StartsWith($NodeDir, [StringComparison]::OrdinalIgnoreCase)) {
-        Fail '这是本应用自己装的 Node，请用“删除应用装的 Node”。'
+        Fail (T '这是本应用自己装的 Node，请用“删除应用装的 Node”。' 'This is the Node the app installed; use "Delete the app''s Node" instead.')
     }
 
     $dir = Get-VersionDir $NodeExe
     if (-not $dir) {
-        Fail "这个 Node 不是 nvm/fnm/volta 装的，应用不会删它：$NodeExe"
+        Fail (T "这个 Node 不是 nvm/fnm/volta 装的，应用不会删它：$NodeExe" "This Node was not installed by nvm, fnm or Volta, so the app will not delete it: $NodeExe")
     }
-    if (-not (Test-Path -LiteralPath $dir)) { Fail "这个 Node 已经不在了：$dir" }
+    if (-not (Test-Path -LiteralPath $dir)) { Fail (T "这个 Node 已经不在了：$dir" "This Node is already gone: $dir") }
 
-    Step "正在删除 $dir…" 0
+    Step (T "正在删除 $dir…" "Deleting $dir…") 0
     try {
         Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction Stop
     } catch {
-        Fail "删除失败：$($_.Exception.Message)"
+        Fail (T "删除失败：$($_.Exception.Message)" "Deleting failed: $($_.Exception.Message)")
     }
 
     # A marker pointing into the directory that just went describes nothing. It
@@ -1521,7 +1617,7 @@ function Remove-Node {
     if (([string]$state['nodeExe']).StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)) {
         Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
     }
-    Step '已删除。' 100
+    Step (T '已删除。' 'Deleted.') 100
 }
 
 # Take the app's own plugin back out of the user's dsh profile.

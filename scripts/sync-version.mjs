@@ -14,6 +14,14 @@
 //   npm version patch      # -> 0.1.4 everywhere, committed and tagged
 //   git push --follow-tags # -> the tag starts the release workflow
 //
+// A beta goes out the same way. `-beta.0` is a semver prerelease suffix, all
+// four files take one, and `release.yml` publishes a tag that carries one as a
+// GitHub prerelease — which `releases/latest` does not resolve to, so no
+// installed copy ever sees it:
+//
+//   npm version prerelease --preid beta  # 0.1.3 -> 0.1.4-beta.0, then .1, …
+//   npm version patch                    # -> 0.1.4, dropping the suffix
+//
 // No dependency does this: it is one field in three files, and a version
 // bumper that has to be installed to bump a version is a strange thing to add
 // to a project that has two dependencies in its package.json.
