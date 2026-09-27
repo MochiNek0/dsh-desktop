@@ -359,7 +359,15 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
             // replaced dialog.
         }
 
-        crate::deliver_setup(app, &payload(nodes.as_deref(), error.as_deref(), mode));
+        // Built here rather than kept beside the error: it reads the log, and
+        // the log is only worth reading for a failure that is on screen.
+        let diagnostics = error
+            .as_deref()
+            .map(|message| crate::dsh::diagnostics(app, message));
+        crate::deliver_setup(
+            app,
+            &payload(nodes.as_deref(), error.as_deref(), diagnostics.as_deref(), mode),
+        );
 
         let choice = receive.recv_timeout(ANSWER_TIMEOUT);
         // The panel is no longer the one on screen either way; take the slot so a
@@ -767,7 +775,12 @@ fn scanning() -> String {
 /// The JSON the panel takes: the nodes, whether the machine could be looked at
 /// at all, the version a fresh install would bring, and the error from a
 /// previous attempt when there was one.
-fn payload(nodes: Option<&[NodeInfo]>, error: Option<&str>, mode: Mode) -> String {
+fn payload(
+    nodes: Option<&[NodeInfo]>,
+    error: Option<&str>,
+    diagnostics: Option<&str>,
+    mode: Mode,
+) -> String {
     let list: Vec<serde_json::Value> = nodes
         .unwrap_or_default()
         .iter()
@@ -792,6 +805,9 @@ fn payload(nodes: Option<&[NodeInfo]>, error: Option<&str>, mode: Mode) -> Strin
         "scanned": nodes.is_some(),
         "nodeVersion": NODE_VERSION,
         "error": error,
+        // What the error box's copy button hands over; see
+        // `crate::dsh::diagnostics`.
+        "diagnostics": diagnostics,
         // What the panel keys its two shapes off: which way out it offers, and
         // whether the verbs that remove things are drawn at all.
         "manage": mode == Mode::Manage,
@@ -832,11 +848,11 @@ pub fn answered(choice: Choice) {
 /// again by [`relabel`], and two copies of these strings would be the drift
 /// [`crate::i18n`] is arranged to prevent.
 fn labels() -> String {
-    json!({
+    let mut labels = json!({
         "title": t!("选择运行环境", "Choose a runtime"),
         "ledeNodes": t!(
-            "这台机器上有不止一个 Node。选一个来运行 dsh —— 已经装好 dsh 的可以直接用，没装的也能在这里装上。",
-            "This machine has more than one Node. Pick one to run dsh — use one that already has it, or install dsh into one here."
+            "这台机器上找到了下面这些 Node。选一个来运行 dsh —— 已经装好 dsh 的可以直接用，没装的也能在这里装上。",
+            "These are the Nodes on this machine. Pick one to run dsh — use one that already has it, or install dsh into one here."
         ),
         "ledeNone": t!(
             "这台机器上没有检测到 Node。可以在这里装一个，dsh 会跟着一起装好。",
@@ -894,8 +910,47 @@ fn labels() -> String {
             "snap": "Snap",
             "": t!("Node", "Node")
         }
-    })
-    .to_string()
+    });
+
+    // A second literal, merged in, because one this long is past what `json!`
+    // can expand.
+    let first_run = json!({
+        // The boot's panel, when it has one answer to put first. Says what the
+        // thing is before anything asks the user to know what a Node is.
+        "ledeSimple": t!(
+            "dsh 需要一个运行环境（Node.js）才能工作。点下面的按钮就能准备好，不需要管理员权限。",
+            "dsh needs a runtime (Node.js) to work. The button below sets it up, and needs no administrator rights."
+        ),
+        // `%v` is a Node version and `%d` a dsh version, filled in by the panel.
+        "recUseTitle": t!("使用已经装好的 dsh %d", "Use the dsh %d already installed"),
+        "recUseText": t!(
+            "在 Node %v 里找到了能用的 dsh，不需要下载，点一下就能开始。",
+            "Node %v already has a dsh that works. Nothing to download — one click and you are in."
+        ),
+        "recUseButton": t!("使用它", "Use it"),
+        "recNodeTitle": t!("一键安装（推荐）", "Set it all up (recommended)"),
+        "recNodeText": t!(
+            "下载 Node %v 和 dsh，约 185 MB，通常需要几分钟。装在应用自己的目录里，不会改动你电脑上已有的任何东西。",
+            "Downloads Node %v and dsh — about 185 MB, usually a few minutes. It goes into the app's own directory and changes nothing else on your computer."
+        ),
+        "recDshTitle": t!("安装 dsh", "Install dsh"),
+        "recDshText": t!(
+            "把 dsh 装进应用自己的 Node %v 里，约 185 MB，通常需要几分钟。",
+            "Installs dsh into the app's own Node %v — about 185 MB, usually a few minutes."
+        ),
+        "recInstallButton": t!("开始安装", "Install"),
+        "more": t!("自己选择 Node（高级）", "Choose a Node myself (advanced)"),
+        "less": t!("收起", "Hide the list"),
+        "copyDiag": t!("复制诊断信息", "Copy diagnostics"),
+        "copied": t!("已复制", "Copied"),
+        "openLogs": t!("打开日志", "Open the log")
+    });
+    if let (Some(labels), serde_json::Value::Object(first_run)) =
+        (labels.as_object_mut(), first_run)
+    {
+        labels.extend(first_run);
+    }
+    labels.to_string()
 }
 
 /// Put the chooser into the language dsh has just switched to; see
@@ -917,6 +972,7 @@ pub fn script() -> String {
     let scheme = crate::controls::SCHEME;
     let font = crate::controls::FONT;
     let maker = crate::controls::dom_make();
+    let copier = crate::controls::copier();
     let watcher = crate::controls::theme_watcher("dsh-su-dark");
     let corners = crate::controls::corners(&["dsh-su"]);
     let labels = labels();
@@ -931,10 +987,21 @@ pub fn script() -> String {
 
   var TEXT = {labels};
 
-  var root = null, sheet, card, lede, list, errBox, errText;
+  var root = null, sheet, card, lede, list, errBox, errText, errCopy;
   var statusBox, statusText, statusFill;
   var installNode, removeNode, rescan, quit;
+  var recBox, recTitle, recText, recButton, more;
   var sent = false;
+  // The one answer the boot's panel puts first, so that someone who has never
+  // heard of Node is not asked to pick one out of a list. `null` on the menu's
+  // panel and whenever nothing on the list can be recommended.
+  var rec = null;
+  // Whether the full list is open under the recommendation. Kept across
+  // showings: a failed install re-shows the panel, and the list the user had
+  // opened should not snap shut under them.
+  var advanced = false;
+  // What the error box's copy button hands over; see `payload`.
+  var diagnostics = '';
   // Set when the language moved under a card that was already built; see
   // `__dshSetupText`.
   var stale = false;
@@ -955,6 +1022,49 @@ pub fn script() -> String {
   }}
 
 {maker}
+
+{copier}
+
+  // A navigation that is not an answer: the panel stays up and still waiting,
+  // so it must not latch `sent` the way `signal` does.
+  function poke(verb) {{
+    window.location.href = '{scheme}://' + verb;
+  }}
+
+  // The Node to put first, and what to do with it. In order: a dsh that is
+  // already there and new enough, which costs nothing; a fresh Node of the
+  // app's own, which touches nothing the user has; and dsh into the app's own
+  // Node, for the machine that has one without a dsh in it.
+  function recommend(nodes, installOffered) {{
+    var usable = -1;
+    nodes.forEach(function (node, index) {{
+      if (!node.meetsMinimum || !node.hasDsh) return;
+      if (usable < 0 || node.current) usable = index;
+    }});
+    if (usable >= 0) return {{ kind: 'use', index: usable, node: nodes[usable] }};
+    if (installOffered) return {{ kind: 'node' }};
+    for (var i = 0; i < nodes.length; i++) {{
+      if (nodes[i].source === 'managed' && nodes[i].meetsMinimum) {{
+        return {{ kind: 'dsh', index: i, node: nodes[i] }};
+      }}
+    }}
+    return null;
+  }}
+
+  // Written out per kind rather than as one computed verb, for the test that
+  // reads the verb literals out of this script.
+  function takeRecommendation() {{
+    if (!rec) return;
+    if (rec.kind === 'use') signal('setup-use?i=' + rec.index);
+    else if (rec.kind === 'dsh') signal('setup-install-dsh?i=' + rec.index);
+    else signal('setup-install-node');
+  }}
+
+  function fill(text, node, nodeVersion) {{
+    return text
+      .replace('%v', node ? node.version : nodeVersion)
+      .replace('%d', node && node.dshVersion ? node.dshVersion : '');
+  }}
 
   function button(parent, text, onclick, primary) {{
     var node = make('button', primary ? 'dsh-su-primary' : '', parent);
@@ -1150,6 +1260,20 @@ pub fn script() -> String {
       '.dsh-su button.dsh-su-danger:hover{{background:var(--su-bad);color:#fff;' +
       'border-color:var(--su-bad)}}' +
       '.dsh-su-row.dsh-su-now{{border-color:var(--su-accent)}}' +
+      // The recommendation: the one card the boot's panel leads with.
+      '.dsh-su-rec{{display:none;border:1px solid var(--su-accent);' +
+      'border-radius:12px;padding:15px 16px;margin-bottom:12px}}' +
+      '.dsh-su-rec.dsh-su-rec-on{{display:block}}' +
+      '.dsh-su-rec-title{{font-weight:600}}' +
+      '.dsh-su-rec-text{{margin-top:4px;font-size:13px;color:var(--su-muted)}}' +
+      '.dsh-su-rec button{{margin-top:12px}}' +
+      '.dsh-su button.dsh-su-more{{border:none;background:none;padding:0;' +
+      'height:auto;margin:0 0 10px;align-self:flex-start;' +
+      'color:var(--su-accent);font-size:13px}}' +
+      '.dsh-su button.dsh-su-more:hover{{background:none;text-decoration:underline}}' +
+      '.dsh-su-list[hidden]{{display:none}}' +
+      '.dsh-su-err-actions{{display:flex;gap:8px;margin-top:10px}}' +
+      '.dsh-su-err-actions button{{height:28px;padding:0 12px;font-size:12px}}' +
       // The status line an action reports onto. Only the menu's panel needs it
       // — the boot's has the loading page underneath — but it is drawn either
       // way and simply stays empty.
@@ -1192,6 +1316,26 @@ pub fn script() -> String {
     lede = make('p', 'dsh-su-lede', card);
     errBox = make('div', 'dsh-su-err', card);
     errText = make('div', '', errBox);
+    // A failure the user cannot hand on is a failure only they can fix. These
+    // two are what they send when they ask for help.
+    var errActions = make('div', 'dsh-su-err-actions', errBox);
+    errCopy = button(errActions, TEXT.copyDiag, function () {{
+      copyText(diagnostics, function (ok) {{
+        if (ok) errCopy.textContent = TEXT.copied;
+      }});
+    }});
+    button(errActions, TEXT.openLogs, function () {{ poke('setup-logs'); }});
+
+    recBox = make('div', 'dsh-su-rec', card);
+    recTitle = make('div', 'dsh-su-rec-title', recBox);
+    recText = make('div', 'dsh-su-rec-text', recBox);
+    recButton = button(recBox, '', takeRecommendation, true);
+    more = button(card, TEXT.more, function () {{
+      advanced = !advanced;
+      showList();
+    }});
+    more.className = 'dsh-su-more';
+
     list = make('div', 'dsh-su-list', card);
 
     statusBox = make('div', 'dsh-su-status', card);
@@ -1252,6 +1396,13 @@ pub fn script() -> String {
     else document.addEventListener('DOMContentLoaded', then, {{ once: true }});
   }}
 
+  // The list is folded away under a recommendation, and always shown without
+  // one -- then it is the only way forward there is.
+  function showList() {{
+    list.hidden = !!rec && !advanced;
+    more.textContent = advanced ? TEXT.less : TEXT.more;
+  }}
+
   window.__dshSetup = function (payload) {{
     var data;
     try {{
@@ -1287,6 +1438,9 @@ pub fn script() -> String {
         errBox.classList.remove('dsh-su-err-shown');
         errText.textContent = '';
         list.textContent = '';
+        list.hidden = false;
+        recBox.classList.remove('dsh-su-rec-on');
+        more.hidden = true;
         statusText.textContent = TEXT.scanning;
         statusBox.classList.add('dsh-su-status-on');
         statusFill.parentNode.classList.remove('dsh-su-bar-on');
@@ -1348,17 +1502,44 @@ pub fn script() -> String {
       // no dsh to follow.
       installNode.disabled = managing && followsPath;
 
+      // Only on the boot's panel, which is the one a first launch meets. The
+      // menu's is for someone who went looking for it, and gets the list.
+      rec = (!managing && scanned) ? recommend(nodes, !installNode.hidden) : null;
+      recBox.classList.toggle('dsh-su-rec-on', !!rec);
+      if (rec) {{
+        var using = rec.kind === 'use';
+        recTitle.textContent = fill(
+          using ? TEXT.recUseTitle : (rec.kind === 'dsh' ? TEXT.recDshTitle : TEXT.recNodeTitle),
+          rec.node, data.nodeVersion);
+        recText.textContent = fill(
+          using ? TEXT.recUseText : (rec.kind === 'dsh' ? TEXT.recDshText : TEXT.recNodeText),
+          rec.node, data.nodeVersion);
+        recButton.textContent = using ? TEXT.recUseButton : TEXT.recInstallButton;
+        lede.textContent = TEXT.ledeSimple;
+        // The same click as the recommendation's; two buttons for it would be
+        // one too many on the screen that is meant to be the simplest.
+        if (rec.kind === 'node') installNode.hidden = true;
+      }}
+      // And one filled button on the card, not two: with a recommendation up,
+      // the footer's is the alternative, not the thing being asked.
+      installNode.classList.toggle('dsh-su-primary', !rec);
+      more.hidden = !rec || !nodes.length;
+
       statusBox.classList.remove('dsh-su-status-on');
       statusText.textContent = '';
 
       var shown = data.error && typeof data.error === 'string';
       errBox.classList.toggle('dsh-su-err-shown', shown);
       errText.textContent = shown ? data.error : '';
+      diagnostics = typeof data.diagnostics === 'string' ? data.diagnostics : '';
+      errCopy.textContent = TEXT.copyDiag;
+      errCopy.hidden = !diagnostics;
 
       list.textContent = '';
       nodes.forEach(function (node, index) {{
         list.appendChild(row(node, index));
       }});
+      showList();
 
       // The label carries the version a fresh install would bring, so the user
       // knows what they are agreeing to download.
@@ -1477,8 +1658,8 @@ mod tests {
     /// Both states reach the panel, and it has to be able to tell them apart.
     #[test]
     fn the_payload_says_whether_the_machine_was_looked_at() {
-        let scanned = super::payload(Some(&[]), None, super::Mode::Required);
-        let failed = super::payload(None, None, super::Mode::Required);
+        let scanned = super::payload(Some(&[]), None, None, super::Mode::Required);
+        let failed = super::payload(None, None, None, super::Mode::Required);
 
         assert!(scanned.contains("\"scanned\":true"));
         assert!(failed.contains("\"scanned\":false"));
@@ -1496,7 +1677,7 @@ mod tests {
         assert!(scanning.contains("\"manage\":true"));
         assert!(scanning.contains("\"nodes\":[]"));
         // And the finished one is not mistaken for it.
-        assert!(!super::payload(Some(&[]), None, super::Mode::Manage).contains("\"scanning\":true"));
+        assert!(!super::payload(Some(&[]), None, None, super::Mode::Manage).contains("\"scanning\":true"));
     }
 
     /// The other flag the panel keys off. Wrong, and either the boot's chooser
@@ -1504,8 +1685,8 @@ mod tests {
     /// out it has.
     #[test]
     fn the_payload_says_which_panel_this_is() {
-        assert!(super::payload(Some(&[]), None, super::Mode::Manage).contains("\"manage\":true"));
-        assert!(super::payload(Some(&[]), None, super::Mode::Required).contains("\"manage\":false"));
+        assert!(super::payload(Some(&[]), None, None, super::Mode::Manage).contains("\"manage\":true"));
+        assert!(super::payload(Some(&[]), None, None, super::Mode::Required).contains("\"manage\":false"));
     }
 
     /// The field the panel greys its switch buttons off, and the panel's read
@@ -1515,7 +1696,7 @@ mod tests {
     /// lands back on the same list.
     #[test]
     fn the_panel_reads_the_follows_path_field_the_payload_sends() {
-        let sent = super::payload(Some(&[]), None, super::Mode::Manage);
+        let sent = super::payload(Some(&[]), None, None, super::Mode::Manage);
 
         assert!(sent.contains("\"followsPath\":"));
         assert!(super::script().contains("data.followsPath"));
@@ -1623,6 +1804,52 @@ mod tests {
                 sh.contains(&format!("\n    {mode}) ")),
                 "install-deps.sh does not accept -Mode {mode}"
             );
+        }
+    }
+
+    /// The error box's two buttons: the copy one reads the field the payload
+    /// sends, and the log one is a verb the app answers without taking the
+    /// panel's pending choice.
+    #[test]
+    fn the_error_box_hands_over_what_the_payload_carries() {
+        let sent = super::payload(Some(&[]), Some("broke"), Some("all of it"), super::Mode::Required);
+        assert!(sent.contains("\"diagnostics\":\"all of it\""));
+
+        let script = super::script();
+        assert!(script.contains("data.diagnostics"));
+        assert!(script.contains("poke('setup-logs')"));
+        let url = tauri::Url::parse(&format!("{}://setup-logs", crate::controls::SCHEME))
+            .expect("a parseable control url");
+        assert!(matches!(
+            crate::controls::action(&url),
+            Some(crate::controls::Action::SetupLogs)
+        ));
+    }
+
+    /// Every string the recommendation reads is one `labels` sends. A missing
+    /// one is `undefined` drawn as the title of the first thing a new user sees.
+    #[test]
+    fn the_recommendation_reads_labels_that_exist() {
+        let labels: serde_json::Value =
+            serde_json::from_str(&super::labels()).expect("labels are JSON");
+        for key in [
+            "ledeSimple",
+            "recUseTitle",
+            "recUseText",
+            "recUseButton",
+            "recNodeTitle",
+            "recNodeText",
+            "recDshTitle",
+            "recDshText",
+            "recInstallButton",
+            "more",
+            "less",
+            "copyDiag",
+            "copied",
+            "openLogs",
+        ] {
+            assert!(labels.get(key).is_some(), "labels has no {key}");
+            assert!(super::script().contains(&format!("TEXT.{key}")), "{key} is unused");
         }
     }
 }

@@ -47,10 +47,10 @@
 //! [`terminal`] for what the user gets instead of a PATH entry.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use semver::Version;
@@ -958,13 +958,31 @@ pub fn requested(app: &AppHandle, saying: &Saying) -> Option<(PathBuf, Version)>
     saying("");
 
     let Some((installed, latest)) = found else {
-        note(
+        // Nothing installs itself any more — a restart only brings the chooser
+        // back — so the way out is the chooser, one click from here.
+        let answering = app.clone();
+        crate::dialog::ask(
             app,
-            t!("找不到 dsh", "No dsh found"),
-            t!(
-                "这台机器上还没有装好的 dsh。重启应用会再装一次。",
-                "There is no working dsh on this machine. Restarting the app installs one."
-            ),
+            crate::dialog::Ask {
+                title: t!("找不到 dsh", "No dsh found").to_string(),
+                body: t!(
+                    "这台机器上还没有能用的 dsh。在「运行环境」里可以一键装好。",
+                    "There is no working dsh on this machine. The runtime panel can set one up in one click."
+                )
+                .to_string(),
+                choices: vec![
+                    crate::dialog::Choice::new("cancel", t!("取消", "Cancel")),
+                    crate::dialog::Choice::primary(
+                        "runtime",
+                        t!("打开运行环境", "Open the runtime panel"),
+                    ),
+                ],
+                answered: Box::new(move |_, id| {
+                    if id == "runtime" {
+                        crate::open_runtime(&answering);
+                    }
+                }),
+            },
         );
         return None;
     };
@@ -1056,7 +1074,7 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
         Err(error) => {
             eprintln!("dsh-desktop: updating dsh failed: {error}");
             report("", -1.0);
-            note(
+            failed(
                 app,
                 t!("dsh 更新失败", "Updating dsh failed"),
                 &t!(
@@ -1065,6 +1083,7 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
                     installed,
                     error
                 ),
+                &error,
             );
             Updated::Failed
         }
@@ -1078,7 +1097,9 @@ pub fn update(app: &AppHandle, prefix: &Path, installed: &Version, report: &Repo
 /// this, and everything else it prints is npm's own log, which goes to stderr
 /// for whoever is watching the app from a console.
 pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<bool, String> {
-    let script = script(app).ok_or_else(|| format!("找不到安装脚本 {SCRIPT}"))?;
+    let script = script(app).ok_or_else(|| {
+        t!("找不到安装脚本 {}", "the install script {} is missing", SCRIPT)
+    })?;
 
     // Whether this run is going to reach a registry at all -- see `FETCHES`.
     // The chooser's `list` and `switch` install nothing, so neither the question
@@ -1096,9 +1117,16 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
         // Turns the plain log into `::` lines and switches stdout to UTF-8,
         // which is what the reader below expects.
         .arg("-Progress")
+        // The language the loading page is in, so what the script says onto it
+        // is too. The scripts default to Chinese, which is what the uninstaller
+        // and a run by hand have always had.
+        .arg("-Lang")
+        .arg(crate::i18n::tag())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        // Kept now, for the log: a PowerShell exception or a shell error lands
+        // here and nowhere else.
+        .stderr(Stdio::piped());
 
     if let Some(source) = source {
         command.arg("-Registry").arg(source.as_str());
@@ -1139,6 +1167,19 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
         .take()
         .ok_or(t!("无法读取脚本输出", "the script's output cannot be read"))?;
 
+    // Everything the script says, both streams, for the failure dialog to hand
+    // over. Without it a failed install on someone else's machine is one
+    // sentence and nothing behind it.
+    let log = Arc::new(Mutex::new(open_log(app, args)));
+    if let Some(stderr) = child.stderr.take() {
+        let log = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                logged(&log, &format!("[stderr] {line}"));
+            }
+        });
+    }
+
     #[cfg(windows)]
     let job = crate::server::Job::hold(&child);
 
@@ -1157,6 +1198,7 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
     let mut failure = None;
     let mut percent = -1.0;
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        logged(&log, &line);
         if let Some(text) = line.strip_prefix("::status ") {
             report(text, percent);
         } else if let Some(reported) = line.strip_prefix("::progress ") {
@@ -1196,7 +1238,170 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
     if status.success() {
         Ok(true)
     } else {
-        Err(failure.unwrap_or_else(|| format!("脚本退出码 {status}")))
+        let failure = failure
+            .unwrap_or_else(|| t!("脚本退出码 {}", "the script exited with {}", status));
+        logged(&log, &format!("-- failed: {failure}"));
+        Err(match hint(&failure) {
+            Some(hint) => format!("{failure}\n\n{hint}"),
+            None => failure,
+        })
+    }
+}
+
+/// Where the last bootstrap run's whole output is kept: one file, replaced by
+/// the next run, because the run that matters is always the one that just
+/// failed.
+pub fn log_path(app: &AppHandle) -> Option<PathBuf> {
+    Some(app_dir(app)?.join("logs").join("bootstrap.log"))
+}
+
+/// Start the log for one run, with what a bug report asks first. `None` is a
+/// log that could not be written, which costs the report and nothing else.
+fn open_log(app: &AppHandle, args: &[&OsStr]) -> Option<std::fs::File> {
+    let path = log_path(app)?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let mut file = std::fs::File::create(&path).ok()?;
+
+    let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+    let _ = writeln!(file, "{}", about(app));
+    let _ = writeln!(file, "{SCRIPT} {}", args.join(" "));
+    Some(file)
+}
+
+fn logged(log: &Mutex<Option<std::fs::File>>, line: &str) {
+    if let Ok(mut log) = log.lock() {
+        if let Some(file) = log.as_mut() {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+/// The app, its version and the platform, as one line.
+fn about(app: &AppHandle) -> String {
+    format!(
+        "dsh desktop {} · {} {}",
+        app.package_info().version,
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// What to paste into an issue or the QQ group when an install failed: the
+/// app and platform, the message the user saw, and the end of the log.
+pub fn diagnostics(app: &AppHandle, message: &str) -> String {
+    let log = log_path(app).and_then(|path| std::fs::read_to_string(path).ok());
+    report_text(&about(app), message, log.as_deref())
+}
+
+/// The assembling half of [`diagnostics`], without the app a test cannot build.
+fn report_text(about: &str, message: &str, log: Option<&str>) -> String {
+    /// Enough for npm's error block and the lines that led to it, and short
+    /// enough to paste into a chat.
+    const TAIL: usize = 60;
+
+    let mut text = format!("{about}\n\n{message}\n");
+    if let Some(log) = log {
+        let lines: Vec<&str> = log.lines().collect();
+        let tail = &lines[lines.len().saturating_sub(TAIL)..];
+        text.push_str("\n--- bootstrap.log ---\n");
+        text.push_str(&tail.join("\n"));
+    }
+    text
+}
+
+/// A failed install, said with a way to hand it on: the log opened in the file
+/// manager, and the diagnostics copied for a chat or an issue.
+pub fn failed(app: &AppHandle, title: &str, body: &str, message: &str) {
+    let answering = app.clone();
+    crate::dialog::ask(
+        app,
+        crate::dialog::Ask {
+            title: title.to_string(),
+            body: body.to_string(),
+            choices: vec![
+                crate::dialog::Choice::new("logs", t!("打开日志", "Open the log")),
+                crate::dialog::Choice::copy(
+                    "copy",
+                    t!("复制诊断信息", "Copy diagnostics"),
+                    diagnostics(app, message),
+                ),
+                crate::dialog::Choice::primary("ok", t!("知道了", "OK")),
+            ],
+            answered: Box::new(move |_, id| {
+                if id == "logs" {
+                    open_logs(&answering);
+                }
+            }),
+        },
+    );
+}
+
+/// Show the log directory in the file manager.
+pub fn open_logs(app: &AppHandle) {
+    use tauri_plugin_opener::OpenerExt;
+
+    let Some(dir) = log_path(app).and_then(|path| path.parent().map(Path::to_path_buf)) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Err(error) = app.opener().open_path(dir.to_string_lossy(), None::<&str>) {
+        eprintln!("dsh-desktop: could not open the log directory: {error}");
+    }
+}
+
+/// What to try next, for the npm failures a first install actually meets.
+///
+/// Read off the code npm printed, which the scripts carry into the message.
+/// `None` for everything else: the message already says what npm said, and a
+/// guess added to it is the kind of wrong that sends someone into their proxy
+/// settings for an afternoon.
+fn hint(message: &str) -> Option<&'static str> {
+    let has = |codes: &[&str]| codes.iter().any(|code| message.contains(code));
+
+    if has(&["ENOSPC"]) {
+        Some(t!(
+            "磁盘空间不足。清理出至少 1 GB 空间后再试。",
+            "The disk is full. Free up at least 1 GB and try again."
+        ))
+    } else if has(&["EPERM", "EBUSY"]) {
+        Some(t!(
+            "文件被占用或被拦截。常见原因是杀毒软件正在扫描刚下载的文件，或者还有一个 dsh / node 在运行。关掉它们，或暂时放行本应用后再试。",
+            "A file was locked or blocked, usually by antivirus scanning what was just downloaded, or by a dsh or node still running. Close them, or let this app through, and try again."
+        ))
+    } else if has(&["EACCES"]) {
+        Some(t!(
+            "没有写入权限：npm 的全局目录只有管理员能写。换成「安装新的 Node」，它会装在应用自己的目录里，不需要管理员权限。",
+            "No permission to write: npm's global directory needs administrator rights. Use \"Install a fresh Node\" instead, which goes into the app's own directory and needs none."
+        ))
+    } else if has(&[
+        "SELF_SIGNED_CERT_IN_CHAIN",
+        "UNABLE_TO_GET_ISSUER_CERT",
+        "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+        "CERT_HAS_EXPIRED",
+    ]) {
+        Some(t!(
+            "证书校验失败，通常是公司网络或代理/抓包软件替换了证书。换一个网络，或关掉代理软件后再试。",
+            "A certificate check failed, usually because a company network or a proxy tool is replacing certificates. Try another network, or turn the proxy off."
+        ))
+    } else if has(&[
+        "ETIMEDOUT",
+        "ESOCKETTIMEDOUT",
+        "ECONNRESET",
+        "ECONNREFUSED",
+        "ENOTFOUND",
+        "EAI_AGAIN",
+    ]) {
+        Some(t!(
+            "网络连接失败。检查网络是否正常；开着代理或 VPN 的话，试试关掉或换个节点再试。",
+            "The network connection failed. Check you are online; if a proxy or VPN is on, try turning it off or switching servers."
+        ))
+    } else if has(&["EINTEGRITY"]) {
+        Some(t!(
+            "下载的文件校验失败，多半是镜像的缓存坏了。稍后再试，或在菜单的「安装源…」里换一个源。",
+            "A download failed its checksum, most likely a mirror's stale cache. Try again later, or pick another source under \"Install source…\"."
+        ))
+    } else {
+        None
     }
 }
 
@@ -1460,9 +1665,42 @@ pub fn registry_source(app: &AppHandle) -> Option<RegistrySource> {
     }
 
     let configured = configured_registry(app)?;
+
+    // A public mirror is not a registry of the user's own: it is what every
+    // tutorial for a Chinese network says to set, and the question below —
+    // "a private mirror or a company proxy is usually there for a reason" —
+    // means nothing to someone who pasted that line once. The measured list
+    // already has the same mirrors in it, so it is taken without asking. Not
+    // written down, so pointing npm at a private registry later still asks.
+    if is_public_mirror(&configured) {
+        return Some(RegistrySource::Auto);
+    }
+
     let source = choose_registry(app, &configured)?;
     crate::settings::set_registry(app, source);
     Some(source)
+}
+
+/// The public mirrors the scripts race, and the dead Taobao address older
+/// tutorials still hand out — which fails every install it is left in charge
+/// of, so racing past it is the only thing that works on those machines.
+///
+/// Scheme-less and without a trailing slash, for [`is_public_mirror`].
+const PUBLIC_MIRRORS: &[&str] = &[
+    "registry.npmmirror.com",
+    "mirrors.cloud.tencent.com/npm",
+    "mirrors.huaweicloud.com/repository/npm",
+    "registry.npm.taobao.org",
+];
+
+/// Whether `registry` is one of [`PUBLIC_MIRRORS`], however it was spelled.
+fn is_public_mirror(registry: &str) -> bool {
+    let bare = registry.trim().trim_end_matches('/').to_ascii_lowercase();
+    let bare = bare
+        .strip_prefix("https://")
+        .or_else(|| bare.strip_prefix("http://"))
+        .unwrap_or(&bare);
+    PUBLIC_MIRRORS.contains(&bare)
 }
 
 /// The question itself. Also what the menu item calls to change the answer.
@@ -1584,24 +1822,43 @@ fn confirm(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
 /// goes in the message instead, for the user to run against whatever they
 /// actually installed it with.
 fn tell(app: &AppHandle, installed: &Version, latest: &Version) {
-    note(
+    // The channel's tag rather than a bare `@latest`: on the alpha line that
+    // command would quietly move the user back onto the release candidates.
+    let command = update_command(crate::settings::dsh_channel(app));
+    crate::dialog::ask(
         app,
-        t!("dsh 有可用更新", "A dsh update is available"),
-        &t!(
-            "dsh 有新版本 {}（当前 {}）。\n\n\
-             这份 dsh 不在应用能写的 npm 全局目录里（比如用版本管理器装的，\
-             或者装在只有管理员能写的地方），应用不会去改动它。要更新的话，\
-             用你当初安装它的方式，在终端里执行：\n\nnpm install -g {}@latest",
-            "dsh {} is available (this machine has {}).\n\n\
-             This dsh is not in an npm global directory the app can write to — a \
-             version manager put it there, or it needs administrator rights — so \
-             the app will not touch it. To update it, use whatever you installed \
-             it with:\n\nnpm install -g {}@latest",
-            latest,
-            installed,
-            PACKAGE
-        ),
+        crate::dialog::Ask {
+            title: t!("dsh 有可用更新", "A dsh update is available").to_string(),
+            body: t!(
+                "dsh 有新版本 {}（当前 {}）。\n\n\
+                 这份 dsh 不在应用能写的 npm 全局目录里（比如用版本管理器装的，\
+                 或者装在只有管理员能写的地方），应用不会去改动它。要更新的话，\
+                 复制下面这行命令，在终端里执行：\n\n{}",
+                "dsh {} is available (this machine has {}).\n\n\
+                 This dsh is not in an npm global directory the app can write to — a \
+                 version manager put it there, or it needs administrator rights — so \
+                 the app will not touch it. To update it, copy this command and run \
+                 it in a terminal:\n\n{}",
+                latest,
+                installed,
+                command
+            ),
+            choices: vec![
+                crate::dialog::Choice::copy(
+                    "copy",
+                    t!("复制命令", "Copy the command"),
+                    command.clone(),
+                ),
+                crate::dialog::Choice::primary("ok", t!("知道了", "OK")),
+            ],
+            answered: Box::new(|_, _| {}),
+        },
     );
+}
+
+/// The command [`tell`] hands over, on the release line the user is on.
+fn update_command(channel: Channel) -> String {
+    format!("npm install -g {PACKAGE}@{}", channel.tag())
 }
 
 /// The version the user turned down. Re-asking on every launch for a download
@@ -2720,6 +2977,114 @@ mod tests {
         assert_eq!(
             package_root(&scratch.at("nothing-here")),
             scratch.at("nothing-here").join("node_modules")
+        );
+    }
+
+    /// The codes a first install actually fails with each get a next step, and
+    /// a failure nobody has a hint for gets none rather than a guess.
+    #[test]
+    fn a_known_npm_code_comes_with_something_to_try() {
+        for code in [
+            "ENOSPC",
+            "EPERM",
+            "EBUSY",
+            "EACCES",
+            "SELF_SIGNED_CERT_IN_CHAIN",
+            "ETIMEDOUT",
+            "ECONNRESET",
+            "ENOTFOUND",
+            "EINTEGRITY",
+        ] {
+            let message = format!("dsh 下载失败。 npm 报错 {code}：something");
+            assert!(super::hint(&message).is_some(), "no hint for {code}");
+        }
+
+        assert!(super::hint("dsh 下载失败。 npm 报错 ETARGET：No matching version").is_none());
+        assert!(super::hint("脚本退出码 1").is_none());
+    }
+
+    /// The mirrors every Chinese tutorial hands out are not asked about, however
+    /// they were typed; anything else still is.
+    #[test]
+    fn a_public_mirror_is_not_a_registry_of_ones_own() {
+        assert!(super::is_public_mirror("https://registry.npmmirror.com/"));
+        assert!(super::is_public_mirror("https://registry.npmmirror.com"));
+        assert!(super::is_public_mirror("http://REGISTRY.NPMMIRROR.COM/"));
+        assert!(super::is_public_mirror("https://registry.npm.taobao.org"));
+        assert!(super::is_public_mirror("https://mirrors.cloud.tencent.com/npm/"));
+
+        assert!(!super::is_public_mirror("https://npm.corp.example.com/"));
+        assert!(!super::is_public_mirror("https://registry.npmmirror.com.evil.example/"));
+        assert!(!super::is_public_mirror("https://mirrors.cloud.tencent.com/"));
+    }
+
+    /// The live mirrors on that list are the ones the scripts race. A mirror
+    /// dropped from the scripts and left here would be a registry the app
+    /// declines to ask about and then never measures.
+    #[test]
+    fn the_public_mirrors_are_the_ones_the_scripts_race() {
+        for path in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.ps1"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.sh"),
+        ] {
+            let script = std::fs::read(path).expect("a readable bootstrap script");
+            let script = String::from_utf8_lossy(&script);
+            for mirror in super::PUBLIC_MIRRORS
+                .iter()
+                .filter(|mirror| !mirror.contains("taobao"))
+            {
+                assert!(
+                    script.contains(&format!("https://{mirror}/")),
+                    "{path} does not race {mirror}"
+                );
+            }
+        }
+    }
+
+    /// `-Lang` carries `i18n::tag`, and both scripts have to take both of its
+    /// answers — one they refused would fail every install in that language.
+    #[test]
+    fn both_scripts_take_the_languages_this_one_sends() {
+        let read = |path: &str| {
+            let bytes = std::fs::read(path).expect("a readable bootstrap script");
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let ps1 = read(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.ps1"));
+        let sh = read(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/install-deps.sh"));
+
+        assert!(ps1.contains("[ValidateSet('zh', 'en')]"));
+        assert!(ps1.contains("[string] $Lang = 'zh'"));
+        assert!(sh.contains("zh|en) UI_LANG=$2 ;;"));
+        assert!(sh.contains("UI_LANG='zh'"));
+    }
+
+    /// What gets pasted into a chat: who, what failed, and the end of the log —
+    /// the end, because npm's error block is the last thing it prints.
+    #[test]
+    fn diagnostics_carry_the_message_and_the_end_of_the_log() {
+        let log: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        let text = super::report_text("dsh desktop 1.0 · windows x86_64", "it broke", Some(&log));
+
+        assert!(text.starts_with("dsh desktop 1.0 · windows x86_64\n\nit broke\n"));
+        assert!(text.contains("line 100"));
+        assert!(text.contains("line 41"));
+        assert!(!text.contains("line 40\n"));
+
+        let bare = super::report_text("about", "it broke", None);
+        assert!(!bare.contains("bootstrap.log"));
+    }
+
+    /// The command handed over for a dsh the app cannot update keeps the user
+    /// on their release line.
+    #[test]
+    fn the_update_command_follows_the_channel() {
+        assert_eq!(
+            super::update_command(Channel::Rc),
+            "npm install -g @deepseek-ai/dsh@latest"
+        );
+        assert_eq!(
+            super::update_command(Channel::Alpha),
+            "npm install -g @deepseek-ai/dsh@alpha"
         );
     }
 }

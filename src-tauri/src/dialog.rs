@@ -114,6 +114,10 @@ pub struct Choice {
     /// Draws as the filled accent button. At most one, and it is the one the
     /// dialog is really asking about.
     pub primary: bool,
+    /// Text this button puts on the clipboard instead of answering. The dialog
+    /// stays up and the label says it worked: a failure note is exactly where
+    /// the user wants to copy something out and then still read the rest.
+    pub copy: Option<String>,
 }
 
 impl Choice {
@@ -125,6 +129,7 @@ impl Choice {
             id,
             label: label.into(),
             primary: false,
+            copy: None,
         }
     }
 
@@ -133,6 +138,17 @@ impl Choice {
             id,
             label: label.into(),
             primary: true,
+            copy: None,
+        }
+    }
+
+    /// A button that copies `text` and leaves the dialog where it is.
+    pub fn copy(id: &'static str, label: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            primary: false,
+            copy: Some(text.into()),
         }
     }
 }
@@ -334,6 +350,7 @@ pub fn ask(app: &AppHandle, ask: Ask) -> bool {
                 "id": choice.id,
                 "label": choice.label,
                 "primary": choice.primary,
+                "copy": choice.copy,
             })
         })
         .collect();
@@ -353,6 +370,7 @@ pub fn ask(app: &AppHandle, ask: Ask) -> bool {
         "title": ask.title,
         "body": ask.body,
         "buttons": buttons,
+        "copied": t!("已复制", "Copied"),
     })
     .to_string();
 
@@ -508,6 +526,7 @@ pub fn script() -> String {
     let maker = crate::controls::dom_make();
     let watcher = crate::controls::theme_watcher("dsh-ask-dark");
     let corners = crate::controls::corners(&["dsh-ask"]);
+    let copier = crate::controls::copier();
 
     format!(
         r#"(function () {{
@@ -541,6 +560,8 @@ pub fn script() -> String {
     restore = null;
     signal(id);
   }}
+
+{copier}
 
   /** The dialog's own buttons, in tab order. */
   function stops() {{
@@ -717,6 +738,14 @@ pub fn script() -> String {
           node.type = 'button';
           node.textContent = choice.label;
           node.addEventListener('click', function () {{
+            // A copy button answers nothing; the dialog stays up for the rest
+            // of what it has to say.
+            if (typeof choice.copy === 'string') {{
+              copyText(choice.copy, function (ok) {{
+                if (ok) node.textContent = data.copied || choice.label;
+              }});
+              return;
+            }}
             close(choice.id);
           }});
         }})(buttons[i]);

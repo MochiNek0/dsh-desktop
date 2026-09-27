@@ -176,6 +176,9 @@ pub enum Action {
     /// the boot's: there is a dsh running behind this one.
     SetupClose,
     SetupQuit,
+    /// Show the bootstrap log from the panel's error box. Not an answer: the
+    /// panel stays up, still waiting on the choice it asked for.
+    SetupLogs,
     /// Open the panel from the menu.
     Runtime,
     /// A shell with dsh on its PATH.
@@ -293,6 +296,7 @@ pub fn action(url: &Url) -> Option<Action> {
         "setup-rescan" => Some(Action::SetupRescan),
         "setup-close" => Some(Action::SetupClose),
         "setup-quit" => Some(Action::SetupQuit),
+        "setup-logs" => Some(Action::SetupLogs),
         "runtime" => Some(Action::Runtime),
         "registry" => Some(Action::Registry),
         "channel" => Some(Action::Channel),
@@ -437,6 +441,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::SetupRescan => return crate::setup::answered(crate::setup::Choice::Rescan),
         Action::SetupClose => return crate::setup::answered(crate::setup::Choice::Close),
         Action::SetupQuit => return crate::setup::answered(crate::setup::Choice::Quit),
+        Action::SetupLogs => return crate::dsh::open_logs(app),
         Action::Runtime => return crate::open_runtime(app),
         Action::Registry => return crate::open_registry(app),
         Action::Channel => return crate::open_channel(app),
@@ -788,6 +793,35 @@ pub(crate) fn dom_make() -> &'static str {
     if (className) node.className = className;
     if (parent) parent.appendChild(node);
     return node;
+  }"#
+}
+
+/// `copyText(text, done)`, for the cards that hand the user something to paste
+/// into a chat: a failure's diagnostics, a command to run.
+///
+/// The async clipboard first, and `execCommand` behind it — the page is dsh's
+/// over plain `http://127.0.0.1`, or the loading page, and not every webview
+/// counts either as a secure context. Both only work inside the click that
+/// asked for them, which is the only place these are called from.
+pub(crate) fn copier() -> &'static str {
+    r#"  function copyText(text, done) {
+    function fallback() {
+      var area = document.createElement('textarea');
+      area.value = text;
+      area.setAttribute('readonly', '');
+      area.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+      document.body.appendChild(area);
+      area.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (error) {}
+      document.body.removeChild(area);
+      done(ok);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { done(true); }, fallback);
+    } else {
+      fallback();
+    }
   }"#
 }
 

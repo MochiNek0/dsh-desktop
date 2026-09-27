@@ -50,6 +50,8 @@ CHANNEL='rc'
 REMOVE_DSH=0
 REMOVE_NODE=0
 PROGRESS=0
+# The language of what reaches the window; see `-Lang` below.
+UI_LANG='zh'
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -104,6 +106,18 @@ while [ $# -gt 0 ]; do
         -RemoveDsh) REMOVE_DSH=1; shift ;;
         -RemoveNode) REMOVE_NODE=1; shift ;;
         -Progress) PROGRESS=1; shift ;;
+        # The language of what reaches the window: the status line and the
+        # error. The app passes the one its own page is in; see `run` in
+        # `src-tauri/src/dsh.rs`. Chinese without it, which is what a run by
+        # hand has always had. The log stays Chinese either way.
+        -Lang)
+            [ $# -ge 2 ] || { echo "-Lang 后面要跟 zh 或 en" >&2; exit 2; }
+            case $2 in
+                zh|en) UI_LANG=$2 ;;
+                *) echo "-Lang 只认 zh 或 en，收到的是：$2" >&2; exit 2 ;;
+            esac
+            shift 2
+            ;;
         *) echo "未知参数：$1" >&2; exit 2 ;;
     esac
 done
@@ -126,6 +140,12 @@ case "$MODE" in
 esac
 
 PACKAGE='@deepseek-ai/dsh'
+
+# One sentence in the language `-Lang` names, Chinese first, the way `t!` in the
+# app is written. Defined this early because the registry labels below use it.
+t() {
+    if [ "$UI_LANG" = en ]; then printf '%s' "$2"; else printf '%s' "$1"; fi
+}
 
 # The npm dist-tag `-Channel` names. Not the same word: the release candidates
 # are published under `latest`, not under `rc`, and `@deepseek-ai/dsh@rc` is a
@@ -181,10 +201,10 @@ https://mirrors.huaweicloud.com/nodejs'
 # somewhere of the user's own choosing: a private mirror or a corporate proxy is
 # there for a reason, may be the only route out of the network at all, and so is
 # never raced against anything.
-REGISTRIES='默认源|
+REGISTRIES="$(t '默认源' 'default registry')|
 npmmirror|https://registry.npmmirror.com/
-腾讯云|https://mirrors.cloud.tencent.com/npm/
-华为云|https://mirrors.huaweicloud.com/repository/npm/'
+$(t '腾讯云' 'Tencent Cloud')|https://mirrors.cloud.tencent.com/npm/
+$(t '华为云' 'Huawei Cloud')|https://mirrors.huaweicloud.com/repository/npm/"
 
 # What an empty URL above resolves to when npm is left to itself and has nothing
 # configured. Recognised rather than assumed: it is the difference between a
@@ -250,7 +270,7 @@ report() {
 }
 
 fail() {
-    say "错误：$1"
+    say "$(t '错误：' 'Error: ')$1"
     if [ "$PROGRESS" = 1 ]; then
         printf '::error %s\n' "$1"
     fi
@@ -467,7 +487,7 @@ rank_mirrors() {
     RANKED=$NODE_MIRRORS
     have curl || return 0
 
-    step '正在测试 Node 镜像的速度…' 0
+    step "$(t '正在测试 Node 镜像的速度…' 'Measuring the Node mirrors…')" 0
 
     scored=''
     while IFS= read -r mirror; do
@@ -475,7 +495,7 @@ rank_mirrors() {
         # Named as it is measured, not only once it has answered. Four probes,
         # each with a timeout of its own, is half a minute in which one
         # unchanging line and a bar that has not moved look the same as a hang.
-        step "正在测试 $host…" 0
+        step "$(t "正在测试 $host…" "Measuring $host…")" 0
         speed=$(measure_mirror "$mirror/v$NODE_VERSION/$1")
         if [ -z "$speed" ]; then
             say "$host：太慢或连不上"
@@ -541,13 +561,14 @@ rank_registries() {
         say "按你的选择，这次不使用 .npmrc 里的源（$configured）。"
         REGISTRIES=$(printf '%s
 ' "$REGISTRIES" |
-            awk -v url="$PUBLIC_REGISTRY" 'NR == 1 { print "npm 官方|" url; next } { print }')
+            awk -v url="$PUBLIC_REGISTRY" -v label="$(t 'npm 官方' 'npm public registry')" \
+                'NR == 1 { print label "|" url; next } { print }')
         RANKED=$REGISTRIES
     fi
 
     have curl || return 0
 
-    step '正在测试各个源的速度…' "$3"
+    step "$(t '正在测试各个源的速度…' 'Measuring the registries…')" "$3"
 
     scored=''
     while IFS= read -r source; do
@@ -555,7 +576,7 @@ rank_registries() {
         url=${source#*|}
         # See `rank_mirrors`. This is the round an `install-dsh` waits on, and
         # `$3` is 0 there, so without this it is a bar pinned at zero.
-        step "正在测试 $label…" "$3"
+        step "$(t "正在测试 $label…" "Measuring $label…")" "$3"
         # The default source is npm's own, and npm's own is the public registry —
         # the case above is what handles it being anything else.
         ms=$(measure_source "${url:-$PUBLIC_REGISTRY}")
@@ -683,20 +704,20 @@ install_node() {
     case "$(uname -s)" in
         Darwin) os=darwin ;;
         Linux) os=linux ;;
-        *) fail "不支持的系统：$(uname -s)。" ;;
+        *) fail "$(t "不支持的系统：$(uname -s)。" "Unsupported system: $(uname -s).")" ;;
     esac
     case "$(uname -m)" in
         arm64|aarch64) arch=arm64 ;;
         x86_64|amd64) arch=x64 ;;
-        *) fail "不支持的处理器架构：$(uname -m)。" ;;
+        *) fail "$(t "不支持的处理器架构：$(uname -m)。" "Unsupported processor architecture: $(uname -m).")" ;;
     esac
 
     if ! have shasum && ! have sha256sum; then
-        fail '这台机器上没有 shasum 或 sha256sum，无法校验下载的 Node。'
+        fail "$(t '这台机器上没有 shasum 或 sha256sum，无法校验下载的 Node。' 'This machine has neither shasum nor sha256sum, so the downloaded Node cannot be verified.')"
     fi
 
     name="node-v$NODE_VERSION-$os-$arch"
-    scratch=$(mktemp -d "${TMPDIR:-/tmp}/dsh-node-XXXXXX") || fail '无法创建临时目录。'
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/dsh-node-XXXXXX") || fail "$(t '无法创建临时目录。' 'Could not create a temporary directory.')"
 
     # Fastest first; `$RANKED` is the declared order on a machine where nothing
     # could be measured.
@@ -712,13 +733,13 @@ install_node() {
         archive="$scratch/$name.tar.gz"
         sums="$scratch/SHASUMS256.txt"
 
-        step "正在下载 Node $NODE_VERSION（$host）…" 0
+        step "$(t "正在下载 Node $NODE_VERSION（$host）…" "Downloading Node $NODE_VERSION ($host)…")" 0
         if ! fetch "$base/$name.tar.gz" "$archive" 0 30; then
             say "从 $mirror 下载 Node 失败。"
             continue
         fi
 
-        step '正在校验 Node…' 32
+        step "$(t '正在校验 Node…' 'Verifying Node…')" 32
         if ! fetch "$base/SHASUMS256.txt" "$sums" 32 33; then
             say "从 $mirror 取校验和失败。"
             continue
@@ -735,7 +756,7 @@ install_node() {
             continue
         fi
 
-        step '正在解压 Node…' 35
+        step "$(t '正在解压 Node…' 'Unpacking Node…')" 35
         if ! tar -xzf "$archive" -C "$scratch"; then
             say '解压 Node 失败。'
             continue
@@ -759,7 +780,7 @@ MIRRORS
     rm -rf "$scratch"
 
     if [ "$installed" = 0 ]; then
-        fail "无法下载 Node $NODE_VERSION。已尝试 nodejs.org 和几个国内镜像，都没有成功，通常是网络或代理的问题。"
+        fail "$(t "无法下载 Node $NODE_VERSION。已尝试 nodejs.org 和几个国内镜像，都没有成功，通常是网络或代理的问题。" "Node $NODE_VERSION could not be downloaded. nodejs.org and several mirrors in China were tried and none worked, which is usually the network or a proxy.")"
     fi
 
     say "Node 已安装到 $NODE_DIR"
@@ -930,7 +951,7 @@ install_package() {
         label=${source%%|*}
         url=${source#*|}
 
-        step "正在安装 dsh（$label）…" "$from"
+        step "$(t "正在安装 dsh（$label）…" "Installing dsh ($label)…")" "$from"
         if npm_install "$node" "$cli" "$prefix" "$url" "$from" "$to"; then
             say "dsh 安装完成（$label）。"
             return 0
@@ -969,19 +990,19 @@ SOURCES
 install_failure() {
     code=$(cat "$NPM_CODE_FILE" 2>/dev/null)
     if [ -z "$code" ]; then
-        printf '%s 已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。' "$1"
+        printf "$(t '%s 已尝试默认源和 npmmirror、腾讯云、华为云三个镜像，都没有成功，通常是网络或代理的问题。' '%s The default registry and the npmmirror, Tencent Cloud and Huawei Cloud mirrors were all tried and none worked, which is usually the network or a proxy.')" "$1"
         return 0
     fi
 
     said=$(cat "$NPM_SAID_FILE" 2>/dev/null)
-    [ -n "$said" ] || said='（npm 没有说明原因）'
+    [ -n "$said" ] || said=$(t '（npm 没有说明原因）' '(npm gave no reason)')
     case " $RESOLUTION_ERRORS " in
         *" $code "*)
-            printf '%s npm 报错 %s：%s 源是通的，装不上的是这个版本本身，换源或改代理都没有用。' "$1" "$code" "$said"
+            printf "$(t '%s npm 报错 %s：%s 源是通的，装不上的是这个版本本身，换源或改代理都没有用。' '%s npm failed with %s: %s The registry answered; it is this version itself that cannot be installed, so another source or proxy will not help.')" "$1" "$code" "$said"
             return 0
             ;;
     esac
-    printf '%s npm 报错 %s：%s' "$1" "$code" "$said"
+    printf "$(t '%s npm 报错 %s：%s' '%s npm failed with %s: %s')" "$1" "$code" "$said"
 }
 
 # ---------------------------------------------------------------------- path --
@@ -1087,8 +1108,8 @@ update_all() {
     node=$M_NODE_EXE
     cli=$M_NPM_CLI
     if [ ! -x "${node:-/nonexistent}" ] || [ ! -f "${cli:-/nonexistent}" ]; then
-        node=$(find_any_node) || fail '这台机器上找不到 Node，无法更新 dsh。'
-        cli=$(find_npm "$node") || fail "这个 Node 旁边没有 npm（$node）。"
+        node=$(find_any_node) || fail "$(t '这台机器上找不到 Node，无法更新 dsh。' 'No Node was found on this machine, so dsh cannot be updated.')"
+        cli=$(find_npm "$node") || fail "$(t "这个 Node 旁边没有 npm（$node）。" "There is no npm beside this Node ($node).")"
         say "用 $node 更新 dsh。"
     fi
 
@@ -1099,11 +1120,11 @@ update_all() {
     [ -n "$prefix" ] || prefix=$M_PREFIX
     [ -n "$prefix" ] || prefix=$(find_prefix "$node" "$cli")
 
-    step '正在更新 dsh…' 0
+    step "$(t '正在更新 dsh…' 'Updating dsh…')" 0
     if ! install_package "$node" "$cli" "$prefix" 0 "$PROGRESS_CEILING"; then
-        fail "$(install_failure 'dsh 更新失败。')"
+        fail "$(install_failure "$(t 'dsh 更新失败。' 'Updating dsh failed.')")"
     fi
-    step 'dsh 更新完成。' 100
+    step "$(t 'dsh 更新完成。' 'dsh updated.')" 100
 }
 
 uninstall_all() {
@@ -1461,8 +1482,8 @@ list_nodes() {
 # and never reads this; the marker is what makes a Node they picked but have not
 # switched to reachable at all. See `search_path` in `dsh.rs`.
 switch_node() {
-    [ -n "$NODE_EXE" ] || fail 'switch 需要 -NodeExe。'
-    [ -x "$NODE_EXE" ] || fail "找不到指定的 Node：$NODE_EXE"
+    [ -n "$NODE_EXE" ] || fail "$(t 'switch 需要 -NodeExe。' 'switch needs -NodeExe.')"
+    [ -x "$NODE_EXE" ] || fail "$(t "找不到指定的 Node：$NODE_EXE" "The chosen Node is not there: $NODE_EXE")"
 
     # The floor, checked here and not only in the panel that offered the button.
     # A dsh already installed into a Node below it still cannot run: dsh's direct
@@ -1470,11 +1491,11 @@ switch_node() {
     # node-pty) are built against one Node ABI. Adopting such a Node would write a
     # marker the app then boots from, and the failure would surface as a dsh that
     # will not start rather than as the version problem it is.
-    node_is_new_enough "$NODE_EXE" || fail "这个 Node 的版本低于 dsh 需要的 $NODE_MINIMUM，无法用它运行 dsh。"
-    cli=$(find_npm "$NODE_EXE") || fail "这个 Node 旁边没有 npm（$NODE_EXE）。"
+    node_is_new_enough "$NODE_EXE" || fail "$(t "这个 Node 的版本低于 dsh 需要的 $NODE_MINIMUM，无法用它运行 dsh。" "This Node is older than the $NODE_MINIMUM dsh needs, so it cannot run dsh.")"
+    cli=$(find_npm "$NODE_EXE") || fail "$(t "这个 Node 旁边没有 npm（$NODE_EXE）。" "There is no npm beside this Node ($NODE_EXE).")"
     prefix=$(node_prefix "$NODE_EXE" "$cli")
     manifest="$prefix/lib/node_modules/$PACKAGE/package.json"
-    [ -f "$manifest" ] || fail "这个 Node 里没有安装 dsh（$prefix），无法直接切换。"
+    [ -f "$manifest" ] || fail "$(t "这个 Node 里没有安装 dsh（$prefix），无法直接切换。" "This Node has no dsh installed ($prefix), so there is nothing to switch to.")"
 
     read_marker
     nodedir=$(dirname "$NODE_EXE")
@@ -1504,8 +1525,8 @@ switch_node() {
 # terminal now share one dsh, and if it is not, the marker is what lets the app
 # reach it anyway.
 install_dsh_into() {
-    [ -n "$NODE_EXE" ] || fail 'install-dsh 需要 -NodeExe。'
-    [ -x "$NODE_EXE" ] || fail "找不到指定的 Node：$NODE_EXE"
+    [ -n "$NODE_EXE" ] || fail "$(t 'install-dsh 需要 -NodeExe。' 'install-dsh needs -NodeExe.')"
+    [ -x "$NODE_EXE" ] || fail "$(t "找不到指定的 Node：$NODE_EXE" "The chosen Node is not there: $NODE_EXE")"
 
     # The floor, checked here and not only in the panel that offered the button.
     # A dsh already installed into a Node below it still cannot run: dsh's direct
@@ -1513,8 +1534,8 @@ install_dsh_into() {
     # node-pty) are built against one Node ABI. Adopting such a Node would write a
     # marker the app then boots from, and the failure would surface as a dsh that
     # will not start rather than as the version problem it is.
-    node_is_new_enough "$NODE_EXE" || fail "这个 Node 的版本低于 dsh 需要的 $NODE_MINIMUM，无法用它运行 dsh。"
-    cli=$(find_npm "$NODE_EXE") || fail "这个 Node 旁边没有 npm（$NODE_EXE），无法安装 dsh。"
+    node_is_new_enough "$NODE_EXE" || fail "$(t "这个 Node 的版本低于 dsh 需要的 $NODE_MINIMUM，无法用它运行 dsh。" "This Node is older than the $NODE_MINIMUM dsh needs, so it cannot run dsh.")"
+    cli=$(find_npm "$NODE_EXE") || fail "$(t "这个 Node 旁边没有 npm（$NODE_EXE），无法安装 dsh。" "There is no npm beside this Node ($NODE_EXE), so dsh cannot be installed into it.")"
     prefix=$(find_prefix "$NODE_EXE" "$cli")
 
     read_marker
@@ -1523,9 +1544,9 @@ install_dsh_into() {
     [ -n "$M_NODE" ] || M_NODE=system
     write_marker
 
-    step '正在下载 dsh，约 185 MB，请耐心等待…' 0
+    step "$(t '正在下载 dsh，约 185 MB，请耐心等待…' 'Downloading dsh, about 185 MB. This takes a while…')" 0
     if ! install_package "$NODE_EXE" "$cli" "$prefix" 0 "$PROGRESS_CEILING"; then
-        fail "$(install_failure 'dsh 下载失败。')"
+        fail "$(install_failure "$(t 'dsh 下载失败。' 'Downloading dsh failed.')")"
     fi
 
     remove_path
@@ -1533,7 +1554,7 @@ install_dsh_into() {
     M_PREFIX=$prefix
     M_PATH_ENTRY=''
     write_marker
-    step 'dsh 安装完成。' 100
+    step "$(t 'dsh 安装完成。' 'dsh is installed.')" 100
 }
 
 # The no-Node-at-all case: download one of ours, then install dsh into it. The
@@ -1549,7 +1570,7 @@ install_node_and_dsh() {
     say "没有可用的 Node，正在为你安装 Node $NODE_VERSION。"
     install_node
     node="$NODE_DIR/bin/node"
-    cli=$(find_npm "$node") || fail "这个 Node 旁边没有 npm（$node）。"
+    cli=$(find_npm "$node") || fail "$(t "这个 Node 旁边没有 npm（$node）。" "There is no npm beside this Node ($node).")"
 
     M_NODE_EXE=$node
     M_NPM_CLI=$cli
@@ -1557,16 +1578,16 @@ install_node_and_dsh() {
     write_marker
 
     prefix=$(find_prefix "$node" "$cli")
-    step '正在下载 dsh，约 185 MB，请耐心等待…' 36
+    step "$(t '正在下载 dsh，约 185 MB，请耐心等待…' 'Downloading dsh, about 185 MB. This takes a while…')" 36
     if ! install_package "$node" "$cli" "$prefix" 36 "$PROGRESS_CEILING"; then
-        fail "$(install_failure 'dsh 下载失败。')"
+        fail "$(install_failure "$(t 'dsh 下载失败。' 'Downloading dsh failed.')")"
     fi
 
     M_DSH=managed
     M_PREFIX=$prefix
     M_PATH_ENTRY=''
     write_marker
-    step 'dsh 安装完成。' 100
+    step "$(t 'dsh 安装完成。' 'dsh is installed.')" 100
 }
 
 # Take dsh out of one Node the user named, and nothing else.
@@ -1575,15 +1596,15 @@ install_node_and_dsh() {
 # can reach is the one the app recorded; a machine can have one in every Node it
 # has, and the panel lists them all.
 uninstall_dsh_from() {
-    [ -n "$NODE_EXE" ] || fail 'uninstall-dsh 需要 -NodeExe。'
-    [ -x "$NODE_EXE" ] || fail "找不到指定的 Node：$NODE_EXE"
+    [ -n "$NODE_EXE" ] || fail "$(t 'uninstall-dsh 需要 -NodeExe。' 'uninstall-dsh needs -NodeExe.')"
+    [ -x "$NODE_EXE" ] || fail "$(t "找不到指定的 Node：$NODE_EXE" "The chosen Node is not there: $NODE_EXE")"
 
-    cli=$(find_npm "$NODE_EXE") || fail "这个 Node 旁边没有 npm（$NODE_EXE）。"
+    cli=$(find_npm "$NODE_EXE") || fail "$(t "这个 Node 旁边没有 npm（$NODE_EXE）。" "There is no npm beside this Node ($NODE_EXE).")"
     prefix=$(node_prefix "$NODE_EXE" "$cli")
     [ -f "$prefix/lib/node_modules/$PACKAGE/package.json" ] ||
-        fail "这个 Node 里没有安装 dsh（$prefix）。"
+        fail "$(t "这个 Node 里没有安装 dsh（$prefix）。" "This Node has no dsh installed ($prefix).")"
 
-    step "正在卸载 dsh（$prefix）…" 0
+    step "$(t "正在卸载 dsh（$prefix）…" "Uninstalling dsh ($prefix)…")" 0
     "$NODE_EXE" "$cli" uninstall -g --prefix "$prefix" --loglevel=error "$PACKAGE" 2>&1 |
         while IFS= read -r line; do say "$line"; done
 
@@ -1593,7 +1614,7 @@ uninstall_dsh_from() {
     # marker file and is left exactly where it is — the same rule `uninstall_all`
     # applies to a dsh the app merely adopted.
     if pnpm_is_ours "$prefix"; then
-        step "正在卸载 pnpm（$prefix）…" 60
+        step "$(t "正在卸载 pnpm（$prefix）…" "Uninstalling pnpm ($prefix)…")" 60
         "$NODE_EXE" "$cli" uninstall -g --prefix "$prefix" --loglevel=error "$PNPM" 2>&1 |
             while IFS= read -r line; do say "$line"; done
         rm -f "$prefix/$PNPM_MARK"
@@ -1607,7 +1628,7 @@ uninstall_dsh_from() {
         M_DSH=''
         write_marker
     fi
-    step 'dsh 已卸载。' 100
+    step "$(t 'dsh 已卸载。' 'dsh is uninstalled.')" 100
 }
 
 # Delete the Node this script unpacked, and the dsh inside it.
@@ -1616,9 +1637,9 @@ uninstall_dsh_from() {
 # writes to; a Node the machine already had is not this app's to remove, from
 # this mode or any other.
 remove_managed_node() {
-    [ -d "$NODE_DIR" ] || fail '本应用没有安装过 Node。'
+    [ -d "$NODE_DIR" ] || fail "$(t '本应用没有安装过 Node。' 'This app has not installed a Node.')"
 
-    step '正在删除应用安装的 Node 和 dsh…' 0
+    step "$(t '正在删除应用安装的 Node 和 dsh…' 'Deleting the Node and dsh the app installed…')" 0
     rm -rf "$NODE_DIR"
 
     # The marker is only wiped when it was describing the Node that just went. A
@@ -1633,7 +1654,7 @@ remove_managed_node() {
             rm -f "$MARKER"
             ;;
     esac
-    step '已删除。' 100
+    step "$(t '已删除。' 'Deleted.')" 100
 }
 
 # Delete one version a version manager installed, and whatever is inside it —
@@ -1651,17 +1672,17 @@ remove_managed_node() {
 # this script unpacked, which has a mode of its own that also clears the marker
 # and the profile block that came with it.
 delete_node() {
-    [ -n "$NODE_EXE" ] || fail 'delete-node 需要 -NodeExe。'
+    [ -n "$NODE_EXE" ] || fail "$(t 'delete-node 需要 -NodeExe。' 'delete-node needs -NodeExe.')"
     case "$NODE_EXE" in
-        "$NODE_DIR"/*) fail '这是本应用自己装的 Node，请用“删除应用装的 Node”。' ;;
+        "$NODE_DIR"/*) fail "$(t '这是本应用自己装的 Node，请用“删除应用装的 Node”。' 'This is the Node the app installed; use "Delete the app'\''s Node" instead.')" ;;
     esac
 
     dir=$(version_dir "$NODE_EXE")
-    [ -n "$dir" ] || fail "这个 Node 不是 nvm/fnm/volta/asdf 装的，应用不会删它：$NODE_EXE"
-    [ -d "$dir" ] || fail "这个 Node 已经不在了：$dir"
+    [ -n "$dir" ] || fail "$(t "这个 Node 不是 nvm/fnm/volta/asdf 装的，应用不会删它：$NODE_EXE" "This Node was not installed by nvm, fnm, Volta or asdf, so the app will not delete it: $NODE_EXE")"
+    [ -d "$dir" ] || fail "$(t "这个 Node 已经不在了：$dir" "This Node is already gone: $dir")"
 
-    step "正在删除 $dir…" 0
-    rm -rf "$dir" || fail "删除失败：$dir"
+    step "$(t "正在删除 $dir…" "Deleting $dir…")" 0
+    rm -rf "$dir" || fail "$(t "删除失败：$dir" "Deleting failed: $dir")"
 
     # A marker pointing into the directory that just went describes nothing. It
     # is cleared rather than left for `search_path` to fall back onto and find a
@@ -1670,7 +1691,7 @@ delete_node() {
     case "$M_NODE_EXE" in
         "$dir"/*) rm -f "$MARKER" ;;
     esac
-    step '已删除。' 100
+    step "$(t '已删除。' 'Deleted.')" 100
 }
 
 case "$MODE" in
