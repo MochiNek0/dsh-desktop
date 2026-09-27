@@ -987,6 +987,10 @@ SOURCES
 #
 # One line and no newlines in it: this ends up behind `::error ` on a single
 # line of the script's output, which is how `run` in `dsh.rs` reads it back.
+#
+# The format strings are `t`'s literals, one per language; everything that
+# varies goes in as an argument, so SC2059's worry does not apply.
+# shellcheck disable=SC2059
 install_failure() {
     code=$(cat "$NPM_CODE_FILE" 2>/dev/null)
     if [ -z "$code" ]; then
