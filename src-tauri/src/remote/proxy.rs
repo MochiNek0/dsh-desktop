@@ -426,9 +426,10 @@ fn join(
     downstream: hyper::upgrade::OnUpgrade,
     upstream_side: hyper::upgrade::OnUpgrade,
 ) {
-    // Subscribed before anything is awaited, so that a kick landing while the
-    // upgrade is still completing is not missed.
+    // Subscribed before anything is awaited, so that a kick — or a channel
+    // switch — landing while the upgrade is still completing is not missed.
     let mut revocations = shared.store.revocations();
+    let mut moved = shared.moved.subscribe();
 
     tokio::spawn(async move {
         let (Ok(phone), Ok(dsh)) = tokio::join!(downstream, upstream_side) else {
@@ -462,6 +463,9 @@ fn join(
                 changed = revocations.changed() => {
                     allowed = changed.is_ok() && shared.store.verify(&device_cookie).is_some();
                 }
+                // The channel this socket came in over is gone. See
+                // [`Shared::hang_up`].
+                _ = moved.changed() => break,
             }
         }
 
@@ -770,6 +774,12 @@ const OFFLINE: &str = "/dsh-mobile-offline";
 /// Everything else goes to the network untouched and fails exactly as it did
 /// before.
 ///
+/// "Failed" counts the answers Cloudflare's edge gives on the computer's
+/// behalf, not only a network error. With the computer off the phone still
+/// reaches the edge, which answers 530 (no tunnel connected) or 502/504 (a
+/// tunnel with nothing behind it) — a response, not a rejection, and without
+/// this the phone would show Cloudflare's error page instead of the one below.
+///
 /// That is a deliberate refusal of what a service worker is usually for. dsh is
 /// an application this app does not own, served by a process it does not
 /// control, and caching its assets would mean a phone quietly running yesterday
@@ -806,12 +816,16 @@ fn worker_script() -> String {
          self.addEventListener('activate', (event) => {{\n\
          \x20 event.waitUntil(self.clients.claim());\n\
          }});\n\
+         const DOWN = [502, 504, 530];\n\
          self.addEventListener('fetch', (event) => {{\n\
          \x20 if (event.request.mode !== 'navigate') return;\n\
+         \x20 const shell = (otherwise) => caches.open(STORE)\n\
+         \x20   .then((cache) => cache.match(SHELL))\n\
+         \x20   .then((hit) => hit || otherwise);\n\
          \x20 event.respondWith(\n\
-         \x20   fetch(event.request).catch(() => caches.open(STORE)\n\
-         \x20     .then((cache) => cache.match(SHELL))\n\
-         \x20     .then((hit) => hit || Response.error()))\n\
+         \x20   fetch(event.request)\n\
+         \x20     .then((response) => DOWN.includes(response.status) ? shell(response) : response)\n\
+         \x20     .catch(() => shell(Response.error()))\n\
          \x20 );\n\
          }});\n"
     )

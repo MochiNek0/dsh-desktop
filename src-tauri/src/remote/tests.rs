@@ -124,6 +124,7 @@ impl Harness {
             seen: AtomicU64::new(0),
             live: AtomicU64::new(0),
             last: Mutex::new(std::time::Instant::now()),
+            moved: Default::default(),
         });
 
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -1159,6 +1160,46 @@ fn a_kicked_device_loses_its_open_websocket() {
         }
         let _ = socket.write_all(b"after");
     }
+}
+
+/// A channel switch closes the sockets opened over the old channel. The phone
+/// is still paired, so the kick above does not reach it — and without this it
+/// would keep driving dsh from an address the new channel does not publish.
+#[test]
+fn a_channel_switch_closes_the_open_websockets() {
+    let Some(harness) = Harness::raise(true) else {
+        return;
+    };
+
+    let nonce = harness.nonce();
+    let cookie = harness
+        .get(&format!("/?pair_token={nonce}"), &[])
+        .device_cookie()
+        .expect("a device cookie");
+
+    let (mut socket, mut reader) = websocket(&harness, &cookie);
+    socket.write_all(b"ping").unwrap();
+    let mut echoed = [0u8; 4];
+    reader.read_exact(&mut echoed).expect("the pipe is up");
+
+    harness.shared.hang_up();
+
+    let mut rest = [0u8; 1];
+    match reader.read(&mut rest) {
+        Ok(0) => {}
+        Ok(_) => panic!("bytes after the switch"),
+        Err(error) => assert!(
+            !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "the socket is still open after the switch"
+        ),
+    }
+    assert!(
+        harness.shared.store.verify(&cookie).is_some(),
+        "the device is still paired"
+    );
 }
 
 /// Open `/api/remote.mux` through the gateway, past the 101 and its headers.

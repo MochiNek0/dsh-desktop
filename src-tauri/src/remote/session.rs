@@ -174,6 +174,8 @@ pub struct SessionStore {
     /// the gateway holds a receiver per socket and checks again when this
     /// moves. See `proxy::join`.
     revoked: tokio::sync::watch::Sender<u64>,
+    /// Held across a write of the device list. See [`SessionStore::remember`].
+    saving: Mutex<()>,
 }
 
 struct Inner {
@@ -247,15 +249,21 @@ impl SessionStore {
             }),
             save: Some(app.clone()),
             revoked: Default::default(),
+            saving: Mutex::new(()),
         }
     }
 
     /// Write the device list down, if this store has anywhere to write it.
     ///
-    /// Takes the value rather than the lock. The caller has already let go of
-    /// the mutex, because a file write is not something to hold one across.
-    fn remember(&self, state: Value) {
+    /// Called after the change, with `inner` already let go of — a file write
+    /// is not something to make every request's `verify` wait on. The list is
+    /// read here, under `saving`, rather than handed in: two phones approved at
+    /// once would otherwise race their snapshots to the disk, and the older one
+    /// landing last would drop the newer device from the file.
+    fn remember(&self) {
         if let Some(app) = &self.save {
+            let _saving = self.saving.lock().unwrap();
+            let state = self.inner.lock().unwrap().stored();
             crate::settings::set_pairing(app, state);
         }
     }
@@ -338,7 +346,7 @@ impl SessionStore {
 
     /// Take a device in, and hand back the cookie value it proves itself with.
     pub fn authorize(&self, label: String, address: String) -> (Device, String) {
-        let (device, cookie, state) = {
+        let (device, cookie) = {
             let mut inner = self.inner.lock().unwrap();
 
             let id = format!("d{}", inner.next);
@@ -352,10 +360,10 @@ impl SessionStore {
             };
             let cookie = sign(&inner.secret, &device.id, device.since);
             inner.devices.push(device.clone());
-            (device, cookie, inner.stored())
+            (device, cookie)
         };
 
-        self.remember(state);
+        self.remember();
         (device, cookie)
     }
 
@@ -380,13 +388,13 @@ impl SessionStore {
 
     /// Kick one device. Its cookie stops verifying on the next request.
     pub fn revoke(&self, id: &str) {
-        let state = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.devices.retain(|device| device.id != id);
-            inner.stored()
-        };
+        self.inner
+            .lock()
+            .unwrap()
+            .devices
+            .retain(|device| device.id != id);
 
-        self.remember(state);
+        self.remember();
         self.revoked.send_modify(|count| *count += 1);
     }
 
@@ -408,12 +416,12 @@ impl SessionStore {
     /// runs on a new one is a key the next launch would read back, and "change
     /// the locks" that a restart undoes is not what the button says.
     pub fn revoke_all(&self) {
-        let (rotated, state) = {
+        let rotated = {
             let mut inner = self.inner.lock().unwrap();
             inner.devices.clear();
             inner.pairs.clear();
             inner.secret = secret();
-            (inner.secret, inner.stored())
+            inner.secret
         };
 
         if let Some(path) = self.save.as_ref().and_then(key_file) {
@@ -423,7 +431,7 @@ impl SessionStore {
             let _ = store_secret(&path, &rotated);
         }
 
-        self.remember(state);
+        self.remember();
         self.revoked.send_modify(|count| *count += 1);
     }
 }
@@ -949,6 +957,7 @@ mod tests {
             }),
             save: None,
             revoked: Default::default(),
+            saving: Mutex::new(()),
         };
 
         assert!(after.verify(&cookie).is_some());

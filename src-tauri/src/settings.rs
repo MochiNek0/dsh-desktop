@@ -450,11 +450,22 @@ fn read(app: &AppHandle) -> Map<String, Value> {
 /// Read-modify-write rather than serialising a struct, so a preference this
 /// build has never heard of — one a newer version wrote — is still there after
 /// an older version toggles something beside it.
+///
+/// One writer at a time, and the file replaced rather than rewritten in place.
+/// The gateway saves its device list from network threads while the card saves
+/// the channel, and two interleaved read-modify-writes lose one key; a `read`
+/// landing between a truncate and the write sees an empty document, and the
+/// next write would save that emptiness over every other preference.
 fn write(app: &AppHandle, key: &str, value: Value) {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     let Some(path) = file(app) else {
         return;
     };
 
+    let _writing = WRITING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut document = read(app);
     document.insert(key.to_string(), value);
 
@@ -468,7 +479,9 @@ fn write(app: &AppHandle, key: &str, value: Value) {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    if let Err(error) = std::fs::write(&path, text) {
+    let staged = path.with_extension("json.tmp");
+    let saved = std::fs::write(&staged, text).and_then(|()| std::fs::rename(&staged, &path));
+    if let Err(error) = saved {
         // Losing a preference is not a reason to interrupt anyone; the setting
         // simply reverts next launch.
         eprintln!("dsh-desktop: could not save the settings: {error}");

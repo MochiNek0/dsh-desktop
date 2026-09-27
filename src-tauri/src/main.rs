@@ -192,8 +192,8 @@ fn main() {
         // but coming down silently is what makes it the same experience as
         // having remembered to switch it off, which is how a user learns that
         // leaving it on costs nothing. See `remote::confirm_exit`.
-        tauri::RunEvent::ExitRequested { api, .. } => {
-            if remote::confirm_exit(handle) {
+        tauri::RunEvent::ExitRequested { code, api, .. } => {
+            if remote::confirm_exit(handle, code) {
                 api.prevent_exit();
             }
         }

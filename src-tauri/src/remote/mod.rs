@@ -193,6 +193,11 @@ pub struct Shared {
     live: AtomicU64,
     /// When the last request arrived. See [`PUBLIC_IDLE`].
     last: Mutex<Instant>,
+    /// Bumped whenever the channel moves or its tunnel comes down. A WebSocket
+    /// opened over the old channel is still open after it — it sends no
+    /// request for the fence to turn away — so each one waits on this and
+    /// closes when it moves. See `proxy::join`.
+    moved: tokio::sync::watch::Sender<u64>,
 }
 
 impl Shared {
@@ -255,6 +260,11 @@ impl Shared {
     /// think; a quiet stretch with no socket open is a gateway nobody is on.
     fn idle(&self, how_long: Duration) -> bool {
         self.live.load(Ordering::Relaxed) == 0 && self.last.lock().unwrap().elapsed() >= how_long
+    }
+
+    /// Close every WebSocket opened over the channel that was up until now.
+    fn hang_up(&self) {
+        self.moved.send_modify(|count| *count += 1);
     }
 
     /// Who is actually asking, as the active tunnel accounts for it.
@@ -360,6 +370,7 @@ impl Remote {
                 seen: AtomicU64::new(0),
                 live: AtomicU64::new(0),
                 last: Mutex::new(Instant::now()),
+                moved: Default::default(),
             }),
             running: Mutex::new(None),
             showing: Mutex::new(None),
@@ -391,8 +402,10 @@ impl Remote {
     /// Called a second time on a gateway that is already bound, this restarts
     /// the tunnel if there is nothing behind it — which is the way back from a
     /// Cloudflare token that was wrong, and from the idle timer having taken a
-    /// public tunnel down. A tunnel that is up, or on its way up, is left
-    /// alone.
+    /// public tunnel down. A public tunnel that is up, or on its way up, is
+    /// left alone. The LAN and the tailnet are started again even when they
+    /// are up: starting them is only reading the machine's address, and a
+    /// laptop that moved to another Wi-Fi since has a new one for the QR code.
     fn start(&self) -> Result<(), String> {
         let mut running = self.running.lock().unwrap();
 
@@ -401,12 +414,19 @@ impl Remote {
             let outcome = {
                 let mut tunnel = self.shared.tunnel.lock().unwrap();
                 match tunnel.state() {
-                    TunnelState::Running { .. } | TunnelState::Starting => Ok(()),
-                    _ => tunnel.start(port).map_err(|error| error.to_string()),
+                    TunnelState::Starting => None,
+                    TunnelState::Running { .. } if tunnel.public() => None,
+                    _ => Some(tunnel.start(port).map_err(|error| error.to_string())),
                 }
             };
             self.shared.forget_authorities();
-            return outcome;
+            // A tunnel raised again starts a fresh idle window, for the same
+            // reason the first one does below: the last request may be from
+            // before the idle timer took the previous tunnel down.
+            if outcome.is_some() {
+                self.shared.touched();
+            }
+            return outcome.unwrap_or(Ok(()));
         }
 
         let remembered = self
@@ -512,6 +532,15 @@ impl Remote {
         // The rate limiter's addresses only mean anything relative to a
         // channel; see [`trust::Guesses::forget_all`].
         self.shared.guesses.forget_all();
+        // A phone still holding a socket from the old channel would otherwise
+        // keep driving dsh through it — past the loopback-only rule, when the
+        // new channel is public — and hold the idle timer off forever.
+        self.shared.hang_up();
+        // The new tunnel's idle window starts now, not at whatever request
+        // last reached the old one.
+        if started.is_some() {
+            self.shared.touched();
+        }
 
         // `None` is nothing bound, so there is nothing to publish and nothing
         // to repair: the next `start` raises this tunnel instead.
@@ -541,6 +570,7 @@ impl Remote {
         let _ = self.shared.tunnel.lock().unwrap().stop();
         self.shared.forget_authorities();
         self.shared.guesses.forget_all();
+        self.shared.hang_up();
         // The nonce on the card is a URL at the address that has just stopped
         // answering. Leaving it there would put a QR code on screen that sends
         // a phone to nothing — and the card would go on looking live.
@@ -1175,7 +1205,11 @@ pub fn cloudflare(app: &AppHandle, token: &str, hostname: &str) {
 ///
 /// Only for the public channels. Closing the app on the LAN takes a socket down
 /// and nothing else, which nobody needs to be asked about.
-pub fn confirm_exit(app: &AppHandle) -> bool {
+///
+/// `code` is the exit that was asked for, and the answer asks for the same one
+/// again: an update's "restart now" arrives here too, and quitting in its place
+/// would leave the user without the app and without the update.
+pub fn confirm_exit(app: &AppHandle, code: Option<i32>) -> bool {
     /// Set by the answer, so the `app.exit` it triggers is not asked again.
     static LEAVING: AtomicBool = AtomicBool::new(false);
 
@@ -1208,7 +1242,11 @@ pub fn confirm_exit(app: &AppHandle) -> bool {
             answered: Box::new(move |_app, id| {
                 if id == "quit" {
                     LEAVING.store(true, Ordering::Relaxed);
-                    app_for_answer.exit(0);
+                    if code == Some(tauri::RESTART_EXIT_CODE) {
+                        app_for_answer.request_restart();
+                    } else {
+                        app_for_answer.exit(code.unwrap_or(0));
+                    }
                 }
             }),
         },
