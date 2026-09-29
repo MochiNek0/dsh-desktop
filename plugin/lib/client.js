@@ -302,6 +302,12 @@ window.__ModuleLoader__.load({
      * The first snapshot only records a baseline: a page that loads while a
      * session is mid-turn should not announce the turn it did not see start,
      * and neither should one that loads with a finished session on screen.
+     *
+     * A subagent's turn is not announced: it is a step inside the turn that
+     * spawned it, and one turn can spawn dozens. Only the outermost turn ending
+     * is news. `origin` is read at the falling edge rather than when the row
+     * first appears, because dsh can fill it in after the first snapshot. A
+     * subagent that stops to ask something still does — see `watchWaits`.
      */
     function watchTurns(ctx) {
       var running = Object.create(null);
@@ -316,7 +322,7 @@ window.__ModuleLoader__.load({
           seen[id] = true;
           var was = running[id];
           running[id] = summary.running;
-          if (announce && was === true && summary.running === false) {
+          if (announce && was === true && summary.running === false && summary.origin !== 'subagent') {
             send({ event: 'turn-end', session: id, done: summary.completed ? '1' : '0' });
           }
         }

@@ -183,6 +183,29 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   console.log('ok  announces a falling running edge exactly once');
 }
 
+// --- a subagent's turn is not the user's ---
+{
+  const { exports, sent } = load({ host: true });
+  const s = services();
+  s.setList({ ids: ['a', 'b'], byId: { a: { running: true }, b: { running: true, parentSessionId: 'a' } } });
+  exports.apply(s.ctx);
+  // `origin` can arrive late: the row was already running without it.
+  s.setList({
+    ids: ['a', 'b'],
+    byId: { a: { running: true }, b: { running: false, completed: true, parentSessionId: 'a', origin: 'subagent' } },
+  });
+  await drain();
+  assert.deepEqual(sent, [], "a subagent finishing is not announced");
+  s.setList({
+    ids: ['a', 'b'],
+    byId: { a: { running: false, completed: true }, b: { running: false, parentSessionId: 'a', origin: 'subagent' } },
+  });
+  await drain();
+  assert.equal(sent.length, 1);
+  assert.equal(query(sent[0]).session, 'a');
+  console.log('ok  only the outermost turn ending is announced');
+}
+
 // --- a session that vanishes did not finish ---
 {
   const { exports, sent } = load({ host: true });
