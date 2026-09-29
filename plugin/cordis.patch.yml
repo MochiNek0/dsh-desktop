@@ -55,6 +55,15 @@
 # `directory-picker-auto` says every composition that pins an interaction owes
 # that declaration — and because a silent resolution failure here looks like a
 # picker that simply stopped working.
+#
+# Those two ranges are open-ended (`>=0.1.5-rc.2`), not caret, on purpose.
+# dsh's plugin manager checks every `@deepseek-ai/dsh-*` peer against the dsh
+# *runtime* version (prereleases included), not against the package's own
+# version, and refuses to run a plugin whose range does not match. A caret on
+# a 0.x range excludes the next minor, so `^0.1.5-rc.2` turned this plugin
+# "incompatible" the day dsh reached 0.2.0-rc.2 — with nothing in it broken.
+# The floor is the version this was verified on; there is no ceiling, because
+# the only thing this file needs from those packages is that they exist.
 - id: directory-picker
   disabled: true
 - insert:

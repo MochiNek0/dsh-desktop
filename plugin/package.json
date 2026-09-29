@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop-signal",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reports dsh session state to the dsh desktop shell, so it can raise a notification and answer from it.",
   "license": "MIT",
   "type": "module",
@@ -28,7 +28,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-client-ui-directory-picker-browse": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-host-directory-picker-browse": "^0.1.5-rc.2"
+    "@deepseek-ai/dsh-client-ui-directory-picker-browse": ">=0.1.5-rc.2",
+    "@deepseek-ai/dsh-host-directory-picker-browse": ">=0.1.5-rc.2"
   }
 }
