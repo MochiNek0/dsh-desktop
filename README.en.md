@@ -23,7 +23,9 @@ A cross-platform desktop client for DeepSeek Harness (`dsh web`)
 
 <br/>
 
-> Unofficial: a third-party desktop client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), not affiliated with DeepSeek. [Issues](https://github.com/MochiNek0/dsh-desktop/issues) and PRs welcome.
+> **Unofficial project**: A third-party desktop client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), not affiliated with DeepSeek. [Issues](https://github.com/MochiNek0/dsh-desktop/issues) and PRs welcome.
+>
+> 💡 **Also try the official client**: DeepSeek now provides an official desktop app. Feel free to check it out at the [official DeepSeek Harness website](https://www.deepseek.com/harness/).
 
 Starts the local `dsh web` in the background on launch and embeds it in a native window — no terminal, no port juggling. Sessions, credentials and config live in `$DSH_HOME` (default `~/.dsh`), the same ones your command-line `dsh` uses.
 
@@ -73,7 +75,8 @@ npm run build   # production bundle, written to src-tauri/target/release/bundle/
 
 ## Links
 
-- **Website**: [English](https://dsh-desktop.cc.cd/en/) · [中文](https://dsh-desktop.cc.cd/)
+- **This Project**: [English](https://dsh-desktop.cc.cd/en/) · [中文](https://dsh-desktop.cc.cd/)
+- **Official Desktop App**: [DeepSeek Harness Official Download](https://www.deepseek.com/harness/)
 - **Upstream**: [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 - **Friends**: [DSH Market](https://github.com/dsh-market/dsh-market) — the visual plugin market inside dsh; browse, search and install community plugins in one click ([dshmarket.com](https://dshmarket.com))
 

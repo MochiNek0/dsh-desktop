@@ -24,7 +24,9 @@ DeepSeek Harness (`dsh web`) 的跨平台桌面客户端
 
 <br/>
 
-> 非官方项目：基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的第三方桌面客户端，与 DeepSeek 官方无隶属关系。欢迎 [Issue](https://github.com/MochiNek0/dsh-desktop/issues) 与 PR。
+> **非官方项目**：基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的第三方桌面客户端，与 DeepSeek 官方无隶属关系。欢迎 [Issue](https://github.com/MochiNek0/dsh-desktop/issues) 与 PR。
+>
+> 💡 **也可体验官方客户端**：DeepSeek 现已推出官方桌面端，欢迎前往 [DeepSeek Harness 官网](https://www.deepseek.com/harness/) 下载体验。
 
 启动时自动在后台拉起本地 `dsh web` 并嵌入原生窗口，无需开终端、无需管理端口。会话、凭证与配置存放在 `$DSH_HOME`（默认 `~/.dsh`），与命令行里的 `dsh` 是同一份。
 
@@ -79,7 +81,8 @@ npm run build   # 构建发布包，输出至 src-tauri/target/release/bundle/
 
 ## 相关链接
 
-- **官方网站**：[中文](https://dsh-desktop.cc.cd/) · [English](https://dsh-desktop.cc.cd/en/)
+- **本项目官网**：[中文](https://dsh-desktop.cc.cd/) · [English](https://dsh-desktop.cc.cd/en/)
+- **官方桌面端**：[DeepSeek Harness 官方下载](https://www.deepseek.com/harness/)
 - **上游项目**：[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 - **友情链接**：[DSH Market](https://github.com/dsh-market/dsh-market) —— dsh 里的可视化插件市场，浏览、搜索并一键安装社区插件（[dshmarket.com](https://dshmarket.com)）
 
