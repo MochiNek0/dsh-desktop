@@ -29,6 +29,11 @@
 
 !include LogicLib.nsh
 !include WinMessages.nsh
+
+; Where this file is, and so `installer-ui.nsh` and the generated
+; `installer\` bitmaps beside it. The template is compiled from a copy under
+; `target\`, so its own `${__FILEDIR__}` points there instead.
+!define DSH_HOOKS_DIR "${__FILEDIR__}"
 !include StrFunc.nsh
 !include FileFunc.nsh
 
@@ -46,14 +51,16 @@ ${Using:StrFunc} UnStrRep
 ; installer looks like it was built in 2003 -- every page, every button and the
 ; details listbox are set in a font no other window on the machine still uses.
 ;
-; `SetFont` replaces it for the whole installer. It can be set here rather than
-; fought over with the language file precisely because that file declares no
-; font of its own -- one that did would still win, and none of the languages
-; this installer is built with do.
+; `SetFont` replaces it for the whole installer -- for every language whose
+; file declares no font of its own. One that does still wins, and the language
+; this installer is built in, `SimpChinese.nlf`, does: SimSun at 9pt, a bitmap
+; serif that looks worse still beside the installer's own pages. So Simplified
+; Chinese (LANGID 2052) gets its own line, Microsoft YaHei UI -- the face
+; Windows itself uses for Chinese UI text. `/LANG=` beats the language file.
 ;
-; Segoe UI carries no CJK glyphs and the `DetailPrint` messages below are
-; Chinese. Windows' font linking covers that, substituting Microsoft YaHei UI
-; for those runs exactly as it does in every other dialog on the system.
+; The plain line is for any other language: Segoe UI carries no CJK glyphs,
+; and Windows' font linking substitutes Microsoft YaHei UI for the Chinese
+; `DetailPrint` messages below exactly as it does in every other dialog.
 ;
 ; The other half of the installer's chrome is `BrandingText`, the line along
 ; the bottom. It cannot be set from here: the template writes its own
@@ -62,6 +69,7 @@ ${Using:StrFunc} UnStrRep
 ; is "Nullsoft Install System %s" -- so the string comes from `bundle.copyright`
 ; in `tauri.conf.json` instead.
 SetFont "Segoe UI" 9
+SetFont /LANG=2052 "Microsoft YaHei UI" 9
 
 ; ---------------------------------------------------------------------------
 ; Where the app goes by default

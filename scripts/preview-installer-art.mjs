@@ -94,7 +94,7 @@ function writePng(file, { width, height, rgb }, factor) {
 }
 
 mkdirSync(to, { recursive: true });
-for (const name of ["installer-sidebar", "installer-header"]) {
+for (const name of ["installer-header", "brand-100", "brand-200"]) {
   const image = readBmp(join(from, `${name}.bmp`));
   writePng(join(to, `${name}.png`), image, scale);
   console.log(

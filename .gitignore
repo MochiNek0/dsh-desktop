@@ -13,7 +13,7 @@ src-tauri/resources/*
 # Not staged: source, which happens to live where the resources go so that one
 # path serves both a bundled build and `tauri dev`. See src-tauri/src/plugins.rs.
 !src-tauri/resources/preset-plugins.json
-# The installer's sidebar and header bitmaps, drawn from the app icon by
+# The installer's header and brand bitmaps, drawn from the app icon by
 # scripts/make-installer-art.mjs. Generated rather than committed: a .bmp is a
 # blob nobody can review, and the icon they are made from is already tracked.
 # Not under resources/, because that glob is copied into the installation

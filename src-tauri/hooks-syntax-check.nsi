@@ -68,7 +68,11 @@ RequestExecutionLevel user
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 
-!insertmacro MUI_LANGUAGE "English"
+; The language the installer is built in, `bundle.windows.nsis.languages` in
+; `tauri.conf.json`. It matters beyond the strings: the hooks file sets a font
+; for this language by its ID, and against any other language that line leaves
+; an empty string table for it, which makensis warns about for every string.
+!insertmacro MUI_LANGUAGE "SimpChinese"
 
 Section Install
   !insertmacro NSIS_HOOK_POSTINSTALL

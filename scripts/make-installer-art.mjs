@@ -1,9 +1,9 @@
-// Draw the installer's two bitmaps.
+// Draw the installer's bitmaps.
 //
-// NSIS wants BMP, at two sizes it will not negotiate: a 164x314 sidebar down
-// the left of the welcome and finish pages, and a 150x57 strip in the header of
-// every page between them. Anything else is ignored or drawn wrong, and the
-// format has to be uncompressed BGR — NSIS does not read PNG.
+// NSIS wants BMP: a 150x57 strip in the header of the uninstaller's pages, at a
+// size it will not negotiate, and the mark in the middle of the installer's own
+// pages. Anything else is ignored or drawn wrong, and the format has to be
+// uncompressed BGR — NSIS does not read PNG.
 //
 // They are generated rather than committed as binaries for the ordinary reason:
 // a checked-in .bmp is 150 KB of bytes nobody can review, and changing the
@@ -95,7 +95,7 @@ function bmp(image) {
   return buffer;
 }
 
-/** The accent, washed over the top of the sidebar the way the loading page does. */
+/** The accent, washed in behind the mark the way the loading page does. */
 function glow(image, cx, cy, radius, colour, strength) {
   for (let y = 0; y < image.height; y++) {
     for (let x = 0; x < image.width; x++) {
@@ -116,7 +116,7 @@ function glow(image, cx, cy, radius, colour, strength) {
  *
  * Box-filtered down from the source rather than sampled, so the pixel art keeps
  * its edges instead of shimmering. The icon is drawn on white, so near-white is
- * treated as background and skipped: the sidebar has a wash behind it, and a
+ * treated as background and skipped: the header has a wash behind it, and a
  * white square around the whale would read as a card sitting on top of it.
  */
 function icon(image, source, left, top, size) {
@@ -189,23 +189,10 @@ function save(name, image) {
 
 const mark = readPng(join(root, "src-tauri", "icons", "icon.png"));
 
-// ------------------------------------------------------------- the sidebar --
-// 164x314, down the left of the welcome and finish pages.
-const side = canvas(164, 314);
-glow(side, 82, 110, 150, ACCENT, 0.16);
-// A second, tighter wash centred on the whale, so it sits in something rather
-// than floating.
-glow(side, 82, 120, 76, ACCENT, 0.1);
-icon(side, mark, 30, 76, 104);
-// Nothing under the mark. Two rules were drawn here once, echoing the loading
-// page's progress bar -- but that bar means something, and a copy of it in a
-// panel with no progress to report is just a line. On screen it read as one:
-// the same complaint as the hairline the header used to carry.
-const sidebar = save("installer-sidebar.bmp", side);
-
 // -------------------------------------------------------------- the header --
-// 150x57, top left of every page between welcome and finish. NSIS draws it on
-// the header's own white, so this stays white and carries just the mark.
+// 150x57, top left of the uninstaller's pages -- the installer's own pages
+// hide MUI2's header. NSIS draws it on the header's own white, so this stays
+// white and carries just the mark.
 //
 // MUI2 puts the header bitmap on the *left*, with the page's title text to
 // its right. `MUI_HEADERIMAGE_RIGHT` would swap the two, and the installer
@@ -219,6 +206,45 @@ glow(head, 112, 28, 58, ACCENT, 0.1);
 icon(head, mark, 96, 8, 42);
 const header = save("installer-header.bmp", head);
 
-console.log(`installer art: ${sidebar}, ${header}`);
+// --------------------------------------------------------------- the brand --
+// The mark in the middle of the welcome page (`installer-welcome.nsh`): the
+// whale on a soft disc, the way the official installer shows its own.
+//
+// Unlike the two above, this one is not stretched to a size NSIS dictates, and
+// Windows will not scale it either -- a static control shows a bitmap at its
+// own pixel size. So it is drawn once per common display scale and the page
+// picks the one nearest the window's DPI; a single 2x image squashed down by
+// `LoadImage` is visibly jagged at 125% and 150%.
+const BRAND = 120;
+const brands = [100, 125, 150, 175, 200].map((percent) => {
+  const s = percent / 100;
+  const size = Math.round(BRAND * s);
+  const image = canvas(size, size);
+  const c = size / 2;
+  const r = 50 * s;
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      // A shadow under the disc, nudged down so it reads as lift rather than
+      // a halo.
+      const shadow = Math.hypot(x + 0.5 - c, y + 0.5 - c - 3 * s) - r;
+      if (shadow > -2 * s && shadow < 14 * s) {
+        const t = Math.max(0, shadow) / (14 * s);
+        image.set(x, y, [0x1f, 0x23, 0x29], 0.09 * (1 - t) * (1 - t));
+      }
+      // The disc, anti-aliased on its edge and shaded top to bottom.
+      const coverage = Math.min(1, Math.max(0, r - Math.hypot(x + 0.5 - c, y + 0.5 - c) + 0.5));
+      if (coverage > 0) {
+        const shade = Math.round(0xff - ((y - (c - r)) / (2 * r)) * 0x0d);
+        image.set(x, y, [shade, shade, Math.min(0xff, shade + 3)], coverage);
+      }
+    }
+  }
+  const whale = Math.round(64 * s);
+  icon(image, mark, Math.round(c - whale / 2), Math.round(c - whale / 2), whale);
+  return save(`brand-${percent}.bmp`, image);
+});
+
+console.log(`installer art: ${header}, ${brands.join(", ")}`);
 
 

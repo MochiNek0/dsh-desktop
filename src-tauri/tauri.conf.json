@@ -45,7 +45,8 @@
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
         "installerHooks": "installer-hooks.nsh",
-        "sidebarImage": "installer/installer-sidebar.bmp",
+        "template": "installer.nsi",
+        "languages": ["SimpChinese"],
         "headerImage": "installer/installer-header.bmp"
       }
     }

@@ -89,7 +89,7 @@ console.log('[bundle] staged plugin/');
 // original will not do.
 await import('./make-mobile-icon.mjs');
 
-// The installer's two bitmaps, drawn from the app icon. They go into
+// The installer's bitmaps, drawn from the app icon. They go into
 // `src-tauri/installer/` rather than here, because everything in `resources/`
 // is copied into the installation directory and these are only read while the
 // installer is being built. An earlier version wrote them here; sweep those.
