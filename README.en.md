@@ -2,7 +2,7 @@
 
 # dsh desktop
 
-A cross-platform desktop client for DeepSeek Harness (`dsh web`)
+A lightweight desktop client for DeepSeek Harness (`dsh web`), with phone access built in
 
 **[Official Website · Download](https://dsh-desktop.cc.cd/en/)** · **English** · [简体中文](README.md)
 
@@ -25,12 +25,13 @@ A cross-platform desktop client for DeepSeek Harness (`dsh web`)
 
 > **Unofficial project**: A third-party desktop client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), not affiliated with DeepSeek. [Issues](https://github.com/MochiNek0/dsh-desktop/issues) and PRs welcome.
 >
-> 💡 **Also try the official client**: DeepSeek now provides an official desktop app. Feel free to check it out at the [official DeepSeek Harness website](https://www.deepseek.com/harness/).
+> **Also try the official client**: DeepSeek now provides an official desktop app. Feel free to check it out at the [official DeepSeek Harness website](https://www.deepseek.com/harness/). The difference: this one installs in a few MB, and lets a phone in to the dsh on your computer.
 
 Starts the local `dsh web` in the background on launch and embeds it in a native window — no terminal, no port juggling. Sessions, credentials and config live in `$DSH_HOME` (default `~/.dsh`), the same ones your command-line `dsh` uses.
 
 ## Features
 
+- **Connect a phone**: open **Connect a phone…** from the menu, scan the code with the phone's camera and click **Allow** on the computer — the phone's browser now has the dsh running on your computer, sessions and all, with no app to install. Pick one of three channels: **Local network** (same Wi-Fi, through nobody else's servers), **Tailscale** (anywhere, mobile data included) or **Cloudflare** (your own hostname, and the only one of the three with HTTPS; it switches itself off after 30 idle minutes and stays flagged in the tray while up). A pairing code lasts five minutes and works once, and every new device needs a yes from someone at the computer. A pairing holds for thirty days; drop one device, or all of them along with the key. Not a line of dsh is changed.
 - **Light**: Tauri v2 on the system WebView, with no bundled browser engine. Installers are 2.3 MB on Windows, 5.8 MB on macOS, 3.8 MB on Debian.
 - **Cross-platform**: the same experience on Windows, macOS and Linux.
 - **Works out of the box**: detects Node, installs `dsh` where needed, and picks a free loopback port so it never collides with an instance you started by hand. No administrator rights at any point.
