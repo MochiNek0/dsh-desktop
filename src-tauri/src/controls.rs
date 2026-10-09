@@ -690,6 +690,7 @@ fn labels() -> String {
         // notification this app raises, a plugin's included. See
         // `crate::settings`.
         ("notify-turns", t!("通知", "Notifications")),
+        ("community", t!("交流群", "Feedback")),
         ("quit", t!("退出 dsh", "Quit dsh")),
     ];
 
@@ -701,6 +702,26 @@ fn labels() -> String {
     serde_json::to_string(&map).expect("a map of strings is always serializable")
 }
 
+/// Where a user goes to ask: the QQ group for a Chinese interface, the issue
+/// tracker for an English one, which has no use for a QQ number. Shown only
+/// where the user is already looking for it — the settings card, and the two
+/// failures that come with diagnostics to paste ([`crate::setup`] and the
+/// loading page in `dist/index.html`, which spells the number out on its own).
+pub(crate) const QQ_GROUP: &str = "1125671315";
+const ISSUES: &str = "https://github.com/MochiNek0/dsh-desktop/issues";
+
+/// `var COMMUNITY`: what the settings card's community row copies or opens,
+/// and the words it says once it has copied. The copy only happens in Chinese,
+/// so that line has only the one language.
+fn community() -> String {
+    serde_json::json!({
+        "qq": QQ_GROUP,
+        "issues": ISSUES,
+        "copied": format!("已复制群号 {QQ_GROUP}"),
+    })
+    .to_string()
+}
+
 /// The line under each row of the settings card, against the same verb its
 /// label is under.
 ///
@@ -710,6 +731,13 @@ fn labels() -> String {
 /// row has only its own words to explain itself and has to be short, and
 /// "Runtime…" on its own never said which of node and dsh it was about.
 fn notes() -> String {
+    // Not `t!`: only the Chinese line carries the group's number, and the macro
+    // formats both halves with the same arguments. See [`QQ_GROUP`].
+    let community = if crate::i18n::chinese() {
+        format!("QQ 群 {QQ_GROUP}，点一下复制群号。")
+    } else {
+        "Questions and bug reports go to GitHub Issues.".to_string()
+    };
     let notes = [
         (
             "runtime",
@@ -747,6 +775,7 @@ fn notes() -> String {
                 "Tell you when a turn finishes, or when dsh stops to ask something."
             ),
         ),
+        ("community", community.as_str()),
     ];
 
     let map: serde_json::Map<String, serde_json::Value> = notes
@@ -999,7 +1028,9 @@ pub fn script() -> String {
 
     let labels = labels();
     let notes = notes();
+    let community = community();
     let maker = dom_make();
+    let copier = copier();
     let icons = lucide();
     let watcher = theme_watcher("dsh-wc-dark");
     let corners = corners(&["dsh-wc", "dsh-wc-set", "dsh-wc-scrim"]);
@@ -1039,6 +1070,8 @@ pub fn script() -> String {
   var LABELS = {labels};
   // The second line each settings row carries; see `notes` in controls.rs.
   var NOTES = {notes};
+  // The community row's payload; see `community` in controls.rs.
+  var COMMUNITY = {community};
 
   // The menu, top to bottom. `panel` marks the one row that opens a card of
   // this app's own instead of signalling Rust.
@@ -1081,6 +1114,9 @@ pub fn script() -> String {
     {{ verb: 'channel' }},
     {{ verb: 'autostart', check: true }},
     {{ verb: 'notify-turns', check: true }},
+    // Last, and on the card rather than the menu: it is for someone who went
+    // looking, and the menu is what everyone sees on every use.
+    {{ verb: 'community', community: true }},
     // The way out that is visible. Escape and the scrim close it too, and
     // neither is something a user finds by looking at the card.
     {{ verb: 'settings-done', close: true }}
@@ -1126,6 +1162,7 @@ pub fn script() -> String {
   // titlebar used to have no card in it and built its row by hand; the
   // settings panel below is a card, so it uses the shared helper.
 {maker}
+{copier}
 
   // ----------------------------------------------------------- the theme --
   // Pasted in from `controls::theme_watcher`, which every card in this app
@@ -1628,13 +1665,38 @@ pub fn script() -> String {
       if (item.check) {{
         make('span', 'dsh-wc-sw', row);
         checks[item.verb] = row;
-      }} else if (!item.close) {{
+      }} else if (!item.close && !item.community) {{
         make('span', 'dsh-wc-set-go', row).innerHTML = GO_GLYPH;
       }}
+
+      // The community row's own note, put back after it said "copied".
+      var was = '', restore = null;
 
       row.addEventListener('click', function () {{
         // The same refusal a menu row makes; see the handler above.
         if (row.getAttribute('aria-disabled') === 'true') return;
+        // Chinese copies the group's number and keeps the card up, so the note
+        // can say it did; English leaves for the issue tracker in the browser.
+        // The language is read at the click, because dsh can switch it under
+        // a card that was drawn in the other one.
+        if (item.community) {{
+          if ((window.__DSH_LANG__ || 'zh') !== 'zh') {{
+            hideSettings();
+            signal('open?url=' + encodeURIComponent(COMMUNITY.issues));
+            return;
+          }}
+          copyText(COMMUNITY.qq, function (ok) {{
+            if (!ok) return;
+            if (restore) clearTimeout(restore);
+            else was = note.textContent;
+            note.textContent = COMMUNITY.copied;
+            restore = setTimeout(function () {{
+              note.textContent = was;
+              restore = null;
+            }}, 2000);
+          }});
+          return;
+        }}
         // A switch leaves the card where it is: the user came here to set it,
         // and Rust answers by marking this very row. Everything else either
         // leaves for a card of its own or is the way out.

@@ -205,6 +205,13 @@
       body.failed #error {
         display: block;
       }
+      #error-ask {
+        margin: 10px 0 0;
+        font-size: 12px;
+        color: var(--muted);
+        user-select: text;
+        -webkit-user-select: text;
+      }
       .actions {
         display: flex;
         gap: 10px;
@@ -285,6 +292,7 @@
           <button id="error-safe"></button>
           <button id="error-copy"></button>
         </div>
+        <p id="error-ask"></p>
       </div>
     </main>
 
@@ -356,6 +364,14 @@
             copy
           );
         });
+
+        // Where to send what was just copied. The number is spelled out here
+        // because this page is a file rather than something Rust writes; it is
+        // `QQ_GROUP` in src-tauri/src/controls.rs.
+        id('error-ask').textContent = t(
+          '复制之后可以发到 QQ 群 1125671315 求助。',
+          'Paste them into an issue at github.com/MochiNek0/dsh-desktop/issues.'
+        );
 
         // This page runs on tauri.localhost, which counts as a secure context,
         // so the clipboard API is there — but fall back rather than leave the

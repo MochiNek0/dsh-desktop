@@ -848,6 +848,13 @@ pub fn answered(choice: Choice) {
 /// again by [`relabel`], and two copies of these strings would be the drift
 /// [`crate::i18n`] is arranged to prevent.
 fn labels() -> String {
+    // Not `t!`: only the Chinese line carries the QQ group's number; see
+    // [`crate::controls::QQ_GROUP`].
+    let ask = if crate::i18n::chinese() {
+        format!("复制之后可以发到 QQ 群 {} 求助。", crate::controls::QQ_GROUP)
+    } else {
+        "Paste them into an issue at github.com/MochiNek0/dsh-desktop/issues.".to_string()
+    };
     let mut labels = json!({
         "title": t!("选择运行环境", "Choose a runtime"),
         "ledeNodes": t!(
@@ -943,7 +950,8 @@ fn labels() -> String {
         "less": t!("收起", "Hide the list"),
         "copyDiag": t!("复制诊断信息", "Copy diagnostics"),
         "copied": t!("已复制", "Copied"),
-        "openLogs": t!("打开日志", "Open the log")
+        "openLogs": t!("打开日志", "Open the log"),
+        "ask": ask
     });
     if let (Some(labels), serde_json::Value::Object(first_run)) =
         (labels.as_object_mut(), first_run)
@@ -987,7 +995,7 @@ pub fn script() -> String {
 
   var TEXT = {labels};
 
-  var root = null, sheet, card, lede, list, errBox, errText, errCopy;
+  var root = null, sheet, card, lede, list, errBox, errText, errCopy, errAsk;
   var statusBox, statusText, statusFill;
   var installNode, removeNode, rescan, quit;
   var recBox, recTitle, recText, recButton, more;
@@ -1274,6 +1282,8 @@ pub fn script() -> String {
       '.dsh-su-list[hidden]{{display:none}}' +
       '.dsh-su-err-actions{{display:flex;gap:8px;margin-top:10px}}' +
       '.dsh-su-err-actions button{{height:28px;padding:0 12px;font-size:12px}}' +
+      // No `display` of its own, so `hidden` still takes it away.
+      '.dsh-su-err-ask{{margin-top:8px;font-size:12px;opacity:.8}}' +
       // The status line an action reports onto. Only the menu's panel needs it
       // — the boot's has the loading page underneath — but it is drawn either
       // way and simply stays empty.
@@ -1325,6 +1335,10 @@ pub fn script() -> String {
       }});
     }});
     button(errActions, TEXT.openLogs, function () {{ poke('setup-logs'); }});
+    // And where to send them. Under the buttons, and only with them: a line
+    // saying "paste them" beside nothing to copy is a line about nothing.
+    errAsk = make('div', 'dsh-su-err-ask', errBox);
+    errAsk.textContent = TEXT.ask;
 
     recBox = make('div', 'dsh-su-rec', card);
     recTitle = make('div', 'dsh-su-rec-title', recBox);
@@ -1534,6 +1548,7 @@ pub fn script() -> String {
       diagnostics = typeof data.diagnostics === 'string' ? data.diagnostics : '';
       errCopy.textContent = TEXT.copyDiag;
       errCopy.hidden = !diagnostics;
+      errAsk.hidden = !diagnostics;
 
       list.textContent = '';
       nodes.forEach(function (node, index) {{
