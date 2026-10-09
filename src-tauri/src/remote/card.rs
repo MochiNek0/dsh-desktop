@@ -563,6 +563,12 @@ pub fn script() -> String {
     setup.style.display = config ? 'block' : 'none';
     if (!config) return;
 
+    // What is half-typed into the form, if it is up. Every redraw comes through
+    // here -- a firewall answer, a tick on one of the boxes below -- and
+    // rebuilding the inputs empty threw away a token the user was pasting.
+    var typed = setup.querySelectorAll('input');
+    var draft = typed.length === 2 ? [typed[0].value, typed[1].value] : null;
+
     setup.textContent = '';
 
     if (config.install) {{
@@ -589,11 +595,12 @@ pub fn script() -> String {
     token.placeholder = TEXT.cfToken || '';
     token.autocapitalize = 'off';
     token.spellcheck = false;
+    if (draft) token.value = draft[0];
 
     var host = make('input', '', setup);
     host.type = 'text';
     host.placeholder = TEXT.cfHost || '';
-    host.value = config.hostname || '';
+    host.value = draft ? draft[1] : (config.hostname || '');
     host.autocapitalize = 'off';
     host.spellcheck = false;
 

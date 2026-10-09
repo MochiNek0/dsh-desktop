@@ -433,10 +433,25 @@ pub fn script() -> String {
   }}
 
   /** The one list, out of the listing's two halves. The log and the line
-   *  above it stay put. */
-  function fill(data) {{
+   *  above it stay put.
+   *
+   *  `keep` is a redraw under a panel already in use -- the update check
+   *  behind it landing, mostly, seconds after the user started ticking -- and
+   *  keeps what they ticked and where they had scrolled to. Keyed by which half
+   *  a card is in as well as by its value: a plugin an install or a removal
+   *  has just moved across is a different card, and starts from its default. */
+  function fill(data, keep) {{
     var presets = data.presets || [];
     var installed = data.installed || [];
+
+    var was = {{}};
+    if (keep) {{
+      [].forEach.call(list.querySelectorAll('.dsh-pp-row input'), function (box) {{
+        var half = box.parentNode.classList.contains('dsh-pp-in') ? 'in:' : 'out:';
+        was[half + box.value] = box.checked;
+      }});
+    }}
+    var scrolled = keep ? list.scrollTop : 0;
 
     // Whatever it was pointing at is about to be thrown away.
     forget();
@@ -496,8 +511,11 @@ pub fn script() -> String {
     }}
 
     cards.forEach(function (item) {{
+      var key = (item.installed ? 'in:' : 'out:') + item.value;
+      if (key in was) item.checked = was[key];
       list.appendChild(card(item));
     }});
+    list.scrollTop = scrolled;
 
     offerRemoval();
   }}
@@ -861,7 +879,7 @@ pub fn script() -> String {
   window.__dshPluginLists = function (listing) {{
     if (!root) return;
     try {{
-      fill(JSON.parse(listing));
+      fill(JSON.parse(listing), true);
     }} catch (error) {{
       // Leaving the list as it was is the better of the two wrong answers.
     }}
