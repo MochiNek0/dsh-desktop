@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.21"
+version = "0.1.22-beta.0"
 description = "Desktop client for the DeepSeek Harness browser UI"
 license = "AGPL-3.0-only"
 edition = "2021"
