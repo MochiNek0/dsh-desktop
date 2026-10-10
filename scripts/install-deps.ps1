@@ -1121,6 +1121,11 @@ function Uninstall-All {
         Say 'dsh 是你自己装的，不会动它。要卸载请用：npm uninstall -g @deepseek-ai/dsh'
     }
 
+    # What went wrong, said once at the end rather than stopping at the first:
+    # the rest of the cleanup is still worth doing, and the marker keeps what
+    # did not go so a later run can try again.
+    $failed = $null
+
     if ($dropDsh) {
         $prefix = Find-DshPrefix $state
 
@@ -1137,7 +1142,9 @@ function Uninstall-All {
             $cli = $state['npmCli']
             if ($node -and $cli -and (Test-Path -LiteralPath $node) -and (Test-Path -LiteralPath $cli)) {
                 Say "正在卸载 dsh（$prefix）…"
-                Invoke-Native $node @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null | Out-Null
+                if (-not (Invoke-Native $node @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null)) {
+                    $failed = "dsh 没能卸载干净（$prefix）。可能有文件正被占用。"
+                }
                 # Same rule as `Uninstall-DshFrom`: the pnpm installed for this
                 # dsh goes with it where it was ours, and stays where it was the
                 # user's.
@@ -1163,10 +1170,15 @@ function Uninstall-All {
         if ($state['pathEntry']) { Remove-Path $state['pathEntry'] }
         Say '正在删除 Node 和 dsh…'
         Remove-Item -LiteralPath $NodeDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $NodeDir) {
+            Fail "Node 目录没能删干净（$NodeDir）。可能有文件正被占用，可以稍后手动删除。"
+        }
+        if ($failed) { Fail $failed }
         Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
         return
     }
 
+    if ($failed) { Fail $failed }
     if ($dropDsh) {
         $state.Remove('dsh')
         Write-Marker $state

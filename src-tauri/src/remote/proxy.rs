@@ -45,7 +45,7 @@ use http::{HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::session::COOKIE as DEVICE_COOKIE;
@@ -67,6 +67,20 @@ const PAIRING_WAIT: Duration = Duration::from_secs(120);
 /// aged out stops sending a cookie rather than being told about it.
 const COOKIE_MAX_AGE: u64 = 30 * 24 * 60 * 60;
 
+/// How many connections the gateway holds at once. A phone on a session page
+/// keeps a handful; this is room for several phones and a ceiling for anyone
+/// on the network opening sockets and leaving them there.
+const MAX_CONNECTIONS: usize = 256;
+
+/// How long a connection may take to finish sending a request's headers. Past
+/// this it is a slow client holding a slot, not a phone.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the launch-token exchange may wait on dsh. It runs under
+/// [`Shared::exchange`], so a dsh that hangs on it would otherwise hold every
+/// other request on the gateway behind it.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// What every response this module builds carries.
 ///
 /// Boxed because the two kinds are different types — dsh's answer streams from
@@ -84,6 +98,7 @@ pub async fn serve(
     shared: Arc<Shared>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
@@ -106,13 +121,26 @@ pub async fn serve(
             .seen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        // Full is closed rather than queued: a queue is the same exhaustion
+        // with a longer fuse. Held for the life of the connection, upgrades
+        // included.
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            continue;
+        };
+
         let shared = shared.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             let service = service_fn(move |request| handle(shared.clone(), peer, request));
             // `with_upgrades`, or the 101 this forwards is a status code and
             // nothing else: without it hyper never hands over the socket, and
             // the WebSocket dsh's client opens would connect and then go silent.
+            //
+            // The timer is what makes the header timeout real: hyper reads the
+            // setting only when it has one to measure with.
             let served = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_TIMEOUT)
                 .serve_connection(TokioIo::new(stream), service)
                 .with_upgrades()
                 .await;
@@ -184,7 +212,7 @@ async fn handle(
     let presented = cookie_value(&request, DEVICE_COOKIE);
     let device = presented
         .as_deref()
-        .and_then(|value| shared.store.verify(value));
+        .and_then(|value| shared.store.verify(value, shared.channel()));
 
     // A pairing URL from somebody who is already paired is a phone that scanned
     // the code twice, or typed one it did not need. Sending it to `/` costs
@@ -326,7 +354,7 @@ async fn pair(
         );
     }
 
-    let (_device, cookie) = shared.store.authorize(label, address);
+    let (_device, cookie) = shared.store.authorize(label, address, shared.channel());
     super::paired(&shared);
     let secure = shared.secure();
 
@@ -460,12 +488,12 @@ fn join(
         // Checked once before waiting at all, for a kick between the request
         // being verified and the socket being handed over. After that, again
         // on every kick; returning drops both sockets, which closes them.
-        let mut allowed = shared.store.verify(&device_cookie).is_some();
+        let mut allowed = shared.store.verify(&device_cookie, shared.channel()).is_some();
         while allowed {
             tokio::select! {
                 _ = &mut copying => break,
                 changed = revocations.changed() => {
-                    allowed = changed.is_ok() && shared.store.verify(&device_cookie).is_some();
+                    allowed = changed.is_ok() && shared.store.verify(&device_cookie, shared.channel()).is_some();
                 }
                 // The channel this socket came in over is gone. See
                 // [`Shared::hang_up`].
@@ -510,7 +538,10 @@ async fn ensure_cookie(shared: &Arc<Shared>) -> Option<String> {
         .body(Empty::<Bytes>::new())
         .ok()?;
 
-    let response = send(&authority, request).await.ok()?;
+    let response = tokio::time::timeout(EXCHANGE_TIMEOUT, send(&authority, request))
+        .await
+        .ok()?
+        .ok()?;
     let cookie = upstream::cookie_from(response.headers())?;
     shared.upstream.hold(cookie.clone());
     Some(cookie)

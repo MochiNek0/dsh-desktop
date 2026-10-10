@@ -1204,7 +1204,7 @@ fn a_channel_switch_closes_the_open_websockets() {
         ),
     }
     assert!(
-        harness.shared.store.verify(&cookie).is_some(),
+        harness.shared.store.verify(&cookie, harness.shared.channel()).is_some(),
         "the device is still paired"
     );
 }

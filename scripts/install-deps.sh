@@ -1166,6 +1166,9 @@ uninstall_all() {
         say 'dsh 是你自己装的，不会动它。要卸载请用：npm uninstall -g @deepseek-ai/dsh'
     fi
 
+    # What went wrong, said once at the end; see the same in install-deps.ps1.
+    failed=''
+
     if [ "$drop_dsh" = 1 ]; then
         prefix=$(find_dsh_prefix) || prefix=''
 
@@ -1183,8 +1186,12 @@ uninstall_all() {
             # npm has to unpick its own tree, pointed at the prefix holding it
             # rather than at whatever this run would default to.
             say "正在卸载 dsh（$prefix）…"
-            "$M_NODE_EXE" "$M_NPM_CLI" uninstall -g --prefix "$prefix" \
-                --loglevel=error "$PACKAGE" 2>&1 | while IFS= read -r line; do say "$line"; done
+            # Captured rather than piped, for the status; see `uninstall_dsh_from`.
+            if ! printed=$("$M_NODE_EXE" "$M_NPM_CLI" uninstall -g --prefix "$prefix" \
+                --loglevel=error "$PACKAGE" 2>&1); then
+                failed="dsh 没能卸载干净（$prefix）。"
+            fi
+            printf '%s\n' "$printed" | while IFS= read -r line; do [ -n "$line" ] && say "$line"; done
             # Same rule as `uninstall_dsh_from`: the pnpm installed for this dsh
             # goes with it where it was ours, and stays where it was the user's.
             if pnpm_is_ours "$prefix"; then
@@ -1207,10 +1214,13 @@ uninstall_all() {
         case "$M_PREFIX" in
             "$APP_DIR"/*) rm -rf "$M_PREFIX" ;;
         esac
+        [ -e "$NODE_DIR" ] && fail "Node 目录没能删干净（$NODE_DIR）。"
+        [ -n "$failed" ] && fail "$failed"
         rm -f "$MARKER"
         return 0
     fi
 
+    [ -n "$failed" ] && fail "$failed"
     if [ "$drop_dsh" = 1 ]; then
         M_DSH=''
         write_marker
@@ -1626,8 +1636,13 @@ uninstall_dsh_from() {
         fail "$(t "这个 Node 里没有安装 dsh（$prefix）。" "This Node has no dsh installed ($prefix).")"
 
     step "$(t "正在卸载 dsh（$prefix）…" "Uninstalling dsh ($prefix)…")" 0
-    "$NODE_EXE" "$cli" uninstall -g --prefix "$prefix" --loglevel=error "$PACKAGE" 2>&1 |
-        while IFS= read -r line; do say "$line"; done
+    # Captured rather than piped: a pipe's status is its last stage's, so a
+    # failed uninstall used to be reported as done.
+    if ! printed=$("$NODE_EXE" "$cli" uninstall -g --prefix "$prefix" --loglevel=error "$PACKAGE" 2>&1); then
+        printf '%s\n' "$printed" | while IFS= read -r line; do say "$line"; done
+        fail "$(t "dsh 没能卸载干净（$prefix）。" "dsh could not be fully uninstalled ($prefix).")"
+    fi
+    printf '%s\n' "$printed" | while IFS= read -r line; do [ -n "$line" ] && say "$line"; done
 
     # And the pnpm that came with it, where that pnpm is ours. Nothing else in
     # this prefix wants one: it is here because dsh forwards plugin installs to

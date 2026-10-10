@@ -208,7 +208,10 @@ fn from_portal(referer: Option<&str>) -> bool {
 
     match host {
         PORTAL => scheme == "https",
-        "localhost" | "127.0.0.1" => true,
+        // The dev server only. In a release build it would let any page a
+        // phone serves to itself on loopback — a Termux server, an app's own
+        // web view — navigate straight in.
+        "localhost" | "127.0.0.1" => cfg!(any(debug_assertions, test)),
         _ => false,
     }
 }

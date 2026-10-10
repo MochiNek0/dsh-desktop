@@ -40,7 +40,7 @@
 //!
 //! ## The device cookie
 //!
-//! `dsh_mobile_session=v1.<id>.<issued>.<mac>`, where the mac is HMAC-SHA256
+//! `dsh_mobile_session=v2.<id>.<issued>.<channel>.<mac>`, where the mac is HMAC-SHA256
 //! over everything before it under the secret described below. The id names a
 //! row in [`Inner::devices`], so a device that has been kicked fails on the row
 //! rather than on the signature, and "disconnect everything" is one call that
@@ -107,6 +107,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tauri::AppHandle;
+
+use super::tunnel::TunnelType;
 
 /// The name the cookie goes out under. Ours, not dsh's — see
 /// [`crate::remote::upstream`] for the one dsh mints, which never leaves this
@@ -345,7 +347,9 @@ impl SessionStore {
     }
 
     /// Take a device in, and hand back the cookie value it proves itself with.
-    pub fn authorize(&self, label: String, address: String) -> (Device, String) {
+    ///
+    /// The cookie is good on `channel` only. See [`verify`](Self::verify).
+    pub fn authorize(&self, label: String, address: String, channel: TunnelType) -> (Device, String) {
         let (device, cookie) = {
             let mut inner = self.inner.lock().unwrap();
 
@@ -358,7 +362,7 @@ impl SessionStore {
                 address,
                 since: epoch_secs(SystemTime::now()),
             };
-            let cookie = sign(&inner.secret, &device.id, device.since);
+            let cookie = sign(&inner.secret, &device.id, device.since, channel.name());
             inner.devices.push(device.clone());
             (device, cookie)
         };
@@ -372,9 +376,26 @@ impl SessionStore {
     /// Three ways to fail, all of them the same answer: the shape is wrong, the
     /// mac does not verify under the current secret, or it verifies and names a
     /// device that has been kicked or has aged out.
-    pub fn verify(&self, offered: &str) -> Option<Device> {
+    ///
+    /// And a fourth: it was signed for another channel. A LAN pairing is plain
+    /// HTTP, so anyone on that Wi-Fi can read the cookie off the air; bound,
+    /// what they read stops at the LAN instead of working through the
+    /// Cloudflare hostname once that is up. A real phone loses nothing by it —
+    /// its browser keeps cookies per origin, and every channel is an origin of
+    /// its own, so it pairs again on a new channel either way.
+    ///
+    /// A `v1` cookie predates the binding and says nothing about its channel.
+    /// It is taken off the internet only: the phones already paired on the LAN
+    /// or a tailnet keep working, and the one place a sniffed cookie would be
+    /// worth carrying to is closed to it.
+    pub fn verify(&self, offered: &str, channel: TunnelType) -> Option<Device> {
         let inner = self.inner.lock().unwrap();
-        let (id, issued) = check(&inner.secret, offered)?;
+        let (id, issued, signed_for) = check(&inner.secret, offered)?;
+        match signed_for {
+            Some(name) if name != channel.name() => return None,
+            None if channel.public() => return None,
+            _ => {}
+        }
 
         let device = inner.devices.iter().find(|device| device.id == id)?;
         let age = epoch_secs(SystemTime::now()).saturating_sub(issued);
@@ -550,18 +571,20 @@ fn row(stored: &Value) -> Option<Device> {
     })
 }
 
-/// `v1.<id>.<issued>.<mac>`.
+/// `v2.<id>.<issued>.<channel>.<mac>`.
 ///
 /// The version prefix is there so that a later build can change what is signed
 /// without a cookie from this one verifying under the new rule by accident.
-fn sign(secret: &[u8; 32], id: &str, issued: u64) -> String {
-    let payload = format!("v1.{id}.{issued}");
+/// `v2` added the channel; `v1.<id>.<issued>.<mac>` is still read.
+fn sign(secret: &[u8; 32], id: &str, issued: u64, channel: &str) -> String {
+    let payload = format!("v2.{id}.{issued}.{channel}");
     let mac = b64(&hmac(secret, payload.as_bytes()));
     format!("{payload}.{mac}")
 }
 
-/// The id and the issuing time out of a cookie whose mac verifies.
-fn check(secret: &[u8; 32], offered: &str) -> Option<(String, u64)> {
+/// The id, the issuing time and — from `v2` on — the channel, out of a cookie
+/// whose mac verifies.
+fn check(secret: &[u8; 32], offered: &str) -> Option<(String, u64, Option<String>)> {
     let (payload, mac) = offered.rsplit_once('.')?;
     let expected = b64(&hmac(secret, payload.as_bytes()));
 
@@ -572,12 +595,17 @@ fn check(secret: &[u8; 32], offered: &str) -> Option<(String, u64)> {
     }
 
     let mut parts = payload.split('.');
-    if parts.next()? != "v1" {
+    let version = parts.next()?;
+    if version != "v1" && version != "v2" {
         return None;
     }
     let id = parts.next()?.to_string();
     let issued = parts.next()?.parse().ok()?;
-    parts.next().is_none().then_some((id, issued))
+    let channel = match version {
+        "v2" => Some(parts.next()?.to_string()),
+        _ => None,
+    };
+    parts.next().is_none().then_some((id, issued, channel))
 }
 
 /// HMAC-SHA256, by hand.
@@ -728,9 +756,9 @@ mod tests {
     #[test]
     fn a_cookie_it_signed_is_one_it_takes_back() {
         let store = SessionStore::default();
-        let (device, cookie) = store.authorize("iPhone".into(), "192.168.1.9".into());
+        let (device, cookie) = store.authorize("iPhone".into(), "192.168.1.9".into(), TunnelType::Lan);
 
-        assert_eq!(store.verify(&cookie), Some(device));
+        assert_eq!(store.verify(&cookie, TunnelType::Lan), Some(device));
     }
 
     /// Every way a forged cookie is forged: the mac changed, the payload changed
@@ -739,7 +767,7 @@ mod tests {
     #[test]
     fn nothing_else_verifies() {
         let store = SessionStore::default();
-        let (_, cookie) = store.authorize("iPhone".into(), "192.168.1.9".into());
+        let (_, cookie) = store.authorize("iPhone".into(), "192.168.1.9".into(), TunnelType::Lan);
         let (payload, mac) = cookie.rsplit_once('.').unwrap();
 
         // One character, changed to a different one whatever it was. A
@@ -756,8 +784,29 @@ mod tests {
             format!("v1.d2.0.{mac}"),
             format!("{payload}.{payload}.{mac}"),
         ] {
-            assert_eq!(store.verify(&forged), None, "{forged} must not verify");
+            assert_eq!(store.verify(&forged, TunnelType::Lan), None, "{forged} must not verify");
         }
+    }
+
+    /// A cookie works on the channel it was signed for and nowhere else, and
+    /// one from before the binding is kept off the internet.
+    #[test]
+    fn a_cookie_stays_on_its_channel() {
+        let store = SessionStore::default();
+        let (device, cookie) =
+            store.authorize("iPhone".into(), "192.168.1.9".into(), TunnelType::Lan);
+
+        assert_eq!(store.verify(&cookie, TunnelType::Lan), Some(device.clone()));
+        assert_eq!(store.verify(&cookie, TunnelType::Cloudflare), None);
+        assert_eq!(store.verify(&cookie, TunnelType::Tailscale), None);
+
+        let legacy = {
+            let inner = store.inner.lock().unwrap();
+            let payload = format!("v1.{}.{}", device.id, device.since);
+            format!("{payload}.{}", b64(&hmac(&inner.secret, payload.as_bytes())))
+        };
+        assert_eq!(store.verify(&legacy, TunnelType::Lan), Some(device));
+        assert_eq!(store.verify(&legacy, TunnelType::Cloudflare), None);
     }
 
     /// A kicked device's cookie still carries a valid signature. What stops it
@@ -765,10 +814,10 @@ mod tests {
     #[test]
     fn a_kicked_device_stops_getting_in() {
         let store = SessionStore::default();
-        let (device, cookie) = store.authorize("iPhone".into(), "192.168.1.9".into());
+        let (device, cookie) = store.authorize("iPhone".into(), "192.168.1.9".into(), TunnelType::Lan);
 
         store.revoke(&device.id);
-        assert_eq!(store.verify(&cookie), None);
+        assert_eq!(store.verify(&cookie, TunnelType::Lan), None);
     }
 
     /// And after a rotation, so does one whose row would have been there: the
@@ -776,13 +825,13 @@ mod tests {
     #[test]
     fn rotating_the_secret_invalidates_everything() {
         let store = SessionStore::default();
-        let (_, cookie) = store.authorize("iPhone".into(), "192.168.1.9".into());
+        let (_, cookie) = store.authorize("iPhone".into(), "192.168.1.9".into(), TunnelType::Lan);
 
         store.revoke_all();
-        let (_, fresh) = store.authorize("iPhone".into(), "192.168.1.9".into());
+        let (_, fresh) = store.authorize("iPhone".into(), "192.168.1.9".into(), TunnelType::Lan);
 
-        assert_eq!(store.verify(&cookie), None, "the old cookie is scrap");
-        assert!(store.verify(&fresh).is_some(), "and the new one is not");
+        assert_eq!(store.verify(&cookie, TunnelType::Lan), None, "the old cookie is scrap");
+        assert!(store.verify(&fresh, TunnelType::Lan).is_some(), "and the new one is not");
     }
 
     /// Two devices that paired separately are two rows, and kicking one leaves
@@ -791,13 +840,13 @@ mod tests {
     #[test]
     fn devices_are_kicked_one_at_a_time() {
         let store = SessionStore::default();
-        let (phone, phone_cookie) = store.authorize("iPhone".into(), "192.168.1.9".into());
-        let (pad, pad_cookie) = store.authorize("iPad".into(), "192.168.1.10".into());
+        let (phone, phone_cookie) = store.authorize("iPhone".into(), "192.168.1.9".into(), TunnelType::Lan);
+        let (pad, pad_cookie) = store.authorize("iPad".into(), "192.168.1.10".into(), TunnelType::Lan);
         assert_ne!(phone.id, pad.id);
 
         store.revoke(&phone.id);
-        assert_eq!(store.verify(&phone_cookie), None);
-        assert!(store.verify(&pad_cookie).is_some());
+        assert_eq!(store.verify(&phone_cookie, TunnelType::Lan), None);
+        assert!(store.verify(&pad_cookie, TunnelType::Lan).is_some());
         assert_eq!(store.devices(), vec![pad]);
     }
 
@@ -924,8 +973,8 @@ mod tests {
     #[test]
     fn the_device_list_survives_the_round_trip() {
         let store = SessionStore::default();
-        store.authorize("iPhone".into(), "192.168.1.9".into());
-        store.authorize("Pixel".into(), "192.168.1.10".into());
+        store.authorize("iPhone".into(), "192.168.1.9".into(), TunnelType::Lan);
+        store.authorize("Pixel".into(), "192.168.1.10".into(), TunnelType::Lan);
 
         let written = store.inner.lock().unwrap().stored();
         let (devices, next) = restore(Some(written));
@@ -940,7 +989,7 @@ mod tests {
     #[test]
     fn a_cookie_signed_before_a_restart_still_verifies_after_it() {
         let before = SessionStore::default();
-        let (_, cookie) = before.authorize("iPhone".into(), "192.168.1.9".into());
+        let (_, cookie) = before.authorize("iPhone".into(), "192.168.1.9".into(), TunnelType::Lan);
 
         let (secret, written) = {
             let inner = before.inner.lock().unwrap();
@@ -960,7 +1009,7 @@ mod tests {
             saving: Mutex::new(()),
         };
 
-        assert!(after.verify(&cookie).is_some());
+        assert!(after.verify(&cookie, TunnelType::Lan).is_some());
     }
 
     /// Every way the stored list can be unusable ends at no devices — the same

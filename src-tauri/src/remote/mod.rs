@@ -248,6 +248,12 @@ impl Shared {
         self.tunnel.lock().unwrap().public()
     }
 
+    /// Which channel is active, for the cookies bound to one. See
+    /// [`session::SessionStore::verify`].
+    fn channel(&self) -> TunnelType {
+        self.tunnel.lock().unwrap().tunnel_type()
+    }
+
     /// Whether the active channel could have carried a connection from `peer`.
     /// See [`RemoteTunnel::admits`].
     fn admits(&self, peer: std::net::IpAddr) -> bool {
@@ -776,6 +782,12 @@ pub fn start_channel(app: &AppHandle) {
         let Some(remote) = app.try_state::<Remote>() else {
             return;
         };
+        // Only while the card is up. Any link in dsh's page can send this verb
+        // — see `controls` for why it cannot be authenticated — and one clicked
+        // in a chat transcript must not put this machine on the internet.
+        if !remote.card.load(Ordering::Relaxed) {
+            return;
+        }
 
         *remote.note.lock().unwrap() = None;
         let started = remote.start();
@@ -1201,6 +1213,12 @@ pub fn cloudflare(app: &AppHandle, token: &str, hostname: &str) {
         let Some(remote) = app.try_state::<Remote>() else {
             return;
         };
+        // Only from the card, for the reason in `start_channel`: a link that
+        // carried somebody else's token would otherwise replace the user's,
+        // and tunnel this machine to a hostname they do not own.
+        if !remote.card.load(Ordering::Relaxed) {
+            return;
+        }
 
         if let Err(why) = cloudflare::remember(&app, &token, &hostname) {
             *remote.note.lock().unwrap() = None;

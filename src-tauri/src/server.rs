@@ -77,7 +77,7 @@ pub fn start(
     // dsh of ours is running yet, so anything that answers to the recorded pid
     // belongs to a run that is over.
     #[cfg(target_os = "macos")]
-    leftover::sweep(app);
+    leftover::sweep(app, &leftover::DSH_WEB);
 
     let mut prepared = command(app, port);
     prepared
@@ -91,7 +91,7 @@ pub fn start(
     #[cfg(windows)]
     let job = Job::hold(&child);
     #[cfg(target_os = "macos")]
-    let record = leftover::remember(app, child.id());
+    let record = leftover::remember(app, &leftover::DSH_WEB, child.id());
 
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
@@ -288,24 +288,58 @@ fn spawner() -> &'static Sender<(Command, Sender<std::io::Result<Child>>)> {
 /// terminal is the one thing here that must not be killed, and it has the
 /// shell's pid as its parent, not 1.
 #[cfg(target_os = "macos")]
-mod leftover {
+pub(crate) mod leftover {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
+    use std::sync::Once;
+
+    /// One kind of child that can be left behind: where its pid is written,
+    /// and how to tell, from `ps`, that a pid still belongs to one.
+    pub struct Kind {
+        file: &'static str,
+        what: &'static str,
+        is: fn(&str) -> bool,
+        swept: Once,
+    }
+
+    pub static DSH_WEB: Kind = Kind {
+        file: "dsh-web.pid",
+        what: "dsh web",
+        is: is_dsh_web,
+        swept: Once::new(),
+    };
+
+    /// The same backstop for the public tunnel. A `cloudflared` the app was
+    /// killed out from under stays registered with Cloudflare's edge, which is
+    /// this machine still on the internet with nobody holding the switch.
+    pub static CLOUDFLARED: Kind = Kind {
+        file: "cloudflared.pid",
+        what: "cloudflared",
+        is: is_cloudflared,
+        swept: Once::new(),
+    };
+
+    fn is_dsh_web(command: &str) -> bool {
+        command.contains("dsh") && command.contains(" web")
+    }
+
+    fn is_cloudflared(command: &str) -> bool {
+        command.contains("cloudflared") && command.contains("tunnel")
+    }
 
     /// Where the pid is written. Beside `desktop.json` and the update stamp,
     /// which is where the rest of this app's small state lives.
-    fn record(app: &tauri::AppHandle) -> Option<PathBuf> {
-        Some(crate::dsh::app_dir(app)?.join("dsh-web.pid"))
+    fn record(app: &tauri::AppHandle, kind: &Kind) -> Option<PathBuf> {
+        Some(crate::dsh::app_dir(app)?.join(kind.file))
     }
 
-    /// Kill the `dsh web` of a run that never got to clean up after itself.
+    /// Kill the child of a run that never got to clean up after itself.
     ///
     /// Once per launch, and before the first spawn: a second call has nothing
-    /// left to read, and every later `dsh web` is one this run is holding.
-    pub fn sweep(app: &tauri::AppHandle) {
-        static SWEPT: std::sync::Once = std::sync::Once::new();
-        SWEPT.call_once(|| {
-            let Some(record) = record(app) else { return };
+    /// left to read, and every later child is one this run is holding.
+    pub fn sweep(app: &tauri::AppHandle, kind: &'static Kind) {
+        kind.swept.call_once(|| {
+            let Some(record) = record(app, kind) else { return };
             let read = std::fs::read_to_string(&record);
             // Whatever it said has now been acted on, and a record that cannot
             // be removed is one this would read again on every launch.
@@ -314,28 +348,31 @@ mod leftover {
             let Some(pid) = read.ok().and_then(|pid| pid.trim().parse::<i32>().ok()) else {
                 return;
             };
-            if !orphaned_dsh(pid) {
+            if !orphaned(pid, kind) {
                 return;
             }
 
-            eprintln!("dsh-desktop: killing the dsh web the last run left behind (pid {pid})");
+            eprintln!(
+                "dsh-desktop: killing the {} the last run left behind (pid {pid})",
+                kind.what
+            );
             // Negative: `group_leader` made it the leader of its own group, so
             // this takes the workers it spawned with it.
             //
-            // SAFETY: a signal to a pid that has just been confirmed to be a
-            // `dsh web` whose parent is launchd.
+            // SAFETY: a signal to a pid that has just been confirmed to be this
+            // kind of child, and one whose parent is launchd.
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
             }
         });
     }
 
-    /// Whether this pid is still a `dsh web`, and an abandoned one.
+    /// Whether this pid is still this kind of child, and an abandoned one.
     ///
     /// `ps` rather than `libproc`, because the answer needs the arguments and
     /// not just the executable — every `dsh` is some `node`, and `node` on its
     /// own says nothing about whose process this is.
-    fn orphaned_dsh(pid: i32) -> bool {
+    fn orphaned(pid: i32, kind: &Kind) -> bool {
         let mut command = Command::new("ps");
         command
             .args(["-p", &pid.to_string(), "-o", "ppid=,command="])
@@ -353,12 +390,12 @@ mod leftover {
         let Some((parent, command)) = listed.split_once(char::is_whitespace) else {
             return false;
         };
-        parent.trim() == "1" && command.contains("dsh") && command.contains(" web")
+        parent.trim() == "1" && (kind.is)(command)
     }
 
-    /// Write down the `dsh web` this run is starting.
-    pub fn remember(app: &tauri::AppHandle, pid: u32) -> Option<PathBuf> {
-        let record = record(app)?;
+    /// Write down the child this run is starting.
+    pub fn remember(app: &tauri::AppHandle, kind: &Kind, pid: u32) -> Option<PathBuf> {
+        let record = record(app, kind)?;
 
         // The directory is the app's own, and on a first launch nothing has
         // needed it yet.
@@ -366,7 +403,7 @@ mod leftover {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Err(error) = std::fs::write(&record, pid.to_string()) {
-            eprintln!("dsh-desktop: could not record the dsh web pid: {error}");
+            eprintln!("dsh-desktop: could not record the {} pid: {error}", kind.what);
             return None;
         }
         Some(record)

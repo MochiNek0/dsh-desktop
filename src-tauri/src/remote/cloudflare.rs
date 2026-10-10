@@ -88,6 +88,10 @@ pub struct CloudflareTunnel {
     /// Windows' backstop against an orphan. See [`crate::server::Job`].
     #[cfg(windows)]
     job: Option<crate::server::Job>,
+    /// macOS' backstop instead: the pid, for the next launch to find if this
+    /// one dies without stopping it. See `crate::server::leftover`.
+    #[cfg(target_os = "macos")]
+    record: Option<PathBuf>,
     /// Where this run has got to.
     ///
     /// Behind an `Arc` because the thread reading `cloudflared`'s stderr is
@@ -117,6 +121,8 @@ impl CloudflareTunnel {
             child: None,
             #[cfg(windows)]
             job: None,
+            #[cfg(target_os = "macos")]
+            record: None,
             state: Arc::new(Mutex::new(TunnelState::Stopped)),
             app: app.cloned(),
         }
@@ -137,6 +143,8 @@ impl CloudflareTunnel {
             child: None,
             #[cfg(windows)]
             job: None,
+            #[cfg(target_os = "macos")]
+            record: None,
             state: Arc::new(Mutex::new(TunnelState::Running {
                 base_url: format!("https://{hostname}"),
             })),
@@ -162,6 +170,12 @@ impl CloudflareTunnel {
         #[cfg(windows)]
         {
             self.job = None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(record) = self.record.take() {
+                let _ = std::fs::remove_file(record);
+            }
         }
     }
 }
@@ -205,12 +219,29 @@ impl RemoteTunnel for CloudflareTunnel {
         #[cfg(unix)]
         crate::server::group_leader(&mut command);
 
+        // Before the spawn, for the same reason `server::start` sweeps first:
+        // no `cloudflared` of ours is running yet.
+        #[cfg(target_os = "macos")]
+        if let Some(app) = &self.app {
+            crate::server::leftover::sweep(app, &crate::server::leftover::CLOUDFLARED);
+        }
+
         let mut child = crate::server::tethered(command)
             .map_err(|error| TunnelError::WouldNotStart(error.to_string()))?;
 
         #[cfg(windows)]
         {
             self.job = crate::server::Job::hold(&child);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.record = self.app.as_ref().and_then(|app| {
+                crate::server::leftover::remember(
+                    app,
+                    &crate::server::leftover::CLOUDFLARED,
+                    child.id(),
+                )
+            });
         }
 
         let state = Arc::new(Mutex::new(TunnelState::Starting));
@@ -619,6 +650,8 @@ mod tests {
             child: None,
             #[cfg(windows)]
             job: None,
+            #[cfg(target_os = "macos")]
+            record: None,
             state: Arc::new(Mutex::new(TunnelState::Starting)),
             app: None,
         };
