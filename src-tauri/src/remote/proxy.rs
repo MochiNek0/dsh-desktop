@@ -141,6 +141,10 @@ async fn handle(
         eprintln!("dsh-desktop: refused a direct connection from {peer} while a tunnel is up");
         return Ok(refused());
     }
+    if !shared.admits(peer.ip()) {
+        eprintln!("dsh-desktop: refused a connection from {peer} that the active channel cannot have carried");
+        return Ok(refused());
+    }
 
     // First and unconditionally. Everything after this point is allowed to
     // assume the request came from a browser talking to an address this machine

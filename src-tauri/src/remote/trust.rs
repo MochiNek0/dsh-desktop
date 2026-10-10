@@ -303,6 +303,7 @@ struct Run {
 impl Guesses {
     /// Whether this address has to wait before it may guess again.
     pub fn blocked(&self, who: IpAddr) -> bool {
+        let who = holder(who);
         self.runs
             .lock()
             .unwrap()
@@ -313,6 +314,7 @@ impl Guesses {
 
     /// Record a wrong code, and start the wait if that was one too many.
     pub fn wrong(&self, who: IpAddr) {
+        let who = holder(who);
         let now = Instant::now();
         let mut runs = self.runs.lock().unwrap();
 
@@ -341,7 +343,7 @@ impl Guesses {
     /// A right one. The run is forgotten, so a user who fumbled the code twice
     /// before getting it does not carry those two into their next pairing.
     pub fn right(&self, who: IpAddr) {
-        self.runs.lock().unwrap().remove(&who);
+        self.runs.lock().unwrap().remove(&holder(who));
     }
 
     /// Forget everybody. Called when the channel changes under the gateway.
@@ -361,6 +363,21 @@ impl Guesses {
     }
 }
 
+/// Who a run is counted against: the address itself for IPv4, and its /64 for
+/// IPv6. A /64 is what one subscriber is handed, and every address in it is
+/// theirs to use — counted one by one, a single line could take a fresh
+/// allowance for every guess, and fill this map while doing it.
+fn holder(who: IpAddr) -> IpAddr {
+    match who {
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let mut segments = v6.segments();
+            segments[4..].fill(0);
+            IpAddr::V6(segments.into())
+        }
+        other => other,
+    }
+}
+
 /// Whether an entry is still worth keeping: inside its window, or still owed a
 /// wait.
 fn lively(run: &Run, now: Instant) -> bool {
@@ -370,6 +387,19 @@ fn lively(run: &Run, now: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One /64 is one subscriber: walking the addresses inside it does not
+    /// buy a fresh allowance.
+    #[test]
+    fn an_ipv6_prefix_shares_one_allowance() {
+        let guesses = Guesses::default();
+        for host in 0..GUESSES {
+            let who: IpAddr = format!("2001:db8:1:2::{:x}", host + 1).parse().unwrap();
+            guesses.wrong(who);
+        }
+        assert!(guesses.blocked("2001:db8:1:2::ffff".parse().unwrap()));
+        assert!(!guesses.blocked("2001:db8:1:3::1".parse().unwrap()));
+    }
 
     fn authorities() -> Vec<String> {
         vec![

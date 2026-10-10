@@ -862,9 +862,13 @@ fn a_live_connection_is_not_an_idle_gateway() {
         return;
     };
 
-    // Nothing has happened for a while.
-    *harness.shared.last.lock().unwrap() =
-        std::time::Instant::now() - std::time::Duration::from_secs(3600);
+    // Nothing has happened for a while. Checked, because on Windows an
+    // `Instant` cannot reach back past boot, and a CI runner may be younger
+    // than the while.
+    let Some(long_ago) = std::time::Instant::now().checked_sub(Duration::from_secs(120)) else {
+        return;
+    };
+    *harness.shared.last.lock().unwrap() = long_ago;
     assert!(harness.shared.idle(Duration::from_secs(60)));
 
     // Except that somebody is holding a socket open.
@@ -887,9 +891,12 @@ fn only_a_paired_device_keeps_the_gateway_awake() {
     let Some(harness) = Harness::raise(true) else {
         return;
     };
+    // Checked for the reason given in the test above.
+    let Some(long_ago) = std::time::Instant::now().checked_sub(Duration::from_secs(120)) else {
+        return;
+    };
     let asleep = || {
-        *harness.shared.last.lock().unwrap() =
-            std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        *harness.shared.last.lock().unwrap() = long_ago;
     };
 
     asleep();

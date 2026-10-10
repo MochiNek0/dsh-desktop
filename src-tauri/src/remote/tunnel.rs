@@ -286,6 +286,14 @@ pub trait RemoteTunnel: Send + Sync {
     /// address.
     fn client_ip(&self, headers: &HeaderMap, peer: IpAddr) -> Option<IpAddr>;
 
+    /// Whether a connection from `peer` can have arrived over this channel at
+    /// all. The listener is bound to `0.0.0.0` whichever channel is active, so
+    /// without this a channel the user picked to keep the Wi-Fi out is one the
+    /// Wi-Fi can still dial straight into.
+    fn admits(&self, _peer: IpAddr) -> bool {
+        true
+    }
+
     /// The `Host` values a request arriving over this tunnel may legitimately
     /// carry, lowercased and with the port on them.
     ///
@@ -408,6 +416,19 @@ impl RemoteTunnel for TailscaleTunnel {
 
     fn tunnel_type(&self) -> TunnelType {
         TunnelType::Tailscale
+    }
+
+    /// The tailnet, or this machine. Anything else is the Wi-Fi or, on a
+    /// machine with a public address, the internet, reaching the port directly
+    /// with a `Host` it copied off the card.
+    fn admits(&self, peer: IpAddr) -> bool {
+        match peer {
+            IpAddr::V4(address) => is_tailnet(address) || address.is_loopback(),
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .is_some_and(|address| is_tailnet(address) || address.is_loopback())
+                || address.is_loopback(),
+        }
     }
 
     /// Plain HTTP, like the LAN. WireGuard has already encrypted every byte of
@@ -793,6 +814,18 @@ mod tests {
         }
         for address in ["100.63.255.255", "100.128.0.1", "10.0.0.5", "192.168.1.9"] {
             assert!(!is_tailnet(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    /// A tailnet channel turns away a direct connection from the Wi-Fi.
+    #[test]
+    fn the_tailnet_admits_only_the_tailnet() {
+        let tunnel = TailscaleTunnel::default();
+        for peer in ["100.101.102.103", "127.0.0.1", "::1", "::ffff:100.64.0.1"] {
+            assert!(tunnel.admits(peer.parse().unwrap()), "{peer}");
+        }
+        for peer in ["192.168.1.9", "8.8.8.8", "2001:db8::1"] {
+            assert!(!tunnel.admits(peer.parse().unwrap()), "{peer}");
         }
     }
 

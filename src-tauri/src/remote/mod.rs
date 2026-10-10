@@ -248,6 +248,12 @@ impl Shared {
         self.tunnel.lock().unwrap().public()
     }
 
+    /// Whether the active channel could have carried a connection from `peer`.
+    /// See [`RemoteTunnel::admits`].
+    fn admits(&self, peer: std::net::IpAddr) -> bool {
+        self.tunnel.lock().unwrap().admits(peer)
+    }
+
     /// A request arrived. What the idle timer counts from.
     fn touched(&self) {
         *self.last.lock().unwrap() = Instant::now();
@@ -697,6 +703,11 @@ pub fn resume(app: &AppHandle) {
         };
 
         if crate::settings::forget_pairings_on_exit(&app) {
+            // What the last exit should have done, if it never got to: a
+            // crash, a kill, or anything else that skipped `stop`.
+            if !remote.shared.store.devices().is_empty() {
+                remote.shared.store.revoke_all();
+            }
             return;
         }
         if remote.shared.store.devices().is_empty() {
