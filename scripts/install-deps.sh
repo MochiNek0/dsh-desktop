@@ -648,9 +648,9 @@ find_any_node() {
 # which costs the bar and nothing else.
 content_length() {
     if have curl; then
-        curl -fsIL --connect-timeout 15 "$1" 2>/dev/null
+        curl -fsIL --connect-timeout 15 --max-time 20 "$1" 2>/dev/null
     else
-        wget -q -S --spider "$1" 2>&1
+        wget -q -S --spider --timeout=15 --tries=1 "$1" 2>&1
     fi | tr -d '\r' | awk 'tolower($1) == "content-length:" { n = $2 } END { print n + 0 }'
 }
 
@@ -667,10 +667,14 @@ fetch() {
     rm -f "$out"
     total=$(content_length "$url")
 
+    # A transfer that stalls is given up on, so the caller moves on to the next
+    # mirror: under 1 KB/s for 30 seconds for curl, 30 seconds of silence for
+    # wget. Without these a connection a middlebox stopped forwarding mid-way
+    # was a loading page that never moved again.
     if have curl; then
-        curl -fsSL --connect-timeout 30 -o "$out" "$url" &
+        curl -fsSL --connect-timeout 30 --speed-limit 1024 --speed-time 30 -o "$out" "$url" &
     elif have wget; then
-        wget -q -O "$out" "$url" &
+        wget -q --timeout=30 --tries=2 -O "$out" "$url" &
     else
         say '这台机器上既没有 curl 也没有 wget，无法下载。'
         return 1
@@ -781,6 +785,14 @@ MIRRORS
 
     if [ "$installed" = 0 ]; then
         fail "$(t "无法下载 Node $NODE_VERSION。已尝试 nodejs.org 和几个国内镜像，都没有成功，通常是网络或代理的问题。" "Node $NODE_VERSION could not be downloaded. nodejs.org and several mirrors in China were tried and none worked, which is usually the network or a proxy.")"
+    fi
+
+    # Run once before anything is built on it. The official builds need glibc
+    # 2.28 and do not run on musl at all; that is the same bytes from every
+    # mirror, and without this it surfaced as an npm failure reported as the
+    # network.
+    if ! "$NODE_DIR/bin/node" --version >/dev/null 2>&1; then
+        fail "$(t "下载的 Node $NODE_VERSION 无法在这台机器上运行，系统可能太旧（需要 glibc 2.28 以上），或者是 Alpine 这类 musl 系统。" "The downloaded Node $NODE_VERSION does not run on this machine: the system may be too old (glibc 2.28 or later is needed), or it may be a musl one such as Alpine.")"
     fi
 
     say "Node 已安装到 $NODE_DIR"
@@ -1514,7 +1526,12 @@ switch_node() {
     M_PREFIX=$prefix
     M_PATH_ENTRY=''
     [ -n "$M_NODE" ] || M_NODE=system
-    [ -n "$M_DSH" ] || M_DSH=system
+    # Whatever the marker said before was about the dsh being switched away from.
+    # The one switched to is ours only if it sits in our own directory.
+    case "$prefix" in
+        "$APP_DIR"/*) M_DSH=managed ;;
+        *) M_DSH=system ;;
+    esac
     write_marker
     say "应用会使用 $nodedir 里的 Node 和 dsh。"
     say "终端里用的还是你的版本管理器当前指定的那个 Node，本应用不会去改它。"

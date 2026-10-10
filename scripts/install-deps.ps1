@@ -628,6 +628,9 @@ function Get-NodeVersion([string] $Exe) {
 function Fetch([string] $Url, [string] $Path, [double] $From, [double] $To) {
     $request = [Net.HttpWebRequest]::Create($Url)
     $request.Timeout = 30000
+    # Per read, not for the whole body: a stall of 30 seconds gives up on this
+    # mirror for the next one, rather than the default five minutes per stall.
+    $request.ReadWriteTimeout = 30000
     $request.UserAgent = 'dsh-desktop-installer'
 
     $reply = $request.GetResponse()
@@ -697,8 +700,13 @@ function Install-Node {
                 # outright because a bare `tar` finds Git for Windows' GNU tar
                 # first on some machines, and that one cannot read a zip.
                 $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
-                & $tar -xf $zip -C $scratch | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw "解压失败（退出码 $LASTEXITCODE）" }
+                if (Test-Path -LiteralPath $tar) {
+                    & $tar -xf $zip -C $scratch | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "解压失败（退出码 $LASTEXITCODE）" }
+                } else {
+                    # Windows 10 before 1803 has no tar.exe. Slower, but there.
+                    Expand-Archive -LiteralPath $zip -DestinationPath $scratch -Force
+                }
 
                 # Replaced rather than merged: a half-unpacked tree from an
                 # earlier attempt would otherwise survive underneath the new one.
@@ -722,8 +730,21 @@ function Install-Node {
         Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # Run once before anything is built on it. A Node this Windows cannot run
+    # is the same bytes from every mirror, and without this it surfaced as an
+    # npm failure and was reported as the network.
+    $exe = Join-Path $NodeDir 'node.exe'
+    $runs = $false
+    try {
+        & $exe --version | Out-Null
+        $runs = ($LASTEXITCODE -eq 0)
+    } catch {}
+    if (-not $runs) {
+        Fail (T "下载的 Node $NodeVersion 无法在这台电脑上运行，可能是 Windows 版本太旧。" "The downloaded Node $NodeVersion does not run on this computer; Windows may be too old for it.")
+    }
+
     Say "Node 已安装到 $NodeDir"
-    return (Join-Path $NodeDir 'node.exe')
+    return $exe
 }
 
 # ---------------------------------------------------------------------- npm --
@@ -980,10 +1001,15 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
 function Remove-Path([string] $Dir) {
     if (-not $Dir) { return }
     $key = 'HKCU:\Environment'
-    $current = (Get-ItemProperty -Path $key -Name Path -ErrorAction SilentlyContinue).Path
+    # Read as stored, not expanded: `Get-ItemProperty` hands back `%JAVA_HOME%\bin`
+    # already resolved, and writing that back pins every such entry to whatever
+    # the variable said today.
+    $current = (Get-Item -Path $key).GetValue('Path', $null, 'DoNotExpandEnvironmentNames')
     if (-not $current) { return }
 
-    $entries = @($current.Split(';') | Where-Object { $_ -ne '' -and $_ -ne $Dir })
+    # Compared expanded, which is how the entries this script once wrote were
+    # always matched.
+    $entries = @($current.Split(';') | Where-Object { $_ -ne '' -and [Environment]::ExpandEnvironmentVariables($_) -ne $Dir })
     if ($entries.Count -eq ($current.Split(';') | Where-Object { $_ -ne '' }).Count) { return }
 
     Set-ItemProperty -Path $key -Name Path -Value ($entries -join ';') -Type ExpandString
@@ -1127,7 +1153,10 @@ function Uninstall-All {
     }
 
     if ($dropNode) {
-        if ($state['prefix']) { Remove-Path $state['prefix'] }
+        # Only a prefix of ours. After a `switch` the marker's prefix is the
+        # user's own npm directory, which their Node's installer put on PATH.
+        $prefix = [string] $state['prefix']
+        if ($prefix -and $prefix.StartsWith($AppDir, 'OrdinalIgnoreCase')) { Remove-Path $prefix }
         # The Node a `switch` or `install-node` put on PATH. `prefix` is usually
         # the same directory on Windows, but a `switch` records the Node's own
         # directory here and the two are worth taking off independently.
@@ -1414,7 +1443,9 @@ function Switch-Node {
     $state['nodeExe'] = $NodeExe
     $state['npmCli'] = $cli
     $state['prefix'] = $prefix
-    if (-not $state.ContainsKey('dsh')) { $state['dsh'] = 'system' }
+    # Whatever the marker said before was about the dsh being switched away from.
+    # The one switched to is ours only if it sits in our own directory.
+    if ($prefix.StartsWith($AppDir, 'OrdinalIgnoreCase')) { $state['dsh'] = 'managed' } else { $state['dsh'] = 'system' }
     if (-not $state.ContainsKey('node')) { $state['node'] = 'system' }
     Write-Marker $state
 
@@ -1526,7 +1557,9 @@ function Uninstall-DshFrom {
     }
 
     Step (T "正在卸载 dsh（$prefix）…" "Uninstalling dsh ($prefix)…") 0
-    Invoke-Native $NodeExe @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null | Out-Null
+    if (-not (Invoke-Native $NodeExe @($cli, 'uninstall', '-g', "--prefix=$prefix", '--loglevel=error', $Package) $null)) {
+        Fail (T "dsh 没能卸载干净（$prefix）。可能有文件正被占用，关掉正在使用它的程序后再试。" "dsh could not be fully uninstalled ($prefix). A file may be in use; close whatever is using it and try again.")
+    }
 
     # And the pnpm that came with it, where that pnpm is ours. Nothing else in
     # this prefix wants one: it is here because dsh forwards plugin installs to

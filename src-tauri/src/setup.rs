@@ -50,7 +50,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::json;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -349,6 +349,9 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
 
     let mut nodes = scan(app, report, mode);
     let mut error = None::<String>;
+    // Whether an uninstall below took the running dsh down and did not get as
+    // far as the restart that would have brought one back.
+    let mut stopped = false;
     loop {
         // A fresh channel each time round: a failed action re-shows the panel,
         // and the answer to the second showing is not the answer to the first.
@@ -383,6 +386,9 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
             }
             Ok(Choice::Quit | Choice::Close) => {
                 crate::hide_setup(app);
+                if stopped {
+                    crate::restart_dsh(app, false);
+                }
                 return true;
             }
             Ok(Choice::Rescan) => {
@@ -427,6 +433,34 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
                 if mode == Mode::Required {
                     crate::hide_setup(app);
                 }
+
+                // Uninstalling the dsh the window is running is uninstalling it
+                // from under a live `dsh web`: on Windows its native modules are
+                // open, and npm stops half way through with EBUSY. So it comes
+                // down first, under the same claim a restart takes, and the
+                // epoch `stop_server` bumps keeps the watcher from starting it
+                // again mid-uninstall.
+                let current = matches!(choice, Choice::UninstallDsh(index)
+                    if listed.get(index).is_some_and(|node| node.current));
+                let _busy = if mode == Mode::Manage && current {
+                    if crate::BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        error = Some(
+                            t!(
+                                "dsh 正在启动或更新中，等它忙完再试。",
+                                "dsh is starting or updating; try again once it has finished."
+                            )
+                            .into(),
+                        );
+                        continue;
+                    }
+                    let busy = crate::Busy;
+                    crate::stop_server(app, &app.state::<crate::Session>());
+                    stopped = true;
+                    Some(busy)
+                } else {
+                    None
+                };
+
                 match act(app, choice, listed, report) {
                     Outcome::Done if mode == Mode::Manage && listed_again => {
                         error = None;
@@ -472,6 +506,9 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
                     return false;
                 }
                 crate::hide_setup(app);
+                if stopped {
+                    crate::restart_dsh(app, false);
+                }
                 return true;
             }
             Err(RecvTimeoutError::Disconnected) => return false,
