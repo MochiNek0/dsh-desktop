@@ -32,7 +32,7 @@ Starts the local `dsh web` in the background on launch and embeds it in a native
 ## Features
 
 - **Connect a phone**: open **Connect a phone…** from the menu, scan the code with the phone's camera and click **Allow** on the computer — the phone's browser now has the dsh running on your computer, sessions and all, with no app to install. Pick one of three channels: **Local network** (same Wi-Fi, through nobody else's servers), **Tailscale** (anywhere, mobile data included) or **Cloudflare** (your own hostname, and the only one of the three with HTTPS; it switches itself off after 30 idle minutes and stays flagged in the tray while up). A pairing code lasts five minutes and works once, and every new device needs a yes from someone at the computer. A pairing holds for thirty days; drop one device, or all of them along with the key. Not a line of dsh is changed.
-- **Light**: Tauri v2 on the system WebView, with no bundled browser engine. Installers are 2.3 MB on Windows, 5.8 MB on macOS, 3.8 MB on Debian.
+- **Light**: Tauri v2 on the system WebView, with no bundled browser engine. Installers are 2.5 MB on Windows, 6.3 MB on macOS, 4.1 MB on Debian.
 - **Cross-platform**: the same experience on Windows, macOS and Linux.
 - **Works out of the box**: detects Node, installs `dsh` where needed, and picks a free loopback port so it never collides with an instance you started by hand. No administrator rights at any point.
 - **Everything is a plugin**: Not a single line of dsh source code is modified. Desktop enhancements (like system notifications) are provided as bundled plugins — remove them and dsh returns to a completely pristine state. Features a built-in visual plugin panel highlighting the [DSH Market](https://dshmarket.com) marketplace, requiring no terminal usage.
@@ -45,9 +45,9 @@ Download the package for your system from the **[website](https://dsh-desktop.cc
 
 | OS | Format | Size | Details |
 | :--- | :--- | :--- | :--- |
-| **Windows** | `.exe` (NSIS) | 2.3 MB | Needs WebView2; downloaded automatically if missing (verified) |
-| **macOS** | `.dmg` | 5.8 MB | Universal binary for Apple Silicon and Intel (verified) |
-| **Linux** | `.deb` / `.AppImage` | 3.8 MB / 78 MB | `.AppImage` carries its own WebKit, hence the size, but has the most complete self-updater support (verified on Debian) |
+| **Windows** | `.exe` (NSIS) | 2.5 MB | Needs WebView2; downloaded automatically if missing (verified) |
+| **macOS** | `.dmg` | 6.3 MB | Universal binary for Apple Silicon and Intel (verified) |
+| **Linux** | `.deb` / `.AppImage` | 4.1 MB / 79 MB | `.AppImage` carries its own WebKit, hence the size, but has the most complete self-updater support (verified on Debian) |
 
 ## Notes
 

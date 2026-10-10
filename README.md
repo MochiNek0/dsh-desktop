@@ -33,7 +33,7 @@ DeepSeek Harness (`dsh web`) 的轻量桌面客户端，支持用手机远程连
 ## 特性
 
 - **手机连接**：在菜单里打开「手机连接…」，用手机相机扫码，再在电脑上点「允许连接」，手机浏览器里就是电脑上的那个 dsh，会话接着用，不用装 App。通道三选一：**局域网**（同一个 Wi-Fi，不经过任何第三方服务器）、**Tailscale**（在外面、走蜂窝网络也能连）、**Cloudflare**（用你自己的域名，三条里唯一带 HTTPS 的；闲置 30 分钟自动关闭，开着期间托盘一直有提醒）。配对码五分钟有效、只能用一次，每台新设备都得有人在电脑上点头同意；配对保持三十天，已连接的设备可以单独断开，也可以一键全部断开并换密钥。dsh 本身一行没改。
-- **轻量**：Tauri v2 + 系统 WebView，不打包浏览器内核。安装包 Windows 2.3 MB，macOS 5.8 MB，Debian 3.8 MB。
+- **轻量**：Tauri v2 + 系统 WebView，不打包浏览器内核。安装包 Windows 2.5 MB，macOS 6.3 MB，Debian 4.1 MB。
 - **跨平台**：Windows / macOS / Linux 同一套体验。
 - **开箱即用**：自动检测 Node、按需安装 `dsh`、自动选用空闲回环端口，与终端里手动运行的实例互不干扰；全程无需管理员权限。
 - **一切皆插件**：桌面端不改 dsh 一行源码。桌面增强能力（如系统通知）均以随包插件形式供给，卸掉即回到纯净 dsh；内置可视化插件面板并首推 [DSH Market](https://dshmarket.com) 插件市场，安装与卸载插件均不必碰终端。
@@ -46,9 +46,9 @@ DeepSeek Harness (`dsh web`) 的轻量桌面客户端，支持用手机远程连
 
 | 系统 | 格式 | 体积 | 说明 |
 | :--- | :--- | :--- | :--- |
-| **Windows** | `.exe`（NSIS） | 2.3 MB | 需 WebView2，缺失时自动引导安装（已验证） |
-| **macOS** | `.dmg` | 5.8 MB | 通用二进制，支持 Apple Silicon 与 Intel（已验证） |
-| **Linux** | `.deb` / `.AppImage` | 3.8 MB / 78 MB | `.AppImage` 自带 WebKit 故体积较大，但自更新支持最完整（Debian 系已验证） |
+| **Windows** | `.exe`（NSIS） | 2.5 MB | 需 WebView2，缺失时自动引导安装（已验证） |
+| **macOS** | `.dmg` | 6.3 MB | 通用二进制，支持 Apple Silicon 与 Intel（已验证） |
+| **Linux** | `.deb` / `.AppImage` | 4.1 MB / 79 MB | `.AppImage` 自带 WebKit 故体积较大，但自更新支持最完整（Debian 系已验证） |
 
 ## 注意事项
 
