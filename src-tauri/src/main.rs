@@ -197,20 +197,41 @@ fn main() {
                 api.prevent_exit();
             }
         }
-        tauri::RunEvent::Exit => {
-            dsh::stop();
-            plugins::stop();
-            // Before the server, because what this takes down is a socket bound
-            // to every interface on the machine — and, on a public channel, a
-            // `cloudflared` holding a connection to Cloudflare's edge. See
-            // `remote::shutdown`.
-            remote::shutdown(handle);
-            if let Some(child) = server.lock().unwrap().as_mut() {
-                child.stop();
-            }
-        }
+        tauri::RunEvent::Exit => shut_down(handle, &server),
         _ => {}
     });
+}
+
+/// Everything that has to come down with the app.
+///
+/// From `RunEvent::Exit`, and from the updater: on Windows that one runs the
+/// installer and ends the process with `std::process::exit`, which never
+/// reaches the event — so "forget phones on exit" was quietly not happening
+/// across an update. See [`update`].
+fn shut_down(handle: &tauri::AppHandle, server: &Mutex<Option<server::Server>>) {
+    // First, so the watcher reads the server stopping below as ours and does
+    // not start another one on the way out — which on macOS, with no job
+    // object behind it, outlived the app.
+    if let Some(session) = handle.try_state::<Session>() {
+        session.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+    dsh::stop();
+    plugins::stop();
+    // Before the server, because what this takes down is a socket bound
+    // to every interface on the machine — and, on a public channel, a
+    // `cloudflared` holding a connection to Cloudflare's edge. See
+    // `remote::shutdown`.
+    remote::shutdown(handle);
+    if let Some(child) = server.lock().unwrap().as_mut() {
+        child.stop();
+    }
+}
+
+/// [`shut_down`] for a caller that has only the handle.
+pub(crate) fn shut_down_now(handle: &tauri::AppHandle) {
+    if let Some(session) = handle.try_state::<Session>() {
+        shut_down(handle, &session.server);
+    }
 }
 
 /// The one window: it opens on the local loading page and is navigated to the
@@ -1430,19 +1451,26 @@ fn watch(window: &WebviewWindow, session: &Session, events: Receiver<server::Eve
             }
 
             // Nothing else may be starting a dsh while this starts one. A flag
-            // already held is a boot, an update, a plugin install or a restart,
-            // and every one of those starts dsh itself when it is finished — so
-            // this steps aside, and silently, because whatever holds the flag is
-            // already saying on screen what it is doing.
+            // already held is a boot, an update, a plugin install or a restart.
+            // Most of those start dsh themselves when they are finished, but not
+            // all: an update the user cancels at its dialog never stopped dsh,
+            // so never starts one either. So this waits its turn, and then asks
+            // whether whoever held the flag took over — a stop moves the epoch,
+            // a start fills the slot — and only steps aside if they did.
             //
             // The block is the whole of the borrow: the wait above must not hold
             // the flag, or a user who wanted to update dsh would be told to wait
             // for a server that is running perfectly well.
             let resumed = {
-                if BUSY.swap(true, Ordering::SeqCst) {
-                    return;
+                while BUSY.swap(true, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(250));
                 }
                 let _busy = Busy;
+                if session.epoch.load(Ordering::SeqCst) != epoch
+                    || session.server.lock().unwrap().is_some()
+                {
+                    return;
+                }
                 resume(&window, &session)
             };
 

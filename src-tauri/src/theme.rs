@@ -233,7 +233,9 @@ pub(crate) fn field<'a>(text: &'a str, section: &str, name: &str) -> Option<&'a 
     let key = format!("{name}:");
     let mut inside = false;
 
-    for line in text.lines() {
+    // A BOM is what PowerShell and older Notepad leave at the front, and it
+    // would otherwise be read as part of the first section's name.
+    for line in text.trim_start_matches('\u{feff}').lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -275,6 +277,14 @@ mod tests {
     fn reads_the_field() {
         assert_eq!(
             parse("ui-theme:\n  preference: dark\n"),
+            Some(Preference::Dark)
+        );
+    }
+
+    #[test]
+    fn reads_the_field_behind_a_bom() {
+        assert_eq!(
+            parse("\u{feff}ui-theme:\n  preference: dark\n"),
             Some(Preference::Dark)
         );
     }

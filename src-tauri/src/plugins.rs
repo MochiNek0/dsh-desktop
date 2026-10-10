@@ -597,8 +597,14 @@ fn captured(mut command: Command, timeout: Duration) -> Option<String> {
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
+    // Tied to the app the way an install is: a panel opened and the app quit
+    // straight after left this dsh and the pnpm under it running.
+    #[cfg(unix)]
+    crate::server::group_leader(&mut command);
 
-    let mut child = command.spawn().ok()?;
+    let mut child = crate::server::tethered(command).ok()?;
+    #[cfg(windows)]
+    let _job = crate::server::Job::hold(&child);
     let mut stdout = child.stdout.take()?;
 
     // Drained on a thread of its own: a child that fills the pipe would block on

@@ -1471,10 +1471,37 @@ impl Tags {
 /// cannot read — a mirror serving an error page, a proxy serving a login form —
 /// is a registry that could not be asked, and reads as `None` the same way a
 /// timeout does.
+///
+/// Raced against npmmirror unless the user said to keep their own registry.
+/// The install that put dsh here measured its sources and may well have taken
+/// the mirror, but nothing on this side knows that: without the race a machine
+/// that cannot reach registry.npmjs.org sat on "Checking for a dsh update…" for
+/// the whole of [`CHECK_TIMEOUT`] on every launch and was never offered one.
+/// Whichever answers first is taken, so the race costs no wait.
 pub fn tags(app: &AppHandle) -> Option<Tags> {
-    let mut npm = npm(app)?;
-    npm.args(["view", PACKAGE, "dist-tags", "--json"]);
-    read_tags(&printed(npm, CHECK_TIMEOUT)?)
+    let view = |registry: Option<String>| {
+        let mut npm = npm(app)?;
+        npm.args(["view", PACKAGE, "dist-tags", "--json"]);
+        if let Some(registry) = registry {
+            npm.arg(format!("--registry={registry}"));
+        }
+        Some(npm)
+    };
+
+    let mut asks = vec![view(None)?];
+    if crate::settings::registry(app) != Some(RegistrySource::Own) {
+        asks.extend(view(Some(format!("https://{}/", PUBLIC_MIRRORS[0]))));
+    }
+
+    let count = asks.len();
+    let (send, receive) = std::sync::mpsc::channel();
+    for ask in asks {
+        let send = send.clone();
+        std::thread::spawn(move || {
+            let _ = send.send(printed(ask, CHECK_TIMEOUT).and_then(|text| read_tags(&text)));
+        });
+    }
+    receive.iter().take(count).flatten().next()
 }
 
 /// The parsing half of [`tags`], without the npm a test cannot run.

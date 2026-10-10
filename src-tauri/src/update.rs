@@ -43,7 +43,18 @@ pub fn check_now(app: &AppHandle) {
 
 fn check(app: AppHandle, verbose: bool) {
     tauri::async_runtime::spawn(async move {
-        let found = match app.updater_builder().timeout(CHECK_TIMEOUT).build() {
+        // Replaces the plugin's own hook, which is only the second line: see
+        // `crate::shut_down` for why the first one is needed.
+        let exiting = app.clone();
+        let found = match app
+            .updater_builder()
+            .timeout(CHECK_TIMEOUT)
+            .on_before_exit(move || {
+                crate::shut_down_now(&exiting);
+                exiting.cleanup_before_exit();
+            })
+            .build()
+        {
             Ok(updater) => updater.check().await,
             Err(error) => Err(error),
         };
