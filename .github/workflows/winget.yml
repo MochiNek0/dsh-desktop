@@ -1,0 +1,58 @@
+# Open a pull request at microsoft/winget-pkgs for each published release, so
+# `winget install MochiNek0.DshDesktop` follows along without anyone writing a
+# manifest by hand.
+#
+# ── Why this is not a step in release.yml ───────────────────────────────
+# The same reason as notify-site.yml: a stable release leaves that workflow as a
+# draft, and a draft's assets are not public — the winget validation pipeline
+# would fail to download the installer. Pressing Publish is the moment the
+# installer URL starts working, which is what `release: published` is.
+#
+# ── What has to be true, once ───────────────────────────────────────────
+# - The package already exists in winget-pkgs. komac, which this action runs,
+#   updates an existing manifest and carries its fields (ProductCode, Scope,
+#   descriptions, …) forward; it cannot create the first one. Version 0.1.22
+#   went in by hand: https://github.com/microsoft/winget-pkgs/pull/450991
+#
+# - MochiNek0 has a fork of microsoft/winget-pkgs. It does; the PR is opened
+#   from a branch there.
+#
+# - In this repository's Settings → Secrets and variables → Actions:
+#
+#     WINGET_TOKEN   a *classic* PAT from the MochiNek0 account with the
+#                    `public_repo` scope. It pushes to the fork and opens the PR
+#                    upstream; GITHUB_TOKEN reaches neither.
+#
+# A red run here leaves the release itself untouched — it only means winget is
+# behind, and the run can be repeated by hand with the tag.
+name: winget
+
+on:
+  release:
+    types: [published]
+  # For re-sending by hand. On a dispatch there is no release in the event, so
+  # the tag has to be given — the action would otherwise take the branch name.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to submit, e.g. v0.1.23'
+        required: true
+
+# Nothing here touches this repository; WINGET_TOKEN carries the only
+# permission this job needs.
+permissions: {}
+
+jobs:
+  submit:
+    # winget-pkgs takes stable versions only, and a beta is a prerelease.
+    if: github.event.release.prerelease != true
+    runs-on: windows-latest
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: MochiNek0.DshDesktop
+          # The NSIS installer only: the release also carries its updater
+          # signature, `…_x64-setup.exe.sig`, which the anchor keeps out.
+          installers-regex: '_x64-setup\.exe$'
+          release-tag: ${{ inputs.tag || github.event.release.tag_name }}
+          token: ${{ secrets.WINGET_TOKEN }}
