@@ -91,8 +91,11 @@ windows-core = "0.61"
 # The jump list and the AppUserModelID it is filed under; see `recent`. Already
 # in the tree under webview2-com at this version, so what is new is the
 # features: the shell's COM interfaces, and the property store that titles a
-# jump-list row.
+# jump-list row. And the window placement saved between launches; see
+# `placement`.
 windows = { version = "0.61", features = [
+    "Win32_Graphics_Dwm",                  # DWMWA_CLOAK
+    "Win32_Graphics_Gdi",                  # MonitorFromPoint
     "Win32_Storage_EnhancedStorage",       # PKEY_Title
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",  # PROPVARIANT
@@ -100,6 +103,7 @@ windows = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",               # IObjectArray, IObjectCollection
     "Win32_UI_Shell_PropertiesSystem",     # IPropertyStore
+    "Win32_UI_WindowsAndMessaging",        # Get/SetWindowPlacement
 ] }
 # Job objects: the kernel-side backstop that kills the dsh process tree when the
 # app dies without running its own shutdown. See `server::Job`.

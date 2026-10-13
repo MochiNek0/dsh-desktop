@@ -15,6 +15,7 @@ mod folder;
 mod memory;
 mod notify;
 mod panel;
+mod placement;
 mod plugins;
 mod recent;
 mod remote;
@@ -214,6 +215,8 @@ fn main() {
         tauri::RunEvent::ExitRequested { code, api, .. } => {
             if remote::confirm_exit(handle, code) {
                 api.prevent_exit();
+            } else if let Some(window) = handle.get_webview_window("main") {
+                placement::save(handle, &window);
             }
         }
         tauri::RunEvent::Exit => shut_down(handle, &server),
@@ -275,10 +278,9 @@ fn build_window(
         .title("dsh desktop")
         .inner_size(1360.0, 900.0)
         .min_inner_size(720.0, 520.0)
-        // The same place every launch. Restoring the last geometry meant the
-        // window was built here and moved afterwards, which is one jump across
-        // the screen in front of the user — and the only thing it bought was
-        // not having to move a window that opens where it can be seen anyway.
+        // The first launch, and any launch whose saved place is on no monitor.
+        // Every other one is moved to where it was before it is shown; see
+        // `placement`.
         .center()
         // Never at build time, even when this launch wants a window. WebView2
         // takes its default background from the options the controller is
@@ -425,6 +427,9 @@ fn build_window(
         })
         .build()?;
 
+    // Where it was last time, while it is still hidden.
+    placement::restore(app, &window);
+
     // Before it is on screen: this is the call that reaches WebView2's default
     // background, and the window that would show the wrong one is not up yet.
     theme::background(&window, preference);
@@ -443,8 +448,7 @@ fn build_window(
         tauri::WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             if let Some(window) = closer.get_webview_window("main") {
-                let _ = window.hide();
-                memory::trim(&window);
+                park(&window);
             }
         }
         // The maximise button's glyph. A snap or a Win+Up never reaches the
@@ -741,6 +745,13 @@ fn toggle_notify_turns(app: &tauri::AppHandle) {
 fn quit(app: &tauri::AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || app.exit(0));
+}
+
+/// Put the window away in the tray: the close button, and the window's own one.
+pub(crate) fn park(window: &WebviewWindow) {
+    placement::save(window.app_handle(), window);
+    let _ = window.hide();
+    memory::trim(window);
 }
 
 /// Bring the window back to the front, whatever it was hidden behind.

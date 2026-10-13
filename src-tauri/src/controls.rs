@@ -490,10 +490,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         }
         // The same thing the frame's close button did: park in the tray rather
         // than tear down an agent mid-task. Quitting is its own menu item.
-        Action::Close => {
-            let _ = window.hide();
-            crate::memory::trim(&window);
-        }
+        Action::Close => crate::park(&window),
         Action::Drag => {
             let _ = window.start_dragging();
         }

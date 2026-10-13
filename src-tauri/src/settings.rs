@@ -429,6 +429,18 @@ pub fn set_forget_pairings_on_exit(app: &AppHandle, on: bool) {
     write(app, FORGET_ON_EXIT_KEY, Value::Bool(on));
 }
 
+/// Where the window was when it was last put away. The shape is
+/// [`crate::placement`]'s; this file stores it without reading into it.
+const WINDOW_KEY: &str = "window";
+
+pub fn window_placement(app: &AppHandle) -> Option<Value> {
+    read(app).get(WINDOW_KEY).cloned()
+}
+
+pub fn set_window_placement(app: &AppHandle, placement: Value) {
+    write(app, WINDOW_KEY, placement);
+}
+
 /// The whole document, or an empty one. Never `Err`: see the module docs.
 fn read(app: &AppHandle) -> Map<String, Value> {
     let Some(path) = file(app) else {
