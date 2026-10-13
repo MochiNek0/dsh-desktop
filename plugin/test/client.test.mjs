@@ -504,7 +504,7 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
     folders: {
       create: (input) => {
         created.push(input.path);
-        return Promise.resolve({ ok: true, value: { workspace: { workspaceId: 'w1' } } });
+        return Promise.resolve({ workspaceId: 'w1' });
       },
       openWorkspace: (id) => { opened.push(id); return Promise.resolve(); },
     },
@@ -520,6 +520,7 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   assert.deepEqual(created, ['C:\work\demo']);
   assert.deepEqual(opened, ['w1']);
   assert.equal(query(sent[1]).event, 'folder-opened');
+  assert.equal(sent.length, 2, 'an opened folder is not also reported as failed');
   console.log('ok  opens a folder as a workspace once dsh can');
 }
 
@@ -529,7 +530,7 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   const opened = [];
   const s = services({
     folders: {
-      create: () => Promise.resolve({ ok: false, error: { message: 'not a directory' } }),
+      create: () => Promise.reject(new Error('not a directory')),
       openWorkspace: (id) => { opened.push(id); return Promise.resolve(); },
     },
   });

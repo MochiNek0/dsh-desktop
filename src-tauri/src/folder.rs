@@ -25,7 +25,8 @@
 //! back is the one the notify row already points at — "load plugins again" for
 //! a launch that set it aside, the plugin panel for one that never had it —
 //! and the path is kept, so the dsh that comes back up with the plugin opens
-//! it. A dismissed question drops it.
+//! it. A dismissed question drops it. Asked once per path, not once per page
+//! that path waits through.
 //!
 //! That check waits for dsh's own page. On the loading page the plugin can be
 //! absent only because this launch has not put it in yet — see
@@ -43,12 +44,17 @@ struct State {
     /// The page now loaded is dsh's, not the loading page.
     on_dsh: bool,
     pending: Option<PathBuf>,
+    /// The user has already been told about the missing plugin for this path.
+    /// Once per request: the way back runs through restarts and the plugin
+    /// panel, and each of those loads a page that would otherwise ask again.
+    asked: bool,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
     ready: false,
     on_dsh: false,
     pending: None,
+    asked: false,
 });
 
 /// A path is with the plugin and has not been answered yet.
@@ -88,6 +94,7 @@ pub fn open(app: &AppHandle, dir: PathBuf) {
     }
     state.pending = Some(dir);
     let ask = state.on_dsh && !crate::plugins::signalling(app);
+    state.asked = ask;
     drop(state);
     if ask {
         missing(app);
@@ -107,7 +114,14 @@ pub fn page_started() {
 pub fn page_finished(app: &AppHandle, on_dsh: bool) {
     let Ok(mut state) = STATE.lock() else { return };
     state.on_dsh = on_dsh;
-    let ask = on_dsh && !state.ready && state.pending.is_some() && !crate::plugins::signalling(app);
+    let ask = on_dsh
+        && !state.ready
+        && !state.asked
+        && state.pending.is_some()
+        && !crate::plugins::signalling(app);
+    if ask {
+        state.asked = true;
+    }
     drop(state);
     if ask {
         missing(app);

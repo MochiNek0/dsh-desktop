@@ -217,14 +217,14 @@ window.__ModuleLoader__.load({
             if (!folders) return failed('not ready');
             var current = folders;
             // `create` adopts an existing workspace for the same directory
-            // rather than adding a second one, and merges the row into the
-            // list before it returns, so `openWorkspace` can find it at once.
-            // `openWorkspace` is the sidebar's own: it reuses a blank session
-            // in that workspace or starts one, and says itself when it fails.
-            current.workspaces.create({ path: path }).then((result) => {
-              if (!result.ok) return failed(result.error);
+            // rather than adding a second one, merges the row into the list
+            // before it resolves with it, and throws when dsh refuses — so
+            // `openWorkspace` can find it at once. `openWorkspace` is the
+            // sidebar's own: it reuses a blank session in that workspace or
+            // starts one, and says itself when it fails.
+            current.workspaces.create({ path: path }).then((workspace) => {
               send({ event: 'folder-opened' });
-              return current.uiWorkspace.openWorkspace(result.value.workspace.workspaceId);
+              return current.uiWorkspace.openWorkspace(workspace.workspaceId);
             }, failed).catch(() => {});
           },
         };
