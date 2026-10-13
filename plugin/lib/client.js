@@ -27,12 +27,14 @@
  * ## The door the other way
  *
  * One global, `window.__dshSignals`, set while the plugin is wired up. The
- * shell calls two things on it. `open(id)` is how a click on a notification
+ * shell calls three things on it. `open(id)` is how a click on a notification
  * gets back to the session the notification was about — `ctx.sessions.open` is
  * dsh's own way to switch the current session. `answer(id, key, choice)` is
  * how a press on one of that notification's buttons reaches the request it
  * answers, which is the same carrier the snapshot above reported: the object
  * that says a question is pending is the object that answers it.
+ * `openFolder(path)` is how a folder handed to the app from outside becomes a
+ * workspace on screen, through dsh's own `workspaces` and `uiWorkspace`.
  *
  * Removed again on teardown, so a click that arrives after the plugin was
  * disabled finds nothing rather than half of something — the shell guards
@@ -163,6 +165,7 @@ window.__ModuleLoader__.load({
       // is required here.
       var sessions = null;
       var waits = null;
+      var folders = null;
 
       ctx.effect(() => {
         window.__dshSignals = {
@@ -198,6 +201,32 @@ window.__ModuleLoader__.load({
             }
             stale();
           },
+          /**
+           * Open a folder as a workspace and switch to it, for a folder handed
+           * to the shell from outside — `dsh-desktop <path>`. Called from the
+           * shell over `window.eval`, and only after `folder-ready`; see its
+           * folder.rs.
+           *
+           * @param {string} path - absolute directory path.
+           */
+          openFolder: (path) => {
+            var failed = (error) => send({
+              event: 'folder-failed',
+              reason: (error && error.message) || String(error),
+            });
+            if (!folders) return failed('not ready');
+            var current = folders;
+            // `create` adopts an existing workspace for the same directory
+            // rather than adding a second one, and merges the row into the
+            // list before it returns, so `openWorkspace` can find it at once.
+            // `openWorkspace` is the sidebar's own: it reuses a blank session
+            // in that workspace or starts one, and says itself when it fails.
+            current.workspaces.create({ path: path }).then((result) => {
+              if (!result.ok) return failed(result.error);
+              send({ event: 'folder-opened' });
+              return current.uiWorkspace.openWorkspace(result.value.workspace.workspaceId);
+            }, failed).catch(() => {});
+          },
         };
         return () => {
           delete window.__dshSignals;
@@ -228,6 +257,19 @@ window.__ModuleLoader__.load({
             stop();
           };
         }, 'dsh-desktop-signal: pending questions to the desktop shell');
+      });
+
+      // A folder opened from outside. `ready` is what tells the shell it can
+      // hand one over: a folder that arrives with the launch has to wait for
+      // this, and so does one that arrives while dsh restarts.
+      ctx.inject(['workspaces', 'uiWorkspace'], (scope) => {
+        scope.effect(() => {
+          folders = { workspaces: scope.workspaces, uiWorkspace: scope.uiWorkspace };
+          send({ event: 'folder-ready' });
+          return () => {
+            folders = null;
+          };
+        }, 'dsh-desktop-signal: folders opened from the desktop shell');
       });
     }
 

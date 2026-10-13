@@ -11,6 +11,7 @@ mod controls;
 mod cookies;
 mod dialog;
 mod dsh;
+mod folder;
 mod memory;
 mod notify;
 mod panel;
@@ -122,9 +123,13 @@ fn main() {
         // First, before anything this process would otherwise start: a second
         // launch has to be turned away before it spawns a dsh of its own. What
         // the user meant by launching again is "show me the app", so the copy
-        // already running answers for it.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        // already running answers for it — and, when the launch named a
+        // folder, "open this in dsh"; see `folder`.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             reveal(app);
+            if let Some(dir) = folder::requested(&argv, std::path::Path::new(&cwd)) {
+                folder::open(app, dir);
+            }
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -178,6 +183,16 @@ fn main() {
             remote::refresh_patch(app.handle(), false);
 
             build_tray(app.handle())?;
+
+            // A folder this launch was asked to open waits in `folder` for dsh
+            // and the plugin to come up.
+            let args: Vec<String> = std::env::args().collect();
+            if let Some(dir) = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| folder::requested(&args, &cwd))
+            {
+                folder::open(app.handle(), dir);
+            }
 
             boot(app.handle().clone(), window, session);
 
@@ -250,6 +265,7 @@ fn build_window(
     let closer = app.clone();
     let new_window_opener = app.clone();
     let new_window_origin = origin.clone();
+    let page_origin = origin.clone();
 
     let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("dsh desktop")
@@ -337,7 +353,17 @@ fn build_window(
             }
             drop(first);
 
+            if payload.event() == PageLoadEvent::Started {
+                folder::page_started();
+            }
+
             if payload.event() == PageLoadEvent::Finished {
+                let on_dsh = page_origin
+                    .read()
+                    .unwrap()
+                    .as_deref()
+                    .is_some_and(|ours| payload.url().origin().ascii_serialization() == ours);
+                folder::page_finished(webview.app_handle(), on_dsh);
                 splash.flush(&webview);
                 // The chrome was just drawn by a fresh document that has no way
                 // of knowing whether the window is maximised, the login item is

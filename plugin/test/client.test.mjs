@@ -34,7 +34,7 @@ function load({ host }) {
 // service — the shape issue #11's follow-up reported from macOS. Cordis never
 // runs a scope whose injected service is missing, and this stub's `inject` does
 // the same rather than pretending the service is there.
-function services({ uiSession = true } = {}) {
+function services({ uiSession = true, folders = null } = {}) {
   let list = { ids: [], byId: {} };
   let pending = new Map();
   const listeners = { list: [], pending: [] };
@@ -55,6 +55,12 @@ function services({ uiSession = true } = {}) {
       open: (id) => { opened.push(id); },
     },
   };
+  // The two services a folder needs. Off unless a test asks, which is also the
+  // dsh that predates them: their scope never runs, and nothing is announced.
+  if (folders) {
+    ctx.workspaces = { create: folders.create };
+    ctx.uiWorkspace = { openWorkspace: folders.openWorkspace };
+  }
   if (uiSession) {
     ctx.uiSession = {
       pendingInteractions: {
@@ -487,6 +493,66 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   said = await stale('a', 'k3', 'allow');
   assert.equal(said.event, 'stale');
   console.log('ok  reports a press it could not submit instead of swallowing it');
+}
+
+// --- a folder from outside ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const created = [];
+  const opened = [];
+  const s = services({
+    folders: {
+      create: (input) => {
+        created.push(input.path);
+        return Promise.resolve({ ok: true, value: { workspace: { workspaceId: 'w1' } } });
+      },
+      openWorkspace: (id) => { opened.push(id); return Promise.resolve(); },
+    },
+  });
+  exports.apply(s.ctx);
+  await drain();
+  // The shell holds a launch's folder until this arrives.
+  assert.equal(sent.length, 1);
+  assert.equal(query(sent[0]).event, 'folder-ready');
+
+  window.__dshSignals.openFolder('C:\work\demo');
+  await drain();
+  assert.deepEqual(created, ['C:\work\demo']);
+  assert.deepEqual(opened, ['w1']);
+  assert.equal(query(sent[1]).event, 'folder-opened');
+  console.log('ok  opens a folder as a workspace once dsh can');
+}
+
+// --- a folder dsh will not take ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const opened = [];
+  const s = services({
+    folders: {
+      create: () => Promise.resolve({ ok: false, error: { message: 'not a directory' } }),
+      openWorkspace: (id) => { opened.push(id); return Promise.resolve(); },
+    },
+  });
+  exports.apply(s.ctx);
+  window.__dshSignals.openFolder('/nope');
+  await drain();
+  const failed = sent.map(query).find((params) => params.event === 'folder-failed');
+  assert.ok(failed, 'a refusal is reported, not swallowed');
+  assert.equal(failed.reason, 'not a directory');
+  assert.deepEqual(opened, []);
+  console.log('ok  reports a folder dsh refused');
+}
+
+// --- a folder before dsh has workspaces ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const s = services();
+  exports.apply(s.ctx);
+  window.__dshSignals.openFolder('/somewhere');
+  await drain();
+  assert.equal(sent.length, 1);
+  assert.equal(query(sent[0]).event, 'folder-failed');
+  console.log('ok  says so when a folder arrives with nothing to open it');
 }
 
 // --- no desktop shell: no door either ---

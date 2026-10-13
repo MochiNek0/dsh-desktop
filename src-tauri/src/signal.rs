@@ -100,6 +100,12 @@ pub enum Signal {
     /// A press on a button reached a request that was no longer there, so
     /// nothing was submitted. Answered in the window instead; see [`act`].
     Stale { session: String },
+    /// The plugin can open a folder now; see [`crate::folder`].
+    FolderReady,
+    /// dsh took the folder it was handed.
+    FolderOpened,
+    /// dsh would not take it, and why.
+    FolderFailed { reason: String },
 }
 
 /// Read a `dsh-window://signal` navigation. `None` for a query this build has
@@ -138,8 +144,17 @@ pub fn received(url: &Url) -> Option<Signal> {
         }
     }
 
-    // Every signal is about a session. One that does not name it cannot be
-    // matched to a notification, so there is nothing to do with it.
+    // The folder events are the plugin's and not a session's; see
+    // [`crate::folder`].
+    match event.as_str() {
+        "folder-ready" => return Some(Signal::FolderReady),
+        "folder-opened" => return Some(Signal::FolderOpened),
+        "folder-failed" => return Some(Signal::FolderFailed { reason }),
+        _ => {}
+    }
+
+    // Every other signal is about a session. One that does not name it cannot
+    // be matched to a notification, so there is nothing to do with it.
     if session.is_empty() {
         return None;
     }
@@ -216,6 +231,9 @@ pub fn act(app: &AppHandle, signal: Signal) {
             crate::reveal(app);
             open(app, &session);
         }
+        Signal::FolderReady => crate::folder::ready(app),
+        Signal::FolderOpened => crate::folder::opened(),
+        Signal::FolderFailed { reason } => crate::folder::failed(app, &reason),
     }
 }
 
@@ -498,6 +516,19 @@ mod tests {
                 options: vec![],
                 tool: String::new(),
                 reason: String::new()
+            })
+        );
+    }
+
+    /// The plugin's own, and about no session.
+    #[test]
+    fn reads_the_folder_events_without_a_session() {
+        assert_eq!(read("event=folder-ready"), Some(Signal::FolderReady));
+        assert_eq!(read("event=folder-opened"), Some(Signal::FolderOpened));
+        assert_eq!(
+            read("event=folder-failed&reason=not%20a%20directory"),
+            Some(Signal::FolderFailed {
+                reason: "not a directory".into()
             })
         );
     }
