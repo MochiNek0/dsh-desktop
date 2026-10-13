@@ -441,6 +441,21 @@ pub fn set_window_placement(app: &AppHandle, placement: Value) {
     write(app, WINDOW_KEY, placement);
 }
 
+/// The global shortcut: absent for the default, `""` for none. See
+/// [`crate::shortcut`].
+const SHORTCUT_KEY: &str = "shortcut";
+
+pub fn shortcut(app: &AppHandle) -> Option<String> {
+    read(app)
+        .get(SHORTCUT_KEY)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+pub fn set_shortcut(app: &AppHandle, keys: &str) {
+    write(app, SHORTCUT_KEY, Value::from(keys));
+}
+
 /// The whole document, or an empty one. Never `Err`: see the module docs.
 fn read(app: &AppHandle) -> Map<String, Value> {
     let Some(path) = file(app) else {

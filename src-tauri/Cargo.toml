@@ -34,6 +34,10 @@ sys-locale = "0.3"
 # One app per machine. Two of them would each spawn a `dsh web` against the same
 # $DSH_HOME, and a dsh update would rewrite the tree the other one is running.
 tauri-plugin-single-instance = "2"
+# The key that shows and hides the window from anywhere; see `shortcut`. Used
+# from Rust only — the webview is granted none of its commands. `~2.3` because
+# 2.4 wants tauri 2.12, which moves webview2-com off the version pinned below.
+tauri-plugin-global-shortcut = "~2.3"
 
 # The phone gateway; see `remote`. Everything below this line was already in the
 # tree — reqwest brings hyper, tokio, http and the body helpers, tauri brings

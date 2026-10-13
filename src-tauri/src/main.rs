@@ -22,6 +22,7 @@ mod remote;
 mod server;
 mod settings;
 mod setup;
+mod shortcut;
 mod signal;
 mod status;
 mod theme;
@@ -135,6 +136,7 @@ fn main() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(shortcut::plugin())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -188,6 +190,7 @@ fn main() {
             remote::refresh_patch(app.handle(), false);
 
             build_tray(app.handle())?;
+            shortcut::init(app.handle());
 
             // A folder this launch was asked to open waits in `folder` for dsh
             // and the plugin to come up.
@@ -374,14 +377,15 @@ fn build_window(
                 splash.flush(&webview);
                 // The chrome was just drawn by a fresh document that has no way
                 // of knowing whether the window is maximised, the login item is
-                // on, notifications are, or this launch is running on no
-                // plugins — nothing resized to tell it, and nothing was
-                // toggled. Every navigation lands here, so every navigation
-                // gets all four.
+                // on, notifications are, this launch is running on no plugins,
+                // or which global shortcut took — nothing resized to tell it,
+                // and nothing was toggled. Every navigation lands here, so
+                // every navigation gets all five.
                 controls::sync(&webview);
                 controls::sync_autostart(webview.app_handle());
                 controls::sync_notify(webview.app_handle());
                 controls::sync_safe(webview.app_handle());
+                shortcut::sync(webview.app_handle());
                 // Last, and only where the page that just loaded is dsh
                 // refusing to serve one: it replaces the page.
                 auth.recover(&webview);
@@ -623,6 +627,9 @@ fn switch_language(app: &tauri::AppHandle, tag: &str) {
     // built in — which, on a page that never loads again, is the rest of the
     // run.
     controls::sync_safe(app);
+    // Its note carries the reason a key did not take, which `relabel` just
+    // wrote over with the plain one.
+    shortcut::sync(app);
     // Not only what is on screen. An initialization script is composed once,
     // when the window is built, so without these two the plugin panel and the
     // runtime chooser would stay in the language the app started in for the

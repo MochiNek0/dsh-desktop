@@ -57,10 +57,11 @@
 //! that hands a target to the system, and [`crate::plugins::is_package_spec`]
 //! for the one that installs a package.
 //!
-//! Five things travel the other way, each pushed rather than asked for, because
+//! Six things travel the other way, each pushed rather than asked for, because
 //! the page has no way to see any of them: whether the window is maximised
 //! ([`sync`]), whether the login item is on ([`sync_autostart`]), whether
-//! notifications are ([`sync_notify`]), the menu's own labels when dsh changes
+//! notifications are ([`sync_notify`]), which global shortcut took
+//! ([`crate::shortcut::sync`]), the menu's own labels when dsh changes
 //! language under it ([`relabel`]), and whatever slow thing is running right
 //! now ([`busy`]).
 
@@ -206,6 +207,9 @@ pub enum Action {
     Answered(Url),
     /// Open an external URL in the system browser.
     OpenUrl(String),
+    /// The key the settings card recorded for the global shortcut, or `""` to
+    /// turn it off; see [`crate::shortcut`].
+    Shortcut(String),
 }
 
 /// Recognise a navigation as a button press. `None` for every ordinary URL,
@@ -334,6 +338,11 @@ pub fn action(url: &Url) -> Option<Action> {
         // An answer to a question this app asked; see `crate::dialog`, which
         // owns the parsing because it owns the callback the answer runs.
         "ask" => Some(Action::Answered(url.clone())),
+        // Absent is not off: only a `keys=` the card actually sent is a choice.
+        "shortcut" => url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "keys").then(|| value.into_owned()))
+            .map(Action::Shortcut),
         other => {
             eprintln!("dsh-desktop: ignoring unknown window action {other}");
             None
@@ -452,6 +461,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::Notify(notice) => return crate::notify::show(app, notice),
         Action::Signal(signal) => return crate::signal::act(app, signal),
         Action::Answered(url) => return crate::dialog::answered(app, &url),
+        Action::Shortcut(keys) => return crate::shortcut::change(app, &keys),
         Action::OpenUrl(target) => {
             let _ = app.opener().open_url(target, None::<&str>);
             return;
@@ -687,6 +697,7 @@ fn labels() -> String {
         // notification this app raises, a plugin's included. See
         // `crate::settings`.
         ("notify-turns", t!("通知", "Notifications")),
+        ("shortcut", t!("全局快捷键", "Global shortcut")),
         ("community", t!("交流群", "Feedback")),
         ("quit", t!("退出 dsh", "Quit dsh")),
     ];
@@ -772,6 +783,7 @@ fn notes() -> String {
                 "Tell you when a turn finishes, or when dsh stops to ask something."
             ),
         ),
+        ("shortcut", crate::shortcut::note()),
         ("community", community.as_str()),
     ];
 
@@ -1111,6 +1123,9 @@ pub fn script() -> String {
     {{ verb: 'channel' }},
     {{ verb: 'autostart', check: true }},
     {{ verb: 'notify-turns', check: true }},
+    // The key on the right is the control: click it, then press the new one.
+    // See `__dshShortcut`.
+    {{ verb: 'shortcut', keys: true }},
     // Last, and on the card rather than the menu: it is for someone who went
     // looking, and the menu is what everyone sees on every use.
     {{ verb: 'community', community: true }},
@@ -1414,6 +1429,15 @@ pub fn script() -> String {
       'background:var(--dsh-wc-accent)}}' +
       '.dsh-wc-set button.dsh-wc-checked .dsh-wc-sw::after{{' +
       'transform:translateX(16px)}}' +
+      // The global shortcut, drawn as the key it is. Ringed in the accent
+      // while it is listening for a new one.
+      '.dsh-wc-key{{margin-left:auto;flex:none;padding:5px 8px;' +
+      'border-radius:6px;box-shadow:inset 0 0 0 1px var(--dsh-wc-line);' +
+      'color:var(--dsh-wc-fg-hi);font:12px/1 {FONT};white-space:nowrap}}' +
+      '.dsh-wc-key.dsh-wc-key-live{{color:var(--dsh-wc-accent);' +
+      'box-shadow:inset 0 0 0 1.5px var(--dsh-wc-accent)}}' +
+      // A key that did not take. The same orange the tray uses for waiting.
+      '.dsh-wc-set-note.dsh-wc-set-warn{{color:#e8833a}}' +
       // Standing, not passing: the launch is running on no plugins, and says so
       // for as long as that is true. Drawn as an outline rather than as text so
       // it does not read as another of the toast's transient messages, and left
@@ -1644,6 +1668,11 @@ pub fn script() -> String {
 
     word(head, LABELS['settings']);
 
+    // The shortcut row's key, its note, and the words Rust last sent for it;
+    // see `__dshShortcut`.
+    var keyChip = null, keyNote = null, keyNow = '', keyWords = {{ off: '', press: '' }};
+    var recording = false;
+
     SETTINGS.forEach(function (item) {{
       var row = make('button', item.close ? 'dsh-wc-set-shut' : '', card);
       row.type = 'button';
@@ -1662,6 +1691,9 @@ pub fn script() -> String {
       if (item.check) {{
         make('span', 'dsh-wc-sw', row);
         checks[item.verb] = row;
+      }} else if (item.keys) {{
+        keyChip = make('span', 'dsh-wc-key', row);
+        keyNote = note;
       }} else if (!item.close && !item.community) {{
         make('span', 'dsh-wc-set-go', row).innerHTML = GO_GLYPH;
       }}
@@ -1672,6 +1704,8 @@ pub fn script() -> String {
       row.addEventListener('click', function () {{
         // The same refusal a menu row makes; see the handler above.
         if (row.getAttribute('aria-disabled') === 'true') return;
+        // Listens for the next key rather than signalling; see `record`.
+        if (item.keys) return record();
         // Chinese copies the group's number and keeps the card up, so the note
         // can say it did; English leaves for the issue tracker in the browser.
         // The language is read at the click, because dsh can switch it under
@@ -1715,6 +1749,7 @@ pub fn script() -> String {
 
     function hideSettings() {{
       if (!card.classList.contains('dsh-wc-shown')) return;
+      if (recording) stopRecording();
       scrim.classList.remove('dsh-wc-shown');
       card.classList.remove('dsh-wc-shown');
       if (returnTo && returnTo.focus) returnTo.focus();
@@ -1744,6 +1779,59 @@ pub fn script() -> String {
 
     window.__dshAutostart = function (on) {{
       mark('autostart', on);
+    }};
+
+    // The shortcut row's recorder. The next key pressed with its modifiers is
+    // sent as `KeyboardEvent.code`, which names the key where it sits rather
+    // than what the layout prints on it -- the same thing the OS registers.
+    // Escape on its own puts the old key back; Backspace or Delete on its own
+    // turns the shortcut off. Whether a key is acceptable is Rust's to say,
+    // and it says so in the row's note.
+    function record() {{
+      recording = true;
+      keyChip.textContent = keyWords.press;
+      keyChip.classList.add('dsh-wc-key-live');
+    }}
+    function stopRecording() {{
+      recording = false;
+      keyChip.classList.remove('dsh-wc-key-live');
+      keyChip.textContent = keyNow || keyWords.off;
+    }}
+    // Capturing on the window, so it runs before the card's own Escape and
+    // before anything dsh listens for.
+    window.addEventListener('keydown', function (event) {{
+      if (!recording) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      var key = event.key;
+      if (key === 'Control' || key === 'Alt' || key === 'Shift' ||
+          key === 'Meta' || key === 'AltGraph') return;
+      var held = [];
+      if (event.ctrlKey) held.push('Ctrl');
+      if (event.altKey) held.push('Alt');
+      if (event.shiftKey) held.push('Shift');
+      if (event.metaKey) held.push('Super');
+      stopRecording();
+      if (!held.length && key === 'Escape') return;
+      if (!held.length && (key === 'Backspace' || key === 'Delete')) {{
+        return signal('shortcut?keys=');
+      }}
+      signal('shortcut?keys=' + encodeURIComponent(held.concat(event.code).join('+')));
+    }}, true);
+    window.addEventListener('blur', function () {{
+      if (recording) stopRecording();
+    }});
+
+    // Called from Rust; see `shortcut::sync`. `keys` is what is registered, or
+    // empty; `note` is the row's second line, which `warn` marks as the reason
+    // a key did not take.
+    window.__dshShortcut = function (keys, note, warn, words) {{
+      keyWords = words || keyWords;
+      keyNow = keys || '';
+      if (!keyChip) return;
+      if (!recording) keyChip.textContent = keyNow || keyWords.off;
+      keyNote.textContent = note || '';
+      keyNote.classList.toggle('dsh-wc-set-warn', !!warn);
     }};
     // `on` is the preference, `available` whether anything can act on it, and
     // `hint` what is missing when it cannot. An unavailable row reads as off
