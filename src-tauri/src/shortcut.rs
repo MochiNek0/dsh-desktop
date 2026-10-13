@@ -292,12 +292,19 @@ pub(crate) fn sync(app: &AppHandle) {
 mod tests {
     use super::*;
 
+    /// What the card calls Alt: macOS names the key Option.
+    const ALT: &str = if cfg!(target_os = "macos") {
+        "Option"
+    } else {
+        "Alt"
+    };
+
     #[test]
     fn the_default_is_two_modifiers_and_d() {
         let shortcut = accept(DEFAULT)
             .ok()
             .expect("the default passes its own rule");
-        assert_eq!(label(&shortcut), "Ctrl+Alt+D");
+        assert_eq!(label(&shortcut), format!("Ctrl+{ALT}+D"));
     }
 
     #[test]
@@ -306,7 +313,7 @@ mod tests {
         let shortcut = accept("Ctrl+Shift+Digit1").ok().unwrap();
         assert_eq!(label(&shortcut), "Ctrl+Shift+1");
         let shortcut = accept("Alt+Shift+F5").ok().unwrap();
-        assert_eq!(label(&shortcut), "Alt+Shift+F5");
+        assert_eq!(label(&shortcut), format!("{ALT}+Shift+F5"));
     }
 
     #[test]
