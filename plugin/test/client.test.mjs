@@ -12,11 +12,12 @@ import assert from 'node:assert/strict';
 
 const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
 
-// `recent` is kept apart from everything else the plugin sends: it goes out
-// whenever the workspace list changes, and most checks here count the events
-// they are about.
+// `status` and `recent` are kept apart from everything else the plugin sends:
+// they go out on every change to the counts and the workspace list, and most
+// checks here count the events they are about.
 function load({ host }) {
   const sent = [];
+  const statuses = [];
   const recents = [];
   let registered = null;
   const window = {
@@ -24,7 +25,7 @@ function load({ host }) {
     location: {
       set href(value) {
         const event = new URL(value).searchParams.get('event');
-        (event === 'recent' ? recents : sent).push(value);
+        (event === 'status' ? statuses : event === 'recent' ? recents : sent).push(value);
       },
       get href() { return ''; },
     },
@@ -35,7 +36,7 @@ function load({ host }) {
   assert.ok(registered, 'the bundle should register a factory');
   assert.equal(registered.id, 'dsh-desktop-signal');
   const exports = registered.factory(() => { throw new Error('should require nothing'); });
-  return { exports, sent, recents, window };
+  return { exports, sent, statuses, recents, window };
 }
 
 // Stub services with hand-driven snapshots.
@@ -585,9 +586,36 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   console.log('ok  says so when a folder arrives with nothing to open it');
 }
 
+// --- how busy dsh is, for the shell's icons ---
+{
+  const { exports, statuses } = load({ host: true });
+  const s = services();
+  // Loaded mid-turn: the baseline counts too, unlike a turn ending.
+  s.setList({ ids: ['a', 'b'], byId: { a: { running: true }, b: { running: false } } });
+  exports.apply(s.ctx);
+  await drain();
+  assert.deepEqual(statuses.map(query).map((p) => [p.running, p.waiting]), [['1', '0']]);
+
+  // A repeat of the same counts says nothing.
+  s.setList({ ids: ['a', 'b'], byId: { a: { running: true }, b: { running: false } } });
+  s.setPending(new Map([['a', carrier({ kind: 'approval', key: 'k1' })]]));
+  s.setList({ ids: ['a', 'b'], byId: { a: { running: false }, b: { running: false } } });
+  await drain();
+  assert.deepEqual(
+    statuses.map(query).map((p) => [p.running, p.waiting]),
+    [['1', '0'], ['1', '1'], ['0', '1']],
+  );
+
+  // A scope going away takes its count with it.
+  s.stop();
+  await drain();
+  assert.deepEqual(statuses.map(query).map((p) => [p.running, p.waiting]).at(-1), ['0', '0']);
+  console.log('ok  reports how many sessions are running and waiting');
+}
+
 // --- dsh 0.2: the waits are on `sessionStatus` ---
 {
-  const { exports, sent, window } = load({ host: true });
+  const { exports, sent, statuses, window } = load({ host: true });
   const s = services({ uiSession: 'status' });
   exports.apply(s.ctx);
   const approval = carrier({ kind: 'approval', key: 'approval:1', toolName: 'bash' });
@@ -597,6 +625,7 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   assert.ok(wait, 'a wait on a 0.2 dsh is announced');
   assert.equal(wait.key, 'approval:1');
   assert.equal(wait.tool, 'bash');
+  assert.equal(query(statuses.at(-1)).waiting, '1');
 
   // And a press reaches the same carrier.
   window.__dshSignals.answer('a', 'approval:1', 'allow');
@@ -606,6 +635,7 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   s.setPending(new Map());
   await drain();
   assert.equal(query(sent.at(-1)).event, 'wait-over');
+  assert.equal(query(statuses.at(-1)).waiting, '0');
   console.log('ok  reads waits off sessionStatus on dsh 0.2');
 }
 

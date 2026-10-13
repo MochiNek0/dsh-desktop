@@ -108,6 +108,9 @@ pub enum Signal {
     FolderFailed { reason: String },
     /// The workspaces used last, most recent first; see [`crate::recent`].
     Recent(Vec<crate::recent::Workspace>),
+    /// How many sessions are mid-turn and how many are waiting on the user;
+    /// see [`crate::status`].
+    Status { running: u32, waiting: u32 },
 }
 
 /// Read a `dsh-window://signal` navigation. `None` for a query this build has
@@ -123,6 +126,8 @@ pub fn received(url: &Url) -> Option<Signal> {
     let mut reason = String::new();
     let mut titles = Vec::new();
     let mut paths = Vec::new();
+    let mut running = 0;
+    let mut waiting = 0;
 
     for (name, value) in url.query_pairs() {
         match name.as_ref() {
@@ -148,6 +153,8 @@ pub fn received(url: &Url) -> Option<Signal> {
             // clamped: cut, it would name some other folder.
             "title" if titles.len() < crate::recent::LIMIT => titles.push(clamp(&value)),
             "path" if paths.len() < crate::recent::LIMIT => paths.push(value.trim().to_string()),
+            "running" => running = value.parse().unwrap_or(0),
+            "waiting" => waiting = value.parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -170,6 +177,7 @@ pub fn received(url: &Url) -> Option<Signal> {
             return Some(Signal::Recent(list));
         }
         "recent" => return None,
+        "status" => return Some(Signal::Status { running, waiting }),
         _ => {}
     }
 
@@ -255,6 +263,7 @@ pub fn act(app: &AppHandle, signal: Signal) {
         Signal::FolderOpened => crate::folder::opened(),
         Signal::FolderFailed { reason } => crate::folder::failed(app, &reason),
         Signal::Recent(list) => crate::recent::set(app, list),
+        Signal::Status { running, waiting } => crate::status::set(app, running, waiting),
     }
 }
 
@@ -554,9 +563,9 @@ mod tests {
         );
     }
 
-    /// The plugin's own too: two lists in step.
+    /// The plugin's own too: two lists in step, and the counts.
     #[test]
-    fn reads_the_recent_workspaces() {
+    fn reads_the_recent_workspaces_and_the_counts() {
         use crate::recent::Workspace;
 
         assert_eq!(
@@ -575,6 +584,21 @@ mod tests {
         // No workspaces is a list too, and it empties the menu.
         assert_eq!(read("event=recent&n=1.2"), Some(Signal::Recent(vec![])));
         assert_eq!(read("event=recent&title=a&title=b&path=%2Fa"), None, "halves that do not pair");
+
+        assert_eq!(
+            read("event=status&running=2&waiting=1&n=3.4"),
+            Some(Signal::Status {
+                running: 2,
+                waiting: 1
+            })
+        );
+        assert_eq!(
+            read("event=status&running=lots"),
+            Some(Signal::Status {
+                running: 0,
+                waiting: 0
+            })
+        );
     }
 
     #[test]

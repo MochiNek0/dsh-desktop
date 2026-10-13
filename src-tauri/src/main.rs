@@ -22,6 +22,7 @@ mod server;
 mod settings;
 mod setup;
 mod signal;
+mod status;
 mod theme;
 mod toast;
 mod update;
@@ -358,6 +359,7 @@ fn build_window(
 
             if payload.event() == PageLoadEvent::Started {
                 folder::page_started();
+                status::page_started(webview.app_handle());
             }
 
             if payload.event() == PageLoadEvent::Finished {
@@ -467,7 +469,7 @@ fn build_window(
 }
 
 /// The tray icon's id, so [`switch_language`] can find it again.
-const TRAY: &str = "main";
+pub(crate) const TRAY: &str = "main";
 
 /// The two items in it, in the language of the moment.
 ///
@@ -571,16 +573,30 @@ pub(crate) fn refresh_tray(app: &tauri::AppHandle) {
         Err(error) => eprintln!("dsh-desktop: could not redraw the tray menu: {error}"),
     }
 
+    refresh_tooltip(app);
+}
+
+/// The tray's tooltip, for what it says may have changed: the tunnel, or what
+/// dsh is doing — see [`status`].
+pub(crate) fn refresh_tooltip(app: &tauri::AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY) else {
+        return;
+    };
+
     // The tooltip is the half that shows without a click, which on Windows is
     // the half a user actually meets.
-    let _ = tray.set_tooltip(Some(match remote::exposed(app) {
+    let mut tip = match remote::exposed(app) {
         Some(host) => t!(
             "dsh desktop — 公网可访问：{}",
             "dsh desktop — on the internet at {}",
             host
         ),
         None => "dsh desktop".to_string(),
-    }));
+    };
+    if let Some(doing) = status::describe() {
+        tip = format!("{tip}\n{doing}");
+    }
+    let _ = tray.set_tooltip(Some(tip));
 }
 
 /// Follow dsh into the language it has just been switched to.

@@ -168,6 +168,19 @@ window.__ModuleLoader__.load({
       var waits = null;
       var folders = null;
 
+      // How many sessions are mid-turn and how many are waiting on the user,
+      // for the shell's icons. Each half fills in its own count and goes back
+      // to zero when its scope goes; only a change is sent.
+      var counts = { running: 0, waiting: 0 };
+      var reported = null;
+      var report = (name, count) => {
+        counts[name] = count;
+        var line = counts.running + '/' + counts.waiting;
+        if (line === reported) return;
+        reported = line;
+        send({ event: 'status', running: String(counts.running), waiting: String(counts.waiting) });
+      };
+
       ctx.effect(() => {
         window.__dshSignals = {
           /**
@@ -238,10 +251,11 @@ window.__ModuleLoader__.load({
       ctx.inject(['sessions'], (scope) => {
         scope.effect(() => {
           sessions = scope.sessions;
-          var stop = watchTurns(scope);
+          var stop = watchTurns(scope, (count) => report('running', count));
           return () => {
             sessions = null;
             stop();
+            report('running', 0);
           };
         }, 'dsh-desktop-signal: turn endings to the desktop shell');
       });
@@ -252,10 +266,11 @@ window.__ModuleLoader__.load({
       ctx.inject(['uiSession'], (scope) => {
         scope.effect(() => {
           waits = pendingOf(scope.uiSession);
-          var stop = watchWaits(waits);
+          var stop = watchWaits(waits, (count) => report('waiting', count));
           return () => {
             waits = null;
             stop();
+            report('waiting', 0);
           };
         }, 'dsh-desktop-signal: pending questions to the desktop shell');
       });
@@ -410,17 +425,19 @@ window.__ModuleLoader__.load({
      * first appears, because dsh can fill it in after the first snapshot. A
      * subagent that stops to ask something still does — see `watchWaits`.
      */
-    function watchTurns(ctx) {
+    function watchTurns(ctx, count) {
       var running = Object.create(null);
 
       var read = (announce) => {
         var list = ctx.sessions.list.getSnapshot();
         var seen = Object.create(null);
+        var busy = 0;
 
         for (var id of list.ids) {
           var summary = list.byId[id];
           if (!summary) continue;
           seen[id] = true;
+          if (summary.running === true) busy += 1;
           var was = running[id];
           running[id] = summary.running;
           if (announce && was === true && summary.running === false && summary.origin !== 'subagent') {
@@ -433,6 +450,9 @@ window.__ModuleLoader__.load({
         for (var known of Object.keys(running)) {
           if (!seen[known]) delete running[known];
         }
+
+        // The baseline included: a page that loads mid-turn still shows busy.
+        count(busy);
       };
 
       read(false);
@@ -477,15 +497,17 @@ window.__ModuleLoader__.load({
      * request must use a new key, so a key change is a new question even when
      * the session never stopped waiting.
      */
-    function watchWaits(source) {
+    function watchWaits(source, count) {
       var keys = Object.create(null);
 
       var read = (announce) => {
         var snapshot = source.getSnapshot();
         var seen = Object.create(null);
+        var waiting = 0;
 
         for (var [id, pending] of snapshot) {
           seen[id] = true;
+          waiting += 1;
           if (keys[id] === pending.key) continue;
           keys[id] = pending.key;
           if (announce) {
@@ -518,6 +540,8 @@ window.__ModuleLoader__.load({
           delete keys[known];
           if (announce) send({ event: 'wait-over', session: known });
         }
+
+        count(waiting);
       };
 
       read(false);
