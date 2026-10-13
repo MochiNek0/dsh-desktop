@@ -12,7 +12,8 @@
  * and `completed` per session, and `ctx.uiSession.pendingInteractions` is the
  * live map of what each session is waiting on — keyed by session id, with the
  * carrier itself as the value, so the same object that says a question is
- * pending is the object that can answer it.
+ * pending is the object that can answer it. (dsh 0.2 moved that map into
+ * `uiSession.sessionStatus`; see `pendingOf`.)
  *
  * ## Not a module bundle
  *
@@ -250,8 +251,8 @@ window.__ModuleLoader__.load({
       // this scope simply never runs; see the note at the top of the file.
       ctx.inject(['uiSession'], (scope) => {
         scope.effect(() => {
-          waits = scope.uiSession.pendingInteractions;
-          var stop = watchWaits(scope);
+          waits = pendingOf(scope.uiSession);
+          var stop = watchWaits(waits);
           return () => {
             waits = null;
             stop();
@@ -439,14 +440,44 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * What each session is waiting on, as a source of a map from session id to
+     * carrier.
+     *
+     * dsh 0.1 published exactly that as `uiSession.pendingInteractions`. dsh
+     * 0.2 dropped it and folded the carrier into `uiSession.sessionStatus`, one
+     * row per session with the carrier as `pendingInteraction`, so the map is
+     * rebuilt from that — once per status snapshot, which is a new object only
+     * when something in it changed. The carrier is the same object in both.
+     */
+    function pendingOf(uiSession) {
+      if (uiSession.pendingInteractions) return uiSession.pendingInteractions;
+      var status = uiSession.sessionStatus;
+      var from = null;
+      var map = new Map();
+      return {
+        getSnapshot: () => {
+          var snapshot = status.getSnapshot();
+          if (snapshot !== from) {
+            from = snapshot;
+            map = new Map();
+            for (var [id, row] of snapshot) {
+              if (row && row.pendingInteraction) map.set(id, row.pendingInteraction);
+            }
+          }
+          return map;
+        },
+        subscribe: (listener) => status.subscribe(listener),
+      };
+    }
+
+    /**
      * What each session is waiting on, as the pending-interaction map changes.
      *
      * Keyed by the request's own `key` rather than by presence: a replacement
      * request must use a new key, so a key change is a new question even when
      * the session never stopped waiting.
      */
-    function watchWaits(ctx) {
-      var source = ctx.uiSession.pendingInteractions;
+    function watchWaits(source) {
       var keys = Object.create(null);
 
       var read = (announce) => {

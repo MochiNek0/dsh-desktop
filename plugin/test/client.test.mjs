@@ -45,6 +45,9 @@ function load({ host }) {
 // runs a scope whose injected service is missing, and this stub's `inject` does
 // the same rather than pretending the service is there.
 function services({ uiSession = true, folders = null } = {}) {
+  // `uiSession: 'status'` is dsh 0.2, which has no `pendingInteractions` and
+  // carries the same carriers as `pendingInteraction` on `sessionStatus` rows.
+  // `setPending` takes the same map either way.
   let list = { ids: [], byId: {} };
   let pending = new Map();
   const listeners = { list: [], pending: [] };
@@ -79,7 +82,14 @@ function services({ uiSession = true, folders = null } = {}) {
     };
     ctx.uiWorkspace = { openWorkspace: folders.openWorkspace };
   }
-  if (uiSession) {
+  if (uiSession === 'status') {
+    ctx.uiSession = {
+      sessionStatus: {
+        getSnapshot: () => new Map([...pending].map(([id, carrier]) => [id, { running: true, pendingInteraction: carrier, completionUnread: false }])),
+        subscribe: (fn) => { listeners.pending.push(fn); return () => {}; },
+      },
+    };
+  } else if (uiSession) {
     ctx.uiSession = {
       pendingInteractions: {
         getSnapshot: () => pending,
@@ -573,6 +583,30 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   assert.equal(sent.length, 1);
   assert.equal(query(sent[0]).event, 'folder-failed');
   console.log('ok  says so when a folder arrives with nothing to open it');
+}
+
+// --- dsh 0.2: the waits are on `sessionStatus` ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const s = services({ uiSession: 'status' });
+  exports.apply(s.ctx);
+  const approval = carrier({ kind: 'approval', key: 'approval:1', toolName: 'bash' });
+  s.setPending(new Map([['a', approval]]));
+  await drain();
+  const wait = sent.map(query).find((p) => p.event === 'wait');
+  assert.ok(wait, 'a wait on a 0.2 dsh is announced');
+  assert.equal(wait.key, 'approval:1');
+  assert.equal(wait.tool, 'bash');
+
+  // And a press reaches the same carrier.
+  window.__dshSignals.answer('a', 'approval:1', 'allow');
+  await drain();
+  assert.deepEqual(approval.calls, [['answer', 'allowed-once']]);
+
+  s.setPending(new Map());
+  await drain();
+  assert.equal(query(sent.at(-1)).event, 'wait-over');
+  console.log('ok  reads waits off sessionStatus on dsh 0.2');
 }
 
 // --- recent workspaces, for the shell's tray ---
