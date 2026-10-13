@@ -271,6 +271,64 @@ window.__ModuleLoader__.load({
           };
         }, 'dsh-desktop-signal: folders opened from the desktop shell');
       });
+
+      // The workspaces the shell lists in its tray menu. `sessions` is what
+      // says which were used last; see `watchRecent`.
+      ctx.inject(['workspaces', 'sessions'], (scope) => {
+        scope.effect(() => watchRecent(scope), 'dsh-desktop-signal: recent workspaces to the desktop shell');
+      });
+    }
+
+    /** How many workspaces the shell is told about. */
+    var RECENT = 5;
+
+    /**
+     * The most recently used workspaces, as their list or their sessions
+     * change.
+     *
+     * A workspace has no last-used time of its own — its `updatedAt` moves on
+     * a rename or a reorder, not on use — so it is ranked by the newest
+     * `updatedAt` among its sessions, which dsh moves on every message. The
+     * workspace's own time stands in when none of its sessions is in the list.
+     * Sent only when the titles, paths or their order change: the session list
+     * moves on every message of a running turn.
+     */
+    function watchRecent(ctx) {
+      var last = null;
+
+      var read = () => {
+        var byId = ctx.sessions.list.getSnapshot().byId;
+        var recent = ctx.workspaces.list.getSnapshot().items
+          .map((workspace) => {
+            var at = Date.parse(workspace.updatedAt) || 0;
+            for (var id of workspace.sessionIds) {
+              var summary = byId[id];
+              if (summary && summary.updatedAt > at) at = summary.updatedAt;
+            }
+            return { workspace: workspace, at: at };
+          })
+          .sort((a, b) => b.at - a.at)
+          .slice(0, RECENT)
+          .map((row) => row.workspace);
+
+        var line = JSON.stringify(recent.map((workspace) => [workspace.title, workspace.path]));
+        if (line === last) return;
+        last = line;
+        // Two repeated keys in step, the way a question's options travel.
+        send({
+          event: 'recent',
+          title: recent.map((workspace) => workspace.title),
+          path: recent.map((workspace) => workspace.path),
+        });
+      };
+
+      read();
+      var stopWorkspaces = ctx.workspaces.list.subscribe(read);
+      var stopSessions = ctx.sessions.list.subscribe(read);
+      return () => {
+        stopWorkspaces();
+        stopSessions();
+      };
     }
 
     /**

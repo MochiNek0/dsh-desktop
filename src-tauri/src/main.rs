@@ -16,6 +16,7 @@ mod memory;
 mod notify;
 mod panel;
 mod plugins;
+mod recent;
 mod remote;
 mod server;
 mod settings;
@@ -30,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, RwLock};
 use std::time::{Duration, Instant};
 
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -144,6 +145,8 @@ fn main() {
             let splash = Splash::default();
             let auth = auth::Retry::default();
             let visible = !std::env::args().any(|argument| argument == AUTOSTART_FLAG);
+
+            recent::init(app.handle());
 
             // The window comes up first now: the update check runs behind it and
             // can put a question and a progress bar on the loading page, neither
@@ -482,6 +485,32 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     )?;
     let quit = MenuItem::with_id(app, "quit", t!("退出 dsh", "Quit dsh"), true, None::<&str>)?;
 
+    // The workspaces used last, above the two standing items, so that the
+    // usual click is the first row. A heading rather than a submenu: one
+    // level deep is the whole point of having them here. Nothing at all until
+    // the plugin has reported — see [`recent`].
+    let mut items: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = Vec::new();
+    let recent = recent::list();
+    if !recent.is_empty() {
+        items.push(Box::new(MenuItem::with_id(
+            app,
+            "recent",
+            t!("最近工作区", "Recent workspaces"),
+            false,
+            None::<&str>,
+        )?));
+        for (index, workspace) in recent.iter().enumerate() {
+            items.push(Box::new(MenuItem::with_id(
+                app,
+                format!("recent:{index}"),
+                recent::label(&workspace.title),
+                true,
+                None::<&str>,
+            )?));
+        }
+        items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    }
+
     // The standing indication the specification asks for, and the third and
     // fourth items this menu has ever had. They are here rather than only on
     // the card because the card is a thing you have to go and open: a tunnel
@@ -493,7 +522,9 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     // clicks. The first is disabled — it is a label, and a label you can press
     // is a button that does nothing.
     let Some(host) = remote::exposed(app) else {
-        return Menu::with_items(app, &[&show, &quit]);
+        items.push(Box::new(show));
+        items.push(Box::new(quit));
+        return Menu::with_items(app, &refs(&items));
     };
 
     let warning = MenuItem::with_id(
@@ -511,7 +542,16 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         None::<&str>,
     )?;
 
-    Menu::with_items(app, &[&warning, &close, &show, &quit])
+    let mut all: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = vec![Box::new(warning), Box::new(close)];
+    all.append(&mut items);
+    all.push(Box::new(show));
+    all.push(Box::new(quit));
+    Menu::with_items(app, &refs(&all))
+}
+
+/// The shape `Menu::with_items` takes.
+fn refs(items: &[Box<dyn IsMenuItem<tauri::Wry>>]) -> Vec<&dyn IsMenuItem<tauri::Wry>> {
+    items.iter().map(|item| item.as_ref()).collect()
 }
 
 /// Draw the tray again, because what it says may have changed.
@@ -612,7 +652,11 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             // Exits the run loop, which stops the dsh server on the way out.
             "quit" => app.exit(0),
             "public-off" => remote::stop_public(app),
-            _ => {}
+            id => {
+                if let Some(index) = id.strip_prefix("recent:").and_then(|at| at.parse().ok()) {
+                    recent::open(app, index);
+                }
+            }
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {

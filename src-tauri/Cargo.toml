@@ -88,6 +88,19 @@ libc = "0.2"
 # cast to `ICoreWebView2_19` is a cast between two unrelated types.
 webview2-com = "0.38"
 windows-core = "0.61"
+# The jump list and the AppUserModelID it is filed under; see `recent`. Already
+# in the tree under webview2-com at this version, so what is new is the
+# features: the shell's COM interfaces, and the property store that titles a
+# jump-list row.
+windows = { version = "0.61", features = [
+    "Win32_Storage_EnhancedStorage",       # PKEY_Title
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",  # PROPVARIANT
+    "Win32_System_Variant",                # VT_LPWSTR
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",               # IObjectArray, IObjectCollection
+    "Win32_UI_Shell_PropertiesSystem",     # IPropertyStore
+] }
 # Job objects: the kernel-side backstop that kills the dsh process tree when the
 # app dies without running its own shutdown. See `server::Job`.
 windows-sys = { version = "0.61", features = [

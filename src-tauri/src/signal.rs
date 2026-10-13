@@ -106,6 +106,8 @@ pub enum Signal {
     FolderOpened,
     /// dsh would not take it, and why.
     FolderFailed { reason: String },
+    /// The workspaces used last, most recent first; see [`crate::recent`].
+    Recent(Vec<crate::recent::Workspace>),
 }
 
 /// Read a `dsh-window://signal` navigation. `None` for a query this build has
@@ -119,6 +121,8 @@ pub fn received(url: &Url) -> Option<Signal> {
     let mut options = Vec::new();
     let mut tool = String::new();
     let mut reason = String::new();
+    let mut titles = Vec::new();
+    let mut paths = Vec::new();
 
     for (name, value) in url.query_pairs() {
         match name.as_ref() {
@@ -140,6 +144,10 @@ pub fn received(url: &Url) -> Option<Signal> {
             // by count as well — a toast has room for two, and the rest would
             // only be buttons nobody drew.
             "option" if options.len() < BUTTONS => options.push(clamp(&value)),
+            // A recent workspace's two halves, repeated in step. A path is not
+            // clamped: cut, it would name some other folder.
+            "title" if titles.len() < crate::recent::LIMIT => titles.push(clamp(&value)),
+            "path" if paths.len() < crate::recent::LIMIT => paths.push(value.trim().to_string()),
             _ => {}
         }
     }
@@ -150,6 +158,18 @@ pub fn received(url: &Url) -> Option<Signal> {
         "folder-ready" => return Some(Signal::FolderReady),
         "folder-opened" => return Some(Signal::FolderOpened),
         "folder-failed" => return Some(Signal::FolderFailed { reason }),
+        // A row with no path has nowhere to go, and a list whose halves do not
+        // pair up cannot be trusted to pair the right ones.
+        "recent" if titles.len() == paths.len() => {
+            let list = titles
+                .into_iter()
+                .zip(paths)
+                .filter(|(_, path)| !path.is_empty())
+                .map(|(title, path)| crate::recent::Workspace { title, path })
+                .collect();
+            return Some(Signal::Recent(list));
+        }
+        "recent" => return None,
         _ => {}
     }
 
@@ -234,6 +254,7 @@ pub fn act(app: &AppHandle, signal: Signal) {
         Signal::FolderReady => crate::folder::ready(app),
         Signal::FolderOpened => crate::folder::opened(),
         Signal::FolderFailed { reason } => crate::folder::failed(app, &reason),
+        Signal::Recent(list) => crate::recent::set(app, list),
     }
 }
 
@@ -531,6 +552,29 @@ mod tests {
                 reason: "not a directory".into()
             })
         );
+    }
+
+    /// The plugin's own too: two lists in step.
+    #[test]
+    fn reads_the_recent_workspaces() {
+        use crate::recent::Workspace;
+
+        assert_eq!(
+            read("event=recent&title=dsh&title=R%26D&path=C%3A%5Cwork%5Cdsh&path=%2Fhome%2Fr%26d&n=1.2"),
+            Some(Signal::Recent(vec![
+                Workspace {
+                    title: "dsh".into(),
+                    path: r"C:\work\dsh".into()
+                },
+                Workspace {
+                    title: "R&D".into(),
+                    path: "/home/r&d".into()
+                },
+            ]))
+        );
+        // No workspaces is a list too, and it empties the menu.
+        assert_eq!(read("event=recent&n=1.2"), Some(Signal::Recent(vec![])));
+        assert_eq!(read("event=recent&title=a&title=b&path=%2Fa"), None, "halves that do not pair");
     }
 
     #[test]
