@@ -408,9 +408,17 @@ fn bundled(app: &AppHandle, name: &str) -> Option<PathBuf> {
 ///
 /// Nothing to quote anywhere else: off Windows there is no shell in the path,
 /// and a quote would become part of the filename.
+///
+/// And not even on Windows unless there is a space to protect. dsh 0.2 hands
+/// pnpm its arguments through `execa` without a shell, so a quote is no longer
+/// eaten on the way: it arrives as part of the spec, which then reads as a
+/// relative path — `profiles\web\"C:\…"` — and the install finds nothing
+/// there. The staged copy lives under `$DSH_HOME` rather than Program Files
+/// now, so the path has a space only where the user's home does, and that one
+/// case still needs the quotes on an older dsh and still breaks on a newer one.
 fn local_spec(dir: &Path) -> String {
     let path = dir.display().to_string();
-    if cfg!(windows) {
+    if cfg!(windows) && path.contains(char::is_whitespace) {
         format!("\"{path}\"")
     } else {
         path
@@ -3324,7 +3332,8 @@ mod tests {
         assert!(!holding("null"), "no profile at all signals nothing");
     }
 
-    /// A path handed to pnpm on Windows arrives quoted, and nowhere else does.
+    /// A path with a space handed to pnpm on Windows arrives quoted, and
+    /// nowhere else does.
     ///
     /// The reasoning is in [`super::local_spec`]; this is the part that would
     /// silently stop being true. An unquoted path through Program Files does
@@ -3342,6 +3351,23 @@ mod tests {
         } else {
             assert!(!quoted.contains('"'), "{quoted}");
         }
+    }
+
+    /// Without a space there is nothing to protect, and a quote would reach a
+    /// dsh that runs pnpm without a shell as part of the path.
+    #[test]
+    fn a_local_path_without_a_space_goes_bare() {
+        let path = [
+            "C:",
+            "Users",
+            "me",
+            ".dsh",
+            ".dsh-desktop",
+            "bundled",
+            "plugin",
+        ]
+        .join(std::path::MAIN_SEPARATOR_STR);
+        assert_eq!(local_spec(Path::new(&path)), path);
     }
 
     /// [`super::copy_tree`] is what `stage_bundled` walks a plugin directory

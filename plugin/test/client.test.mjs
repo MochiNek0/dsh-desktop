@@ -12,12 +12,23 @@ import assert from 'node:assert/strict';
 
 const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
 
+// `status` and `recent` are kept apart from everything else the plugin sends:
+// they go out on every change to the counts and the workspace list, and most
+// checks here count the events they are about.
 function load({ host }) {
   const sent = [];
+  const statuses = [];
+  const recents = [];
   let registered = null;
   const window = {
     __ModuleLoader__: { load: (row) => { registered = row; } },
-    location: { set href(value) { sent.push(value); }, get href() { return ''; } },
+    location: {
+      set href(value) {
+        const event = new URL(value).searchParams.get('event');
+        (event === 'status' ? statuses : event === 'recent' ? recents : sent).push(value);
+      },
+      get href() { return ''; },
+    },
   };
   if (host) window.__DSH_VERSION__ = '0.1.13';
   const context = vm.createContext({ window, setTimeout, console });
@@ -25,7 +36,7 @@ function load({ host }) {
   assert.ok(registered, 'the bundle should register a factory');
   assert.equal(registered.id, 'dsh-desktop-signal');
   const exports = registered.factory(() => { throw new Error('should require nothing'); });
-  return { exports, sent, window };
+  return { exports, sent, statuses, recents, window };
 }
 
 // Stub services with hand-driven snapshots.
@@ -34,7 +45,10 @@ function load({ host }) {
 // service — the shape issue #11's follow-up reported from macOS. Cordis never
 // runs a scope whose injected service is missing, and this stub's `inject` does
 // the same rather than pretending the service is there.
-function services({ uiSession = true } = {}) {
+function services({ uiSession = true, folders = null } = {}) {
+  // `uiSession: 'status'` is dsh 0.2, which has no `pendingInteractions` and
+  // carries the same carriers as `pendingInteraction` on `sessionStatus` rows.
+  // `setPending` takes the same map either way.
   let list = { ids: [], byId: {} };
   let pending = new Map();
   const listeners = { list: [], pending: [] };
@@ -55,7 +69,28 @@ function services({ uiSession = true } = {}) {
       open: (id) => { opened.push(id); },
     },
   };
-  if (uiSession) {
+  // The two services a folder needs. Off unless a test asks, which is also the
+  // dsh that predates them: their scope never runs, and nothing is announced.
+  let workspaces = { items: [] };
+  const workspaceListeners = [];
+  if (folders) {
+    ctx.workspaces = {
+      create: folders.create,
+      list: {
+        getSnapshot: () => workspaces,
+        subscribe: (fn) => { workspaceListeners.push(fn); return () => {}; },
+      },
+    };
+    ctx.uiWorkspace = { openWorkspace: folders.openWorkspace };
+  }
+  if (uiSession === 'status') {
+    ctx.uiSession = {
+      sessionStatus: {
+        getSnapshot: () => new Map([...pending].map(([id, carrier]) => [id, { running: true, pendingInteraction: carrier, completionUnread: false }])),
+        subscribe: (fn) => { listeners.pending.push(fn); return () => {}; },
+      },
+    };
+  } else if (uiSession) {
     ctx.uiSession = {
       pendingInteractions: {
         getSnapshot: () => pending,
@@ -69,6 +104,7 @@ function services({ uiSession = true } = {}) {
     ctx,
     setList(next) { list = next; listeners.list.forEach((fn) => fn()); },
     setPending(next) { pending = next; listeners.pending.forEach((fn) => fn()); },
+    setWorkspaces(items) { workspaces = { items }; workspaceListeners.forEach((fn) => fn()); },
   };
 }
 
@@ -487,6 +523,158 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   said = await stale('a', 'k3', 'allow');
   assert.equal(said.event, 'stale');
   console.log('ok  reports a press it could not submit instead of swallowing it');
+}
+
+// --- a folder from outside ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const created = [];
+  const opened = [];
+  const s = services({
+    folders: {
+      create: (input) => {
+        created.push(input.path);
+        return Promise.resolve({ workspaceId: 'w1' });
+      },
+      openWorkspace: (id) => { opened.push(id); return Promise.resolve(); },
+    },
+  });
+  exports.apply(s.ctx);
+  await drain();
+  // The shell holds a launch's folder until this arrives.
+  assert.equal(sent.length, 1);
+  assert.equal(query(sent[0]).event, 'folder-ready');
+
+  window.__dshSignals.openFolder('C:\work\demo');
+  await drain();
+  assert.deepEqual(created, ['C:\work\demo']);
+  assert.deepEqual(opened, ['w1']);
+  assert.equal(query(sent[1]).event, 'folder-opened');
+  assert.equal(sent.length, 2, 'an opened folder is not also reported as failed');
+  console.log('ok  opens a folder as a workspace once dsh can');
+}
+
+// --- a folder dsh will not take ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const opened = [];
+  const s = services({
+    folders: {
+      create: () => Promise.reject(new Error('not a directory')),
+      openWorkspace: (id) => { opened.push(id); return Promise.resolve(); },
+    },
+  });
+  exports.apply(s.ctx);
+  window.__dshSignals.openFolder('/nope');
+  await drain();
+  const failed = sent.map(query).find((params) => params.event === 'folder-failed');
+  assert.ok(failed, 'a refusal is reported, not swallowed');
+  assert.equal(failed.reason, 'not a directory');
+  assert.deepEqual(opened, []);
+  console.log('ok  reports a folder dsh refused');
+}
+
+// --- a folder before dsh has workspaces ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const s = services();
+  exports.apply(s.ctx);
+  window.__dshSignals.openFolder('/somewhere');
+  await drain();
+  assert.equal(sent.length, 1);
+  assert.equal(query(sent[0]).event, 'folder-failed');
+  console.log('ok  says so when a folder arrives with nothing to open it');
+}
+
+// --- how busy dsh is, for the shell's icons ---
+{
+  const { exports, statuses } = load({ host: true });
+  const s = services();
+  // Loaded mid-turn: the baseline counts too, unlike a turn ending.
+  s.setList({ ids: ['a', 'b'], byId: { a: { running: true }, b: { running: false } } });
+  exports.apply(s.ctx);
+  await drain();
+  assert.deepEqual(statuses.map(query).map((p) => [p.running, p.waiting]), [['1', '0']]);
+
+  // A repeat of the same counts says nothing.
+  s.setList({ ids: ['a', 'b'], byId: { a: { running: true }, b: { running: false } } });
+  s.setPending(new Map([['a', carrier({ kind: 'approval', key: 'k1' })]]));
+  s.setList({ ids: ['a', 'b'], byId: { a: { running: false }, b: { running: false } } });
+  await drain();
+  assert.deepEqual(
+    statuses.map(query).map((p) => [p.running, p.waiting]),
+    [['1', '0'], ['1', '1'], ['0', '1']],
+  );
+
+  // A scope going away takes its count with it.
+  s.stop();
+  await drain();
+  assert.deepEqual(statuses.map(query).map((p) => [p.running, p.waiting]).at(-1), ['0', '0']);
+  console.log('ok  reports how many sessions are running and waiting');
+}
+
+// --- dsh 0.2: the waits are on `sessionStatus` ---
+{
+  const { exports, sent, statuses, window } = load({ host: true });
+  const s = services({ uiSession: 'status' });
+  exports.apply(s.ctx);
+  const approval = carrier({ kind: 'approval', key: 'approval:1', toolName: 'bash' });
+  s.setPending(new Map([['a', approval]]));
+  await drain();
+  const wait = sent.map(query).find((p) => p.event === 'wait');
+  assert.ok(wait, 'a wait on a 0.2 dsh is announced');
+  assert.equal(wait.key, 'approval:1');
+  assert.equal(wait.tool, 'bash');
+  assert.equal(query(statuses.at(-1)).waiting, '1');
+
+  // And a press reaches the same carrier.
+  window.__dshSignals.answer('a', 'approval:1', 'allow');
+  await drain();
+  assert.deepEqual(approval.calls, [['answer', 'allowed-once']]);
+
+  s.setPending(new Map());
+  await drain();
+  assert.equal(query(sent.at(-1)).event, 'wait-over');
+  assert.equal(query(statuses.at(-1)).waiting, '0');
+  console.log('ok  reads waits off sessionStatus on dsh 0.2');
+}
+
+// --- recent workspaces, for the shell's tray ---
+{
+  const { exports, recents } = load({ host: true });
+  const s = services({ folders: { create: () => Promise.reject(), openWorkspace: () => {} } });
+  const ws = (id, title, updatedAt, sessionIds = []) =>
+    ({ workspaceId: id, title, path: '/' + id, updatedAt, sessionIds });
+  s.setList({
+    ids: ['s1', 's2'],
+    byId: { s1: { running: false, updatedAt: Date.parse('2026-01-05') }, s2: { running: false, updatedAt: Date.parse('2026-01-02') } },
+  });
+  s.setWorkspaces([
+    ws('w1', 'Old', '2026-01-01T00:00:00Z', ['s2']),
+    ws('w2', 'Used', '2026-01-01T00:00:00Z', ['s1']),
+    ws('w3', 'Renamed & new', '2026-01-04T00:00:00Z'),
+  ]);
+  exports.apply(s.ctx);
+  await drain();
+  assert.equal(recents.length, 1);
+  // Ranked by the newest session, and the workspace's own time when it has none.
+  assert.deepEqual(queryAll(recents[0], 'title'), ['Used', 'Renamed & new', 'Old']);
+  assert.deepEqual(queryAll(recents[0], 'path'), ['/w2', '/w3', '/w1']);
+
+  // A session moving without changing the order says nothing.
+  s.setList({
+    ids: ['s1', 's2'],
+    byId: { s1: { running: true, updatedAt: Date.parse('2026-01-06') }, s2: { running: false, updatedAt: Date.parse('2026-01-02') } },
+  });
+  await drain();
+  assert.equal(recents.length, 1, 'the same list should not be sent again');
+
+  // Only the first few.
+  s.setWorkspaces(Array.from({ length: 8 }, (_, i) => ws('x' + i, 'X' + i, `2026-02-0${i + 1}T00:00:00Z`)));
+  await drain();
+  assert.equal(recents.length, 2);
+  assert.deepEqual(queryAll(recents[1], 'title'), ['X7', 'X6', 'X5', 'X4', 'X3']);
+  console.log('ok  reports the most recently used workspaces');
 }
 
 // --- no desktop shell: no door either ---

@@ -12,7 +12,8 @@
  * and `completed` per session, and `ctx.uiSession.pendingInteractions` is the
  * live map of what each session is waiting on — keyed by session id, with the
  * carrier itself as the value, so the same object that says a question is
- * pending is the object that can answer it.
+ * pending is the object that can answer it. (dsh 0.2 moved that map into
+ * `uiSession.sessionStatus`; see `pendingOf`.)
  *
  * ## Not a module bundle
  *
@@ -27,12 +28,14 @@
  * ## The door the other way
  *
  * One global, `window.__dshSignals`, set while the plugin is wired up. The
- * shell calls two things on it. `open(id)` is how a click on a notification
+ * shell calls three things on it. `open(id)` is how a click on a notification
  * gets back to the session the notification was about — `ctx.sessions.open` is
  * dsh's own way to switch the current session. `answer(id, key, choice)` is
  * how a press on one of that notification's buttons reaches the request it
  * answers, which is the same carrier the snapshot above reported: the object
  * that says a question is pending is the object that answers it.
+ * `openFolder(path)` is how a folder handed to the app from outside becomes a
+ * workspace on screen, through dsh's own `workspaces` and `uiWorkspace`.
  *
  * Removed again on teardown, so a click that arrives after the plugin was
  * disabled finds nothing rather than half of something — the shell guards
@@ -163,6 +166,20 @@ window.__ModuleLoader__.load({
       // is required here.
       var sessions = null;
       var waits = null;
+      var folders = null;
+
+      // How many sessions are mid-turn and how many are waiting on the user,
+      // for the shell's icons. Each half fills in its own count and goes back
+      // to zero when its scope goes; only a change is sent.
+      var counts = { running: 0, waiting: 0 };
+      var reported = null;
+      var report = (name, count) => {
+        counts[name] = count;
+        var line = counts.running + '/' + counts.waiting;
+        if (line === reported) return;
+        reported = line;
+        send({ event: 'status', running: String(counts.running), waiting: String(counts.waiting) });
+      };
 
       ctx.effect(() => {
         window.__dshSignals = {
@@ -198,6 +215,32 @@ window.__ModuleLoader__.load({
             }
             stale();
           },
+          /**
+           * Open a folder as a workspace and switch to it, for a folder handed
+           * to the shell from outside — `dsh-desktop <path>`. Called from the
+           * shell over `window.eval`, and only after `folder-ready`; see its
+           * folder.rs.
+           *
+           * @param {string} path - absolute directory path.
+           */
+          openFolder: (path) => {
+            var failed = (error) => send({
+              event: 'folder-failed',
+              reason: (error && error.message) || String(error),
+            });
+            if (!folders) return failed('not ready');
+            var current = folders;
+            // `create` adopts an existing workspace for the same directory
+            // rather than adding a second one, merges the row into the list
+            // before it resolves with it, and throws when dsh refuses — so
+            // `openWorkspace` can find it at once. `openWorkspace` is the
+            // sidebar's own: it reuses a blank session in that workspace or
+            // starts one, and says itself when it fails.
+            current.workspaces.create({ path: path }).then((workspace) => {
+              send({ event: 'folder-opened' });
+              return current.uiWorkspace.openWorkspace(workspace.workspaceId);
+            }, failed).catch(() => {});
+          },
         };
         return () => {
           delete window.__dshSignals;
@@ -208,10 +251,11 @@ window.__ModuleLoader__.load({
       ctx.inject(['sessions'], (scope) => {
         scope.effect(() => {
           sessions = scope.sessions;
-          var stop = watchTurns(scope);
+          var stop = watchTurns(scope, (count) => report('running', count));
           return () => {
             sessions = null;
             stop();
+            report('running', 0);
           };
         }, 'dsh-desktop-signal: turn endings to the desktop shell');
       });
@@ -221,14 +265,86 @@ window.__ModuleLoader__.load({
       // this scope simply never runs; see the note at the top of the file.
       ctx.inject(['uiSession'], (scope) => {
         scope.effect(() => {
-          waits = scope.uiSession.pendingInteractions;
-          var stop = watchWaits(scope);
+          waits = pendingOf(scope.uiSession);
+          var stop = watchWaits(waits, (count) => report('waiting', count));
           return () => {
             waits = null;
             stop();
+            report('waiting', 0);
           };
         }, 'dsh-desktop-signal: pending questions to the desktop shell');
       });
+
+      // A folder opened from outside. `ready` is what tells the shell it can
+      // hand one over: a folder that arrives with the launch has to wait for
+      // this, and so does one that arrives while dsh restarts.
+      ctx.inject(['workspaces', 'uiWorkspace'], (scope) => {
+        scope.effect(() => {
+          folders = { workspaces: scope.workspaces, uiWorkspace: scope.uiWorkspace };
+          send({ event: 'folder-ready' });
+          return () => {
+            folders = null;
+          };
+        }, 'dsh-desktop-signal: folders opened from the desktop shell');
+      });
+
+      // The workspaces the shell lists in its tray menu. `sessions` is what
+      // says which were used last; see `watchRecent`.
+      ctx.inject(['workspaces', 'sessions'], (scope) => {
+        scope.effect(() => watchRecent(scope), 'dsh-desktop-signal: recent workspaces to the desktop shell');
+      });
+    }
+
+    /** How many workspaces the shell is told about. */
+    var RECENT = 5;
+
+    /**
+     * The most recently used workspaces, as their list or their sessions
+     * change.
+     *
+     * A workspace has no last-used time of its own — its `updatedAt` moves on
+     * a rename or a reorder, not on use — so it is ranked by the newest
+     * `updatedAt` among its sessions, which dsh moves on every message. The
+     * workspace's own time stands in when none of its sessions is in the list.
+     * Sent only when the titles, paths or their order change: the session list
+     * moves on every message of a running turn.
+     */
+    function watchRecent(ctx) {
+      var last = null;
+
+      var read = () => {
+        var byId = ctx.sessions.list.getSnapshot().byId;
+        var recent = ctx.workspaces.list.getSnapshot().items
+          .map((workspace) => {
+            var at = Date.parse(workspace.updatedAt) || 0;
+            for (var id of workspace.sessionIds) {
+              var summary = byId[id];
+              if (summary && summary.updatedAt > at) at = summary.updatedAt;
+            }
+            return { workspace: workspace, at: at };
+          })
+          .sort((a, b) => b.at - a.at)
+          .slice(0, RECENT)
+          .map((row) => row.workspace);
+
+        var line = JSON.stringify(recent.map((workspace) => [workspace.title, workspace.path]));
+        if (line === last) return;
+        last = line;
+        // Two repeated keys in step, the way a question's options travel.
+        send({
+          event: 'recent',
+          title: recent.map((workspace) => workspace.title),
+          path: recent.map((workspace) => workspace.path),
+        });
+      };
+
+      read();
+      var stopWorkspaces = ctx.workspaces.list.subscribe(read);
+      var stopSessions = ctx.sessions.list.subscribe(read);
+      return () => {
+        stopWorkspaces();
+        stopSessions();
+      };
     }
 
     /**
@@ -309,17 +425,19 @@ window.__ModuleLoader__.load({
      * first appears, because dsh can fill it in after the first snapshot. A
      * subagent that stops to ask something still does — see `watchWaits`.
      */
-    function watchTurns(ctx) {
+    function watchTurns(ctx, count) {
       var running = Object.create(null);
 
       var read = (announce) => {
         var list = ctx.sessions.list.getSnapshot();
         var seen = Object.create(null);
+        var busy = 0;
 
         for (var id of list.ids) {
           var summary = list.byId[id];
           if (!summary) continue;
           seen[id] = true;
+          if (summary.running === true) busy += 1;
           var was = running[id];
           running[id] = summary.running;
           if (announce && was === true && summary.running === false && summary.origin !== 'subagent') {
@@ -332,10 +450,44 @@ window.__ModuleLoader__.load({
         for (var known of Object.keys(running)) {
           if (!seen[known]) delete running[known];
         }
+
+        // The baseline included: a page that loads mid-turn still shows busy.
+        count(busy);
       };
 
       read(false);
       return ctx.sessions.list.subscribe(() => read(true));
+    }
+
+    /**
+     * What each session is waiting on, as a source of a map from session id to
+     * carrier.
+     *
+     * dsh 0.1 published exactly that as `uiSession.pendingInteractions`. dsh
+     * 0.2 dropped it and folded the carrier into `uiSession.sessionStatus`, one
+     * row per session with the carrier as `pendingInteraction`, so the map is
+     * rebuilt from that — once per status snapshot, which is a new object only
+     * when something in it changed. The carrier is the same object in both.
+     */
+    function pendingOf(uiSession) {
+      if (uiSession.pendingInteractions) return uiSession.pendingInteractions;
+      var status = uiSession.sessionStatus;
+      var from = null;
+      var map = new Map();
+      return {
+        getSnapshot: () => {
+          var snapshot = status.getSnapshot();
+          if (snapshot !== from) {
+            from = snapshot;
+            map = new Map();
+            for (var [id, row] of snapshot) {
+              if (row && row.pendingInteraction) map.set(id, row.pendingInteraction);
+            }
+          }
+          return map;
+        },
+        subscribe: (listener) => status.subscribe(listener),
+      };
     }
 
     /**
@@ -345,16 +497,17 @@ window.__ModuleLoader__.load({
      * request must use a new key, so a key change is a new question even when
      * the session never stopped waiting.
      */
-    function watchWaits(ctx) {
-      var source = ctx.uiSession.pendingInteractions;
+    function watchWaits(source, count) {
       var keys = Object.create(null);
 
       var read = (announce) => {
         var snapshot = source.getSnapshot();
         var seen = Object.create(null);
+        var waiting = 0;
 
         for (var [id, pending] of snapshot) {
           seen[id] = true;
+          waiting += 1;
           if (keys[id] === pending.key) continue;
           keys[id] = pending.key;
           if (announce) {
@@ -387,6 +540,8 @@ window.__ModuleLoader__.load({
           delete keys[known];
           if (announce) send({ event: 'wait-over', session: known });
         }
+
+        count(waiting);
       };
 
       read(false);

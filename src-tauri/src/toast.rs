@@ -335,24 +335,8 @@ fn press(response: &notify_rust::NotificationResponse) -> Option<Press<'_>> {
 #[allow(unused_variables)]
 fn identify(app: &AppHandle, notification: &mut notify_rust::Notification) {
     #[cfg(windows)]
-    {
-        use std::path::MAIN_SEPARATOR as SEP;
-
-        // The AUMID only resolves to a name and an icon through a Start Menu
-        // shortcut, which a build running straight out of `target` has not
-        // installed. Passing it anyway is what makes an uninstalled build's
-        // toast blank rather than merely mislabelled.
-        let Ok(exe) = tauri::utils::platform::current_exe() else {
-            return;
-        };
-        let Some(directory) = exe.parent().map(|path| path.display().to_string()) else {
-            return;
-        };
-        if !(directory.ends_with(&format!("{SEP}target{SEP}debug"))
-            || directory.ends_with(&format!("{SEP}target{SEP}release")))
-        {
-            notification.app_id(&app.config().identifier);
-        }
+    if let Some(id) = app_id(app) {
+        notification.app_id(&id);
     }
 
     #[cfg(target_os = "macos")]
@@ -366,6 +350,28 @@ fn identify(app: &AppHandle, notification: &mut notify_rust::Notification) {
             &app.config().identifier
         });
     }
+}
+
+/// The AppUserModelID this app is under, or `None` for a build running
+/// straight out of `target`.
+///
+/// The AUMID only resolves to a name and an icon through a Start Menu shortcut,
+/// which a build running straight out of `target` has not installed. Passing it
+/// anyway is what makes an uninstalled build's toast blank rather than merely
+/// mislabelled. The jump list takes the same id, so that it lands on the same
+/// taskbar button the shortcut's window does; see [`crate::recent`].
+#[cfg(windows)]
+pub(crate) fn app_id(app: &AppHandle) -> Option<String> {
+    use std::path::MAIN_SEPARATOR as SEP;
+
+    let exe = tauri::utils::platform::current_exe().ok()?;
+    let directory = exe.parent()?.display().to_string();
+    if directory.ends_with(&format!("{SEP}target{SEP}debug"))
+        || directory.ends_with(&format!("{SEP}target{SEP}release"))
+    {
+        return None;
+    }
+    Some(app.config().identifier.clone())
 }
 
 #[cfg(test)]

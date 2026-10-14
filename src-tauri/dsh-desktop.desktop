@@ -1,0 +1,15 @@
+# Tauri's own template for the .deb, plus the two lines that put the app under
+# "Open With" on a folder in a file manager: `%F` for the folder it was opened
+# on, `MimeType` for which. Set in `tauri.linux.conf.json`; see `folder.rs`.
+[Desktop Entry]
+Categories={{categories}}
+{{#if comment}}
+Comment={{comment}}
+{{/if}}
+Exec={{exec}} %F
+StartupWMClass={{exec}}
+Icon={{icon}}
+Name={{name}}
+Terminal=false
+Type=Application
+MimeType=inode/directory;

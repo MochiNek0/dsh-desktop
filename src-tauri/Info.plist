@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged by the Tauri bundler into the Info.plist it generates.
+
+  Lists the app as able to open folders, which is what makes the Dock icon take
+  a dropped folder and puts the app under "Open With" on a folder in Finder.
+  `Alternate` keeps Finder the default for a double-click. What arrives is a
+  `RunEvent::Opened`; see `main.rs`.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Folder</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.folder</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

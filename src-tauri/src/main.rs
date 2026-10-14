@@ -11,15 +11,20 @@ mod controls;
 mod cookies;
 mod dialog;
 mod dsh;
+mod folder;
 mod memory;
 mod notify;
 mod panel;
+mod placement;
 mod plugins;
+mod recent;
 mod remote;
 mod server;
 mod settings;
 mod setup;
+mod shortcut;
 mod signal;
+mod status;
 mod theme;
 mod toast;
 mod update;
@@ -29,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, RwLock};
 use std::time::{Duration, Instant};
 
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -122,11 +127,16 @@ fn main() {
         // First, before anything this process would otherwise start: a second
         // launch has to be turned away before it spawns a dsh of its own. What
         // the user meant by launching again is "show me the app", so the copy
-        // already running answers for it.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        // already running answers for it — and, when the launch named a
+        // folder, "open this in dsh"; see `folder`.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             reveal(app);
+            if let Some(dir) = folder::requested(&argv, std::path::Path::new(&cwd)) {
+                folder::open(app, dir);
+            }
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(shortcut::plugin())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -139,6 +149,8 @@ fn main() {
             let splash = Splash::default();
             let auth = auth::Retry::default();
             let visible = !std::env::args().any(|argument| argument == AUTOSTART_FLAG);
+
+            recent::init(app.handle());
 
             // The window comes up first now: the update check runs behind it and
             // can put a question and a progress bar on the loading page, neither
@@ -178,6 +190,17 @@ fn main() {
             remote::refresh_patch(app.handle(), false);
 
             build_tray(app.handle())?;
+            shortcut::init(app.handle());
+
+            // A folder this launch was asked to open waits in `folder` for dsh
+            // and the plugin to come up.
+            let args: Vec<String> = std::env::args().collect();
+            if let Some(dir) = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| folder::requested(&args, &cwd))
+            {
+                folder::open(app.handle(), dir);
+            }
 
             boot(app.handle().clone(), window, session);
 
@@ -195,9 +218,26 @@ fn main() {
         tauri::RunEvent::ExitRequested { code, api, .. } => {
             if remote::confirm_exit(handle, code) {
                 api.prevent_exit();
+            } else if let Some(window) = handle.get_webview_window("main") {
+                placement::save(handle, &window);
             }
         }
         tauri::RunEvent::Exit => shut_down(handle, &server),
+        // A folder dropped on the Dock icon or opened from Finder's "Open
+        // With", which `Info.plist` lists this app for. macOS hands it over as
+        // an event, not on the command line, whether or not the app was
+        // already running — and after `setup`, so the window is there.
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Opened { urls } => {
+            if let Some(dir) = urls
+                .iter()
+                .filter_map(|url| url.to_file_path().ok())
+                .find_map(|path| folder::folder_of(&path))
+            {
+                reveal(handle);
+                folder::open(handle, dir);
+            }
+        }
         _ => {}
     });
 }
@@ -250,15 +290,15 @@ fn build_window(
     let closer = app.clone();
     let new_window_opener = app.clone();
     let new_window_origin = origin.clone();
+    let page_origin = origin.clone();
 
     let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("dsh desktop")
         .inner_size(1360.0, 900.0)
         .min_inner_size(720.0, 520.0)
-        // The same place every launch. Restoring the last geometry meant the
-        // window was built here and moved afterwards, which is one jump across
-        // the screen in front of the user — and the only thing it bought was
-        // not having to move a window that opens where it can be seen anyway.
+        // The first launch, and any launch whose saved place is on no monitor.
+        // Every other one is moved to where it was before it is shown; see
+        // `placement`.
         .center()
         // Never at build time, even when this launch wants a window. WebView2
         // takes its default background from the options the controller is
@@ -337,18 +377,30 @@ fn build_window(
             }
             drop(first);
 
+            if payload.event() == PageLoadEvent::Started {
+                folder::page_started();
+                status::page_started(webview.app_handle());
+            }
+
             if payload.event() == PageLoadEvent::Finished {
+                let on_dsh = page_origin
+                    .read()
+                    .unwrap()
+                    .as_deref()
+                    .is_some_and(|ours| payload.url().origin().ascii_serialization() == ours);
+                folder::page_finished(webview.app_handle(), on_dsh);
                 splash.flush(&webview);
                 // The chrome was just drawn by a fresh document that has no way
                 // of knowing whether the window is maximised, the login item is
-                // on, notifications are, or this launch is running on no
-                // plugins — nothing resized to tell it, and nothing was
-                // toggled. Every navigation lands here, so every navigation
-                // gets all four.
+                // on, notifications are, this launch is running on no plugins,
+                // or which global shortcut took — nothing resized to tell it,
+                // and nothing was toggled. Every navigation lands here, so
+                // every navigation gets all five.
                 controls::sync(&webview);
                 controls::sync_autostart(webview.app_handle());
                 controls::sync_notify(webview.app_handle());
                 controls::sync_safe(webview.app_handle());
+                shortcut::sync(webview.app_handle());
                 // Last, and only where the page that just loaded is dsh
                 // refusing to serve one: it replaces the page.
                 auth.recover(&webview);
@@ -394,9 +446,13 @@ fn build_window(
         })
         .build()?;
 
+    // Where it was last time, while it is still hidden.
+    placement::restore(app, &window);
+
     // Before it is on screen: this is the call that reaches WebView2's default
     // background, and the window that would show the wrong one is not up yet.
     theme::background(&window, preference);
+    status_bar(&window);
     if visible {
         let _ = window.show();
     }
@@ -412,8 +468,7 @@ fn build_window(
         tauri::WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             if let Some(window) = closer.get_webview_window("main") {
-                let _ = window.hide();
-                memory::trim(&window);
+                park(&window);
             }
         }
         // The maximise button's glyph. A snap or a Win+Up never reaches the
@@ -438,7 +493,7 @@ fn build_window(
 }
 
 /// The tray icon's id, so [`switch_language`] can find it again.
-const TRAY: &str = "main";
+pub(crate) const TRAY: &str = "main";
 
 /// The two items in it, in the language of the moment.
 ///
@@ -456,6 +511,32 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     )?;
     let quit = MenuItem::with_id(app, "quit", t!("退出 dsh", "Quit dsh"), true, None::<&str>)?;
 
+    // The workspaces used last, above the two standing items, so that the
+    // usual click is the first row. A heading rather than a submenu: one
+    // level deep is the whole point of having them here. Nothing at all until
+    // the plugin has reported — see [`recent`].
+    let mut items: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = Vec::new();
+    let recent = recent::list();
+    if !recent.is_empty() {
+        items.push(Box::new(MenuItem::with_id(
+            app,
+            "recent",
+            t!("最近工作区", "Recent workspaces"),
+            false,
+            None::<&str>,
+        )?));
+        for (index, workspace) in recent.iter().enumerate() {
+            items.push(Box::new(MenuItem::with_id(
+                app,
+                format!("recent:{index}"),
+                recent::label(&workspace.title),
+                true,
+                None::<&str>,
+            )?));
+        }
+        items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    }
+
     // The standing indication the specification asks for, and the third and
     // fourth items this menu has ever had. They are here rather than only on
     // the card because the card is a thing you have to go and open: a tunnel
@@ -467,7 +548,9 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     // clicks. The first is disabled — it is a label, and a label you can press
     // is a button that does nothing.
     let Some(host) = remote::exposed(app) else {
-        return Menu::with_items(app, &[&show, &quit]);
+        items.push(Box::new(show));
+        items.push(Box::new(quit));
+        return Menu::with_items(app, &refs(&items));
     };
 
     let warning = MenuItem::with_id(
@@ -485,7 +568,16 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         None::<&str>,
     )?;
 
-    Menu::with_items(app, &[&warning, &close, &show, &quit])
+    let mut all: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = vec![Box::new(warning), Box::new(close)];
+    all.append(&mut items);
+    all.push(Box::new(show));
+    all.push(Box::new(quit));
+    Menu::with_items(app, &refs(&all))
+}
+
+/// The shape `Menu::with_items` takes.
+fn refs(items: &[Box<dyn IsMenuItem<tauri::Wry>>]) -> Vec<&dyn IsMenuItem<tauri::Wry>> {
+    items.iter().map(|item| item.as_ref()).collect()
 }
 
 /// Draw the tray again, because what it says may have changed.
@@ -505,16 +597,30 @@ pub(crate) fn refresh_tray(app: &tauri::AppHandle) {
         Err(error) => eprintln!("dsh-desktop: could not redraw the tray menu: {error}"),
     }
 
+    refresh_tooltip(app);
+}
+
+/// The tray's tooltip, for what it says may have changed: the tunnel, or what
+/// dsh is doing — see [`status`].
+pub(crate) fn refresh_tooltip(app: &tauri::AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY) else {
+        return;
+    };
+
     // The tooltip is the half that shows without a click, which on Windows is
     // the half a user actually meets.
-    let _ = tray.set_tooltip(Some(match remote::exposed(app) {
+    let mut tip = match remote::exposed(app) {
         Some(host) => t!(
             "dsh desktop — 公网可访问：{}",
             "dsh desktop — on the internet at {}",
             host
         ),
         None => "dsh desktop".to_string(),
-    }));
+    };
+    if let Some(doing) = status::describe() {
+        tip = format!("{tip}\n{doing}");
+    }
+    let _ = tray.set_tooltip(Some(tip));
 }
 
 /// Follow dsh into the language it has just been switched to.
@@ -537,6 +643,9 @@ fn switch_language(app: &tauri::AppHandle, tag: &str) {
     // built in — which, on a page that never loads again, is the rest of the
     // run.
     controls::sync_safe(app);
+    // Its note carries the reason a key did not take, which `relabel` just
+    // wrote over with the plain one.
+    shortcut::sync(app);
     // Not only what is on screen. An initialization script is composed once,
     // when the window is built, so without these two the plugin panel and the
     // runtime chooser would stay in the language the app started in for the
@@ -586,7 +695,11 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             // Exits the run loop, which stops the dsh server on the way out.
             "quit" => app.exit(0),
             "public-off" => remote::stop_public(app),
-            _ => {}
+            id => {
+                if let Some(index) = id.strip_prefix("recent:").and_then(|at| at.parse().ok()) {
+                    recent::open(app, index);
+                }
+            }
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
@@ -655,6 +768,38 @@ fn toggle_notify_turns(app: &tauri::AppHandle) {
 fn quit(app: &tauri::AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || app.exit(0));
+}
+
+/// Give back the address a browser shows in the corner when a link is hovered.
+///
+/// wry turns WebView2's status bar off for every webview it builds, and with it
+/// the only place a link says where it goes before it is clicked — chat links,
+/// and the ones inside the sidebar's frames, alike. WebKit on the other two
+/// platforms has no such bar to turn back on.
+#[cfg(windows)]
+fn status_bar(window: &WebviewWindow) {
+    let _ = window.with_webview(|webview| {
+        // SAFETY: the controller is the live one Tauri hands out for this
+        // window, and `Settings` is a documented entry point on its webview.
+        unsafe {
+            let Ok(core) = webview.controller().CoreWebView2() else {
+                return;
+            };
+            if let Ok(settings) = core.Settings() {
+                let _ = settings.SetIsStatusBarEnabled(true);
+            }
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn status_bar(_window: &WebviewWindow) {}
+
+/// Put the window away in the tray: the close button, and the window's own one.
+pub(crate) fn park(window: &WebviewWindow) {
+    placement::save(window.app_handle(), window);
+    let _ = window.hide();
+    memory::trim(window);
 }
 
 /// Bring the window back to the front, whatever it was hidden behind.
