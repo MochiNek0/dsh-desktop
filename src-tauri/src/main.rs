@@ -452,6 +452,7 @@ fn build_window(
     // Before it is on screen: this is the call that reaches WebView2's default
     // background, and the window that would show the wrong one is not up yet.
     theme::background(&window, preference);
+    status_bar(&window);
     if visible {
         let _ = window.show();
     }
@@ -768,6 +769,31 @@ fn quit(app: &tauri::AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || app.exit(0));
 }
+
+/// Give back the address a browser shows in the corner when a link is hovered.
+///
+/// wry turns WebView2's status bar off for every webview it builds, and with it
+/// the only place a link says where it goes before it is clicked — chat links,
+/// and the ones inside the sidebar's frames, alike. WebKit on the other two
+/// platforms has no such bar to turn back on.
+#[cfg(windows)]
+fn status_bar(window: &WebviewWindow) {
+    let _ = window.with_webview(|webview| {
+        // SAFETY: the controller is the live one Tauri hands out for this
+        // window, and `Settings` is a documented entry point on its webview.
+        unsafe {
+            let Ok(core) = webview.controller().CoreWebView2() else {
+                return;
+            };
+            if let Ok(settings) = core.Settings() {
+                let _ = settings.SetIsStatusBarEnabled(true);
+            }
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn status_bar(_window: &WebviewWindow) {}
 
 /// Put the window away in the tray: the close button, and the window's own one.
 pub(crate) fn park(window: &WebviewWindow) {
