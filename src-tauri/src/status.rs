@@ -94,13 +94,15 @@ fn paint(app: &AppHandle, look: Look) {
     crate::refresh_tooltip(app);
 
     // Windows draws the overlay over the bottom-right of the taskbar button at
-    // 16 pixels, whatever it is given; this is the same dot, filling it.
+    // 16 pixels, whatever it is given. Filling all of it put a dot two thirds
+    // the size of the 24-pixel icon on the button; this is 10 of the 16, in the
+    // same corner.
     #[cfg(windows)]
     if let Some(window) = app.get_webview_window("main") {
         const SIZE: u32 = 32;
         let overlay = look.colour().map(|colour| {
             let blank = vec![0; (SIZE * SIZE * 4) as usize];
-            Image::new_owned(dot(&blank, SIZE, SIZE, colour, 1.0), SIZE, SIZE)
+            Image::new_owned(dot(&blank, SIZE, SIZE, colour, 0.625), SIZE, SIZE)
         });
         if let Err(error) = window.set_overlay_icon(overlay) {
             eprintln!("dsh-desktop: could not set the taskbar overlay: {error}");
