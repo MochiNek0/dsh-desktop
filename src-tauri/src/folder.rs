@@ -1,4 +1,7 @@
-//! A folder handed to the app from outside: `dsh-desktop <path>`.
+//! A folder handed to the app from outside: `dsh-desktop <path>`, the "用 dsh
+//! 打开" entry Explorer and Linux file managers show on a folder, and on macOS
+//! a folder dropped on the Dock icon or opened from Finder's "Open With" (those
+//! arrive as `RunEvent::Opened`, not as arguments).
 //!
 //! What the user means by it is "open this folder in dsh", which in dsh's own
 //! terms is a workspace for that directory and a session in it. Neither can be
@@ -73,7 +76,12 @@ static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// that does not exist is not a request to create it.
 pub fn requested(args: &[String], cwd: &Path) -> Option<PathBuf> {
     let arg = args.iter().skip(1).find(|arg| !arg.starts_with('-'))?;
-    let path = std::path::absolute(cwd.join(arg)).ok()?;
+    folder_of(&cwd.join(arg))
+}
+
+/// The folder `path` stands for: itself, or the one a file is in.
+pub fn folder_of(path: &Path) -> Option<PathBuf> {
+    let path = std::path::absolute(path).ok()?;
     if path.is_dir() {
         Some(path)
     } else if path.is_file() {
@@ -256,6 +264,24 @@ mod tests {
                 Path::new("/")
             ),
             Some(std::path::absolute(&root).unwrap())
+        );
+    }
+
+    /// The form Explorer's "用 dsh 打开" passes; see `DshFolderMenu` in
+    /// `installer-hooks.nsh`.
+    #[cfg(windows)]
+    #[test]
+    fn the_folder_menu_argument_names_the_folder_itself() {
+        let root = std::env::temp_dir().join("dsh-desktop-folder-test-c");
+        std::fs::create_dir_all(&root).unwrap();
+        let arg = format!(r"{}\.", root.display());
+        assert_eq!(
+            requested(&args(&["dsh-desktop", &arg]), Path::new("/")),
+            Some(std::path::absolute(&root).unwrap())
+        );
+        assert_eq!(
+            requested(&args(&["dsh-desktop", r"C:\\."]), Path::new("/")),
+            Some(PathBuf::from(r"C:\"))
         );
     }
 

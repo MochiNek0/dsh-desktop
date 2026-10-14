@@ -223,6 +223,21 @@ fn main() {
             }
         }
         tauri::RunEvent::Exit => shut_down(handle, &server),
+        // A folder dropped on the Dock icon or opened from Finder's "Open
+        // With", which `Info.plist` lists this app for. macOS hands it over as
+        // an event, not on the command line, whether or not the app was
+        // already running — and after `setup`, so the window is there.
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Opened { urls } => {
+            if let Some(dir) = urls
+                .iter()
+                .filter_map(|url| url.to_file_path().ok())
+                .find_map(|path| folder::folder_of(&path))
+            {
+                reveal(handle);
+                folder::open(handle, dir);
+            }
+        }
         _ => {}
     });
 }

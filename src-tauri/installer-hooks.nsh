@@ -241,6 +241,27 @@ FunctionEnd
 ; Bypass` applies to this one invocation and changes no machine policy.
 !define DSH_POWERSHELL "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File"
 
+; "用 dsh 打开" on a folder in Explorer (`Directory`) and on the empty space
+; inside one (`Directory\Background`), which runs `dsh-desktop <folder>`; see
+; `src-tauri/src/folder.rs`. On Windows 11 it sits under "显示更多选项": the
+; first-level menu takes a signed package and a COM extension.
+;
+; In the user's own classes, like the install itself. Written on every install,
+; so an update or a move to another drive points it at the current exe, and
+; there whether or not the Session signals plugin is: without it the app says
+; so and offers the way back.
+;
+; `%V\.` and not `%V`: on the background of a drive root `%V` is `C:\`, and
+; `"C:\"` is read as an escaped quote, the argument `C:"`. `C:\\.` resolves to
+; the same folder as `C:\`, and `D:\work\.` to `D:\work`.
+!define DSH_FOLDER_VERB "dsh-desktop"
+
+!macro DshFolderMenu class
+  WriteRegStr HKCU "Software\Classes\${class}\shell\${DSH_FOLDER_VERB}" "" "用 dsh 打开"
+  WriteRegStr HKCU "Software\Classes\${class}\shell\${DSH_FOLDER_VERB}" "Icon" "$INSTDIR\${MAINBINARYNAME}.exe,0"
+  WriteRegStr HKCU "Software\Classes\${class}\shell\${DSH_FOLDER_VERB}\command" "" '"$INSTDIR\${MAINBINARYNAME}.exe" "%V\."'
+!macroend
+
 ; Tell everything already running that the environment changed. The script
 ; broadcasts this itself after touching PATH; this copy is for the entries the
 ; migration below removes.
@@ -332,6 +353,9 @@ FunctionEnd
 
   !insertmacro DshMigrate
 
+  !insertmacro DshFolderMenu "Directory"
+  !insertmacro DshFolderMenu "Directory\Background"
+
   ; Nothing is detected and nothing is installed here any more. The installer
   ; used to run the script's `install` mode at this point, and that mode picked
   ; a Node on the user's behalf — the first one on PATH — and installed 185 MB
@@ -420,6 +444,10 @@ FunctionEnd
     DetailPrint "这是更新或重装，保留已安装的 Node 和 dsh。"
     Goto uninstall_done
   ${EndIf}
+
+  ; The folder menu would otherwise point at an exe that is gone.
+  DeleteRegKey HKCU "Software\Classes\Directory\shell\${DSH_FOLDER_VERB}"
+  DeleteRegKey HKCU "Software\Classes\Directory\Background\shell\${DSH_FOLDER_VERB}"
 
   ; The app's own dsh plugin, out of the user's profile, before anything below
   ; asks the user anything.
