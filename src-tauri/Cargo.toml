@@ -38,6 +38,13 @@ tauri-plugin-single-instance = "2"
 # from Rust only — the webview is granted none of its commands. `~2.3` because
 # 2.4 wants tauri 2.12, which moves webview2-com off the version pinned below.
 tauri-plugin-global-shortcut = "~2.3"
+# The folder picker behind the plugin panel's "local folder" button; see
+# `plugins::pick_local`. The one dialog that has to be the system's own: the
+# point of it is that a path only gets in by the user choosing it there, which
+# no script in the page can do for them. `gtk3` rather than the default portal
+# backend because GTK 3 is already in the tree under tao; the rest is
+# windows-sys 0.61 and objc2, both already here too.
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 
 # The phone gateway; see `remote`. Everything below this line was already in the
 # tree — reqwest brings hyper, tokio, http and the body helpers, tauri brings

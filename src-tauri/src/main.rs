@@ -400,6 +400,7 @@ fn build_window(
                 controls::sync_autostart(webview.app_handle());
                 controls::sync_notify(webview.app_handle());
                 controls::sync_safe(webview.app_handle());
+                controls::sync_plugin_updates(webview.app_handle());
                 shortcut::sync(webview.app_handle());
                 // Last, and only where the page that just loaded is dsh
                 // refusing to serve one: it replaces the page.
@@ -643,6 +644,8 @@ fn switch_language(app: &tauri::AppHandle, tag: &str) {
     // built in — which, on a page that never loads again, is the rest of the
     // run.
     controls::sync_safe(app);
+    // The mark's hover says which plugins, in words.
+    controls::sync_plugin_updates(app);
     // Its note carries the reason a key did not take, which `relabel` just
     // wrote over with the plain one.
     shortcut::sync(app);
@@ -1714,6 +1717,7 @@ fn attempt(
             // wrong: same port, new process, new token, and the cookie the
             // gateway is holding is now worth nothing. See `remote::upstream`.
             remote::dsh_ready(app, &url);
+            check_plugin_updates(app);
 
             // Only when the port moved. On the same one the page is already
             // pointed at a server that is back, and reloading it would throw
@@ -2108,7 +2112,12 @@ fn look_for_updates(app: &tauri::AppHandle, session: &Session) {
     let session = session.clone();
 
     std::thread::spawn(move || {
-        let behind = plugins::outdated(&app);
+        let Some(behind) = plugins::check_updates(&app) else {
+            return;
+        };
+        // Whatever the panel does with it, the titlebar's mark follows — an
+        // update the panel just ran is how the mark comes off.
+        controls::sync_plugin_updates(&app);
         if behind.is_empty() {
             return;
         }
@@ -2121,6 +2130,20 @@ fn look_for_updates(app: &tauri::AppHandle, session: &Session) {
             session
                 .splash
                 .plugin_lists(&window, &plugins::listing(&app, &behind));
+        }
+    });
+}
+
+/// Find out, with no panel open, whether any plugin is behind, and mark the
+/// titlebar's menu if one is. Run each time dsh comes up: the user who never
+/// opens the panel is the one who would otherwise never hear of an update.
+///
+/// On a thread, because it reaches the network, and with nothing waiting on it.
+fn check_plugin_updates(app: &tauri::AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if plugins::check_updates(&app).is_some() {
+            controls::sync_plugin_updates(&app);
         }
     });
 }
@@ -2186,7 +2209,7 @@ where
 
 /// Install what the panel asked for: the ticked presets, and whatever was
 /// typed into its box.
-fn install_plugins(app: &tauri::AppHandle, ids: Vec<String>, spec: Option<String>) {
+fn install_plugins(app: &tauri::AppHandle, ids: Vec<String>, spec: Option<String>, local: bool) {
     change_plugins(
         app,
         t!(
@@ -2197,7 +2220,7 @@ fn install_plugins(app: &tauri::AppHandle, ids: Vec<String>, spec: Option<String
             "装好了。回到 dsh 时会重新启动它，插件在那之后生效。",
             "Done. dsh restarts on the way back, and the plugins take effect then."
         ),
-        move |app, log| plugins::install(app, &ids, spec.as_deref(), log),
+        move |app, log| plugins::install(app, &ids, spec.as_deref(), local, log),
     );
 }
 
@@ -2381,6 +2404,7 @@ fn serve(
                 // rather than to this launch — so every URL dsh prints has to
                 // reach `remote`, not just the first. See `remote::upstream`.
                 remote::dsh_ready(window.app_handle(), &url);
+                check_plugin_updates(window.app_handle());
                 splash.status(window, t!("正在打开界面…", "Opening the interface…"));
 
                 // Before the navigation rather than after it: the header this

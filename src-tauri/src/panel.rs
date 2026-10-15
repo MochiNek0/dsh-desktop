@@ -49,8 +49,8 @@ fn labels() -> String {
             "These install into dsh’s web profile — the same thing `dsh plugin add` does in a terminal. dsh stops while an install runs and starts again afterwards."
         ),
         "hint": t!(
-            "也可以直接填一个 pnpm 认识的包：包名，或 github:owner/repo。",
-            "Or name anything pnpm understands: a package name, or github:owner/repo."
+            "也可以直接填一个 pnpm 认识的包：包名，或 github:owner/repo；本地的插件用旁边的按钮选文件夹或 .tgz。",
+            "Or name anything pnpm understands: a package name, or github:owner/repo. A plugin on this machine goes in through the buttons beside the box, as a folder or a .tgz."
         ),
         "empty": t!(
             "没有读到预设插件清单，下面还是可以自己填一个。",
@@ -83,6 +83,22 @@ fn labels() -> String {
             "Everything on the suggested list is installed. The box below takes anything else."
         ),
         "directory": t!("打开插件目录", "Open the plugin folder"),
+        // The button beside the box, for a plugin that is a folder on this
+        // machine rather than a package anywhere; see `plugins::pick_local`.
+        "local": t!("选择本地文件夹…", "Choose a local folder…"),
+        "tarball": t!("选择 .tgz 文件…", "Choose a .tgz…"),
+        "unpick": t!("不装这个", "Leave it out"),
+        // Under the lede, every time the panel is up: whatever goes in from
+        // here runs as the user, and the box and the two buttons beside it will
+        // take a package from anywhere.
+        "trustLead": t!(
+            "请确认插件来源可信。",
+            "Only install plugins from sources you trust."
+        ),
+        "trust": t!(
+            "插件在本机以你的权限运行，来源不明的插件可能损坏 DeepSeek Harness，或读取和泄露你的数据。",
+            "A plugin runs on this machine with your permissions; one from an unknown source can break DeepSeek Harness, or read and leak your data."
+        ),
         "skip": t!("跳过", "Skip"),
         "back": t!("返回", "Back"),
         "install": t!("安装选中的插件", "Install selected"),
@@ -147,6 +163,9 @@ pub fn script() -> String {
   var TEXT = {labels};
 
   var root = null, sheet, lede, list, hint, spec, log, note;
+  // The folder chosen with the system picker, shown but never sent: Rust holds
+  // the path and the install only says whether to use it. See `pick_local`.
+  var local, picked, chosen = false;
   var dir, drop, leave, install;
   // Set when the language moved under a card that was already built; see
   // `__dshPluginText`.
@@ -206,7 +225,8 @@ pub fn script() -> String {
     // The same plugin come round at the next version. Not an arrow off a
     // line, which is what a file being uploaded wears, and this card uploads
     // nothing.
-    update: 'refreshCw'
+    update: 'refreshCw',
+    trust: 'shieldAlert'
   }};
 
   /** One of them at the size a card draws its marks, which is all of them. */
@@ -524,7 +544,7 @@ pub fn script() -> String {
     var ids = ticked(OFFERED);
     var typed = spec.value.trim();
 
-    if (!ids.length && !typed) {{
+    if (!ids.length && !typed && !chosen) {{
       say('bad', TEXT.pick);
       return;
     }}
@@ -532,8 +552,17 @@ pub fn script() -> String {
     running(TEXT.running);
     signal(
       'plugins-install?ids=' + encodeURIComponent(ids.join(',')) +
-        '&spec=' + encodeURIComponent(typed)
+        '&spec=' + encodeURIComponent(typed) +
+        (chosen ? '&local=1' : '')
     );
+  }}
+
+  function choose(path) {{
+    chosen = !!path;
+    picked.textContent = path || '';
+    // Cut short with an ellipsis when it is long; the whole of it on hover.
+    picked.title = path || '';
+    local.hidden = !chosen;
   }}
 
   function drops() {{
@@ -564,12 +593,15 @@ pub fn script() -> String {
       // wash it takes after: both sit between the line colour and the accent,
       // and both have to be given per theme rather than mixed from the accent.
       '--pp-soft:#f7f8fa;--pp-fix:#b54708;--pp-star:#fab105;' +
-      '--pp-hover:#c3cbe6;--pp-tint:rgba(77,107,254,.07)}}' +
+      '--pp-hover:#c3cbe6;--pp-tint:rgba(77,107,254,.07);' +
+      '--pp-warn:#d97706;--pp-warn-bg:#fffaeb;--pp-warn-line:#fde9b8}}' +
       '.dsh-pp.dsh-pp-dark{{background:rgba(0,0,0,.5);' +
       '--pp-bg:#17171d;--pp-fg:#ececf1;--pp-muted:#9aa0ac;--pp-line:#2b2b34;' +
       '--pp-danger:#f97066;--pp-ok:#3ccb9a;' +
       '--pp-soft:rgba(255,255,255,.04);--pp-fix:#f0a35e;--pp-star:#f5c344;' +
-      '--pp-hover:#454554;--pp-tint:rgba(77,107,254,.16)}}' +
+      '--pp-hover:#454554;--pp-tint:rgba(77,107,254,.16);' +
+      '--pp-warn:#f5b545;--pp-warn-bg:rgba(245,181,69,.08);' +
+      '--pp-warn-line:rgba(245,181,69,.22)}}' +
       '.dsh-pp.dsh-pp-shown{{display:flex}}' +
       // The page underneath has styles of its own for every tag this is built
       // out of. The family is the one thing worth taking back wholesale; the
@@ -585,6 +617,15 @@ pub fn script() -> String {
       'box-shadow:0 24px 64px rgba(0,0,0,.32),0 0 0 .5px var(--pp-line)}}' +
       '.dsh-pp-card h1{{font-size:17px;font-weight:600;line-height:1.4;margin:0 0 6px}}' +
       '.dsh-pp-lede{{margin:0 0 16px;color:var(--pp-muted);font-size:13px}}' +
+      // A shield, a line in the body's own colour, and the reason in the
+      // muted one under it, on an amber wash. Amber says "mind this" without
+      // the red the failures wear, and the type stays the panel's own.
+      '.dsh-pp-trust{{display:flex;gap:10px;align-items:flex-start;' +
+      'margin:-4px 0 14px;padding:10px 12px;border-radius:10px;' +
+      'border:1px solid var(--pp-warn-line);background:var(--pp-warn-bg);' +
+      'font-size:12px;line-height:1.6;color:var(--pp-muted)}}' +
+      '.dsh-pp-trust svg{{flex:none;margin-top:2px;color:var(--pp-warn)}}' +
+      '.dsh-pp-trust b{{display:block;font-weight:600;color:var(--pp-fg)}}' +
       // Padded, and pulled back out again by the same margin, so a card that
       // lifts on hover has somewhere to lift into. Without it the scroller's
       // own edge cut the top off the whole first row.
@@ -706,11 +747,22 @@ pub fn script() -> String {
       // this one is here to be taken away.
       '.dsh-pp-chip.dsh-pp-stale{{color:var(--pp-danger)}}' +
       '.dsh-pp-hint{{display:block;margin-top:12px;font-size:12px;color:var(--pp-muted)}}' +
-      '.dsh-pp-spec{{width:100%;margin-top:4px;padding:8px 11px;' +
+      // The box and the two local buttons share a line while the card is wide
+      // enough for the box to keep a useful width beside them, and the buttons
+      // drop below it when it is not.
+      '.dsh-pp-entry{{display:flex;flex-wrap:wrap;align-items:center;gap:8px;' +
+      'margin-top:4px}}' +
+      '.dsh-pp-picks{{display:flex;flex:none;gap:8px}}' +
+      '.dsh-pp-spec{{flex:1 1 220px;min-width:0;height:32px;padding:0 11px;' +
       'border:1px solid var(--pp-line);border-radius:8px;background:var(--pp-bg);' +
       'color:var(--pp-fg);font:13px ui-monospace,Consolas,monospace;' +
       'user-select:text;-webkit-user-select:text}}' +
       '.dsh-pp-spec:focus{{outline:2px solid var(--pp-accent);outline-offset:-1px}}' +
+      '.dsh-pp-local{{display:flex;align-items:center;gap:10px;margin-top:8px}}' +
+      '.dsh-pp-local[hidden]{{display:none}}' +
+      '.dsh-pp-picked{{flex:1 1 auto;min-width:0;overflow:hidden;' +
+      'text-overflow:ellipsis;white-space:nowrap;' +
+      'font:12px ui-monospace,Consolas,monospace;color:var(--pp-fg)}}' +
       '.dsh-pp-log{{display:none;flex:1 1 auto;min-height:120px;margin:12px 0 0;' +
       'overflow:auto;padding:12px 14px;border:1px solid var(--pp-line);' +
       'border-radius:8px;background:var(--pp-soft);' +
@@ -721,7 +773,9 @@ pub fn script() -> String {
       // comes back above it and the log keeps what it printed, because on a
       // failure that output is the whole of what the user has to go on.
       '.dsh-pp-running .dsh-pp-list,' +
-      '.dsh-pp-running .dsh-pp-hint{{display:none}}' +
+      '.dsh-pp-running .dsh-pp-hint,' +
+      '.dsh-pp-running .dsh-pp-entry,' +
+      '.dsh-pp-running .dsh-pp-local{{display:none}}' +
       '.dsh-pp-running .dsh-pp-log,.dsh-pp-logged .dsh-pp-log{{display:block}}' +
       '.dsh-pp-logged .dsh-pp-log{{flex:none;max-height:30vh}}' +
       // Wraps, and the buttons keep to their own line once it does. A note is
@@ -764,17 +818,47 @@ pub fn script() -> String {
     var card = make('div', 'dsh-pp-card', root);
     make('h1', '', card).textContent = TEXT.title;
     lede = make('p', 'dsh-pp-lede', card);
+    var trust = make('div', 'dsh-pp-trust', card);
+    trust.innerHTML = svg(ICONS.trust);
+    var said = make('div', '', trust);
+    make('b', '', said).textContent = TEXT.trustLead;
+    make('span', '', said).textContent = TEXT.trust;
     list = make('div', 'dsh-pp-list dsh-pp-grid', card);
     // A description is raised over the list; the icon it was raised from goes
     // out from under it as soon as the list moves.
     list.addEventListener('scroll', forget);
 
+    // The label names the box by id rather than wrapping it: the box shares a
+    // row with two buttons now, and a button inside a label is one more thing
+    // a click on the label could mean.
     hint = make('label', 'dsh-pp-hint', card);
-    make('span', '', hint).textContent = TEXT.hint;
-    spec = make('input', 'dsh-pp-spec', hint);
+    hint.textContent = TEXT.hint;
+    hint.htmlFor = 'dsh-pp-spec';
+
+    var entry = make('div', 'dsh-pp-entry', card);
+    spec = make('input', 'dsh-pp-spec', entry);
+    spec.id = 'dsh-pp-spec';
     spec.type = 'text';
     spec.spellcheck = false;
     spec.placeholder = 'github:owner/repo';
+    // One unit, so a row too narrow for all three moves both buttons below
+    // the box rather than leaving one of them beside it.
+    var picks = make('div', 'dsh-pp-picks', entry);
+    button(picks, TEXT.local, function () {{
+      signal('plugins-pick');
+    }});
+    button(picks, TEXT.tarball, function () {{
+      signal('plugins-pick?what=tgz');
+    }});
+
+    // What was chosen, on a line of its own under the row, and only while
+    // something is.
+    local = make('div', 'dsh-pp-local', card);
+    picked = make('span', 'dsh-pp-picked', local);
+    button(local, TEXT.unpick, function () {{
+      choose(null);
+    }});
+    local.hidden = true;
 
     log = make('pre', 'dsh-pp-log', card);
 
@@ -807,6 +891,8 @@ pub fn script() -> String {
     // It hung off the root that has just gone; the next one builds another.
     pop = null;
     popFor = null;
+    // The card showing it has gone; the next one starts with nothing chosen.
+    chosen = false;
     stale = false;
   }}
 
@@ -894,6 +980,18 @@ pub fn script() -> String {
     var following = log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
     log.textContent += line + '\n';
     if (following) log.scrollTop = log.scrollHeight;
+  }};
+
+  /** What the folder picker came back with: a path to show, or why the folder
+   *  it came back with will not do. */
+  window.__dshPluginPicked = function (path, error) {{
+    if (!root) return;
+    if (path) {{
+      choose(path);
+      say('', '');
+    }} else if (error) {{
+      say('bad', error);
+    }}
   }};
 
   /** How it ended. */

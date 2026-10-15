@@ -137,8 +137,9 @@ pub enum Action {
     RemoteForget(bool),
     /// Open the plugin panel on the loading page.
     Plugins,
-    /// Install what was ticked in it, and whatever was typed into its box.
-    PluginsInstall(Vec<String>, Option<String>),
+    /// Install what was ticked in it, whatever was typed into its box, and the
+    /// folder chosen with its picker when the flag is set.
+    PluginsInstall(Vec<String>, Option<String>, bool),
     /// Take the ticked ones back out again.
     PluginsRemove(Vec<String>),
     /// Bring the named ones up to their newest release. One card's button, so
@@ -152,6 +153,9 @@ pub enum Action {
     /// Show the profile directory in the file manager — the one step the panel
     /// does not take on the user's behalf. See [`crate::plugins`].
     PluginsDirectory,
+    /// Ask for a plugin's folder on disk, or its `.tgz` when set; see
+    /// [`crate::plugins::pick_local`].
+    PluginsPick(bool),
     /// Change which registry an install of dsh is taken from, on a machine
     /// whose npm points somewhere of the user's own choosing; see
     /// [`crate::settings::RegistrySource`].
@@ -283,12 +287,15 @@ pub fn action(url: &Url) -> Option<Action> {
         "plugins" => Some(Action::Plugins),
         "plugins-install" => {
             let (ids, spec) = crate::plugins::requested(url);
-            Some(Action::PluginsInstall(ids, spec))
+            Some(Action::PluginsInstall(ids, spec, crate::plugins::local_asked(url)))
         }
         "plugins-remove" => Some(Action::PluginsRemove(crate::plugins::wanted_gone(url))),
         "plugins-update" => Some(Action::PluginsUpdate(crate::plugins::wanted_gone(url))),
         "plugins-done" => Some(Action::PluginsDone),
         "plugins-directory" => Some(Action::PluginsDirectory),
+        "plugins-pick" => Some(Action::PluginsPick(
+            url.query_pairs().any(|(key, value)| key == "what" && value == "tgz"),
+        )),
         // The runtime chooser's verbs; see `setup`. The Node index travels as
         // `?i=` on the two that name one.
         "setup-use" => setup_index(url).map(Action::SetupUse),
@@ -428,11 +435,14 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::RemoteForget(on) => return crate::remote::forget_on_exit(app, on),
         Action::Locale(tag) => return crate::switch_language(app, &tag),
         Action::Plugins => return crate::open_plugins(app),
-        Action::PluginsInstall(ids, spec) => return crate::install_plugins(app, ids, spec),
+        Action::PluginsInstall(ids, spec, local) => {
+            return crate::install_plugins(app, ids, spec, local)
+        }
         Action::PluginsRemove(names) => return crate::remove_plugins(app, names),
         Action::PluginsUpdate(names) => return crate::update_plugins(app, names),
         Action::PluginsDone => return crate::leave_plugins(app),
         Action::PluginsDirectory => return crate::plugins::open_directory(app),
+        Action::PluginsPick(tarball) => return crate::plugins::pick_local(app, tarball),
         Action::SetupUse(i) => return crate::setup::answered(crate::setup::Choice::Use(i)),
         Action::SetupInstallDsh(i) => {
             return crate::setup::answered(crate::setup::Choice::InstallDsh(i))
@@ -608,6 +618,31 @@ pub fn sync_safe(app: &AppHandle) {
 
     let call = safe_call(crate::plugins::safe(app), &label, &hint);
     eval(app, &call);
+}
+
+/// Put the mark on the menu button and the plugins row when the last update
+/// check found a plugin behind, and take it off when it found none.
+///
+/// The check itself is [`crate::plugins::check_updates`], run when dsh comes up
+/// and whenever the panel looks; this only says what it last found, which is
+/// why every page load calls it — a fresh document has no mark on it however
+/// many plugins are behind.
+pub fn sync_plugin_updates(app: &AppHandle) {
+    eval(app, &updates_call(&crate::plugins::updates_waiting()));
+}
+
+/// The call [`sync_plugin_updates`] makes; see [`safe_call`] for why a string.
+fn updates_call(names: &[String]) -> String {
+    let hint = if names.is_empty() {
+        String::new()
+    } else {
+        t!("有插件可以更新：{}", "Plugin updates available: {}", names.join(", "))
+    };
+    let hint = serde_json::to_string(&hint).expect("a string is always serializable");
+    format!(
+        "window.__dshPluginUpdates && window.__dshPluginUpdates({}, {hint})",
+        !names.is_empty()
+    )
 }
 
 /// The call [`sync_safe`] makes, as a string so both halves of it can be read
@@ -900,6 +935,10 @@ pub(crate) fn lucide() -> &'static str {
       '.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.' +
       '881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.90' +
       '6l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/>',
+    shieldAlert: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5' +
+      ' 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0' +
+      'C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/>' +
+      '<path d="M12 16h.01"/>',
     user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>' +
       '<circle cx="12" cy="7" r="4"/>',
     smartphone: '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/>' +
@@ -1317,6 +1356,16 @@ pub fn script() -> String {
       '.dsh-wc button.dsh-wc-menu:hover,.dsh-wc button.dsh-wc-menu.dsh-wc-shown{{' +
       'background:var(--dsh-wc-hover);color:var(--dsh-wc-fg-hi)}}' +
       '.dsh-wc button.dsh-wc-menu:active{{filter:none}}' +
+      // A plugin has an update; see `__dshPluginUpdates`. On the corner of the
+      // button, so it is seen without opening anything, and again at the end of
+      // the row it leads to, so the menu says which row it meant.
+      '.dsh-wc button.dsh-wc-menu.dsh-wc-badged{{position:relative}}' +
+      '.dsh-wc button.dsh-wc-menu.dsh-wc-badged::after,' +
+      '.dsh-wc-pop button.dsh-wc-badged::after{{content:"";width:6px;height:6px;' +
+      'border-radius:50%;background:#ff3b30;pointer-events:none}}' +
+      '.dsh-wc button.dsh-wc-menu.dsh-wc-badged::after{{position:absolute;' +
+      'top:3px;right:3px}}' +
+      '.dsh-wc-pop button.dsh-wc-badged::after{{flex:none;margin-left:auto}}' +
       // Beside the menu rather than away from it: the gap before the menu is
       // there to keep the magnification off the green dot, and there is no dot
       // on this side to keep clear of.
@@ -1866,6 +1915,20 @@ pub fn script() -> String {
       var entry = entries['safe-off'];
       if (!entry) return;
       entry.hidden = !on;
+      if (on) entry.title = hint || '';
+      else entry.removeAttribute('title');
+    }};
+    // Called from Rust; see `sync_plugin_updates`. Drawn from what the last
+    // check found rather than kept here, for the same reason as safe mode's:
+    // every page load starts without it.
+    window.__dshPluginUpdates = function (on, hint) {{
+      opener.classList.toggle('dsh-wc-badged', !!on);
+      if (on) opener.title = hint || '';
+      else opener.removeAttribute('title');
+
+      var entry = entries['plugins'];
+      if (!entry) return;
+      entry.classList.toggle('dsh-wc-badged', !!on);
       if (on) entry.title = hint || '';
       else entry.removeAttribute('title');
     }};

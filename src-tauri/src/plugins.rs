@@ -66,6 +66,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::channel;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -92,6 +93,11 @@ const PRESETS: &str = "preset-plugins.json";
 /// The install running right now, if one is. Held so that quitting takes pnpm
 /// down rather than leaving it writing into the profile with no owner.
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
+
+/// The folder or `.tgz` last chosen with one of the panel's local buttons; see
+/// [`pick_local`]. Kept here rather than sent to the page and back: the page
+/// only ever says *whether* to install it, never *what*.
+static PICKED: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 struct Running {
     child: Child,
@@ -564,23 +570,53 @@ const OUTDATED_TIMEOUT: Duration = Duration::from_secs(30);
 /// update button. And residue, which is not a dependency at all, is not in
 /// pnpm's answer either.
 ///
-/// Everything that can go wrong answers with an empty list: no dsh, a profile
-/// that is not there, a registry that will not answer, output in a shape this
-/// does not recognise. The panel then draws no update buttons, which is exactly
-/// what it did before there were any.
-pub fn outdated(app: &AppHandle) -> Vec<(String, String, String)> {
-    let Some(dsh) = crate::dsh::current(app) else {
-        return Vec::new();
-    };
+/// `None` when there is no answer: no dsh, or a pnpm that would not start or
+/// did not finish in time. Output in a shape this does not recognise is an
+/// answer, and an empty one. Either way the panel draws no update buttons, which
+/// is exactly what it did before there were any; the difference is for the
+/// titlebar's mark, which a check that never got through should not clear.
+fn outdated(app: &AppHandle) -> Option<Vec<(String, String, String)>> {
+    let dsh = crate::dsh::current(app)?;
 
     let mut command = Command::new(&dsh.bin);
     command.args(["plugin", "--profile", PROFILE, "outdated", "--no-table"]);
     crate::dsh::apply_path(app, &mut command);
 
-    match captured(command, OUTDATED_TIMEOUT) {
-        Some(printed) => parse_outdated(&printed),
-        None => Vec::new(),
+    captured(command, OUTDATED_TIMEOUT).map(|printed| parse_outdated(&printed))
+}
+
+/// What the latest update check to finish found, under the number it was
+/// started with; see [`check_updates`].
+static BEHIND: Mutex<(u64, Vec<(String, String, String)>)> = Mutex::new((0, Vec::new()));
+
+/// Numbers the checks in the order they started.
+static CHECKS: AtomicU64 = AtomicU64::new(0);
+
+/// Ask [`outdated`], and keep the answer for the titlebar's mark.
+///
+/// Checks overlap — one when dsh comes up, one when the panel opens, one after
+/// every change it makes — and the network decides which finishes first. So an
+/// answer is only kept when no check started after it has already been kept:
+/// a slow one from before an update must not put the mark back for the version
+/// that update just installed.
+pub fn check_updates(app: &AppHandle) -> Option<Vec<(String, String, String)>> {
+    let ticket = CHECKS.fetch_add(1, Ordering::SeqCst) + 1;
+    let behind = outdated(app)?;
+
+    if let Ok(mut kept) = BEHIND.lock() {
+        if ticket > kept.0 {
+            *kept = (ticket, behind.clone());
+        }
     }
+    Some(behind)
+}
+
+/// The names of the plugins the last kept check found behind.
+pub fn updates_waiting() -> Vec<String> {
+    BEHIND
+        .lock()
+        .map(|kept| kept.1.iter().map(|(name, _, _)| name.clone()).collect())
+        .unwrap_or_default()
 }
 
 /// Run `command` and take its stdout, whatever it exits with.
@@ -670,6 +706,18 @@ fn parse_outdated(printed: &str) -> Vec<(String, String, String)> {
         };
         if name.is_empty() || name.contains("=>") {
             continue;
+        }
+
+        // Both halves have to be versions, and the right way round. pnpm puts
+        // other things in the second column: `Deprecated` when the latest
+        // release is deprecated — printed even when it is the very version
+        // installed, so a current plugin grew an "Update to Deprecated" button
+        // that ran `pnpm add name@Deprecated` — and `missing` in the first.
+        // And a registry mirror that lags behind can name a `latest` older
+        // than what is installed. None of those is an update.
+        match (semver::Version::parse(from), semver::Version::parse(to)) {
+            (Ok(old), Ok(new)) if new > old => {}
+            _ => continue,
         }
 
         behind.push((name.to_string(), from.to_string(), to.to_string()));
@@ -1479,7 +1527,7 @@ pub fn adopt(app: &AppHandle, report: &crate::dsh::Report) -> bool {
             match stage_bundled(app, &name) {
                 Ok(_staged) if signal_link_is_gone(app) => {
                     let log = |line: &str| eprintln!("dsh-desktop: {line}");
-                    if let Err(why) = install(app, &[SIGNAL.to_string()], None, &log) {
+                    if let Err(why) = install(app, &[SIGNAL.to_string()], None, false, &log) {
                         eprintln!(
                             "dsh-desktop: could not re-link {SIGNAL} after its target went away: {why}"
                         );
@@ -1513,7 +1561,7 @@ pub fn adopt(app: &AppHandle, report: &crate::dsh::Report) -> bool {
     // into; a wall of pnpm output on the loading page would be answering a
     // question nobody asked. What the user sees is the line above.
     let log = |line: &str| eprintln!("dsh-desktop: {line}");
-    match install(app, &[SIGNAL.to_string()], None, &log) {
+    match install(app, &[SIGNAL.to_string()], None, false, &log) {
         Ok(()) => false,
         Err(why) => {
             // The terminal gets the reason, because the panel the caller is
@@ -1571,7 +1619,8 @@ pub(crate) fn dsh_home() -> PathBuf {
 /// What an install writes as it goes: one line of output, verbatim.
 pub type Log<'a> = dyn Fn(&str) + 'a;
 
-/// Install the presets named by `ids`, plus `extra` if the user typed one.
+/// Install the presets named by `ids`, plus `extra` if the user typed one, plus
+/// the folder they picked with [`pick_local`] if `local` is set.
 ///
 /// Blocking, and for minutes: pnpm is fetching packages. The caller runs it on a
 /// thread with `dsh web` already stopped — pnpm is about to rewrite the profile
@@ -1581,6 +1630,7 @@ pub fn install(
     app: &AppHandle,
     ids: &[String],
     extra: Option<&str>,
+    local: bool,
     log: &Log,
 ) -> Result<(), String> {
     let presets = presets(app);
@@ -1597,14 +1647,24 @@ pub fn install(
         if !is_package_spec(extra) {
             return Err(t!(
                 "{} 不是可以装的插件。这里接受 npm 上的包（@scope/name、name@1.2.3）\
-                 和 github:owner/repo；本地路径、tarball 地址和其它协议都不行。",
+                 和 github:owner/repo；本地的文件夹或 .tgz 请用旁边的按钮选，\
+                 tarball 地址和其它协议都不行。",
                 "{} is not something this can install. This field takes a package on npm — \
-                 `@scope/name`, `name@1.2.3` — or `github:owner/repo`. Not a local path, \
-                 a tarball URL, or another scheme.",
+                 `@scope/name`, `name@1.2.3` — or `github:owner/repo`. A local folder or \
+                 .tgz goes through the buttons beside it; a tarball URL or another scheme \
+                 does not go in at all.",
                 extra
             ));
         }
         specs.push(extra.to_string());
+    }
+    if local {
+        let path = PICKED
+            .lock()
+            .ok()
+            .and_then(|picked| picked.clone())
+            .ok_or_else(|| t!("还没有选择本地插件", "no local plugin has been chosen").to_string())?;
+        specs.push(local_spec(&path));
     }
 
     if specs.is_empty() {
@@ -2580,6 +2640,112 @@ pub fn requested(url: &tauri::Url) -> (Vec<String>, Option<String>) {
     (ids, spec)
 }
 
+/// Whether a `dsh-window://plugins-install` navigation asks for the folder or
+/// `.tgz` [`pick_local`] holds as well. A flag and not a path, which is the
+/// point.
+pub fn local_asked(url: &tauri::Url) -> bool {
+    url.query_pairs().any(|(key, value)| key == "local" && value == "1")
+}
+
+/// Ask for a plugin's folder — or, with `tarball`, its packed `.tgz` — with the
+/// system's own picker, and remember it for the next install.
+///
+/// This is the hole [`is_package_spec`] does not leave in the text box, opened
+/// somewhere a script cannot reach. Anything in the window can make the
+/// navigation that gets here, but all it gets is a dialog on screen: the path
+/// comes only from the user choosing one in it, and stays on this side of the
+/// channel.
+///
+/// The two install differently. A folder becomes a `link:` to the folder
+/// itself, so an edit there is live after the next restart of dsh — which is
+/// what someone installing their own plugin from disk is usually after. A
+/// `.tgz` is unpacked into the profile as a copy, but pnpm records it as a
+/// `file:` path to the archive and goes back to it on a fresh install, so the
+/// file has to stay where it was.
+///
+/// On the main thread, where every platform wants its dialogs, but not inside
+/// the navigation callback this was signalled from: queued behind it, so the
+/// webview is not left waiting on a modal.
+pub fn pick_local(app: &AppHandle, tarball: bool) {
+    use tauri::Manager;
+
+    let handle = app.clone();
+    let queued = app.run_on_main_thread(move || {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(window) = handle.get_webview_window("main") {
+            dialog = dialog.set_parent(&window);
+        }
+        let picked = if tarball {
+            dialog
+                .set_title(t!("选择插件的 .tgz 包", "Choose the plugin's .tgz"))
+                .add_filter("npm package (.tgz)", &["tgz"])
+                .pick_file()
+        } else {
+            dialog
+                .set_title(t!("选择插件所在的文件夹", "Choose the plugin's folder"))
+                .pick_folder()
+        };
+        let Some(path) = picked else {
+            return;
+        };
+
+        // pnpm would take either wrong and fail a minute later, deep in its own
+        // output; this says the same thing straight away. The extension is what
+        // pnpm itself goes by to read a path as a tarball rather than a folder.
+        let refused = if tarball {
+            (!is_tarball(&path)).then(|| {
+                t!(
+                    "{} 不是 .tgz 文件。",
+                    "{} is not a .tgz file.",
+                    path.display()
+                )
+            })
+        } else {
+            (!path.join("package.json").is_file()).then(|| {
+                t!(
+                    "{} 里没有 package.json，不像是一个插件。",
+                    "{} has no package.json in it, so it is not a plugin.",
+                    path.display()
+                )
+            })
+        };
+        if let Some(said) = refused {
+            crate::controls::eval(
+                &handle,
+                &format!(
+                    "window.__dshPluginPicked && window.__dshPluginPicked(null, {})",
+                    serde_json::Value::from(said)
+                ),
+            );
+            return;
+        }
+
+        let shown = path.display().to_string();
+        if let Ok(mut picked) = PICKED.lock() {
+            *picked = Some(path);
+        }
+        crate::controls::eval(
+            &handle,
+            &format!(
+                "window.__dshPluginPicked && window.__dshPluginPicked({})",
+                serde_json::Value::from(shown)
+            ),
+        );
+    });
+    if let Err(error) = queued {
+        eprintln!("dsh-desktop: could not open the folder picker: {error}");
+    }
+}
+
+/// A file pnpm will read as a packed package: `.tgz`, or `.tar.gz` spelled out.
+fn is_tarball(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    path.is_file() && (name.ends_with(".tgz") || name.ends_with(".tar.gz"))
+}
+
 /// The package names a `dsh-window://plugins-remove` navigation carries. What
 /// is not installed is dropped by [`remove`], not here.
 pub fn wanted_gone(url: &tauri::Url) -> Vec<String> {
@@ -2762,7 +2928,7 @@ pub fn open_directory(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dependencies_in, holdings, installed_bundles, is_package_spec, local_spec, parse,
+        dependencies_in, holdings, installed_bundles, is_package_spec, local_asked, local_spec, parse,
         parse_outdated, pnpm_blamed, pnpm_codes, pnpm_stuck, requested, spec_name,
         engagement, named_in, stale_bundles, stall_watch, sweep, wanted_gone, with_bundles,
         without_bundles, Outcome, BUNDLED, IN_BOX, PRESETS, RELEASE_AGE, SIGNAL, STALLED,
@@ -2994,6 +3160,25 @@ mod tests {
 
         // An arrow whose halves are missing.
         assert!(parse_outdated("dshmarket\n=>\n").is_empty());
+    }
+
+    /// What pnpm prints that has an arrow in it and is still not an update.
+    /// The first is verbatim from pnpm 9 and 10 on a package whose latest
+    /// release is deprecated — which it prints even when that release is the
+    /// one installed.
+    #[test]
+    fn an_arrow_to_something_that_is_not_newer_is_not_an_update() {
+        assert!(parse_outdated("request\n2.88.2 => Deprecated\n").is_empty());
+        assert!(parse_outdated("dshmarket\nmissing => 1.66.22\n").is_empty());
+        // A mirror whose `latest` is behind what is installed.
+        assert!(parse_outdated("dshmarket\n1.66.22 => 1.66.21\n").is_empty());
+        assert!(parse_outdated("dshmarket\n1.66.22 => 1.66.22\n").is_empty());
+
+        // And a real one beside them still comes through.
+        assert_eq!(
+            parse_outdated("request\n2.88.2 => Deprecated\n\ndsh-agy\n0.4.0 => 0.4.6\n"),
+            vec![("dsh-agy".to_string(), "0.4.0".to_string(), "0.4.6".to_string())]
+        );
     }
 
     /// `dependencies_in` reads a parsed manifest now, because `listing` parses
@@ -3531,6 +3716,20 @@ mod tests {
 
         assert_eq!(ids, ["a", "b"]);
         assert!(spec.is_none());
+    }
+
+    /// The picked folder is asked for by a flag, and nothing else turns it on —
+    /// least of all a path where the flag should be.
+    #[test]
+    fn asks_for_the_picked_folder_only_by_flag() {
+        let url = |query: &str| {
+            Url::parse(&format!("dsh-window://plugins-install?{query}")).expect("a URL")
+        };
+
+        assert!(local_asked(&url("ids=&spec=&local=1")));
+        assert!(!local_asked(&url("ids=&spec=")));
+        assert!(!local_asked(&url("local=0")));
+        assert!(!local_asked(&url("local=C%3A%5Cplugin")));
     }
     /// What a user actually types into the panel's box.
     #[test]
