@@ -115,6 +115,12 @@ pub enum Signal {
     /// The sessions of each of those workspaces, for the quick-ask box; see
     /// [`crate::ask`].
     Sessions(Vec<crate::ask::Session>),
+    /// The models dsh can run a session on, and the one a new session gets;
+    /// see [`crate::ask`].
+    Models {
+        list: Vec<crate::ask::Model>,
+        default: crate::ask::Choice,
+    },
     /// How many sessions are mid-turn and how many are waiting on the user,
     /// and the few the tray lists by name; see [`crate::status`].
     Status {
@@ -141,6 +147,9 @@ pub fn received(url: &Url) -> Option<Signal> {
     let mut waiting = 0;
     let (mut wid, mut wtitle, mut rid, mut rtitle) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut spath, mut sid, mut stitle) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut sprov, mut smod) = (Vec::new(), Vec::new());
+    let (mut mprov, mut mpname, mut mid, mut mname) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut default = crate::ask::Choice::default();
 
     for (name, value) in url.query_pairs() {
         match name.as_ref() {
@@ -179,6 +188,18 @@ pub fn received(url: &Url) -> Option<Signal> {
             "spath" if spath.len() < crate::ask::SESSIONS => spath.push(value.trim().to_string()),
             "sid" if sid.len() < crate::ask::SESSIONS => sid.push(clamp(&value)),
             "stitle" if stitle.len() < crate::ask::SESSIONS => stitle.push(clamp(&value)),
+            // And the model each runs on, in step too: a provider and a model
+            // id, empty when dsh has not said.
+            "sprov" if sprov.len() < crate::ask::SESSIONS => sprov.push(clamp(&value)),
+            "smod" if smod.len() < crate::ask::SESSIONS => smod.push(clamp(&value)),
+            // The model catalog: each model's provider by id and by name, and
+            // its own id and name, in step. Then the default.
+            "mprov" if mprov.len() < crate::ask::MODELS => mprov.push(clamp(&value)),
+            "mpname" if mpname.len() < crate::ask::MODELS => mpname.push(clamp(&value)),
+            "mid" if mid.len() < crate::ask::MODELS => mid.push(clamp(&value)),
+            "mname" if mname.len() < crate::ask::MODELS => mname.push(clamp(&value)),
+            "dprov" => default.provider = clamp(&value),
+            "dmod" => default.model = clamp(&value),
             _ => {}
         }
     }
@@ -203,17 +224,46 @@ pub fn received(url: &Url) -> Option<Signal> {
             return Some(Signal::Recent(list));
         }
         "recent" => return None,
-        "sessions" if spath.len() == sid.len() && sid.len() == stitle.len() => {
+        "sessions"
+            if spath.len() == sid.len()
+                && sid.len() == stitle.len()
+                && sprov.len() == sid.len()
+                && smod.len() == sid.len() =>
+        {
             let list = spath
                 .into_iter()
                 .zip(sid)
                 .zip(stitle)
-                .filter(|((path, id), _)| !path.is_empty() && !id.is_empty())
-                .map(|((path, id), title)| crate::ask::Session { path, id, title })
+                .zip(sprov.into_iter().zip(smod))
+                .filter(|(((path, id), _), _)| !path.is_empty() && !id.is_empty())
+                .map(|(((path, id), title), (provider, model))| crate::ask::Session {
+                    path,
+                    id,
+                    title,
+                    model: crate::ask::Choice { provider, model },
+                })
                 .collect();
             return Some(Signal::Sessions(list));
         }
         "sessions" => return None,
+        "models"
+            if mprov.len() == mid.len() && mpname.len() == mid.len() && mname.len() == mid.len() =>
+        {
+            let list = mprov
+                .into_iter()
+                .zip(mpname)
+                .zip(mid.into_iter().zip(mname))
+                .filter(|((provider, _), (id, _))| !provider.is_empty() && !id.is_empty())
+                .map(|((provider, provider_name), (id, name))| crate::ask::Model {
+                    provider,
+                    provider_name,
+                    id,
+                    name,
+                })
+                .collect();
+            return Some(Signal::Models { list, default });
+        }
+        "models" => return None,
         // Rows whose halves do not pair up are dropped rather than the counts:
         // the dot is worth drawing even when the menu has nothing to list.
         "status" => {
@@ -322,6 +372,7 @@ pub fn act(app: &AppHandle, signal: Signal) {
         Signal::FolderFailed { reason } => crate::folder::failed(app, &reason),
         Signal::Recent(list) => crate::recent::set(app, list),
         Signal::Sessions(list) => crate::ask::set_sessions(list),
+        Signal::Models { list, default } => crate::ask::set_models(list, default),
         Signal::Status {
             running,
             waiting,
@@ -703,20 +754,57 @@ mod tests {
         );
     }
 
-    /// The quick-ask box's sessions: three halves in step, or nothing.
+    /// The quick-ask box's sessions: five halves in step, or nothing.
     #[test]
     fn reads_the_sessions_of_the_recent_workspaces() {
-        let session = |path: &str, id: &str, title: &str| crate::ask::Session {
+        let session = |path: &str, id: &str, title: &str, model: &str| crate::ask::Session {
             path: path.into(),
             id: id.into(),
             title: title.into(),
+            model: crate::ask::Choice {
+                provider: if model.is_empty() { "" } else { "ds" }.into(),
+                model: model.into(),
+            },
         };
         assert_eq!(
-            read("event=sessions&spath=%2Fa&sid=s1&stitle=Fix%20it&spath=%2Fb&sid=s2&stitle=&n=1"),
-            Some(Signal::Sessions(vec![session("/a", "s1", "Fix it"), session("/b", "s2", "")]))
+            read(
+                "event=sessions&spath=%2Fa&sid=s1&stitle=Fix%20it&sprov=ds&smod=v4%2Fpro\
+                 &spath=%2Fb&sid=s2&stitle=&sprov=&smod=&n=1"
+            ),
+            Some(Signal::Sessions(vec![
+                session("/a", "s1", "Fix it", "v4/pro"),
+                session("/b", "s2", "", "")
+            ]))
         );
-        assert_eq!(read("event=sessions&spath=%2Fa&sid=s1&n=1"), None, "a title short");
+        assert_eq!(read("event=sessions&spath=%2Fa&sid=s1&sprov=&smod=&n=1"), None, "a title short");
+        assert_eq!(read("event=sessions&spath=%2Fa&sid=s1&stitle=x&n=1"), None, "no model");
         assert_eq!(read("event=sessions&n=1"), Some(Signal::Sessions(vec![])));
+    }
+
+    /// The model catalog: four halves in step and the default, or nothing.
+    #[test]
+    fn reads_the_models() {
+        let model = |id: &str, name: &str| crate::ask::Model {
+            provider: "ds".into(),
+            provider_name: "DeepSeek".into(),
+            id: id.into(),
+            name: name.into(),
+        };
+        let default = crate::ask::Choice {
+            provider: "ds".into(),
+            model: "flash".into(),
+        };
+        assert_eq!(
+            read(
+                "event=models&mprov=ds&mpname=DeepSeek&mid=flash&mname=Flash\
+                 &mprov=ds&mpname=DeepSeek&mid=pro&mname=Pro&dprov=ds&dmod=flash&n=1"
+            ),
+            Some(Signal::Models {
+                list: vec![model("flash", "Flash"), model("pro", "Pro")],
+                default
+            })
+        );
+        assert_eq!(read("event=models&mprov=ds&mid=pro&mname=Pro&n=1"), None, "a provider name short");
     }
 
     /// The tray's rows: waiting ones first, each half paired up on its own,

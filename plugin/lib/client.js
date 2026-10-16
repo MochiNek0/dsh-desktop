@@ -170,6 +170,11 @@ window.__ModuleLoader__.load({
       var waits = null;
       var folders = null;
       var composer = null;
+      var remote = null;
+      // Read the model catalog again; see `watchModels`.
+      var reloadModels = null;
+      // Each listed session's model, read on the side; see `selections`.
+      var picked = selections(() => remote);
 
       // Which sessions are mid-turn and which are waiting on the user, for the
       // shell's icons, its tray menu and whether it keeps the machine awake.
@@ -214,23 +219,43 @@ window.__ModuleLoader__.load({
            * pressed the key is somewhere else, and the notification at the
            * turn's end is how they hear.
            *
+           * A model chosen in the box is selected for the session first, with
+           * `selectModel` — what dsh's own model menu calls, and which makes
+           * it the default too. None chosen, none is selected, and the session
+           * keeps what it had, reasoning effort and all.
+           *
            * @param {string} path - the workspace's directory.
            * @param {string} text - the line typed into the box.
            * @param {string} [session] - a session in that workspace, as
            *   `sessions` listed it; absent or '' for a new one.
+           * @param {string} [provider] - the chosen model's provider, as
+           *   `models` listed it; absent or '' for none chosen.
+           * @param {string} [model] - and the model's id.
            */
-          ask: (path, text, session) => {
+          ask: (path, text, session, provider, model) => {
             var failed = (error) => send({
               event: 'ask-failed',
               reason: (error && error.message) || String(error),
             });
             if (!folders || !sessions) return failed('not ready');
-            var current = { folders: folders, sessions: sessions };
+            if (provider && model && !remote) return failed('not ready');
+            var current = { folders: folders, sessions: sessions, remote: remote };
             var target = session
               ? Promise.resolve(session)
               : current.folders.workspaces.create({ path: path })
                 .then((workspace) => current.sessions.create({ workspaceId: workspace.workspaceId }));
+            var select = (id) => {
+              if (!provider || !model) return id;
+              return current.remote.session.selectModel({ sessionId: id, provider: provider, model: model })
+                .then((result) => {
+                  if (!result || !result.ok) {
+                    throw new Error((result && result.error && result.error.message) || 'model refused');
+                  }
+                  return id;
+                });
+            };
             target
+              .then(select)
               .then((id) => current.sessions.using(id, { source: 'controllerOperation' }, (reference) =>
                 reference.ready.then((binding) => binding.session.prompt([{ type: 'text', text: text }], 'queue')),
               ).then((result) => {
@@ -238,6 +263,9 @@ window.__ModuleLoader__.load({
                   throw new Error((result && result.error && result.error.message) || 'refused');
                 }
                 send({ event: 'asked', session: id });
+                // Selecting a model made it dsh's default too, which the
+                // catalog carries and nothing announces.
+                if (provider && model && reloadModels) reloadModels();
               }))
               .catch(failed);
           },
@@ -366,7 +394,24 @@ window.__ModuleLoader__.load({
       // The workspaces the shell lists in its tray menu. `sessions` is what
       // says which were used last; see `watchRecent`.
       ctx.inject(['workspaces', 'sessions'], (scope) => {
-        scope.effect(() => watchRecent(scope), 'dsh-desktop-signal: recent workspaces to the desktop shell');
+        scope.effect(() => watchRecent(scope, picked), 'dsh-desktop-signal: recent workspaces to the desktop shell');
+      });
+
+      // The models the quick-ask box offers, and what `ask` selects one with.
+      // The same two services dsh's own model menu injects.
+      ctx.inject(['remote', 'remote.session'], (scope) => {
+        scope.effect(() => {
+          remote = scope.remote;
+          var watching = watchModels(scope.remote);
+          reloadModels = watching.reload;
+          // The sessions already listed went without their models.
+          picked.changed();
+          return () => {
+            remote = null;
+            reloadModels = null;
+            watching.stop();
+          };
+        }, 'dsh-desktop-signal: models to the desktop shell');
       });
     }
 
@@ -458,6 +503,106 @@ window.__ModuleLoader__.load({
     /** How many sessions of each of them the quick-ask box offers. */
     var SESSIONS = 8;
 
+    /** How many models the quick-ask box offers; the shell's `MODELS`. */
+    var MODELS = 64;
+
+    /**
+     * Tell the shell what models dsh can run a session on, and which one a new
+     * session gets: `modelCatalog`, what dsh's model menu lists, read once and
+     * again on each of the changes that menu reloads on — a provider added or
+     * a key entered. A catalog that cannot be read is not sent; the box shows
+     * no model chip until one is. Only a change is sent.
+     *
+     * @param {object} remote - the `remote` service.
+     * @returns {{ stop: () => void, reload: () => void }} The listeners' end,
+     *   and a read on demand.
+     */
+    function watchModels(remote) {
+      var last = null;
+      var stopped = false;
+      var load = () => {
+        remote.session.modelCatalog().then((response) => {
+          if (stopped || !response || !response.ok) return;
+          var rows = [];
+          response.value.groups.forEach((group) => {
+            group.models.forEach((model) => rows.push([group.id, group.name, model.id, model.name || model.id]));
+          });
+          rows = rows.slice(0, MODELS);
+          var fallback = response.value.default || {};
+          var line = JSON.stringify([rows, fallback.provider, fallback.model]);
+          if (line === last) return;
+          last = line;
+          // Four repeated keys in step, and the default.
+          send({
+            event: 'models',
+            mprov: rows.map((row) => row[0]),
+            mpname: rows.map((row) => row[1]),
+            mid: rows.map((row) => row[2]),
+            mname: rows.map((row) => row[3]),
+            dprov: fallback.provider || '',
+            dmod: fallback.model || '',
+          });
+        }, () => {});
+      };
+      load();
+      var stops = [
+        'llm/adapters-updated',
+        'settings/document-updated',
+        'credentials/record-updated',
+        'credentials/reference-updated',
+      ].map((name) => remote.$on(name, load));
+      return {
+        reload: load,
+        stop: () => {
+          stopped = true;
+          stops.forEach((stop) => { if (typeof stop === 'function') stop(); });
+        },
+      };
+    }
+
+    /**
+     * The model each session's next turn runs on: the one selected for the
+     * next request, or else the one the last used — dsh's own `modelSelection`
+     * projection, which the session list does not carry. So it is read on the
+     * side, one `projections` call a session, which reads without activating
+     * an agent, and kept until the session's `updatedAt` moves. Not while it
+     * runs: its every message moves that, and a turn does not change models.
+     * Null until read, and then the box shows dsh's default.
+     *
+     * @param {() => object | null} remoteOf - the `remote` service, if wired.
+     */
+    function selections(remoteOf) {
+      var cache = new Map();
+      var listeners = new Set();
+      var changed = () => listeners.forEach((fn) => fn());
+      return {
+        changed: changed,
+        subscribe: (fn) => {
+          listeners.add(fn);
+          return () => listeners.delete(fn);
+        },
+        of: (id, summary) => {
+          var hit = cache.get(id);
+          var stale = !hit || (hit.at !== summary.updatedAt && !summary.running);
+          var remote = remoteOf();
+          if (stale && remote && (!hit || hit.reading !== summary.updatedAt)) {
+            var at = summary.updatedAt;
+            var value = hit ? hit.value : null;
+            cache.set(id, { at: hit ? hit.at : null, value: value, reading: at });
+            remote.session.projections({ sessionId: id }).then((result) => {
+              var values = result && result.ok && result.value && result.value.values;
+              var selection = values && values.modelSelection;
+              cache.set(id, { at: at, value: (selection && (selection.next || selection.lastUsed)) || null });
+              changed();
+            }, () => {
+              cache.set(id, { at: at, value: value });
+            });
+          }
+          return hit ? hit.value : null;
+        },
+      };
+    }
+
     /**
      * The most recently used workspaces, as their list or their sessions
      * change.
@@ -474,9 +619,9 @@ window.__ModuleLoader__.load({
      * sidebar lists — not archived, not the blank one dsh holds for its next
      * "new session", not a subagent's — newest first. Its own event and its own
      * check, so that a session moving up its workspace does not redraw the
-     * tray.
+     * tray. With each, the model it runs on, from `picked`; see `selections`.
      */
-    function watchRecent(ctx) {
+    function watchRecent(ctx, picked) {
       var last = null;
       var lastSessions = null;
 
@@ -517,26 +662,35 @@ window.__ModuleLoader__.load({
             })
             .sort((a, b) => byId[b].updatedAt - byId[a].updatedAt)
             .slice(0, SESSIONS)
-            .forEach((id) => rows.push([workspace.path, id, byId[id].displayTitle || '']));
+            .forEach((id) => {
+              var model = picked.of(id, byId[id]);
+              rows.push([workspace.path, id, byId[id].displayTitle || '',
+                (model && model.provider) || '', (model && model.model) || '']);
+            });
         });
         var listed = JSON.stringify(rows);
         if (listed === lastSessions) return;
         lastSessions = listed;
-        // Three repeated keys in step: whose, which, and what it is called.
+        // Five repeated keys in step: whose, which, what it is called, and
+        // the model it runs on.
         send({
           event: 'sessions',
           spath: rows.map((row) => row[0]),
           sid: rows.map((row) => row[1]),
           stitle: rows.map((row) => row[2]),
+          sprov: rows.map((row) => row[3]),
+          smod: rows.map((row) => row[4]),
         });
       };
 
       read();
       var stopWorkspaces = ctx.workspaces.list.subscribe(read);
       var stopSessions = ctx.sessions.list.subscribe(read);
+      var stopPicked = picked.subscribe(read);
       return () => {
         stopWorkspaces();
         stopSessions();
+        stopPicked();
       };
     }
 

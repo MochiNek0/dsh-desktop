@@ -166,6 +166,33 @@
 
 **已验证**（Windows 11，真机截屏 + CDP）：亚克力毛玻璃和圆角生效；点工作区/会话标签，下拉出现在小窗口正下方、和标签左对齐；在下拉里点一行（CDP 发 mousedown）→ 下拉收起、标签变成选中的工作区、焦点回到输入框。**没验证的**：真鼠标点下拉时焦点会不会跑到下拉窗口（代码里兜了：真跑过去就拿回来，不藏小窗口）。
 
+#### 再改：极简、去掉毛玻璃
+
+用户反馈：点标签时小窗口会闪一下；下拉看起来像压在小窗口下面；要去掉立体感和毛玻璃，改成极简。
+
+- **闪一下**：系统的亚克力只画在活动窗口后面，焦点在小窗口和下拉之间交接一次（`show` 会激活下拉，再 `set_focus` 拿回来）背景就从模糊跳到纯色再跳回去。现在两个窗口都是不透明的纯色，不再 `transparent` + Acrylic；圆角保留。
+- **像在下面**：原来是先 `show` 下拉、再 `set_focus` 小窗口，小窗口被抬到下拉前面，活动窗口更大的阴影盖住了下拉上沿。Windows 上下拉改用 `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE | SWP_SHOWWINDOW)` 放到小窗口前面、不激活；小窗口已经有焦点时不再 `set_focus`。这样绕过了 tao 自己记的可见状态，它的 `hide` 会以为窗口本来就是藏着的、什么都不做，所以收起也改成 `ShowWindow(SW_HIDE)`。
+- **样式**：去掉渐变、描边、阴影、内高光、按下缩放和过渡。标签是透明底、6px 圆角，悬停/打开时只铺一层很淡的灰；发送按钮是 6px 圆角的方块，有字时是前景色（浅色下黑、深色下白），没字时只剩灰色箭头；焦点环是 1px 灰线。
+- 托盘菜单这次没动（用户说先不管）。
+
+**已验证**（Windows 11，测试版 + CDP，没碰键鼠）：每 1ms 记前台窗口和 z 序，打开工作区 → 切到会话 → 在下拉里点一行 → 再打开 → 点输入框，前台一直是小窗口，下拉显示时一直排在小窗口前面，点完一行或点别处下拉都真的藏起来了，焦点回到输入框。截屏看过浅色真机和深色（CDP 模拟 `prefers-color-scheme`）。**没验证的**：真鼠标点击时的观感（闪不闪要用户自己看）；Windows 10。
+
+**后续两处**：点另一个标签时不再先关掉已开的下拉（mousedown 关掉了，click 那一下就落空了，要点两次）；可点的地方都是手形光标，禁用的按钮不是。
+
+#### 加：换模型
+
+标签栏第三个标签是模型，显示这句话会跑在哪个模型上：选中的会话用它自己的，新会话用 dsh 的默认。点开是模型列表，按提供方分组（不止一个提供方时右边写提供方名），当前的打勾，打开时滚到它那一行。
+
+- **模型列表**：插件 inject `remote` + `remote.session`（和 dsh 自己的模型菜单一样），调 `remote.session.modelCatalog()`，发 `models` 事件（`mprov/mpname/mid/mname` 成组重复 + `dprov/dmod` 默认，最多 64 个）。和 dsh 一样在 `llm/adapters-updated`、`settings/document-updated`、`credentials/record-updated`、`credentials/reference-updated` 时重读，只在变了时发。读不到就不发，小窗口不显示模型标签。
+- **每个会话的模型**：会话列表里没有 `modelSelection`（`projections` 提示里实测是空的），所以插件对列出的每个会话调一次 `remote.session.projections({ sessionId })`（不会激活 agent），取 `modelSelection.next ?? lastUsed`，按 `updatedAt` 缓存，运行中的会话不重读（每条消息都会动 `updatedAt`）。读到后随 `sessions` 事件的 `sprov/smod` 一起发。
+- **发送**：只有选了一个和「本来会用的」不同的模型才带 `provider/model`；选回同一个等于没选——`selectModel` 会把推理强度重置成默认。插件先 `remote.session.selectModel({ sessionId, provider, model })`，成功再 `prompt`；被拒就 `ask-failed`，小窗口带着这句话、工作区、会话和那个模型回来。Rust 只认目录里列过的模型。
+- **副作用**：`selectModel` 同时把它存成 dsh 的默认模型（写进 `~/.dsh/profiles/web/cordis.patch.yml` 的 `dsh-agent-default-model`），和在 dsh 里换模型一样。发送后插件重读一次目录，小窗口的默认跟着变。
+- 没做推理强度（思考档位）：换了模型就用那个模型的默认强度。
+
+**已验证**：Rust 和插件单测；headless Chrome 用真实 payload 渲染小窗口和下拉页并驱动标签（会话切换时模型标签跟着变、不在目录里的也显示名字、选的模型随 `quick-ask` 带出去、选回会话自己的模型时不带）；测试版里真实跑了一轮：新会话 + 选 `deepseek-official/deepseek-flash`，会话的 projection 缓存里 `lastUsed` 就是它。那一轮本身失败了：`no API key for provider route "deepseek-official"`——dsh 的目录里列着没配 key 的提供方（`routableProviders` 只看模型列表读没读到），dsh 自己的模型菜单选它也一样失败。测完把默认模型改回了原来的 `agy/gemini-3.8-flash-tiered`。
+
+**看到但没动的**：快速提问在一个新文件夹里开会话后，dsh 侧边栏里它排第一，但插件的「最近工作区」里没有它（这次的 `e2e-ws`）。
+
 
 ### 6. 粘贴到 dsh
 

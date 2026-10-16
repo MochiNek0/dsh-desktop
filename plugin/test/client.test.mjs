@@ -700,6 +700,92 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   console.log('ok  starts a new session on a quick-ask line, or sends it into one');
 }
 
+// --- the models the quick-ask box offers, and one chosen there ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const calls = [];
+  const handlers = {};
+  let catalog = {
+    default: { provider: 'ds', model: 'flash' },
+    routableProviders: ['ds'],
+    groups: [{ id: 'ds', name: 'DeepSeek', models: [{ id: 'flash', name: 'Flash' }, { id: 'pro', name: 'Pro' }] }],
+    failures: [],
+  };
+  let refuse = false;
+  const s = services({
+    folders: {
+      create: ({ path }) => Promise.resolve({ workspaceId: 'ws-' + path }),
+      openWorkspace: () => {},
+    },
+  });
+  s.ctx.sessions.create = () => { calls.push('create'); return Promise.resolve('session-new'); };
+  s.ctx.sessions.using = (id, options, operation) => Promise.resolve(operation({
+    ready: Promise.resolve({
+      session: { prompt: (content) => { calls.push(['prompt', id, content[0].text]); return Promise.resolve({ ok: true }); } },
+    }),
+  }));
+  s.ctx.remote = {
+    session: {
+      modelCatalog: () => Promise.resolve({ ok: true, value: catalog }),
+      selectModel: (request) => {
+        calls.push(['select', request.sessionId, request.provider, request.model]);
+        return Promise.resolve(refuse
+          ? { ok: false, error: { code: 'session/model-unavailable', message: 'no such model' } }
+          : { ok: true, value: { selected: request } });
+      },
+    },
+    $on: (name, fn) => { handlers[name] = fn; return () => { delete handlers[name]; }; },
+  };
+  s.ctx['remote.session'] = s.ctx.remote.session;
+  exports.apply(s.ctx);
+  await drain();
+
+  const models = () => sent.filter((url) => query(url).event === 'models');
+  assert.equal(models().length, 1);
+  assert.deepEqual(queryAll(models()[0], 'mid'), ['flash', 'pro']);
+  assert.deepEqual(queryAll(models()[0], 'mname'), ['Flash', 'Pro']);
+  assert.deepEqual(queryAll(models()[0], 'mprov'), ['ds', 'ds']);
+  assert.deepEqual(queryAll(models()[0], 'mpname'), ['DeepSeek', 'DeepSeek']);
+  assert.deepEqual([query(models()[0]).dprov, query(models()[0]).dmod], ['ds', 'flash']);
+
+  // Read again when what it is made of changes, and sent only if it did.
+  handlers['settings/document-updated']();
+  await drain();
+  assert.equal(models().length, 1, 'the same catalog is not sent again');
+  catalog = { ...catalog, default: { provider: 'ds', model: 'pro' } };
+  handlers['credentials/record-updated']();
+  await drain();
+  assert.equal(models().length, 2);
+  assert.equal(query(models()[1]).dmod, 'pro');
+
+  // A model chosen in the box is selected before the line goes in.
+  // It is the default now, too, and the catalog is read again to say so.
+  catalog = { ...catalog, default: { provider: 'ds', model: 'flash' } };
+  window.__dshSignals.ask('/work/a', 'on pro', '', 'ds', 'pro');
+  await drain();
+  assert.deepEqual(calls, ['create', ['select', 'session-new', 'ds', 'pro'], ['prompt', 'session-new', 'on pro']]);
+  assert.equal(models().length, 3);
+  assert.equal(query(models()[2]).dmod, 'flash');
+
+  // None chosen, none selected.
+  calls.length = 0;
+  window.__dshSignals.ask('/work/a', 'as it was', 'session-old', '', '');
+  await drain();
+  assert.deepEqual(calls, [['prompt', 'session-old', 'as it was']]);
+
+  // dsh refusing the model: nothing goes in, and the box hears why.
+  calls.length = 0;
+  refuse = true;
+  window.__dshSignals.ask('/work/a', 'x', 'session-old', 'ds', 'gone');
+  await drain();
+  assert.deepEqual(calls, [['select', 'session-old', 'ds', 'gone']]);
+  assert.deepEqual([query(sent.at(-1)).event, query(sent.at(-1)).reason], ['ask-failed', 'no such model']);
+
+  s.stop();
+  assert.deepEqual(Object.keys(handlers), [], 'the listeners go with the scope');
+  console.log('ok  reports the model catalog and selects a model chosen in the quick-ask box');
+}
+
 // --- text into a composer, after what is already there ---
 {
   const { exports, window } = load({ host: true });
@@ -849,6 +935,8 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   assert.deepEqual(queryAll(sessionLists[0], 'sid'), ['b1', 'a2', 'a1']);
   assert.deepEqual(queryAll(sessionLists[0], 'spath'), ['/b', '/a', '/a']);
   assert.deepEqual(queryAll(sessionLists[0], 'stitle'), ['T6', 'T3', 'T1']);
+  assert.deepEqual(queryAll(sessionLists[0], 'smod'), ['', '', ''], 'no remote, no models');
+  assert.deepEqual(queryAll(sessionLists[0], 'sprov'), ['', '', '']);
 
   // A session moving up its workspace changes this list and not the tray's.
   s.setList({
@@ -866,6 +954,57 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   await drain();
   assert.equal(sessionLists.length, count, 'the same list is not sent again');
   console.log('ok  reports the sessions of each recent workspace');
+}
+
+// --- and the model each of those sessions runs on ---
+{
+  const { exports, sessionLists } = load({ host: true });
+  const s = services({ folders: { create: () => Promise.reject(), openWorkspace: () => {} } });
+  const read = [];
+  const selection = {
+    a1: { lastUsed: { provider: 'ds', model: 'flash' }, next: { provider: 'ds', model: 'flash' } },
+    a2: { lastUsed: { provider: 'ds', model: 'flash' }, next: { provider: 'ds', model: 'pro' } },
+  };
+  s.ctx.remote = {
+    session: {
+      modelCatalog: () => Promise.resolve({ ok: false, error: { code: 'x', message: 'not now' } }),
+      projections: ({ sessionId }) => {
+        read.push(sessionId);
+        const values = selection[sessionId] ? { modelSelection: selection[sessionId] } : {};
+        return Promise.resolve({ ok: true, value: { asOfSeq: 1, values } });
+      },
+    },
+    $on: () => () => {},
+  };
+  s.ctx['remote.session'] = s.ctx.remote.session;
+  const row = (day, more) => ({ running: false, displayTitle: 'T' + day, updatedAt: Date.parse(`2026-02-0${day}`), ...more });
+  s.setList({ ids: ['a1', 'a2', 'a3'], byId: { a1: row(1), a2: row(3), a3: row(2) } });
+  s.setWorkspaces([
+    { workspaceId: 'a', title: 'A', path: '/a', updatedAt: '2026-01-01T00:00:00Z', sessionIds: ['a1', 'a2', 'a3'] },
+  ]);
+  exports.apply(s.ctx);
+  await drain();
+  // Newest first; next, else last used, else unknown.
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'sid'), ['a2', 'a3', 'a1']);
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'smod'), ['pro', '', 'flash']);
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'sprov'), ['ds', '', 'ds']);
+  assert.deepEqual(read.sort(), ['a1', 'a2', 'a3'], 'one read a session');
+
+  // Not again until the session moves, and not while it runs.
+  read.length = 0;
+  s.setList({ ids: ['a1', 'a2', 'a3'], byId: { a1: row(1), a2: row(3), a3: row(2) } });
+  s.setList({ ids: ['a1', 'a2', 'a3'], byId: { a1: row(5, { running: true }), a2: row(3), a3: row(2) } });
+  await drain();
+  assert.deepEqual(read, []);
+
+  // Its turn over, and on another model.
+  selection.a1 = { lastUsed: { provider: 'ds', model: 'pro' }, next: { provider: 'ds', model: 'pro' } };
+  s.setList({ ids: ['a1', 'a2', 'a3'], byId: { a1: row(6), a2: row(3), a3: row(2) } });
+  await drain();
+  assert.deepEqual(read, ['a1']);
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'sid'), ['a1', 'a2', 'a3']);
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'smod'), ['pro', 'pro', '']);
+  console.log('ok  reports the model each listed session runs on');
 }
 
 // --- no desktop shell: no door either ---

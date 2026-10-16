@@ -20,6 +20,17 @@
 //! offered for the rest of the run, the picker being somewhere a script cannot
 //! reach — the same reasoning as [`crate::plugins::pick_local`].
 //!
+//! ## The model
+//!
+//! A third chip says which model the line runs on: the session's own, or for
+//! a new session the default dsh gives one, from the catalog the plugin reads
+//! (`modelCatalog`, what dsh's own model menu lists). Choosing another one
+//! there is sent with the line, and the plugin selects it for the session
+//! before the line goes in — `selectModel`, the call dsh's menu makes, which
+//! also makes it dsh's default from then on. Left alone, nothing is selected,
+//! and the session keeps its model and its reasoning effort. A model is only
+//! taken if the catalog listed it.
+//!
 //! ## The dropdown
 //!
 //! Each of the two choices opens a list that hangs below its chip, past the
@@ -31,9 +42,11 @@
 //! (`quick-menu-active`), and a click on a row comes back here
 //! (`menu-pick`) and goes on to the box as the choice it was.
 //!
-//! On Windows both windows are acrylic glass with rounded corners. Elsewhere
-//! they are opaque: a see-through window on macOS takes Tauri's private-API
-//! feature, and Linux has no blur behind a window to ask for.
+//! Both windows are plain and opaque, with rounded corners on Windows 11. Not
+//! acrylic: Windows draws that backdrop only behind the active window, and
+//! every hand-over of activation between the two showed as the box flashing.
+//! On Windows the list is put up without being activated, and in front of the
+//! box, so that it reads as lying over the box rather than under it.
 //!
 //! The box does not wait for the turn. It closes on Enter, and the turn's end
 //! is announced the way any other is: by the notification [`crate::signal`]
@@ -76,20 +89,53 @@ const GAP: f64 = 6.0;
 /// The plugin sends at most eight a workspace; see `SESSIONS` there.
 pub const SESSIONS: usize = crate::recent::LIMIT * 8;
 
-/// One session the box offers, under the workspace it belongs to.
+/// How many models the box lists.
+pub const MODELS: usize = 64;
+
+/// One session the box offers, under the workspace it belongs to, and the
+/// model it runs on — empty when dsh has not said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub path: String,
     pub id: String,
     pub title: String,
+    pub model: Choice,
 }
 
-/// A line, the workspace it is for by path, and the session in it — empty for
-/// a new one.
+/// A model by its provider and its id, the pair dsh selects by. Both empty
+/// for none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Choice {
+    pub provider: String,
+    pub model: String,
+}
+
+impl Choice {
+    fn is_empty(&self) -> bool {
+        self.provider.is_empty() || self.model.is_empty()
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "provider": self.provider, "model": self.model })
+    }
+}
+
+/// One model in the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Model {
+    pub provider: String,
+    pub provider_name: String,
+    pub id: String,
+    pub name: String,
+}
+
+/// A line, the workspace it is for by path, the session in it — empty for a
+/// new one — and the model chosen for it, empty if none was.
 #[derive(Clone)]
 struct Line {
     path: String,
     session: String,
+    model: Choice,
     text: String,
 }
 
@@ -109,6 +155,15 @@ static MENU_SHOWN: Mutex<String> = Mutex::new(String::new());
 /// The plugin's latest list of sessions; see [`set_sessions`].
 static LISTED: Mutex<Vec<Session>> = Mutex::new(Vec::new());
 
+/// The plugin's latest model catalog and default; see [`set_models`].
+static CATALOG: Mutex<(Vec<Model>, Choice)> = Mutex::new((
+    Vec::new(),
+    Choice {
+        provider: String::new(),
+        model: String::new(),
+    },
+));
+
 /// Folders chosen in the box's own picker this run.
 static PICKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -120,6 +175,13 @@ static PICKING: AtomicBool = AtomicBool::new(false);
 pub fn set_sessions(list: Vec<Session>) {
     if let Ok(mut listed) = LISTED.lock() {
         *listed = list;
+    }
+}
+
+/// The plugin's latest model catalog. Read the next time the box is shown.
+pub fn set_models(list: Vec<Model>, default: Choice) {
+    if let Ok(mut catalog) = CATALOG.lock() {
+        *catalog = (list, default);
     }
 }
 
@@ -166,6 +228,18 @@ fn show(app: &AppHandle, text: &str, error: &str, line: Option<&Line>) {
 /// word it shows, in the language of the moment.
 fn payload(text: &str, error: &str, line: Option<&Line>) -> String {
     let sessions = LISTED.lock().map(|listed| listed.clone()).unwrap_or_default();
+    let (models, default) = CATALOG.lock().map(|catalog| catalog.clone()).unwrap_or_default();
+    let models: Vec<_> = models
+        .iter()
+        .map(|model| {
+            serde_json::json!({
+                "provider": model.provider,
+                "providerName": model.provider_name,
+                "model": model.id,
+                "name": model.name,
+            })
+        })
+        .collect();
     let recent = crate::recent::list();
     let mut workspaces: Vec<_> = recent
         .iter()
@@ -181,9 +255,11 @@ fn payload(text: &str, error: &str, line: Option<&Line>) -> String {
         "workspaces": workspaces,
         "path": line.map(|line| line.path.as_str()).unwrap_or(""),
         "session": line.map(|line| line.session.as_str()).unwrap_or(""),
+        "model": line.map(|line| line.model.json()).unwrap_or(serde_json::Value::Null),
+        "models": models,
+        "default": default.json(),
         "text": text,
         "error": error,
-        "glass": GLASS,
         "words": words(),
     });
     format!("window.__dshAsk && window.__dshAsk({payload})")
@@ -193,7 +269,9 @@ fn workspace_json(title: &str, path: &str, sessions: &[Session]) -> serde_json::
     let sessions: Vec<_> = sessions
         .iter()
         .filter(|session| session.path == path)
-        .map(|session| serde_json::json!({ "id": session.id, "title": session.title }))
+        .map(|session| {
+            serde_json::json!({ "id": session.id, "title": session.title, "model": session.model.json() })
+        })
         .collect();
     serde_json::json!({ "title": title, "path": path, "sessions": sessions })
 }
@@ -208,6 +286,7 @@ fn words() -> serde_json::Value {
         "send": t!("发送", "Send"),
         "workspace": t!("工作区", "Workspace"),
         "session": t!("会话", "Session"),
+        "model": t!("模型", "Model"),
     })
 }
 
@@ -220,31 +299,20 @@ fn folder_title(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Whether the two windows are glass; see the module docs.
-const GLASS: bool = cfg!(windows);
-
-/// The settings both windows share: frameless, on top, out of the taskbar,
-/// and on Windows see-through behind acrylic.
+/// The settings both windows share: frameless, on top, out of the taskbar.
 fn builder<'a>(
     app: &'a AppHandle,
     label: &str,
     page: &str,
 ) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
-    let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(page.into()))
+    WebviewWindowBuilder::new(app, label, WebviewUrl::App(page.into()))
         .title("dsh")
         .resizable(false)
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false)
-        .theme(crate::theme::preference().window());
-    #[cfg(windows)]
-    let builder = builder.transparent(true).effects(
-        tauri::window::EffectsBuilder::new()
-            .effect(tauri::window::Effect::Acrylic)
-            .build(),
-    );
-    builder
+        .theme(crate::theme::preference().window())
 }
 
 /// Round the corners the way Windows 11 rounds its own menus. A frameless
@@ -272,6 +340,68 @@ fn round(window: &WebviewWindow) {
 
 #[cfg(not(windows))]
 fn round(_: &WebviewWindow) {}
+
+/// Put the list up in front of the box without activating it. `show` would
+/// activate it, the box would lose and take back the focus, and the box —
+/// raised again by taking it — would cover the list's top edge with its shadow.
+#[cfg(windows)]
+fn show_over(menu: &WebviewWindow) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    };
+    let Ok(hwnd) = menu.hwnd() else {
+        let _ = menu.show();
+        return;
+    };
+    // SAFETY: a live handle; nothing but its place in the z-order and its
+    // visibility changes.
+    let shown = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    };
+    if shown.is_err() {
+        let _ = menu.show();
+    }
+}
+
+/// Put the list away, the same way it was put up: tao keeps its own record of
+/// whether the window is showing, which [`show_over`] went around, and its
+/// `hide` is a no-op for a window it thinks is hidden already.
+#[cfg(windows)]
+fn hide_list(menu: &WebviewWindow) {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    let Ok(hwnd) = menu.hwnd() else {
+        let _ = menu.hide();
+        return;
+    };
+    // SAFETY: a live handle.
+    let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+}
+
+#[cfg(not(windows))]
+fn show_over(menu: &WebviewWindow) {
+    let _ = menu.show();
+}
+
+#[cfg(not(windows))]
+fn hide_list(menu: &WebviewWindow) {
+    let _ = menu.hide();
+}
+
+/// The focus back on the box, unless it has it: taking it again when it
+/// already has it is a needless round of activation.
+fn refocus(window: &WebviewWindow) {
+    if !window.is_focused().unwrap_or(false) {
+        let _ = window.set_focus();
+    }
+}
 
 fn build(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let handle = app.clone();
@@ -381,7 +511,7 @@ fn menu_navigated(app: &AppHandle, url: &Url) -> bool {
                 hide_menu(app);
                 if let Some(window) = app.get_webview_window(LABEL) {
                     let _ = window.eval(format!("window.__dshAskChose && window.__dshAskChose({index})"));
-                    let _ = window.set_focus();
+                    refocus(&window);
                 }
             }
             Some("menu-ready") => {
@@ -419,7 +549,7 @@ fn hide(app: &AppHandle) {
 
 fn hide_menu(app: &AppHandle) {
     if let Some(menu) = app.get_webview_window(MENU) {
-        let _ = menu.hide();
+        hide_list(&menu);
     }
 }
 
@@ -499,7 +629,7 @@ fn open_menu(app: &AppHandle, url: &Url) {
 
     let call = format!(
         "window.__dshMenu && window.__dshMenu({})",
-        serde_json::json!({ "items": items, "active": active, "glass": GLASS })
+        serde_json::json!({ "items": items, "active": active })
     );
     let _ = menu.set_theme(crate::theme::preference().window());
     let _ = menu.set_size(LogicalSize::new(anchor.width, anchor.height));
@@ -508,10 +638,10 @@ fn open_menu(app: &AppHandle, url: &Url) {
     if let Ok(mut shown) = MENU_SHOWN.lock() {
         *shown = call;
     }
-    let _ = menu.show();
+    show_over(&menu);
     // It cannot take the focus, but showing a window can still hand it over
     // on some systems; the box is where the keys go.
-    let _ = window.set_focus();
+    refocus(&window);
 }
 
 /// "Open another folder…": the system's folder picker, over the box.
@@ -560,18 +690,26 @@ fn picked_call(path: &str) -> String {
 }
 
 /// Whether the box offered this workspace and, unless it is a new one, this
-/// session in it.
-fn offered(path: &str, session: &str) -> bool {
+/// session in it, and, unless none was chosen, this model.
+fn offered(path: &str, session: &str, model: &Choice) -> bool {
     let known = crate::recent::list().iter().any(|workspace| workspace.path == path)
         || PICKED.lock().map(|picked| picked.iter().any(|p| p == path)).unwrap_or(false);
     if !known {
         return false;
     }
-    session.is_empty()
+    let session = session.is_empty()
         || LISTED
             .lock()
             .map(|listed| listed.iter().any(|s| s.path == path && s.id == session))
-            .unwrap_or(false)
+            .unwrap_or(false);
+    session
+        && (model.is_empty()
+            || CATALOG
+                .lock()
+                .map(|catalog| {
+                    catalog.0.iter().any(|m| m.provider == model.provider && m.id == model.model)
+                })
+                .unwrap_or(false))
 }
 
 /// A line was sent from the box.
@@ -579,12 +717,18 @@ fn submitted(app: &AppHandle, url: &Url) {
     let text = field(url, "text").trim().to_string();
     let path = field(url, "path");
     let session = field(url, "session");
-    if text.is_empty() || !offered(&path, &session) {
+    let model = Choice {
+        provider: field(url, "provider"),
+        model: field(url, "model"),
+    };
+    // Half a model is none.
+    let model = if model.is_empty() { Choice::default() } else { model };
+    if text.is_empty() || !offered(&path, &session, &model) {
         return;
     }
 
     hide(app);
-    let line = Line { path, session, text };
+    let line = Line { path, session, model, text };
     if crate::folder::is_ready() {
         hand(app, line);
     } else if let Ok(mut pending) = PENDING.lock() {
@@ -610,7 +754,7 @@ fn hand(app: &AppHandle, line: Line) {
     } else {
         eprintln!("dsh-desktop: a quick ask goes to {} in {}", line.session, line.path);
     }
-    let _ = window.eval(call(&line.path, &line.session, &line.text));
+    let _ = window.eval(call(&line.path, &line.session, &line.model, &line.text));
     if let Ok(mut last) = LAST.lock() {
         *last = Some(line);
     }
@@ -635,28 +779,31 @@ pub fn failed(app: &AppHandle, reason: &str) {
 
 /// The call [`hand`] makes. Every string as JSON, the text being the user's
 /// own; see `signal::drafted` for why not `{:?}`.
-fn call(path: &str, session: &str, text: &str) -> String {
+fn call(path: &str, session: &str, model: &Choice, text: &str) -> String {
     let json = |text: &str| serde_json::to_string(text).expect("a string is always serializable");
     let (path, session, text) = (json(path), json(session), json(text));
+    let (provider, model) = (json(&model.provider), json(&model.model));
     format!(
-        "window.__dshSignals ? window.__dshSignals.ask({path}, {text}, {session}) \
+        "window.__dshSignals ? window.__dshSignals.ask({path}, {text}, {session}, {provider}, {model}) \
          : (window.location.href = 'dsh-window://signal?event=ask-failed&reason=not%20ready&n=' + Date.now());"
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{call, folder_title, payload, picked_call, Anchor, Line};
+    use super::{call, folder_title, payload, picked_call, Anchor, Choice, Line};
     use tauri::Url;
 
     #[test]
     fn hands_the_line_over_as_javascript_strings() {
-        let call = call(r"C:\work\a b", "", "it's \"quoted\"\nand two lines");
-        assert!(call.starts_with(r#"window.__dshSignals ? window.__dshSignals.ask("C:\\work\\a b", "it's \"quoted\"\nand two lines", "")"#), "{call}");
+        let none = Choice::default();
+        let call = call(r"C:\work\a b", "", &none, "it's \"quoted\"\nand two lines");
+        assert!(call.starts_with(r#"window.__dshSignals ? window.__dshSignals.ask("C:\\work\\a b", "it's \"quoted\"\nand two lines", "", "", "")"#), "{call}");
         assert!(call.contains("event=ask-failed"), "the fallback when no plugin is there");
 
-        let call = super::call("/w", "session-1", "x");
-        assert!(call.contains(r#"ask("/w", "x", "session-1")"#), "{call}");
+        let model = Choice { provider: "ds".into(), model: "v4\"pro".into() };
+        let call = super::call("/w", "session-1", &model, "x");
+        assert!(call.contains(r#"ask("/w", "x", "session-1", "ds", "v4\"pro")"#), "{call}");
     }
 
     fn read(call: &str, prefix: &str) -> serde_json::Value {
@@ -672,11 +819,12 @@ mod tests {
         let value = read(&payload("draft", "", None), "window.__dshAsk && window.__dshAsk(");
         assert_eq!(value["text"], "draft");
         assert_eq!(value["path"], "", "the page picks the latest workspace");
-        assert_eq!(value["glass"], cfg!(windows));
-        for word in ["placeholder", "hint", "pick", "other", "fresh", "send", "workspace", "session"] {
+        for word in ["placeholder", "hint", "pick", "other", "fresh", "send", "workspace", "session", "model"] {
             assert!(value["words"][word].as_str().is_some_and(|w| !w.is_empty()), "{word}");
         }
         assert!(value["workspaces"].is_array());
+        assert!(value["models"].is_array());
+        assert!(value["model"].is_null(), "nothing chosen");
     }
 
     /// Coming back after a failure, to a folder that was picked rather than
@@ -686,11 +834,13 @@ mod tests {
         let line = Line {
             path: "/elsewhere/picked".into(),
             session: "session-1".into(),
+            model: Choice { provider: "ds".into(), model: "pro".into() },
             text: "again".into(),
         };
         let value = read(&payload("again", "no", Some(&line)), "window.__dshAsk && window.__dshAsk(");
         assert_eq!(value["path"], "/elsewhere/picked");
         assert_eq!(value["session"], "session-1");
+        assert_eq!(value["model"], serde_json::json!({ "provider": "ds", "model": "pro" }));
         let last = value["workspaces"].as_array().unwrap().last().unwrap().clone();
         assert_eq!(last["title"], "picked");
         assert_eq!(last["path"], "/elsewhere/picked");
