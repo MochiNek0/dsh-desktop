@@ -20,8 +20,20 @@
 //! offered for the rest of the run, the picker being somewhere a script cannot
 //! reach — the same reasoning as [`crate::plugins::pick_local`].
 //!
-//! The box grows while one of its two lists is open and shrinks back after;
-//! the page says how tall it needs to be (`quick-size`).
+//! ## The dropdown
+//!
+//! Each of the two choices opens a list that hangs below its chip, past the
+//! box's own edge. That is a second window, `dist/ask-menu.html`: a page
+//! cannot draw outside its window, and growing the box to make room for the
+//! list was the box changing shape under the user. It cannot take the focus,
+//! so the box keeps it and the keyboard stays there; the box says what to
+//! list and where (`quick-menu`), which row the keys are on
+//! (`quick-menu-active`), and a click on a row comes back here
+//! (`menu-pick`) and goes on to the box as the choice it was.
+//!
+//! On Windows both windows are acrylic glass with rounded corners. Elsewhere
+//! they are opaque: a see-through window on macOS takes Tauri's private-API
+//! feature, and Linux has no blur behind a window to ask for.
 //!
 //! The box does not wait for the turn. It closes on Enter, and the turn's end
 //! is announced the way any other is: by the notification [`crate::signal`]
@@ -44,15 +56,21 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use tauri::{AppHandle, LogicalSize, Manager, Url, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    AppHandle, LogicalSize, Manager, PhysicalPosition, Url, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
+};
 
-/// The window's label.
+/// The two windows' labels.
 const LABEL: &str = "ask";
+const MENU: &str = "ask-menu";
 
-/// The window's size with neither list open, and the tallest it grows to.
+/// The box's size.
 const WIDTH: f64 = 640.0;
 const HEIGHT: f64 = 132.0;
-const TALLEST: f64 = 480.0;
+
+/// The gap between a chip and the list hanging off it.
+const GAP: f64 = 6.0;
 
 /// How many sessions are kept for the box, over all the recent workspaces.
 /// The plugin sends at most eight a workspace; see `SESSIONS` there.
@@ -83,8 +101,10 @@ static LAST: Mutex<Option<Line>> = Mutex::new(None);
 
 /// What the box was last told to show, for a page that loads after it was
 /// told: the first time the window is built, its page is not there yet when
-/// [`show`] hands it the payload, so the page asks again (`quick-ready`).
+/// [`show`] hands it the payload, so the page asks again (`quick-ready`). The
+/// same for the dropdown's page (`menu-ready`).
 static SHOWN: Mutex<String> = Mutex::new(String::new());
+static MENU_SHOWN: Mutex<String> = Mutex::new(String::new());
 
 /// The plugin's latest list of sessions; see [`set_sessions`].
 static LISTED: Mutex<Vec<Session>> = Mutex::new(Vec::new());
@@ -107,7 +127,7 @@ pub fn set_sessions(list: Vec<Session>) {
 pub fn toggle(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(LABEL) {
         if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
+            hide(app);
             return;
         }
     }
@@ -129,8 +149,8 @@ fn show(app: &AppHandle, text: &str, error: &str, line: Option<&Line>) {
         },
     };
 
+    hide_menu(app);
     let _ = window.set_theme(crate::theme::preference().window());
-    let _ = window.set_size(LogicalSize::new(WIDTH, HEIGHT));
     let _ = window.center();
     let call = payload(text, error, line);
     let _ = window.eval(&call);
@@ -163,6 +183,7 @@ fn payload(text: &str, error: &str, line: Option<&Line>) -> String {
         "session": line.map(|line| line.session.as_str()).unwrap_or(""),
         "text": text,
         "error": error,
+        "glass": GLASS,
         "words": words(),
     });
     format!("window.__dshAsk && window.__dshAsk({payload})")
@@ -199,19 +220,66 @@ fn folder_title(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-fn build(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
-    let handle = app.clone();
-    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("ask.html".into()))
+/// Whether the two windows are glass; see the module docs.
+const GLASS: bool = cfg!(windows);
+
+/// The settings both windows share: frameless, on top, out of the taskbar,
+/// and on Windows see-through behind acrylic.
+fn builder<'a>(
+    app: &'a AppHandle,
+    label: &str,
+    page: &str,
+) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
+    let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(page.into()))
         .title("dsh")
-        .inner_size(WIDTH, HEIGHT)
         .resizable(false)
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false)
-        .theme(crate::theme::preference().window())
+        .theme(crate::theme::preference().window());
+    #[cfg(windows)]
+    let builder = builder.transparent(true).effects(
+        tauri::window::EffectsBuilder::new()
+            .effect(tauri::window::Effect::Acrylic)
+            .build(),
+    );
+    builder
+}
+
+/// Round the corners the way Windows 11 rounds its own menus. A frameless
+/// window is square unless it asks; Windows 10 has no such attribute, and the
+/// call failing there leaves it square.
+#[cfg(windows)]
+fn round(window: &WebviewWindow) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let preference = DWMWCP_ROUND;
+    // SAFETY: a live handle, and a value of the size the attribute takes.
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const _ as *const _,
+            std::mem::size_of_val(&preference) as u32,
+        )
+    };
+}
+
+#[cfg(not(windows))]
+fn round(_: &WebviewWindow) {}
+
+fn build(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+    let handle = app.clone();
+    let window = builder(app, LABEL, "ask.html")
+        .inner_size(WIDTH, HEIGHT)
         .on_navigation(move |url| navigated(&handle, url))
         .build()?;
+    round(&window);
 
     // Away once it is not in front, the way a launcher is: the box is for one
     // line, and one left floating over other work is in the way.
@@ -221,20 +289,42 @@ fn build(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
     // reports that hand-over as the window losing focus and getting it back —
     // so hiding on the event itself hid the box the moment it first appeared.
     // A moment later the window is asked again, and only a window that is
-    // still not focused is put away. Nor while the folder picker is up: the
-    // focus went to it, and the box is what it answers to.
+    // still not focused is put away. Nor while the folder picker is up, nor
+    // when it was its own dropdown that took the focus: the box is what both
+    // of those answer to.
     let away = window.clone();
+    let app = app.clone();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::Focused(false) = event {
             let away = away.clone();
+            let app = app.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(150));
+                let menu = app
+                    .get_webview_window(MENU)
+                    .and_then(|menu| menu.is_focused().ok())
+                    .unwrap_or(false);
+                if menu {
+                    let _ = away.set_focus();
+                    return;
+                }
                 if !away.is_focused().unwrap_or(false) && !PICKING.load(Ordering::SeqCst) {
-                    let _ = away.hide();
+                    hide(&app);
                 }
             });
         }
     });
+    Ok(window)
+}
+
+fn build_menu(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+    let handle = app.clone();
+    let window = builder(app, MENU, "ask-menu.html")
+        .inner_size(280.0, 120.0)
+        .focusable(false)
+        .on_navigation(move |url| menu_navigated(&handle, url))
+        .build()?;
+    round(&window);
     Ok(window)
 }
 
@@ -246,7 +336,14 @@ fn navigated(app: &AppHandle, url: &Url) -> bool {
             Some("quick-ask") => submitted(app, url),
             Some("quick-close") => hide(app),
             Some("quick-pick") => pick(app),
-            Some("quick-size") => resize(app, &field(url, "h")),
+            Some("quick-menu") => open_menu(app, url),
+            Some("quick-menu-active") => {
+                let index: i64 = field(url, "i").parse().unwrap_or(-1);
+                if let Some(menu) = app.get_webview_window(MENU) {
+                    let _ = menu.eval(format!("window.__dshMenuActive && window.__dshMenuActive({index})"));
+                }
+            }
+            Some("quick-menu-close") => hide_menu(app),
             Some("quick-ready") => {
                 let call = SHOWN.lock().map(|shown| shown.clone()).unwrap_or_default();
                 if let Some(window) = app.get_webview_window(LABEL) {
@@ -257,8 +354,37 @@ fn navigated(app: &AppHandle, url: &Url) -> bool {
         }
         return false;
     }
-    // The page itself, under whichever spelling of the app's own origin this
-    // platform serves it from.
+    is_own_page(url)
+}
+
+/// The dropdown's navigation: its page loading, and a row picked.
+fn menu_navigated(app: &AppHandle, url: &Url) -> bool {
+    if url.scheme() == crate::controls::SCHEME {
+        match url.host_str() {
+            Some("menu-pick") => {
+                let index: i64 = field(url, "i").parse().unwrap_or(-1);
+                hide_menu(app);
+                if let Some(window) = app.get_webview_window(LABEL) {
+                    let _ = window.eval(format!("window.__dshAskChose && window.__dshAskChose({index})"));
+                    let _ = window.set_focus();
+                }
+            }
+            Some("menu-ready") => {
+                let call = MENU_SHOWN.lock().map(|shown| shown.clone()).unwrap_or_default();
+                if let Some(menu) = app.get_webview_window(MENU) {
+                    let _ = menu.eval(&call);
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+    is_own_page(url)
+}
+
+/// The page itself, under whichever spelling of the app's own origin this
+/// platform serves it from.
+fn is_own_page(url: &Url) -> bool {
     url.scheme() == "tauri" || url.host_str() == Some("tauri.localhost")
 }
 
@@ -268,21 +394,117 @@ fn field(url: &Url, name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Away, the box and its dropdown both.
 fn hide(app: &AppHandle) {
+    hide_menu(app);
     if let Some(window) = app.get_webview_window(LABEL) {
         let _ = window.hide();
     }
 }
 
-/// The page opened or closed a list and needs this many pixels of height.
-/// Only ever between the box's own two sizes, whatever the URL says.
-fn resize(app: &AppHandle, height: &str) {
-    let Ok(height) = height.parse::<f64>() else {
+fn hide_menu(app: &AppHandle) {
+    if let Some(menu) = app.get_webview_window(MENU) {
+        let _ = menu.hide();
+    }
+}
+
+/// Where the dropdown goes and how big it is, in the box's own CSS pixels:
+/// the chip's left edge, its top and bottom, and the list's size.
+#[derive(Debug, PartialEq)]
+struct Anchor {
+    x: f64,
+    top: f64,
+    bottom: f64,
+    width: f64,
+    height: f64,
+}
+
+impl Anchor {
+    /// Read off the page's URL, and held to sizes a list can be whatever the
+    /// URL says.
+    fn read(url: &Url) -> Option<Anchor> {
+        let number = |name: &str| field(url, name).parse::<f64>().ok().filter(|n| n.is_finite());
+        Some(Anchor {
+            x: number("x")?.clamp(0.0, WIDTH),
+            top: number("top")?.clamp(0.0, HEIGHT),
+            bottom: number("bottom")?.clamp(0.0, HEIGHT),
+            width: number("w")?.clamp(160.0, 520.0),
+            height: number("h")?.clamp(40.0, 440.0),
+        })
+    }
+
+    /// Where the list's top-left corner goes on screen: under the chip, or
+    /// above it when there is not room below. `origin` is the box's content
+    /// on screen, `floor` the bottom of the work area, both physical.
+    fn place(&self, origin: (i32, i32), scale: f64, floor: i32) -> (i32, i32) {
+        let x = origin.0 + (self.x * scale).round() as i32;
+        let below = origin.1 + ((self.bottom + GAP) * scale).round() as i32;
+        if below + (self.height * scale).round() as i32 <= floor {
+            return (x, below);
+        }
+        (x, origin.1 + ((self.top - GAP - self.height) * scale).round() as i32)
+    }
+}
+
+/// The page opened one of its lists: put the dropdown under that chip.
+fn open_menu(app: &AppHandle, url: &Url) {
+    let Some(anchor) = Anchor::read(url) else {
         return;
     };
-    if let Some(window) = app.get_webview_window(LABEL) {
-        let _ = window.set_size(LogicalSize::new(WIDTH, height.clamp(HEIGHT, TALLEST)));
+    // Re-read, so that what is evaluated in the dropdown is JSON this side
+    // wrote, whatever the URL held.
+    let Ok(items) = serde_json::from_str::<serde_json::Value>(&field(url, "items")) else {
+        return;
+    };
+    if !items.is_array() {
+        return;
     }
+    let active: i64 = field(url, "active").parse().unwrap_or(0);
+    let Some(window) = app.get_webview_window(LABEL) else {
+        return;
+    };
+    let menu = match app.get_webview_window(MENU) {
+        Some(menu) => menu,
+        None => match build_menu(app) {
+            Ok(menu) => menu,
+            Err(error) => {
+                eprintln!("dsh-desktop: could not open the quick-ask list: {error}");
+                return;
+            }
+        },
+    };
+
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let origin = window
+        .inner_position()
+        .map(|position| (position.x, position.y))
+        .unwrap_or_default();
+    let floor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| {
+            let area = monitor.work_area();
+            area.position.y + area.size.height as i32
+        })
+        .unwrap_or(i32::MAX);
+    let (x, y) = anchor.place(origin, scale, floor);
+
+    let call = format!(
+        "window.__dshMenu && window.__dshMenu({})",
+        serde_json::json!({ "items": items, "active": active, "glass": GLASS })
+    );
+    let _ = menu.set_theme(crate::theme::preference().window());
+    let _ = menu.set_size(LogicalSize::new(anchor.width, anchor.height));
+    let _ = menu.set_position(PhysicalPosition::new(x, y));
+    let _ = menu.eval(&call);
+    if let Ok(mut shown) = MENU_SHOWN.lock() {
+        *shown = call;
+    }
+    let _ = menu.show();
+    // It cannot take the focus, but showing a window can still hand it over
+    // on some systems; the box is where the keys go.
+    let _ = window.set_focus();
 }
 
 /// "Open another folder…": the system's folder picker, over the box.
@@ -292,6 +514,7 @@ fn resize(app: &AppHandle, height: &str) {
 /// was picked is handed to the page, which adds it to the list and chooses it;
 /// the text in the box stays where it was.
 fn pick(app: &AppHandle) {
+    hide_menu(app);
     PICKING.store(true, Ordering::SeqCst);
     let handle = app.clone();
     let queued = app.run_on_main_thread(move || {
@@ -416,7 +639,8 @@ fn call(path: &str, session: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{call, folder_title, payload, picked_call, Line};
+    use super::{call, folder_title, payload, picked_call, Anchor, Line};
+    use tauri::Url;
 
     #[test]
     fn hands_the_line_over_as_javascript_strings() {
@@ -441,6 +665,7 @@ mod tests {
         let value = read(&payload("draft", "", None), "window.__dshAsk && window.__dshAsk(");
         assert_eq!(value["text"], "draft");
         assert_eq!(value["path"], "", "the page picks the latest workspace");
+        assert_eq!(value["glass"], cfg!(windows));
         for word in ["placeholder", "hint", "pick", "other", "fresh", "send", "workspace", "session"] {
             assert!(value["words"][word].as_str().is_some_and(|w| !w.is_empty()), "{word}");
         }
@@ -472,5 +697,22 @@ mod tests {
         assert_eq!(value["title"], "b c");
         assert_eq!(value["path"], "/a/b c");
         assert_eq!(value["sessions"], serde_json::json!([]));
+    }
+
+    /// The dropdown hangs under its chip, flips above it at the bottom of the
+    /// screen, and takes no size from the URL that a list could not be.
+    #[test]
+    fn the_dropdown_goes_under_its_chip_or_above_it() {
+        let url = |query: &str| Url::parse(&format!("dsh-window://quick-menu?{query}")).unwrap();
+        let anchor = Anchor::read(&url("x=16&top=90&bottom=120&w=300&h=200")).unwrap();
+        // At 150%, from a box whose content starts at (100, 200).
+        assert_eq!(anchor.place((100, 200), 1.5, 2000), (124, 389));
+        // Not enough room below: above the chip instead.
+        assert_eq!(anchor.place((100, 200), 1.5, 600), (124, 26));
+
+        let wild = Anchor::read(&url("x=-5&top=0&bottom=9999&w=1&h=100000")).unwrap();
+        assert_eq!((wild.x, wild.bottom, wild.width, wild.height), (0.0, 132.0, 160.0, 440.0));
+        assert_eq!(Anchor::read(&url("x=1&top=2&bottom=3&w=NaN&h=4")), None);
+        assert_eq!(Anchor::read(&url("top=2&bottom=3&w=4&h=4")), None);
     }
 }

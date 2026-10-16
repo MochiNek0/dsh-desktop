@@ -7,38 +7,54 @@
     <!--
       The quick-ask box; see `src-tauri/src/ask.rs`. No IPC: it talks back by
       navigating to `dsh-window://`, which only its own window's navigation
-      handler hears. Colours are the loading page's, and follow the window's
-      theme, which Rust sets to dsh's own preference before showing it.
+      handler hears. Colours follow the window's theme, which Rust sets to
+      dsh's own preference before showing it.
 
-      Two chips under the text choose where it goes: a workspace, and a
-      session in it or a new one. Each opens a list below the box, drawn here
-      rather than as a <select>, and the window grows to fit it while it is
-      open (`quick-size`).
+      Two pill-shaped chips under the text choose where it goes: a workspace,
+      and a session in it or a new one. Each opens a dropdown, which is a
+      window of its own (`ask-menu.html`) so that it can hang past the box's
+      edge. This page keeps the focus and the keyboard, and says what the
+      dropdown lists and which row the keys are on.
+
+      On Windows the window is acrylic glass, and `glass` on <html> lets it
+      show through; elsewhere the background is solid.
     -->
     <style>
       :root {
         color-scheme: light dark;
         --bg: #ffffff;
-        --fg: #1a1a1a;
-        --fg-2: #3f4350;
-        --muted: #8a8f9c;
-        --line: #e7e8ec;
-        --hover: rgba(0, 0, 0, 0.045);
-        --active: rgba(77, 107, 254, 0.1);
+        --tint: rgba(250, 250, 252, 0.6);
+        --fg: #16171b;
+        --fg-2: #353843;
+        --muted: #868b98;
+        --line: rgba(0, 0, 0, 0.08);
         --accent: #4d6bfe;
-        --danger: #b42318;
+        --accent-hi: #6b84ff;
+        --danger: #c0352a;
+        --pill: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(242, 243, 247, 0.9));
+        --pill-hover: linear-gradient(180deg, #ffffff, rgba(247, 248, 251, 0.96));
+        --pill-edge: 0 0 0 0.5px rgba(0, 0, 0, 0.14), 0 1px 2px rgba(0, 0, 0, 0.07),
+          0 2px 6px rgba(0, 0, 0, 0.04), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+        --ring: 0 0 0 0.5px rgba(77, 107, 254, 0.5), 0 0 0 3px rgba(77, 107, 254, 0.16),
+          inset 0 1px 0 rgba(255, 255, 255, 0.9);
       }
       @media (prefers-color-scheme: dark) {
         :root {
-          --bg: #1b1b21;
-          --fg: #ececf1;
-          --fg-2: #c9cbd3;
-          --muted: #8b90a0;
-          --line: #2e2e37;
-          --hover: rgba(255, 255, 255, 0.06);
-          --active: rgba(120, 144, 255, 0.18);
+          --bg: #1c1c21;
+          --tint: rgba(30, 30, 36, 0.52);
+          --fg: #eeeff3;
+          --fg-2: #d3d5dd;
+          --muted: #8d92a1;
+          --line: rgba(255, 255, 255, 0.1);
           --accent: #6f86ff;
-          --danger: #f97066;
+          --accent-hi: #8a9cff;
+          --danger: #ff8a7f;
+          --pill: linear-gradient(180deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.06));
+          --pill-hover: linear-gradient(180deg, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.09));
+          --pill-edge: 0 0 0 0.5px rgba(255, 255, 255, 0.16), 0 1px 2px rgba(0, 0, 0, 0.35),
+            inset 0 1px 0 rgba(255, 255, 255, 0.1);
+          --ring: 0 0 0 0.5px rgba(138, 156, 255, 0.6), 0 0 0 3px rgba(111, 134, 255, 0.22),
+            inset 0 1px 0 rgba(255, 255, 255, 0.1);
         }
       }
       html,
@@ -48,11 +64,17 @@
         overflow: hidden;
         background: var(--bg);
         color: var(--fg);
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
       }
-      body {
-        box-sizing: border-box;
-        border: 1px solid var(--line);
+      html.glass,
+      html.glass body {
+        background: transparent;
+      }
+      /* The frosting over the acrylic: lighter than the desktop behind it,
+         with a faint sheen along the top edge the way glass catches light. */
+      html.glass body {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0) 40%), var(--tint);
       }
       svg {
         flex: none;
@@ -64,17 +86,13 @@
         stroke-linecap: round;
         stroke-linejoin: round;
       }
-
-      /* ------------------------------------------------------- the box -- */
-      /* 130 inside the window's 132, less its border: the height Rust gives
-         the window with no list open. */
       .box {
         box-sizing: border-box;
-        height: 130px;
+        height: 100%;
         display: flex;
         flex-direction: column;
         gap: 6px;
-        padding: 14px 14px 12px 16px;
+        padding: 15px 14px 13px 18px;
       }
       textarea {
         flex: 1;
@@ -86,8 +104,8 @@
         background: transparent;
         color: inherit;
         font: inherit;
-        font-size: 15px;
-        line-height: 1.55;
+        font-size: 16px;
+        line-height: 1.5;
       }
       textarea::placeholder {
         color: var(--muted);
@@ -105,45 +123,51 @@
       .bar {
         display: flex;
         align-items: center;
-        gap: 6px;
+        gap: 8px;
         min-width: 0;
       }
       button {
         all: unset;
         box-sizing: border-box;
-        cursor: pointer;
+        cursor: default;
       }
       button:focus-visible {
         outline: 2px solid var(--accent);
-        outline-offset: 1px;
+        outline-offset: 2px;
       }
       .chip {
         display: inline-flex;
         align-items: center;
         gap: 6px;
-        height: 28px;
+        height: 30px;
         min-width: 0;
-        padding: 0 7px 0 9px;
-        border-radius: 8px;
-        box-shadow: inset 0 0 0 1px var(--line);
+        padding: 0 9px 0 11px;
+        border-radius: 999px;
+        background: var(--pill);
+        box-shadow: var(--pill-edge);
         color: var(--fg-2);
         font-size: 12.5px;
-        transition: background 0.12s ease, box-shadow 0.12s ease;
+        font-weight: 500;
+        transition: box-shadow 0.15s ease, background 0.15s ease, transform 0.1s ease;
       }
       .chip:hover {
-        background: var(--hover);
+        background: var(--pill-hover);
+      }
+      .chip:active {
+        transform: scale(0.98);
       }
       .chip[aria-expanded="true"] {
-        background: var(--active);
-        box-shadow: inset 0 0 0 1px transparent;
+        box-shadow: var(--ring);
         color: var(--accent);
       }
       .chip[aria-disabled="true"] {
         opacity: 0.45;
-        cursor: default;
       }
       .chip[aria-disabled="true"]:hover {
-        background: none;
+        background: var(--pill);
+      }
+      .chip[aria-disabled="true"]:active {
+        transform: none;
       }
       .chip > svg:first-child {
         color: var(--muted);
@@ -161,6 +185,10 @@
         width: 12px;
         height: 12px;
         color: var(--muted);
+        transition: transform 0.15s ease;
+      }
+      .chip[aria-expanded="true"] .caret {
+        transform: rotate(180deg);
       }
       .hint {
         margin-left: auto;
@@ -176,74 +204,30 @@
         align-items: center;
         justify-content: center;
         flex: none;
-        width: 28px;
-        height: 28px;
+        width: 30px;
+        height: 30px;
         border-radius: 50%;
-        background: var(--accent);
+        background: linear-gradient(180deg, var(--accent-hi), var(--accent));
+        box-shadow: 0 1px 2px rgba(41, 64, 200, 0.3), 0 3px 10px rgba(77, 107, 254, 0.28),
+          inset 0 1px 0 rgba(255, 255, 255, 0.28);
         color: #fff;
-        transition: background 0.12s ease, opacity 0.12s ease;
+        transition: opacity 0.15s ease, transform 0.1s ease;
+      }
+      .send:active {
+        transform: scale(0.94);
       }
       .send svg {
         width: 15px;
         height: 15px;
-        stroke-width: 2.2;
+        stroke-width: 2.4;
       }
       .send[aria-disabled="true"] {
-        background: var(--line);
-        color: var(--muted);
-        cursor: default;
-      }
-
-      /* ------------------------------------------------------ the list -- */
-      .list {
-        box-sizing: border-box;
-        max-height: 330px;
-        overflow-y: auto;
-        padding: 6px;
-        border-top: 1px solid var(--line);
-      }
-      .list[hidden] {
-        display: none;
-      }
-      .row {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        height: 34px;
-        padding: 0 10px;
-        border-radius: 8px;
-        color: var(--fg);
-        font-size: 13px;
-        cursor: pointer;
-      }
-      .row.active {
-        background: var(--hover);
-      }
-      .row > svg:first-child {
+        background: var(--pill);
+        box-shadow: var(--pill-edge);
         color: var(--muted);
       }
-      .row .label {
-        flex: 1;
-        min-width: 0;
-        overflow: hidden;
-        white-space: nowrap;
-        text-overflow: ellipsis;
-      }
-      .row .where {
-        max-width: 45%;
-        overflow: hidden;
-        white-space: nowrap;
-        text-overflow: ellipsis;
-        color: var(--muted);
-        font-size: 11.5px;
-      }
-      .row .tick {
-        color: var(--accent);
-      }
-      .rule {
-        height: 1px;
-        margin: 5px 6px;
-        background: var(--line);
+      .send[aria-disabled="true"]:active {
+        transform: none;
       }
     </style>
   </head>
@@ -258,17 +242,15 @@
         <button type="button" class="send" id="send"></button>
       </div>
     </div>
-    <div class="list" id="list" role="listbox" hidden></div>
     <script>
       (function () {
-        // Lucide icons, ISC licence. https://lucide.dev
+        // Lucide icons, ISC licence. https://lucide.dev. The dropdown has a
+        // copy of the ones its rows use; it is handed their names.
         var ICONS = {
           folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
-          folderPlus: '<path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
           message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
           plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
           caret: '<path d="m6 9 6 6 6-6"/>',
-          tick: '<path d="M20 6 9 17l-5-5"/>',
           send: '<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>'
         };
         function icon(name, className) {
@@ -284,19 +266,20 @@
           session: document.getElementById('session')
         };
         var sendButton = document.getElementById('send');
-        var list = document.getElementById('list');
 
         // What Rust last handed over, and what is chosen out of it. `session`
         // is '' for a new one.
         var words = {};
         var workspaces = [];
         var chosen = { path: '', session: '' };
-        // The list that is open, as the chip it hangs off, its rows' choices
-        // and which of them the keyboard is on.
-        var open = null, choices = [], active = -1;
+        // The dropdown that is open, as the chip it hangs off, what each of
+        // its rows does when chosen, and which row the keyboard is on.
+        var open = null, choices = [], active = 0;
 
         // Each navigation different from the last, or a repeated one does not
-        // navigate at all; see `notify::script`.
+        // navigate at all; see `notify::script`. One per turn of the event
+        // loop at most: a second `location.href` set before the first has
+        // gone replaces it, and the first never reaches Rust.
         var nonce = 0;
         function go(verb, params) {
           var query = [];
@@ -337,120 +320,112 @@
           chip(chips.session, picked ? 'message' : 'plus', picked ? picked.title : words.fresh,
             picked ? picked.title : '', !here);
           chips.session.setAttribute('aria-label', words.session || '');
-          var empty = !box.value.trim();
-          sendButton.setAttribute('aria-disabled', empty ? 'true' : 'false');
+          chips.workspace.setAttribute('aria-expanded', open === 'workspace' ? 'true' : 'false');
+          chips.session.setAttribute('aria-expanded', open === 'session' ? 'true' : 'false');
+          sendButton.setAttribute('aria-disabled', box.value.trim() ? 'false' : 'true');
           sendButton.title = words.send || '';
         }
 
-        // ------------------------------------------------------- the list --
+        // ------------------------------------------------- the dropdown --
 
-        // How tall the window has to be: the box, and the list when it is up.
-        function fit() {
-          go('quick-size', { h: 132 + (open ? list.offsetHeight : 0) });
-        }
-
-        function row(glyph, label, where, selected, choose) {
-          var node = document.createElement('div');
-          node.className = 'row';
-          node.setAttribute('role', 'option');
-          node.setAttribute('aria-selected', selected ? 'true' : 'false');
-          node.innerHTML = icon(glyph) + '<span class="label"></span>' +
-            (where ? '<span class="where"></span>' : '') + (selected ? icon('tick', 'tick') : '');
-          node.querySelector('.label').textContent = label;
-          if (where) node.querySelector('.where').textContent = where;
-          node.title = where || label;
-          var index = choices.length;
-          choices.push({ node: node, choose: choose });
-          node.addEventListener('mouseenter', function () { highlight(index); });
-          // On mousedown, so the box does not lose its focus first.
-          node.addEventListener('mousedown', function (event) {
-            event.preventDefault();
-            choose();
-          });
-          list.appendChild(node);
-          if (selected) active = index;
-        }
-
-        function rule() {
-          var node = document.createElement('div');
-          node.className = 'rule';
-          list.appendChild(node);
-        }
-
-        function highlight(index) {
-          if (!choices.length) return;
-          active = (index + choices.length) % choices.length;
-          choices.forEach(function (choice, i) {
-            choice.node.classList.toggle('active', i === active);
-          });
-          choices[active].node.scrollIntoView({ block: 'nearest' });
-        }
+        // Sizes the dropdown page draws its rows at; see `ask-menu.html`.
+        var ROW = 34, RULE = 11, PAD = 12;
 
         function show(which) {
           if (chips[which].getAttribute('aria-disabled') === 'true') return;
           if (open === which) return close();
-          close(true);
-          open = which;
-          chips[which].setAttribute('aria-expanded', 'true');
-          list.textContent = '';
+
+          var items = [];
           choices = [];
           active = 0;
+          function row(glyph, label, where, selected, choose) {
+            if (selected) active = choices.length;
+            items.push({ icon: glyph, label: label, where: where || '', selected: !!selected });
+            choices.push(choose);
+          }
+          function rule() {
+            items.push({ rule: true });
+          }
 
           if (which === 'workspace') {
             workspaces.forEach(function (each) {
               row('folder', each.title, each.path, each.path === chosen.path, function () {
                 if (each.path !== chosen.path) chosen = { path: each.path, session: '' };
-                close();
               });
             });
             if (workspaces.length) rule();
             row('folderPlus', words.other, '', false, function () {
-              close();
               go('quick-pick');
+              return true;
             });
           } else {
             row('plus', words.fresh, '', !chosen.session, function () {
               chosen.session = '';
-              close();
             });
             var sessions = (workspace() || {}).sessions || [];
             if (sessions.length) rule();
             sessions.forEach(function (each) {
               row('message', each.title, '', each.id === chosen.session, function () {
                 chosen.session = each.id;
-                close();
               });
             });
           }
 
-          list.hidden = false;
-          highlight(active);
-          fit();
+          open = which;
+          draw();
+          var rect = chips[which].getBoundingClientRect();
+          var rules = items.filter(function (item) { return item.rule; }).length;
+          go('quick-menu', {
+            x: Math.round(rect.left),
+            top: Math.round(rect.top),
+            bottom: Math.round(rect.bottom),
+            w: which === 'workspace' ? 380 : Math.max(280, Math.round(rect.width)),
+            h: choices.length * ROW + rules * RULE + PAD,
+            active: active,
+            items: JSON.stringify(items)
+          });
         }
 
-        // `quietly` is for one list giving way to the other: the window is
-        // about to be sized again for that one.
+        // `quietly` when Rust has already put the dropdown away, or is about
+        // to, and a navigation here would only take the place of one that
+        // matters more.
         function close(quietly) {
           if (!open) return;
-          chips[open].setAttribute('aria-expanded', 'false');
           open = null;
-          list.hidden = true;
-          list.textContent = '';
           choices = [];
           draw();
-          if (quietly) return;
-          fit();
+          if (!quietly) go('quick-menu-close');
           box.focus();
         }
 
+        // Row `index` was chosen, by a click in the dropdown (Rust has hidden
+        // it already) or by Enter here.
+        function choose(index, quietly) {
+          var picked = choices[index];
+          if (!picked) return close(quietly);
+          // The picker's own verb hides the dropdown on the way.
+          var navigated = picked();
+          close(quietly || navigated);
+        }
+
+        // A click on a row in the dropdown; see `ask::menu_navigated`.
+        window.__dshAskChose = function (index) {
+          choose(index, true);
+        };
+
         chips.workspace.addEventListener('click', function () { show('workspace'); });
         chips.session.addEventListener('click', function () { show('session'); });
+        // A click anywhere else in the box puts the dropdown away.
+        document.addEventListener('mousedown', function (event) {
+          if (open && !chips[open].contains(event.target)) close();
+        });
 
         // ---------------------------------------------------- what Rust says --
 
         // Called from Rust each time the box is shown; see `ask::payload`.
         window.__dshAsk = function (payload) {
           words = payload.words || {};
+          document.documentElement.classList.toggle('glass', !!payload.glass);
           box.placeholder = words.placeholder || '';
           hint.textContent = words.hint || '';
           sendButton.innerHTML = icon('send');
@@ -460,7 +435,9 @@
           if (!workspace()) chosen = { path: workspaces.length ? workspaces[0].path : '', session: '' };
           if (!session()) chosen.session = '';
 
-          close(true);
+          // Rust put the dropdown away before showing the box.
+          open = null;
+          choices = [];
           error.textContent = payload.error || '';
           box.value = payload.text || '';
           draw();
@@ -492,6 +469,7 @@
           go('quick-ask', { text: text, path: chosen.path, session: chosen.session });
           box.value = '';
           error.textContent = '';
+          open = null;
           draw();
         }
 
@@ -507,12 +485,14 @@
           if (open) {
             if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
               event.preventDefault();
-              highlight(active + (event.key === 'ArrowDown' ? 1 : -1));
+              if (!choices.length) return;
+              active = (active + (event.key === 'ArrowDown' ? 1 : -1) + choices.length) % choices.length;
+              go('quick-menu-active', { i: active });
               return;
             }
             if (event.key === 'Enter' && !event.isComposing) {
               event.preventDefault();
-              if (choices[active]) choices[active].choose();
+              choose(active);
               return;
             }
             if (event.key === 'Escape' || event.key === 'Tab') {
@@ -526,8 +506,8 @@
             go('quick-close');
             return;
           }
-          // A chip with the focus opens its list on Enter or Space, being a
-          // button, and on the down arrow the way a <select> does.
+          // A chip with the focus opens its dropdown on Enter or Space, being
+          // a button, and on the down arrow the way a <select> does.
           var on = event.target === chips.workspace ? 'workspace'
             : event.target === chips.session ? 'session' : null;
           if (on && event.key === 'ArrowDown') {
