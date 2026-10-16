@@ -186,35 +186,6 @@ pub fn raise(app: &AppHandle, title: String, body: String, click: Option<crate::
     let app = app.clone();
 
     std::thread::spawn(move || {
-        // A finished turn's toast, with a box to type the next message into,
-        // where that can be drawn. Falls through to the ordinary toast when it
-        // cannot; see [`inline`].
-        #[cfg(windows)]
-        if let Some(click) = click.as_ref().filter(|click| click.reply) {
-            match inline::show(&app, &title, &body) {
-                Ok((outcomes, toast)) => {
-                    if LISTENING.fetch_add(1, Ordering::Relaxed) < LISTENERS {
-                        match outcomes.recv_timeout(inline::WAIT) {
-                            Ok(inline::Outcome::Open) => {
-                                crate::reveal(&app);
-                                crate::signal::open(&app, &click.session);
-                            }
-                            Ok(inline::Outcome::Reply(text)) => {
-                                crate::signal::send_reply(&app, &click.session, &text);
-                            }
-                            Ok(inline::Outcome::Gone) | Err(_) => {}
-                        }
-                    }
-                    LISTENING.fetch_sub(1, Ordering::Relaxed);
-                    drop(toast);
-                    return;
-                }
-                Err(error) => {
-                    eprintln!("dsh-desktop: could not raise a toast to reply on: {error}");
-                }
-            }
-        }
-
         let mut notification = notify_rust::Notification::new();
         notification.summary(&title);
         if !body.is_empty() {
@@ -320,147 +291,6 @@ pub fn raise(app: &AppHandle, title: String, body: String, click: Option<crate::
             LISTENING.fetch_sub(1, Ordering::Relaxed);
         }
     });
-}
-
-/// A Windows toast with a text box, for replying to a finished turn.
-///
-/// `notify-rust` cannot draw one: its Windows backend is
-/// `tauri-winrt-notification`, which has no text input, and its `Reply`
-/// response is only ever produced by a macOS backend this app does not use. So
-/// this one toast is built here, straight on the WinRT classes that crate wraps
-/// — the same `ToastNotificationManager`, under the same AppUserModelID
-/// ([`app_id`]), so it looks like every other toast this app raises.
-///
-/// The typed text comes back on the `Activated` event, as `UserInput["reply"]`,
-/// and like every activation here it is heard only while the popup is on
-/// screen; see the module docs. A toast that times out into the notification
-/// centre answers `Dismissed`, which ends the wait.
-///
-/// Not on macOS or Linux, which keep the plain toast and its body click:
-/// neither `notify-rust` backend there hands back typed text.
-#[cfg(windows)]
-mod inline {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    use tauri::AppHandle;
-    use windows::core::{IInspectable, Interface, Ref, HSTRING};
-    use windows::Data::Xml::Dom::XmlDocument;
-    use windows::Foundation::{IPropertyValue, TypedEventHandler};
-    use windows::UI::Notifications::{
-        ToastActivatedEventArgs, ToastDismissedEventArgs, ToastFailedEventArgs, ToastNotification,
-        ToastNotificationManager,
-    };
-
-    /// The longest a reply toast is waited on. Far longer than it stays up —
-    /// typing holds it on screen, and it answers `Dismissed` the moment it
-    /// leaves — so this only bounds a toast that somehow says nothing at all.
-    pub const WAIT: Duration = Duration::from_secs(600);
-
-    /// The longest reply taken off a toast. A message typed into a popup is a
-    /// sentence; this is a bound, not a size.
-    const LIMIT: usize = 4000;
-
-    /// The identity `notify-rust` falls back to for a build with no
-    /// AppUserModelID of its own, so that an uninstalled build's reply toast
-    /// appears where its other toasts do. See [`crate::notify`] for why it
-    /// says *Windows PowerShell*.
-    const POWERSHELL: &str = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
-
-    pub enum Outcome {
-        /// The body was clicked.
-        Open,
-        /// Something was typed and sent.
-        Reply(String),
-        /// It went away, or was sent empty.
-        Gone,
-    }
-
-    /// Put one up. Answers the channel the outcome arrives on and the toast,
-    /// which the caller holds until then: the handlers live on it.
-    pub fn show(
-        app: &AppHandle,
-        title: &str,
-        body: &str,
-    ) -> windows::core::Result<(mpsc::Receiver<Outcome>, ToastNotification)> {
-        let document = XmlDocument::new()?;
-        document.LoadXml(&HSTRING::from(xml(title, body)))?;
-        let toast = ToastNotification::CreateToastNotification(&document)?;
-
-        let (tx, rx) = mpsc::channel();
-        let activated = tx.clone();
-        toast.Activated(&TypedEventHandler::new(
-            move |_: Ref<ToastNotification>, args: Ref<IInspectable>| {
-                let outcome = args
-                    .ok()
-                    .and_then(|args| args.cast::<ToastActivatedEventArgs>())
-                    .map(|args| read(&args))
-                    .unwrap_or(Outcome::Open);
-                let _ = activated.send(outcome);
-                Ok(())
-            },
-        ))?;
-        let dismissed = tx.clone();
-        toast.Dismissed(&TypedEventHandler::new(
-            move |_: Ref<ToastNotification>, _: Ref<ToastDismissedEventArgs>| {
-                let _ = dismissed.send(Outcome::Gone);
-                Ok(())
-            },
-        ))?;
-        toast.Failed(&TypedEventHandler::new(
-            move |_: Ref<ToastNotification>, _: Ref<ToastFailedEventArgs>| {
-                let _ = tx.send(Outcome::Gone);
-                Ok(())
-            },
-        ))?;
-
-        let id = super::app_id(app).unwrap_or_else(|| POWERSHELL.to_string());
-        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(id))?.Show(&toast)?;
-        Ok((rx, toast))
-    }
-
-    /// Which part was activated: `reply` is the send button, anything else the
-    /// body, whose `launch` is `open`.
-    fn read(args: &ToastActivatedEventArgs) -> Outcome {
-        if args.Arguments().map(|value| value != "reply").unwrap_or(true) {
-            return Outcome::Open;
-        }
-        let text = args
-            .UserInput()
-            .and_then(|input| input.Lookup(&HSTRING::from("reply")))
-            .and_then(|value| value.cast::<IPropertyValue>())
-            .and_then(|value| value.GetString())
-            .map(|text| text.to_string_lossy())
-            .unwrap_or_default();
-        let text = text.trim();
-        if text.is_empty() {
-            return Outcome::Gone;
-        }
-        Outcome::Reply(match text.char_indices().nth(LIMIT) {
-            Some((cut, _)) => text[..cut].to_string(),
-            None => text.to_string(),
-        })
-    }
-
-    /// The toast, as the XML Windows builds it from. Every string through
-    /// [`super::label`], which escapes for exactly this.
-    pub(super) fn xml(title: &str, body: &str) -> String {
-        format!(
-            "<toast launch='open' duration='long'>\
-             <visual><binding template='ToastGeneric'>\
-             <text>{}</text><text>{}</text>\
-             </binding></visual>\
-             <actions>\
-             <input id='reply' type='text' placeHolderContent='{}'/>\
-             <action content='{}' arguments='reply' hint-inputId='reply'/>\
-             </actions>\
-             </toast>",
-            super::label(title),
-            super::label(body),
-            super::label(t!("接着说点什么…", "Say something next…")),
-            super::label(t!("发送", "Send")),
-        )
-    }
 }
 
 /// What the user did to the toast, out of the things worth doing anything
@@ -633,21 +463,6 @@ mod tests {
                 Err(error) => println!("{name:12} FAILED: {error}"),
             }
         }
-    }
-
-    /// The reply toast's XML is a document Windows can load: whatever the
-    /// title and body hold, it parses, and it has the box and the button.
-    #[test]
-    #[cfg(windows)]
-    fn the_reply_toast_is_well_formed() {
-        use windows::core::HSTRING;
-        use windows::Data::Xml::Dom::XmlDocument;
-
-        let xml = super::inline::xml("Don't <stop> & go", "it's \"done\"");
-        let document = XmlDocument::new().unwrap();
-        document.LoadXml(&HSTRING::from(xml.as_str())).expect("the toast XML should parse");
-        assert!(xml.contains("<input id='reply' type='text'"));
-        assert!(xml.contains("hint-inputId='reply'"));
     }
 
     /// The escape itself, without a platform in the way.

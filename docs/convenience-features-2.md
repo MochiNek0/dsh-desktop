@@ -12,14 +12,14 @@
 | :--- | :--- | :--- |
 | 1 | 跑任务时不让电脑睡眠 | 已完成并验证（Windows） |
 | 2 | 托盘里列出在跑 / 在等你的会话 | 已完成并验证（托盘菜单的样子没截图） |
-| 3 | 通知里直接回复 | 已完成并验证（仅 Windows） |
+| 3 | 通知里直接回复 | 做过，用下来效果不好，已撤掉 |
 | 4 | 快捷键唤出的小输入框 | 已完成并验证（Windows） |
 | 5 | `dsh-desktop://` 链接 | 已完成并验证（Windows） |
 | 6 | 把剪贴板送进当前会话 | 已完成并验证（Windows） |
 
 ## 先查清楚的：插件能对会话做什么
 
-3、4、6 都要插件往会话里写东西。查的是 dsh 0.2.0-rc.2 的类型声明（`node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/*/lib/types`）：
+4、6（以及撤掉的 3）都要插件往会话里写东西。查的是 dsh 0.2.0-rc.2 的类型声明（`node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/*/lib/types`）：
 
 - **新建会话**：`ctx.sessions.create({ workspaceId })` 返回会话 id。
 - **发消息**：`ctx.sessions.retain(id, { source })` 拿到引用，等 `reference.ready` 后得到 binding；`binding.ctx` 是这个会话的 scope，`ctx.conversation.send(text)` 在调用者 scope 的会话里排一轮（和输入框回车走同一条路，带本地回显）。底层是 `binding.session.prompt([{ type: 'text', text }], 'queue')`。
@@ -69,30 +69,10 @@
 
 ## 3. 通知里直接回复
 
-**要做的**：「对话已完成」的通知上加一个输入框和「发送」按钮，输入后不用打开窗口就把这句话发进那个会话。
+**撤掉了。** 做出来是 Windows 上「对话已完成」的通知里带一个输入框和「发送」按钮（自己用 WinRT 拼 toast XML），真人试过能用，但效果不好，按用户的意思整条去掉：
 
-- 只做 Windows。`tauri-winrt-notification` 不支持输入框，`notify-rust` 的 `Reply` 只有 macOS 的预览后端会给，所以这一种通知自己用 WinRT 拼 toast XML（`<input id="reply" type="text"/>`），从 `ToastActivatedEventArgs.UserInput` 读回文字。
-- macOS、Linux 照旧，只有正文点击。
-- 发送走插件：`__dshSignals.reply(session, text)`，失败（会话不在了、插件不在）就打开窗口到那个会话，并把文字放进输入框，不丢。
-
-**完成标准**：一轮跑完弹的通知里能输入，发送后这句话出现在那个会话里并开始新的一轮，窗口不出来。
-
-### 已完成
-
-- 插件 `__dshSignals.reply(id, text)`：`sessions.using(id, { source: 'controllerOperation' }, …)` 拿住那个会话，`binding.session.prompt([{ type: 'text', text }], 'queue')`（输入框发送最后调的也是它），被接受就放开，回 `replied`，否则回 `reply-failed`。会话不用在屏幕上，那一轮在宿主上照样跑。
-- 插件 `__dshSignals.draft(id, text)`：切到那个会话（`''` 表示当前会话，也就是 `retainedBy.mainView` 持有的那个），等它有了 scope，把文字接在原草稿后面另起一行，焦点放进输入框，不发送。要注入 `conversation` 服务（cordis 访问没注入的服务会抛错），所以单独一个 scope。
-- `notify::Notice::replyable`：「对话已完成」的通知带 `reply` 标记。`toast::inline` 在 Windows 上用 WinRT 自己拼 XML（`<input id='reply'>` 加一个 `hint-inputId` 指向它的「发送」按钮），身份和其他 toast 一样走 `app_id`；`Activated` 里 `Arguments == "reply"` 读 `UserInput["reply"]`，其他是正文点击。弹不出来就退回普通 toast。
-- `signal::send_reply` 把文字交给插件，并按会话留着，直到听到结果；`reply-failed` 时把窗口拿出来、切到那个会话、文字放进输入框，不丢。插件根本不在页面上时，由页面自己回 `reply-failed`。
-- 文字经 `serde_json` 变成 JS 字符串字面量再 `eval`：`{:?}` 对某些字符的转义只有新版 JS 认。
-
-**已验证**（Windows，dsh 0.2.0-rc.2，编到 `C:\Users\EDY\dsh-desktop-target` 让 toast 用正式 AUMID）：
-
-- 窗口在前台时一轮跑完不弹通知（`watching` 那道门）；`WM_CLOSE` 收进托盘后再跑一轮，通知历史里最新一条带 `<input`、`duration=long`。
-- 切到新会话后经 CDP 调 `__dshSignals.reply(<另一个会话>, …)`：日志「a reply went into …」，那个会话里多了这条消息和 dsh 的回答，屏幕上的会话没变。
-- `__dshSignals.draft(<会话>, …)` 切过去并把文字放进输入框、拿到焦点；`draft('', …)` 接在当前草稿后面。
-- **真人操作**：用户在弹出的通知里输入「查找一下杭州明天的天气」点发送，这句话作为下一轮进了那个会话并开始跑，窗口没出来。
-
-**没验证的**：`reply-failed` 时把文字放回输入框这条，只分别验证了 `draft`，没有制造一次真的发送失败。
+- 删了 `toast::inline`、`Notice::replyable` / `Click::reply`、`signal` 里的 `Replied` / `ReplyFailed` / `send_reply`、插件的 `__dshSignals.reply`，以及只为它加的 `windows` crate 特性（`Data_Xml_Dom`、`Foundation`、`Foundation_Collections`、`UI_Notifications`）。「对话已完成」回到普通通知，点一下打开那个会话。
+- 留下了当时一起加的插件 `__dshSignals.draft(id, text)`（切到会话、把文字接在草稿后面、聚焦输入框），第 6 条在用。
 
 ## 4. 快捷键唤出的小输入框
 
@@ -151,14 +131,14 @@
 
 - `ask.rs` + `dist/ask.html`：一个无边框、置顶、不进任务栏的小窗口，第一次用时才建。没有 IPC（capabilities 只给了主窗口），靠 `dsh-window://quick-ask|quick-close|quick-ready` 跟 Rust 说话，只有它自己的导航回调听得到。`dsh-window://ask` 已经被对话框的回答占了，所以用 `quick-` 前缀。
 - 窗口里是一个输入框和最近工作区的下拉框（默认最近的那个）。Enter 发送（输入法还在组字时不算），Shift+Enter 换行，Esc 关闭，失焦也关。Rust 只接受最近工作区里有的路径。
-- 提交后窗口收起，Rust 调插件 `__dshSignals.ask(path, text)`：`workspaces.create({ path })`（和打开文件夹同一个调用，同一路径复用）→ `sessions.create({ workspaceId })` → 和回复一样 `prompt`，回 `asked` / `ask-failed`。不切换会话；跑完靠已有的通知（能直接回复）。
+- 提交后窗口收起，Rust 调插件 `__dshSignals.ask(path, text)`：`workspaces.create({ path })`（和打开文件夹同一个调用，同一路径复用）→ `sessions.create({ workspaceId })` → `sessions.using` 拿住新会话、`binding.session.prompt(..., 'queue')`，回 `asked` / `ask-failed`。不切换会话；跑完靠已有的通知。
 - dsh 还没起来时先存着，等 `folder-ready` 再交出去。失败时小窗口带着原来的文字和原因重新弹出来。
 - 第一次建窗口时页面还没加载完，Rust 推的数据会丢，所以页面加载后发 `quick-ready` 再要一次。
 - **修掉的坑**：第一次弹出时 WebView2 建子窗口并把焦点交给它，Tauri 把这次转手报成窗口 `Focused(false)` 再 `Focused(true)`，「失焦就隐藏」把窗口立刻藏掉了，看起来像第一次按键没反应。现在失焦后等 150ms 再问一次窗口是否真的没有焦点。
 
 ### 6. 粘贴到 dsh
 
-- `paste.rs`：读剪贴板文字 → `reveal` → 插件 `__dshSignals.draft('', text)`（第 3 条加的，接在当前草稿后面、聚焦，不发送）。只认文字，图片不管，窗口照样出来。
+- `paste.rs`：读剪贴板文字 → `reveal` → 插件 `__dshSignals.draft('', text)`（`''` 是当前会话，即 `retainedBy.mainView` 持有的那个；等它有了 scope，接在当前草稿后面另起一行、聚焦，不发送）。只认文字，图片不管，窗口照样出来。
 - 不为一段文字加剪贴板 crate：Windows 直接用 Win32 剪贴板（`OpenClipboard` 失败重试几次，读的长度同时受终止符和分配大小限制），macOS 用 `pbpaste`，Linux 依次试 `wl-paste`、`xclip`、`xsel`。
 - macOS、Linux 只在 CI 编译。
 
@@ -170,4 +150,4 @@
 - 设置卡片三行：Ctrl+Alt+D / Ctrl+Alt+Space / 未设置。在「粘贴到 dsh」上录 Ctrl+Alt+D → 提示已经是「全局快捷键」的快捷键；录 Ctrl+Alt+B → 生效，写进 `pasteShortcut`，别的进程再注册不上。
 - 备份用户剪贴板后放进两行报错，主窗口收起，按 Ctrl+Alt+B：主窗口出来，当前会话输入框里是这两行，焦点在输入框；之后还原了剪贴板、清掉了草稿。
 
-**没验证的**：快速提问失败时带着文字重新弹出（插件单元测试覆盖了 `ask-failed`）；在已有草稿后面追加（第 3 条验证过 `draft` 追加）。
+**没验证的**：快速提问失败时带着文字重新弹出（插件单元测试覆盖了 `ask-failed`）；在已有草稿后面追加（撤掉的第 3 条当时验证过 `draft` 追加）。

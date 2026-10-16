@@ -100,11 +100,6 @@ pub enum Signal {
     /// A press on a button reached a request that was no longer there, so
     /// nothing was submitted. Answered in the window instead; see [`act`].
     Stale { session: String },
-    /// A reply typed into a notification went in as the session's next turn.
-    Replied { session: String },
-    /// It did not. The text goes into that session's composer instead; see
-    /// [`send_reply`].
-    ReplyFailed { session: String },
     /// The plugin can open a folder now; see [`crate::folder`].
     FolderReady,
     /// A line from the quick-ask box started a session; see [`crate::ask`].
@@ -236,8 +231,6 @@ pub fn received(url: &Url) -> Option<Signal> {
         }),
         "wait-over" => Some(Signal::WaitOver { session }),
         "stale" => Some(Signal::Stale { session }),
-        "replied" => Some(Signal::Replied { session }),
-        "reply-failed" => Some(Signal::ReplyFailed { session }),
         other => {
             eprintln!("dsh-desktop: ignoring unknown session signal {other}");
             None
@@ -265,7 +258,7 @@ pub fn act(app: &AppHandle, signal: Signal) {
         Signal::TurnEnd { session, done } => {
             eprintln!("dsh-desktop: turn ended in {session} (unopened: {done})");
             let (title, body) = turn_ended();
-            crate::notify::show(app, crate::notify::Notice::replyable(&session, title, body));
+            crate::notify::show(app, crate::notify::Notice::about(&session, title, body));
         }
         Signal::Wait {
             session,
@@ -295,20 +288,6 @@ pub fn act(app: &AppHandle, signal: Signal) {
             eprintln!("dsh-desktop: an answer for {session} arrived too late");
             crate::reveal(app);
             open(app, &session);
-        }
-        Signal::Replied { session } => {
-            eprintln!("dsh-desktop: a reply went into {session}");
-            take_reply(&session);
-        }
-        // What the user typed is not dropped: it goes into that session's
-        // composer, with the window in front of it, to be sent from there.
-        Signal::ReplyFailed { session } => {
-            eprintln!("dsh-desktop: a reply could not be sent into {session}");
-            crate::reveal(app);
-            open(app, &session);
-            if let Some(text) = take_reply(&session) {
-                draft(app, &session, &text);
-            }
         }
         Signal::FolderReady => {
             crate::folder::ready(app);
@@ -488,36 +467,6 @@ pub fn answer(app: &AppHandle, session: &str, key: &str, choice: &str) {
     let _ = window.eval(reply(session, key, choice));
 }
 
-/// Replies sent and not yet heard back about, by session: kept so that a
-/// failure can put the text in front of the user instead of losing it. One per
-/// session, the latest — a second reply typed before the first was answered
-/// is the one the user is now waiting on.
-static REPLIES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
-
-fn take_reply(session: &str) -> Option<String> {
-    let mut replies = REPLIES.lock().ok()?;
-    let at = replies.iter().position(|(id, _)| id == session)?;
-    Some(replies.remove(at).1)
-}
-
-/// Send a reply typed into a notification into the session it was about, as
-/// its next turn, without the window coming forward.
-///
-/// Through the plugin, which answers [`Signal::Replied`] or
-/// [`Signal::ReplyFailed`]. When the plugin is not on the page at all — dsh is
-/// restarting, or the plugin has gone — the page answers the failure itself, so
-/// the text still ends up somewhere the user can see it.
-pub fn send_reply(app: &AppHandle, session: &str, text: &str) {
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-    if let Ok(mut replies) = REPLIES.lock() {
-        replies.retain(|(id, _)| id != session);
-        replies.push((session.to_string(), text.to_string()));
-    }
-    let _ = window.eval(sent(session, text));
-}
-
 /// Put text into a session's composer and switch to it; see `draft` in the
 /// plugin.
 pub fn draft(app: &AppHandle, session: &str, text: &str) {
@@ -527,20 +476,10 @@ pub fn draft(app: &AppHandle, session: &str, text: &str) {
     let _ = window.eval(drafted(session, text));
 }
 
-/// The call [`send_reply`] makes. The text is the user's own and can be anything,
+/// The call [`draft`] makes. The text is the user's own and can be anything,
 /// so it goes in as JSON — a JavaScript string literal for every input, which
 /// `{:?}` is not quite (Rust escapes some characters in a way only newer
 /// JavaScript reads).
-fn sent(session: &str, text: &str) -> String {
-    let text = serde_json::to_string(text).expect("a string is always serializable");
-    format!(
-        "window.__dshSignals ? window.__dshSignals.reply({session:?}, {text}) \
-         : (window.location.href = 'dsh-window://signal?event=reply-failed&session=' \
-         + encodeURIComponent({session:?}) + '&n=' + Date.now());"
-    )
-}
-
-/// The call [`draft`] makes.
 fn drafted(session: &str, text: &str) -> String {
     let text = serde_json::to_string(text).expect("a string is always serializable");
     format!("window.__dshSignals && window.__dshSignals.draft({session:?}, {text});")
@@ -1004,33 +943,13 @@ mod tests {
         assert!(call("a\"b").contains("\\\""), "a quote must arrive escaped");
     }
 
-    /// A reply's two answers are read like any other session signal.
+    /// The text handed to a composer reaches the page as a JavaScript string
+    /// whatever it holds.
     #[test]
-    fn reads_what_became_of_a_reply() {
-        assert_eq!(
-            read("event=replied&session=s1&n=1.2"),
-            Some(Signal::Replied {
-                session: "s1".into()
-            })
-        );
-        assert_eq!(
-            read("event=reply-failed&session=s1&n=1.2"),
-            Some(Signal::ReplyFailed {
-                session: "s1".into()
-            })
-        );
-        assert_eq!(read("event=replied"), None, "no session");
-    }
-
-    /// The text a user typed reaches the page as a JavaScript string whatever
-    /// it holds, and with no plugin to take it the page answers the failure
-    /// itself.
-    #[test]
-    fn hands_a_typed_reply_over_as_a_string_literal() {
-        let call = super::sent("session-1", "it's \"fine\"\n</script>\u{2028}😀");
-        assert!(call.starts_with("window.__dshSignals ? window.__dshSignals.reply(\"session-1\", "));
+    fn hands_text_for_a_composer_over_as_a_string_literal() {
+        let call = super::drafted("session-1", "it's \"fine\"\n</script>\u{2028}😀");
+        assert!(call.starts_with("window.__dshSignals && window.__dshSignals.draft(\"session-1\", "));
         assert!(call.contains(r#""it's \"fine\"\n</script>"#), "{call}");
-        assert!(call.contains("event=reply-failed"), "the fallback when no plugin is there");
 
         let draft = super::drafted("", "x");
         assert_eq!(draft, "window.__dshSignals && window.__dshSignals.draft(\"\", \"x\");");

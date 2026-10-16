@@ -656,43 +656,6 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   console.log('ok  lists the waiting and running sessions by name');
 }
 
-// --- a reply typed into a notification goes in as the next turn ---
-{
-  const { exports, sent, window } = load({ host: true });
-  const s = services();
-  const prompts = [];
-  let released = 0;
-  let result = { ok: true, value: { accepted: true } };
-  s.ctx.sessions.using = (id, options, operation) => {
-    assert.equal(options.source, 'controllerOperation');
-    const reference = {
-      ready: Promise.resolve({
-        session: { prompt: (content, mode) => { prompts.push([id, content, mode]); return Promise.resolve(result); } },
-      }),
-    };
-    return Promise.resolve(operation(reference)).finally(() => { released += 1; });
-  };
-  exports.apply(s.ctx);
-
-  window.__dshSignals.reply('session-7', 'and now the tests');
-  await drain();
-  // Through JSON: the prompt was built inside the vm, under its own Object.
-  assert.equal(JSON.stringify(prompts), JSON.stringify([['session-7', [{ type: 'text', text: 'and now the tests' }], 'queue']]));
-  assert.equal(released, 1, 'the session is let go once the prompt is in');
-  assert.deepEqual(sent.map(query).map((p) => [p.event, p.session]).at(-1), ['replied', 'session-7']);
-
-  // Refused by dsh, or thrown: either way the shell hears it failed.
-  result = { ok: false, error: { code: 'busy' } };
-  window.__dshSignals.reply('session-7', 'again');
-  await drain();
-  assert.equal(query(sent.at(-1)).event, 'reply-failed');
-  s.ctx.sessions.using = () => Promise.reject(new Error('gone'));
-  window.__dshSignals.reply('session-7', 'once more');
-  await drain();
-  assert.equal(query(sent.at(-1)).event, 'reply-failed');
-  console.log('ok  sends a typed reply as the next turn, and says when it could not');
-}
-
 // --- a line from the quick-ask box starts a new session on it ---
 {
   const { exports, sent, window } = load({ host: true });
@@ -758,12 +721,12 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
 
   // A named session is switched to, and waited for until it has a scope.
   draft = '';
-  window.__dshSignals.draft('a', 'reply that did not go');
+  window.__dshSignals.draft('a', 'from the clipboard');
   assert.deepEqual(s.opened, ['a']);
   assert.equal(draft, '', 'nothing to write into yet');
   scopes.a = { id: 'a' };
   await new Promise((resolve) => setTimeout(resolve, 120));
-  assert.equal(draft, 'reply that did not go');
+  assert.equal(draft, 'from the clipboard');
   assert.deepEqual(focused, ['b', 'a']);
   console.log('ok  adds text to a composer and focuses it');
 }

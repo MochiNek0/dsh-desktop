@@ -202,42 +202,16 @@ window.__ModuleLoader__.load({
             else if (sessions && sessions.open) sessions.open(id);
           },
           /**
-           * Send a line into a session as its next turn, for a reply typed
-           * into a notification. Called from the shell over `window.eval`;
-           * see its signal.rs.
-           *
-           * The session need not be on screen: it is held for exactly as long
-           * as the prompt takes to be accepted, through the session face's own
-           * `prompt` — the call the composer's send ends in — and let go. The
-           * turn runs on the host whether or not anything is holding it here.
-           *
-           * Answers `replied` or `reply-failed`. The shell keeps the text until
-           * it hears which, and on a failure puts it into that session's
-           * composer rather than losing what the user typed.
-           *
-           * @param {string} id - session id, as it was reported from here.
-           * @param {string} text - what the user typed.
-           */
-          reply: (id, text) => {
-            var failed = () => send({ event: 'reply-failed', session: id });
-            if (!sessions) return failed();
-            sessions.using(id, { source: 'controllerOperation' }, (reference) =>
-              reference.ready.then((binding) => binding.session.prompt([{ type: 'text', text: text }], 'queue')),
-            ).then((result) => {
-              if (result && result.ok) send({ event: 'replied', session: id });
-              else failed();
-            }, failed);
-          },
-          /**
            * Start a new session in a workspace on one line, for the shell's
            * quick-ask box. Called from the shell over `window.eval`, and only
            * after `folder-ready`; see its ask.rs.
            *
            * The workspace is made or adopted the way `openFolder` does it, the
            * session is a new one in it — `sessions.create`, what "new
-           * session" calls — and the line goes in the way a reply does. The
-           * session is not switched to: whoever pressed the key is somewhere
-           * else, and the notification at the turn's end is how they hear.
+           * session" calls — and the line goes in through the session face's
+           * own `prompt`, the call the composer's send ends in. The session
+           * is not switched to: whoever pressed the key is somewhere else, and
+           * the notification at the turn's end is how they hear.
            *
            * @param {string} path - the workspace's directory.
            * @param {string} text - the line typed into the box.
@@ -263,9 +237,8 @@ window.__ModuleLoader__.load({
           },
           /**
            * Put text into a session's composer, after whatever is already
-           * there, and switch to that session. For a notification reply that
-           * could not be sent, and for the clipboard shortcut. Nothing is
-           * sent: the user sees it and presses Enter themselves.
+           * there, and switch to that session. For the clipboard shortcut.
+           * Nothing is sent: the user sees it and presses Enter themselves.
            *
            * @param {string} id - session id, or '' for the one on screen.
            * @param {string} text - what to add.

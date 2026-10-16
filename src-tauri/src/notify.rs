@@ -115,10 +115,6 @@ pub struct Click {
     pub key: String,
     /// At most two, and none unless `key` names a request.
     pub buttons: Vec<Button>,
-    /// Whether the toast takes a typed reply, sent into the session as its
-    /// next turn. Only a finished turn's, and only where the platform can
-    /// draw a text box; see [`crate::toast`].
-    pub reply: bool,
 }
 
 /// One button: the id that comes back when it is pressed, and what it says.
@@ -150,20 +146,8 @@ impl Notice {
                 session: session.to_string(),
                 key: String::new(),
                 buttons: Vec::new(),
-                reply: false,
             }),
         }
-    }
-
-    /// One about a session that has finished a turn: a click opens it, and
-    /// where the platform can, the toast has a box to type the next message
-    /// into.
-    pub fn replyable(session: &str, title: &str, body: &str) -> Notice {
-        let mut notice = Notice::about(session, title, body);
-        if let Some(click) = notice.click.as_mut() {
-            click.reply = true;
-        }
-        notice
     }
 
     /// One a press can answer. Falls back to [`Notice::about`] when the wait
@@ -187,7 +171,6 @@ impl Notice {
                 session: session.to_string(),
                 key: key.to_string(),
                 buttons,
-                reply: false,
             }),
         }
     }

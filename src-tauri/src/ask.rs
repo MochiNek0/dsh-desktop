@@ -12,7 +12,7 @@
 //!
 //! The box does not wait for the turn. It closes on Enter, and the turn's end
 //! is announced the way any other is: by the notification [`crate::signal`]
-//! raises, which can be replied to.
+//! raises.
 //!
 //! ## Before dsh is up
 //!
@@ -244,7 +244,7 @@ pub fn failed(app: &AppHandle, reason: &str) {
 }
 
 /// The call [`hand`] makes. Both strings as JSON, the text being the user's
-/// own; see `signal::sent` for why not `{:?}`.
+/// own; see `signal::drafted` for why not `{:?}`.
 fn call(path: &str, text: &str) -> String {
     let path = serde_json::to_string(path).expect("a string is always serializable");
     let text = serde_json::to_string(text).expect("a string is always serializable");
