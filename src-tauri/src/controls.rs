@@ -737,6 +737,10 @@ fn labels() -> String {
         // they were making long; see [`SETTINGS`] in [`script`].
         ("settings", t!("设置…", "Settings…")),
         ("settings-done", t!("关闭", "Close")),
+        // The settings card's group headings.
+        ("group-dsh", "dsh"),
+        ("group-general", t!("通用", "General")),
+        ("group-keys", t!("快捷键", "Shortcuts")),
         ("runtime", t!("运行环境…", "Runtime…")),
         ("registry", t!("安装源…", "Install source…")),
         // "版本通道" rather than "测试版": the row is not a switch that turns a
@@ -1179,7 +1183,11 @@ pub fn script() -> String {
 
   // The settings card, top to bottom. `check` marks a row that carries state
   // and stays put when it is clicked; the rest act and close the card.
+  // `heading` starts a group: a small title, and the rows after it on a
+  // panel of their own. Ten rows of two lines each in one column was a page
+  // to read rather than a card to glance at.
   var SETTINGS = [
+    {{ verb: 'group-dsh', heading: true }},
     // One row for the whole of which Node and which dsh, rather than one per
     // verb: the panel behind it can switch, install and uninstall. See `setup`.
     {{ verb: 'runtime' }},
@@ -1189,16 +1197,19 @@ pub fn script() -> String {
     // Which line of dsh releases, right below where they come from: the two
     // rows are the same question asked about a source and about a version.
     {{ verb: 'channel' }},
+    {{ verb: 'group-general', heading: true }},
     {{ verb: 'autostart', check: true }},
     {{ verb: 'notify-turns', check: true }},
     {{ verb: 'keep-awake', check: true }},
+    {{ verb: 'group-keys', heading: true }},
     // The key on the right is the control: click it, then press the new one.
     // See `__dshShortcut`.
     {{ verb: 'shortcut', keys: true }},
     {{ verb: 'ask-shortcut', keys: true }},
     {{ verb: 'paste-shortcut', keys: true }},
     // Last, and on the card rather than the menu: it is for someone who went
-    // looking, and the menu is what everyone sees on every use.
+    // looking, and the menu is what everyone sees on every use. In the footer,
+    // beside the way out, rather than in a group of its own.
     {{ verb: 'community', community: true }},
     // The way out that is visible. Escape and the scrim close it too, and
     // neither is something a user finds by looking at the card.
@@ -1326,11 +1337,14 @@ pub fn script() -> String {
       // off, and the switch was the one control on the card you had to look
       // twice at to find.
       '--dsh-wc-sw-off:rgba(0,0,0,.22);' +
+      // Under each group of rows on the settings card.
+      '--dsh-wc-group:rgba(0,0,0,.035);' +
       '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.18),0 0 0 .5px rgba(0,0,0,.09);}}' +
       '.dsh-wc.dsh-wc-dark,.dsh-wc-set.dsh-wc-dark{{' +
       '--dsh-wc-fg:rgba(255,255,255,.62);--dsh-wc-fg-hi:rgba(255,255,255,.94);' +
       '--dsh-wc-panel:rgba(42,42,46,.96);--dsh-wc-line:rgba(255,255,255,.11);' +
       '--dsh-wc-hover:rgba(255,255,255,.09);--dsh-wc-sw-off:rgba(255,255,255,.26);' +
+      '--dsh-wc-group:rgba(255,255,255,.045);' +
       '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.5),0 0 0 .5px rgba(255,255,255,.09);}}' +
       'html,body{{height:100%!important;margin:0!important;overflow:hidden!important;}}' +
       '#root{{height:calc(100% - var(--dsh-titlebar-height))!important;margin-top:var(--dsh-titlebar-height)!important;box-sizing:border-box!important;}}' +
@@ -1450,8 +1464,8 @@ pub fn script() -> String {
       // Centred rather than hung off the menu button: it is a page of its own
       // now, not a longer menu, and the rows have two lines each.
       '.dsh-wc-set{{position:fixed;top:50%;left:50%;z-index:2147483647;' +
-      'width:min(420px,calc(100vw - 48px));max-height:calc(100vh - 96px);' +
-      'overflow:auto;box-sizing:border-box;padding:14px;' +
+      'width:min(440px,calc(100vw - 48px));max-height:calc(100vh - 96px);' +
+      'overflow:auto;box-sizing:border-box;padding:18px 16px 14px;' +
       'background:var(--dsh-wc-panel);border-radius:14px;' +
       'box-shadow:var(--dsh-wc-shadow);' +
       '-webkit-backdrop-filter:blur(24px) saturate(180%);' +
@@ -1464,24 +1478,35 @@ pub fn script() -> String {
       'pointer-events:auto;transform:translate(-50%,-50%) scale(1);' +
       'transition-delay:0s}}' +
       '.dsh-wc-set-head{{display:flex;align-items:center;' +
-      'margin:2px 4px 10px;color:var(--dsh-wc-fg-hi);' +
-      'font:600 14px/1 {FONT}}}' +
+      'margin:2px 6px 16px;color:var(--dsh-wc-fg-hi);' +
+      'font:600 15px/1 {FONT}}}' +
+      // A group's title, and the panel its rows sit on.
+      '.dsh-wc-set-label{{margin:0 10px 7px;color:var(--dsh-wc-fg);' +
+      'font:500 12px/1 {FONT}}}' +
+      '.dsh-wc-set-group{{margin-bottom:18px;padding:4px;border-radius:12px;' +
+      'background:var(--dsh-wc-group)}}' +
+      // The community row and the way out, side by side under the groups.
+      '.dsh-wc-set-foot{{display:flex;align-items:center;gap:8px}}' +
       '.dsh-wc-set button{{all:unset;box-sizing:border-box;pointer-events:auto;' +
-      'display:flex;align-items:center;gap:12px;width:100%;' +
-      'padding:9px 10px;border-radius:9px;cursor:pointer;' +
-      'color:var(--dsh-wc-fg-hi);font:13px/1 {FONT}}}' +
+      'display:flex;align-items:center;gap:12px;width:100%;min-height:40px;' +
+      'padding:6px 12px;border-radius:9px;cursor:pointer;' +
+      'color:var(--dsh-wc-fg-hi);font:13px/1.2 {FONT}}}' +
+      '.dsh-wc-set-foot button{{width:auto;min-height:32px;padding:0 12px;' +
+      'color:var(--dsh-wc-fg);font-size:12px}}' +
       '.dsh-wc-set button:hover{{background:var(--dsh-wc-hover)}}' +
       // `all: unset` above took the focus ring with it, and this card is
       // opened with the keyboard as readily as with the pointer.
       '.dsh-wc-set button:focus-visible{{outline:2px solid var(--dsh-wc-accent);' +
       'outline-offset:2px}}' +
       '.dsh-wc-set button.dsh-wc-set-shut{{justify-content:center;' +
-      'margin-top:8px;color:var(--dsh-wc-fg);' +
+      'margin-left:auto;padding:0 18px;color:var(--dsh-wc-fg-hi);' +
       'box-shadow:inset 0 0 0 1px var(--dsh-wc-line)}}' +
       '.dsh-wc-set-text{{display:flex;flex-direction:column;gap:4px;' +
       'min-width:0;text-align:left}}' +
-      '.dsh-wc-set-note{{color:var(--dsh-wc-fg);font:11px/1.45 {FONT};' +
-      'white-space:normal}}' +
+      // A row's note is its tooltip; see `SETTINGS`. Drawn under the name only
+      // when it is a warning -- a key that did not take.
+      '.dsh-wc-set-note{{display:none;color:var(--dsh-wc-fg);' +
+      'font:11px/1.45 {FONT};white-space:normal}}' +
       // The one glyph that says "this opens something else". A flex box
       // rather than a font size, because what is in it is a shape now.
       '.dsh-wc-set-go{{display:flex;margin-left:auto;flex:none;' +
@@ -1518,7 +1543,7 @@ pub fn script() -> String {
       '.dsh-wc-key.dsh-wc-key-live{{color:var(--dsh-wc-accent);' +
       'box-shadow:inset 0 0 0 1.5px var(--dsh-wc-accent)}}' +
       // A key that did not take. The same orange the tray uses for waiting.
-      '.dsh-wc-set-note.dsh-wc-set-warn{{color:#e8833a}}' +
+      '.dsh-wc-set-note.dsh-wc-set-warn{{display:block;color:#e8833a}}' +
       // Standing, not passing: the launch is running on no plugins, and says so
       // for as long as that is true. Drawn as an outline rather than as text so
       // it does not read as another of the toast's transient messages, and left
@@ -1755,8 +1780,20 @@ pub fn script() -> String {
     var keyRows = {{}}, keyWords = {{ off: '', press: '' }};
     var recording = null;
 
+    // Where the next row goes: the group the last heading started, or the
+    // footer for the community row and the way out.
+    var group = card, foot = null;
+
     SETTINGS.forEach(function (item) {{
-      var row = make('button', item.close ? 'dsh-wc-set-shut' : '', card);
+      if (item.heading) {{
+        var title = make('div', 'dsh-wc-set-label', card);
+        word(title, LABELS[item.verb]);
+        (spans[item.verb] = spans[item.verb] || []).push(title);
+        group = make('div', 'dsh-wc-set-group', card);
+        return;
+      }}
+      if (item.community || item.close) group = foot = foot || make('div', 'dsh-wc-set-foot', card);
+      var row = make('button', item.close ? 'dsh-wc-set-shut' : '', group);
       row.type = 'button';
 
       var text = make('span', 'dsh-wc-set-text', row);
@@ -1768,18 +1805,19 @@ pub fn script() -> String {
         var note = make('span', 'dsh-wc-set-note', text);
         note.textContent = NOTES[item.verb];
         noteSpans[item.verb] = note;
+        row.title = NOTES[item.verb];
       }}
 
       if (item.check) {{
         make('span', 'dsh-wc-sw', row);
         checks[item.verb] = row;
       }} else if (item.keys) {{
-        keyRows[item.verb] = {{ chip: make('span', 'dsh-wc-key', row), note: note, now: '' }};
+        keyRows[item.verb] = {{ chip: make('span', 'dsh-wc-key', row), note: note, row: row, now: '' }};
       }} else if (!item.close && !item.community) {{
         make('span', 'dsh-wc-set-go', row).innerHTML = GO_GLYPH;
       }}
 
-      // The community row's own note, put back after it said "copied".
+      // The community row's own name, put back after it said "copied".
       var was = '', restore = null;
 
       row.addEventListener('click', function () {{
@@ -1800,10 +1838,10 @@ pub fn script() -> String {
           copyText(COMMUNITY.qq, function (ok) {{
             if (!ok) return;
             if (restore) clearTimeout(restore);
-            else was = note.textContent;
-            note.textContent = COMMUNITY.copied;
+            else was = name.textContent;
+            name.textContent = COMMUNITY.copied;
             restore = setTimeout(function () {{
-              note.textContent = was;
+              name.textContent = was;
               restore = null;
             }}, 2000);
           }});
@@ -1923,6 +1961,7 @@ pub fn script() -> String {
       if (recording !== verb) row.chip.textContent = row.now || keyWords.off;
       row.note.textContent = note || '';
       row.note.classList.toggle('dsh-wc-set-warn', !!warn);
+      row.row.title = note || '';
     }};
     // `on` is the preference, `available` whether anything can act on it, and
     // `hint` what is missing when it cannot. An unavailable row reads as off
@@ -1939,8 +1978,9 @@ pub fn script() -> String {
       // the row would dim with no way left to say why. The class carries the
       // look, `aria-disabled` the meaning, and the click handler the refusal.
       entry.setAttribute('aria-disabled', usable ? 'false' : 'true');
-      if (usable) entry.removeAttribute('title');
-      else entry.title = hint || '';
+      // Usable, the tooltip is the row's note again.
+      var note = noteSpans['notify-turns'];
+      entry.title = usable ? (note ? note.textContent : '') : (hint || '');
     }};
     // Called from Rust; see `sync_safe`. Drawn from the answer every page load
     // asks for rather than remembered from the click that caused it, because a
@@ -1987,7 +2027,13 @@ pub fn script() -> String {
         }});
       }}
       for (var noted in notes || {{}}) {{
-        if (noteSpans[noted]) noteSpans[noted].textContent = notes[noted];
+        var note = noteSpans[noted];
+        if (!note) continue;
+        note.textContent = notes[noted];
+        // The tooltip follows, except on a row that is saying why it is
+        // unavailable; see `__dshNotifyTurns`.
+        var row = note.closest('button');
+        if (row.getAttribute('aria-disabled') !== 'true') row.title = notes[noted];
       }}
     }};
 

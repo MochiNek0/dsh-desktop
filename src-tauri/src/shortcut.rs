@@ -345,7 +345,9 @@ fn explain(shortcut: &Shortcut, failure: &Failure) -> String {
 /// What the card calls a slot's row.
 pub(crate) fn name(slot: Slot) -> &'static str {
     match slot {
-        Slot::Window => t!("全局快捷键", "Global shortcut"),
+        // Not "global shortcut": it sits under the settings card's
+        // "Shortcuts" heading, beside two more that are just as global.
+        Slot::Window => t!("显示窗口", "Show window"),
         Slot::Ask => t!("快速提问", "Quick ask"),
         Slot::Paste => t!("粘贴到 dsh", "Paste into dsh"),
     }
