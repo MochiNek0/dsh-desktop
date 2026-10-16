@@ -69,7 +69,7 @@ const MENU: &str = "ask-menu";
 const WIDTH: f64 = 640.0;
 const HEIGHT: f64 = 132.0;
 
-/// The gap between a chip and the list hanging off it.
+/// The gap between the box and the list hanging off it.
 const GAP: f64 = 6.0;
 
 /// How many sessions are kept for the box, over all the recent workspaces.
@@ -281,6 +281,15 @@ fn build(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .build()?;
     round(&window);
 
+    // The dropdown, now rather than when a chip is first clicked. That click
+    // arrives inside the box's navigation callback, and a webview created
+    // there never gets past `about:blank`: WebView2 finishes making one only
+    // once control is back in its message loop, which that callback is
+    // holding up.
+    if let Err(error) = build_menu(app) {
+        eprintln!("dsh-desktop: could not make the quick-ask list: {error}");
+    }
+
     // Away once it is not in front, the way a launcher is: the box is for one
     // line, and one left floating over other work is in the way.
     //
@@ -336,7 +345,13 @@ fn navigated(app: &AppHandle, url: &Url) -> bool {
             Some("quick-ask") => submitted(app, url),
             Some("quick-close") => hide(app),
             Some("quick-pick") => pick(app),
-            Some("quick-menu") => open_menu(app, url),
+            // Off this callback, for the reason `build` makes the dropdown
+            // early: the window calls below wait on the event loop this
+            // callback is part of.
+            Some("quick-menu") => {
+                let (app, url) = (app.clone(), url.clone());
+                std::thread::spawn(move || open_menu(&app, &url));
+            }
             Some("quick-menu-active") => {
                 let index: i64 = field(url, "i").parse().unwrap_or(-1);
                 if let Some(menu) = app.get_webview_window(MENU) {
@@ -409,12 +424,10 @@ fn hide_menu(app: &AppHandle) {
 }
 
 /// Where the dropdown goes and how big it is, in the box's own CSS pixels:
-/// the chip's left edge, its top and bottom, and the list's size.
+/// the chip's left edge, and the list's size.
 #[derive(Debug, PartialEq)]
 struct Anchor {
     x: f64,
-    top: f64,
-    bottom: f64,
     width: f64,
     height: f64,
 }
@@ -426,23 +439,24 @@ impl Anchor {
         let number = |name: &str| field(url, name).parse::<f64>().ok().filter(|n| n.is_finite());
         Some(Anchor {
             x: number("x")?.clamp(0.0, WIDTH),
-            top: number("top")?.clamp(0.0, HEIGHT),
-            bottom: number("bottom")?.clamp(0.0, HEIGHT),
             width: number("w")?.clamp(160.0, 520.0),
             height: number("h")?.clamp(40.0, 440.0),
         })
     }
 
-    /// Where the list's top-left corner goes on screen: under the chip, or
-    /// above it when there is not room below. `origin` is the box's content
-    /// on screen, `floor` the bottom of the work area, both physical.
+    /// Where the list's top-left corner goes on screen: in line with the
+    /// chip, just below the box, or just above it when there is not room
+    /// below. Clear of the box either way: the box stays in front, and a list
+    /// hung from the chip itself would start behind its edge. `origin` is the
+    /// box's content on screen, `floor` the bottom of the work area, both
+    /// physical.
     fn place(&self, origin: (i32, i32), scale: f64, floor: i32) -> (i32, i32) {
         let x = origin.0 + (self.x * scale).round() as i32;
-        let below = origin.1 + ((self.bottom + GAP) * scale).round() as i32;
+        let below = origin.1 + ((HEIGHT + GAP) * scale).round() as i32;
         if below + (self.height * scale).round() as i32 <= floor {
             return (x, below);
         }
-        (x, origin.1 + ((self.top - GAP - self.height) * scale).round() as i32)
+        (x, origin.1 - ((GAP + self.height) * scale).round() as i32)
     }
 }
 
@@ -463,15 +477,8 @@ fn open_menu(app: &AppHandle, url: &Url) {
     let Some(window) = app.get_webview_window(LABEL) else {
         return;
     };
-    let menu = match app.get_webview_window(MENU) {
-        Some(menu) => menu,
-        None => match build_menu(app) {
-            Ok(menu) => menu,
-            Err(error) => {
-                eprintln!("dsh-desktop: could not open the quick-ask list: {error}");
-                return;
-            }
-        },
+    let Some(menu) = app.get_webview_window(MENU) else {
+        return;
     };
 
     let scale = window.scale_factor().unwrap_or(1.0);
@@ -699,20 +706,21 @@ mod tests {
         assert_eq!(value["sessions"], serde_json::json!([]));
     }
 
-    /// The dropdown hangs under its chip, flips above it at the bottom of the
-    /// screen, and takes no size from the URL that a list could not be.
+    /// The dropdown hangs below the box in line with its chip, flips above the
+    /// box at the bottom of the screen, and takes no size from the URL that a
+    /// list could not be.
     #[test]
-    fn the_dropdown_goes_under_its_chip_or_above_it() {
+    fn the_dropdown_goes_below_the_box_or_above_it() {
         let url = |query: &str| Url::parse(&format!("dsh-window://quick-menu?{query}")).unwrap();
-        let anchor = Anchor::read(&url("x=16&top=90&bottom=120&w=300&h=200")).unwrap();
+        let anchor = Anchor::read(&url("x=16&w=300&h=200")).unwrap();
         // At 150%, from a box whose content starts at (100, 200).
-        assert_eq!(anchor.place((100, 200), 1.5, 2000), (124, 389));
-        // Not enough room below: above the chip instead.
-        assert_eq!(anchor.place((100, 200), 1.5, 600), (124, 26));
+        assert_eq!(anchor.place((100, 200), 1.5, 2000), (124, 407));
+        // Not enough room below: above the box instead.
+        assert_eq!(anchor.place((100, 200), 1.5, 600), (124, -109));
 
-        let wild = Anchor::read(&url("x=-5&top=0&bottom=9999&w=1&h=100000")).unwrap();
-        assert_eq!((wild.x, wild.bottom, wild.width, wild.height), (0.0, 132.0, 160.0, 440.0));
-        assert_eq!(Anchor::read(&url("x=1&top=2&bottom=3&w=NaN&h=4")), None);
-        assert_eq!(Anchor::read(&url("top=2&bottom=3&w=4&h=4")), None);
+        let wild = Anchor::read(&url("x=-5&w=1&h=100000")).unwrap();
+        assert_eq!((wild.x, wild.width, wild.height), (0.0, 160.0, 440.0));
+        assert_eq!(Anchor::read(&url("x=1&w=NaN&h=4")), None);
+        assert_eq!(Anchor::read(&url("w=4&h=4")), None);
     }
 }

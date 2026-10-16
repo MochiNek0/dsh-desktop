@@ -35,8 +35,10 @@
         --pill-hover: linear-gradient(180deg, #ffffff, rgba(247, 248, 251, 0.96));
         --pill-edge: 0 0 0 0.5px rgba(0, 0, 0, 0.14), 0 1px 2px rgba(0, 0, 0, 0.07),
           0 2px 6px rgba(0, 0, 0, 0.04), inset 0 1px 0 rgba(255, 255, 255, 0.9);
-        --ring: 0 0 0 0.5px rgba(77, 107, 254, 0.5), 0 0 0 3px rgba(77, 107, 254, 0.16),
-          inset 0 1px 0 rgba(255, 255, 255, 0.9);
+        /* An open chip reads as pressed in, not lit up. */
+        --pressed: linear-gradient(180deg, rgba(0, 0, 0, 0.07), rgba(0, 0, 0, 0.04));
+        --pressed-edge: 0 0 0 0.5px rgba(0, 0, 0, 0.16), inset 0 1px 2px rgba(0, 0, 0, 0.1);
+        --focus: 0 0 0 0.5px rgba(0, 0, 0, 0.2), 0 0 0 3px rgba(0, 0, 0, 0.08);
       }
       @media (prefers-color-scheme: dark) {
         :root {
@@ -53,8 +55,9 @@
           --pill-hover: linear-gradient(180deg, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.09));
           --pill-edge: 0 0 0 0.5px rgba(255, 255, 255, 0.16), 0 1px 2px rgba(0, 0, 0, 0.35),
             inset 0 1px 0 rgba(255, 255, 255, 0.1);
-          --ring: 0 0 0 0.5px rgba(138, 156, 255, 0.6), 0 0 0 3px rgba(111, 134, 255, 0.22),
-            inset 0 1px 0 rgba(255, 255, 255, 0.1);
+          --pressed: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.08));
+          --pressed-edge: 0 0 0 0.5px rgba(255, 255, 255, 0.16), inset 0 1px 2px rgba(0, 0, 0, 0.35);
+          --focus: 0 0 0 0.5px rgba(255, 255, 255, 0.3), 0 0 0 3px rgba(255, 255, 255, 0.1);
         }
       }
       html,
@@ -132,8 +135,7 @@
         cursor: default;
       }
       button:focus-visible {
-        outline: 2px solid var(--accent);
-        outline-offset: 2px;
+        box-shadow: var(--focus);
       }
       .chip {
         display: inline-flex;
@@ -157,8 +159,9 @@
         transform: scale(0.98);
       }
       .chip[aria-expanded="true"] {
-        box-shadow: var(--ring);
-        color: var(--accent);
+        background: var(--pressed);
+        box-shadow: var(--pressed-edge);
+        color: var(--fg);
       }
       .chip[aria-disabled="true"] {
         opacity: 0.45;
@@ -171,9 +174,6 @@
       }
       .chip > svg:first-child {
         color: var(--muted);
-      }
-      .chip[aria-expanded="true"] > svg {
-        color: inherit;
       }
       .chip .label {
         max-width: 190px;
@@ -377,8 +377,6 @@
           var rules = items.filter(function (item) { return item.rule; }).length;
           go('quick-menu', {
             x: Math.round(rect.left),
-            top: Math.round(rect.top),
-            bottom: Math.round(rect.bottom),
             w: which === 'workspace' ? 380 : Math.max(280, Math.round(rect.width)),
             h: choices.length * ROW + rules * RULE + PAD,
             active: active,
