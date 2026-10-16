@@ -110,6 +110,18 @@ pub fn page_started(app: &AppHandle) {
     set(app, 0, 0, Vec::new());
 }
 
+/// Repaint the icons from whatever was last set.
+///
+/// Called when the window comes back from the tray: Windows does not apply a
+/// taskbar overlay set while the window is hidden, so the dot that was there
+/// when the window was parked is gone by the time it comes back. Repainting
+/// unconditionally is cheap — one icon and one overlay — and the alternative
+/// is a window that looks idle while a turn is running.
+pub fn repaint(app: &AppHandle) {
+    let look = LOOK.lock().map(|l| *l).unwrap_or(Look::Idle);
+    paint(app, look);
+}
+
 /// What the tray lists now.
 pub fn rows() -> Vec<Row> {
     ROWS.lock().map(|rows| rows.clone()).unwrap_or_default()

@@ -852,6 +852,10 @@ pub(crate) fn reveal(app: &tauri::AppHandle) {
         memory::restore(&window);
     }
 
+    // The taskbar overlay set while the window was hidden may not have taken;
+    // repaint it now that the button is back on the bar. See `status::repaint`.
+    status::repaint(app);
+
     // The app has been asked for, so a check held back for want of a window to
     // ask in now has one. Only ever a check the boot already finished with.
     if PENDING_CHECK.swap(false, Ordering::Relaxed) {
