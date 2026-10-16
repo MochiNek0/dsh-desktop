@@ -12,7 +12,7 @@
 | :--- | :--- | :--- |
 | 1 | 跑任务时不让电脑睡眠 | 已完成并验证（Windows） |
 | 2 | 托盘里列出在跑 / 在等你的会话 | 已完成并验证（托盘菜单的样子没截图） |
-| 3 | 通知里直接回复 | 未开始 |
+| 3 | 通知里直接回复 | 已完成并验证（仅 Windows） |
 | 4 | 快捷键唤出的小输入框 | 未开始 |
 | 5 | `dsh://` 链接 | 未开始 |
 | 6 | 把剪贴板送进当前会话 | 未开始 |
@@ -76,6 +76,23 @@
 - 发送走插件：`__dshSignals.reply(session, text)`，失败（会话不在了、插件不在）就打开窗口到那个会话，并把文字放进输入框，不丢。
 
 **完成标准**：一轮跑完弹的通知里能输入，发送后这句话出现在那个会话里并开始新的一轮，窗口不出来。
+
+### 已完成
+
+- 插件 `__dshSignals.reply(id, text)`：`sessions.using(id, { source: 'controllerOperation' }, …)` 拿住那个会话，`binding.session.prompt([{ type: 'text', text }], 'queue')`（输入框发送最后调的也是它），被接受就放开，回 `replied`，否则回 `reply-failed`。会话不用在屏幕上，那一轮在宿主上照样跑。
+- 插件 `__dshSignals.draft(id, text)`：切到那个会话（`''` 表示当前会话，也就是 `retainedBy.mainView` 持有的那个），等它有了 scope，把文字接在原草稿后面另起一行，焦点放进输入框，不发送。要注入 `conversation` 服务（cordis 访问没注入的服务会抛错），所以单独一个 scope。
+- `notify::Notice::replyable`：「对话已完成」的通知带 `reply` 标记。`toast::inline` 在 Windows 上用 WinRT 自己拼 XML（`<input id='reply'>` 加一个 `hint-inputId` 指向它的「发送」按钮），身份和其他 toast 一样走 `app_id`；`Activated` 里 `Arguments == "reply"` 读 `UserInput["reply"]`，其他是正文点击。弹不出来就退回普通 toast。
+- `signal::send_reply` 把文字交给插件，并按会话留着，直到听到结果；`reply-failed` 时把窗口拿出来、切到那个会话、文字放进输入框，不丢。插件根本不在页面上时，由页面自己回 `reply-failed`。
+- 文字经 `serde_json` 变成 JS 字符串字面量再 `eval`：`{:?}` 对某些字符的转义只有新版 JS 认。
+
+**已验证**（Windows，dsh 0.2.0-rc.2，编到 `C:\Users\EDY\dsh-desktop-target` 让 toast 用正式 AUMID）：
+
+- 窗口在前台时一轮跑完不弹通知（`watching` 那道门）；`WM_CLOSE` 收进托盘后再跑一轮，通知历史里最新一条带 `<input`、`duration=long`。
+- 切到新会话后经 CDP 调 `__dshSignals.reply(<另一个会话>, …)`：日志「a reply went into …」，那个会话里多了这条消息和 dsh 的回答，屏幕上的会话没变。
+- `__dshSignals.draft(<会话>, …)` 切过去并把文字放进输入框、拿到焦点；`draft('', …)` 接在当前草稿后面。
+- **真人操作**：用户在弹出的通知里输入「查找一下杭州明天的天气」点发送，这句话作为下一轮进了那个会话并开始跑，窗口没出来。
+
+**没验证的**：`reply-failed` 时把文字放回输入框这条，只分别验证了 `draft`，没有制造一次真的发送失败。
 
 ## 4. 快捷键唤出的小输入框
 
