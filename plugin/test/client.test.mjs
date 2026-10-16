@@ -596,14 +596,16 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   await drain();
   assert.deepEqual(statuses.map(query).map((p) => [p.running, p.waiting]), [['1', '0']]);
 
-  // A repeat of the same counts says nothing.
+  // A repeat of the same counts says nothing, and a session stopped on the
+  // user is waiting rather than running, though dsh still calls its turn
+  // running.
   s.setList({ ids: ['a', 'b'], byId: { a: { running: true }, b: { running: false } } });
   s.setPending(new Map([['a', carrier({ kind: 'approval', key: 'k1' })]]));
   s.setList({ ids: ['a', 'b'], byId: { a: { running: false }, b: { running: false } } });
   await drain();
   assert.deepEqual(
     statuses.map(query).map((p) => [p.running, p.waiting]),
-    [['1', '0'], ['1', '1'], ['0', '1']],
+    [['1', '0'], ['0', '1']],
   );
 
   // A scope going away takes its count with it.
@@ -611,6 +613,62 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   await drain();
   assert.deepEqual(statuses.map(query).map((p) => [p.running, p.waiting]).at(-1), ['0', '0']);
   console.log('ok  reports how many sessions are running and waiting');
+}
+
+// --- which sessions, by name, for the shell's tray menu ---
+{
+  const { exports, statuses } = load({ host: true });
+  const s = services();
+  exports.apply(s.ctx);
+  s.setList({
+    ids: ['a', 'b', 'c', 'sub'],
+    byId: {
+      a: { running: true, displayTitle: 'Fix the build' },
+      b: { running: true, displayTitle: 'Write the docs' },
+      c: { running: false, displayTitle: 'Idle one' },
+      sub: { running: true, displayTitle: 'A subagent', origin: 'subagent' },
+    },
+  });
+  s.setPending(new Map([['b', carrier({ kind: 'approval', key: 'k1' })]]));
+  await drain();
+  const last = statuses.at(-1);
+  // Waiting first; a running subagent is counted and not listed.
+  assert.deepEqual(queryAll(last, 'wid'), ['b']);
+  assert.deepEqual(queryAll(last, 'wtitle'), ['Write the docs']);
+  assert.deepEqual(queryAll(last, 'rid'), ['a']);
+  assert.deepEqual(queryAll(last, 'rtitle'), ['Fix the build']);
+  assert.deepEqual([query(last).running, query(last).waiting], ['2', '1']);
+
+  // A title dsh fills in later goes out with the next list change.
+  const before = statuses.length;
+  s.setList({
+    ids: ['a', 'b', 'c', 'sub'],
+    byId: {
+      a: { running: true, displayTitle: 'Fix the CI build' },
+      b: { running: true, displayTitle: 'Write the docs' },
+      c: { running: false, displayTitle: 'Idle one' },
+      sub: { running: true, displayTitle: 'A subagent', origin: 'subagent' },
+    },
+  });
+  await drain();
+  assert.equal(statuses.length, before + 1);
+  assert.deepEqual(queryAll(statuses.at(-1), 'rtitle'), ['Fix the CI build']);
+  console.log('ok  lists the waiting and running sessions by name');
+}
+
+// --- a click on a notification switches sessions the dsh 0.2 way ---
+{
+  const { exports, window } = load({ host: true });
+  const viewed = [];
+  const s = services({
+    folders: { create: () => Promise.reject(), openWorkspace: () => {} },
+  });
+  s.ctx.uiWorkspace.openSession = (id) => { viewed.push(id); };
+  exports.apply(s.ctx);
+  window.__dshSignals.open('session-7');
+  assert.deepEqual(viewed, ['session-7'], 'open should go through uiWorkspace.openSession');
+  assert.deepEqual(s.opened, [], 'and not through the sessions.open dsh 0.2 dropped');
+  console.log('ok  opens a session through the workspace view on dsh 0.2');
 }
 
 // --- dsh 0.2: the waits are on `sessionStatus` ---

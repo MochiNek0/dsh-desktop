@@ -522,6 +522,24 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     // level deep is the whole point of having them here. Nothing at all until
     // the plugin has reported — see [`recent`].
     let mut items: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = Vec::new();
+
+    // Above even those, the sessions that are running or waiting on the user,
+    // by name: when there are any, one of them is the likeliest reason the
+    // menu was opened. No heading, because each row says what it is doing.
+    let sessions = status::rows();
+    for (index, row) in sessions.iter().enumerate() {
+        items.push(Box::new(MenuItem::with_id(
+            app,
+            format!("session:{index}"),
+            status::label(row),
+            true,
+            None::<&str>,
+        )?));
+    }
+    if !sessions.is_empty() {
+        items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    }
+
     let recent = recent::list();
     if !recent.is_empty() {
         items.push(Box::new(MenuItem::with_id(
@@ -706,6 +724,10 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             id => {
                 if let Some(index) = id.strip_prefix("recent:").and_then(|at| at.parse().ok()) {
                     recent::open(app, index);
+                } else if let Some(index) =
+                    id.strip_prefix("session:").and_then(|at| at.parse().ok())
+                {
+                    status::open(app, index);
                 }
             }
         })

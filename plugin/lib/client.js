@@ -29,8 +29,10 @@
  *
  * One global, `window.__dshSignals`, set while the plugin is wired up. The
  * shell calls three things on it. `open(id)` is how a click on a notification
- * gets back to the session the notification was about — `ctx.sessions.open` is
- * dsh's own way to switch the current session. `answer(id, key, choice)` is
+ * gets back to the session the notification was about, through dsh's own way
+ * to switch the current session — `ctx.uiWorkspace.openSession` on dsh 0.2,
+ * `ctx.sessions.open` before it. The tray's rows for running and waiting
+ * sessions go the same way. `answer(id, key, choice)` is
  * how a press on one of that notification's buttons reaches the request it
  * answers, which is the same carrier the snapshot above reported: the object
  * that says a question is pending is the object that answers it.
@@ -168,17 +170,19 @@ window.__ModuleLoader__.load({
       var waits = null;
       var folders = null;
 
-      // How many sessions are mid-turn and how many are waiting on the user,
-      // for the shell's icons. Each half fills in its own count and goes back
-      // to zero when its scope goes; only a change is sent.
-      var counts = { running: 0, waiting: 0 };
+      // Which sessions are mid-turn and which are waiting on the user, for the
+      // shell's icons, its tray menu and whether it keeps the machine awake.
+      // Each half fills in its own set and empties it when its scope goes;
+      // only a change is sent.
+      var ids = { running: new Set(), waiting: new Set() };
       var reported = null;
-      var report = (name, count) => {
-        counts[name] = count;
-        var line = counts.running + '/' + counts.waiting;
-        if (line === reported) return;
-        reported = line;
-        send({ event: 'status', running: String(counts.running), waiting: String(counts.waiting) });
+      var report = (name, set) => {
+        ids[name] = set;
+        var line = status(sessions, ids.running, ids.waiting);
+        var text = JSON.stringify(line);
+        if (text === reported) return;
+        reported = text;
+        send(line);
       };
 
       ctx.effect(() => {
@@ -190,7 +194,11 @@ window.__ModuleLoader__.load({
            * @param {string} id - session id, as it was reported from here.
            */
           open: (id) => {
-            if (sessions) sessions.open(id);
+            // dsh 0.2 moved switching sessions off `sessions` — "navigation
+            // belongs to view owners" — and onto the workspace view. The old
+            // call is kept for a dsh that predates the move.
+            if (folders && folders.uiWorkspace.openSession) folders.uiWorkspace.openSession(id);
+            else if (sessions && sessions.open) sessions.open(id);
           },
           /**
            * Answer what a session is waiting on, for a press on one of a
@@ -251,11 +259,11 @@ window.__ModuleLoader__.load({
       ctx.inject(['sessions'], (scope) => {
         scope.effect(() => {
           sessions = scope.sessions;
-          var stop = watchTurns(scope, (count) => report('running', count));
+          var stop = watchTurns(scope, (set) => report('running', set));
           return () => {
             sessions = null;
             stop();
-            report('running', 0);
+            report('running', new Set());
           };
         }, 'dsh-desktop-signal: turn endings to the desktop shell');
       });
@@ -266,11 +274,11 @@ window.__ModuleLoader__.load({
       ctx.inject(['uiSession'], (scope) => {
         scope.effect(() => {
           waits = pendingOf(scope.uiSession);
-          var stop = watchWaits(waits, (count) => report('waiting', count));
+          var stop = watchWaits(waits, (set) => report('waiting', set));
           return () => {
             waits = null;
             stop();
-            report('waiting', 0);
+            report('waiting', new Set());
           };
         }, 'dsh-desktop-signal: pending questions to the desktop shell');
       });
@@ -293,6 +301,50 @@ window.__ModuleLoader__.load({
       ctx.inject(['workspaces', 'sessions'], (scope) => {
         scope.effect(() => watchRecent(scope), 'dsh-desktop-signal: recent workspaces to the desktop shell');
       });
+    }
+
+    /** How many sessions the shell's tray menu lists. */
+    var LISTED = 5;
+
+    /**
+     * The `status` event: how many sessions are mid-turn and how many are
+     * waiting on the user, and the few the tray lists by name.
+     *
+     * A session waiting on the user is counted as waiting and not as running,
+     * though dsh still reports its turn as running: the turn is stopped on the
+     * user, and what the shell does with "running" — a blue dot, and keeping
+     * the machine awake — is for a turn that is getting somewhere on its own.
+     *
+     * Waiting ones are listed first, being the ones worth a click. A subagent
+     * that is merely running is not listed: one turn can spawn dozens, and the
+     * row worth having is the turn that spawned them. One that stops to ask is,
+     * because that is where the question is. Titles are dsh's `displayTitle`,
+     * read when the line is built, so a title dsh fills in later goes out with
+     * the next list change rather than never.
+     *
+     * The rows travel as two pairs of repeated keys in step, the way the
+     * recent workspaces do.
+     */
+    function status(sessions, running, waiting) {
+      var list = sessions ? sessions.list.getSnapshot() : { byId: {} };
+      var title = (id) => {
+        var summary = list.byId[id];
+        return (summary && summary.displayTitle) || '';
+      };
+      var going = [...running].filter((id) => !waiting.has(id));
+      var asking = [...waiting].slice(0, LISTED);
+      var listed = going
+        .filter((id) => !(list.byId[id] && list.byId[id].origin === 'subagent'))
+        .slice(0, LISTED - asking.length);
+      return {
+        event: 'status',
+        running: String(going.length),
+        waiting: String(waiting.size),
+        wid: asking,
+        wtitle: asking.map(title),
+        rid: listed,
+        rtitle: listed.map(title),
+      };
     }
 
     /** How many workspaces the shell is told about. */
@@ -431,13 +483,13 @@ window.__ModuleLoader__.load({
       var read = (announce) => {
         var list = ctx.sessions.list.getSnapshot();
         var seen = Object.create(null);
-        var busy = 0;
+        var busy = new Set();
 
         for (var id of list.ids) {
           var summary = list.byId[id];
           if (!summary) continue;
           seen[id] = true;
-          if (summary.running === true) busy += 1;
+          if (summary.running === true) busy.add(id);
           var was = running[id];
           running[id] = summary.running;
           if (announce && was === true && summary.running === false && summary.origin !== 'subagent') {
@@ -503,11 +555,11 @@ window.__ModuleLoader__.load({
       var read = (announce) => {
         var snapshot = source.getSnapshot();
         var seen = Object.create(null);
-        var waiting = 0;
+        var waiting = new Set();
 
         for (var [id, pending] of snapshot) {
           seen[id] = true;
-          waiting += 1;
+          waiting.add(id);
           if (keys[id] === pending.key) continue;
           keys[id] = pending.key;
           if (announce) {

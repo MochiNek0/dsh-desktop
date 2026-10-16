@@ -108,9 +108,13 @@ pub enum Signal {
     FolderFailed { reason: String },
     /// The workspaces used last, most recent first; see [`crate::recent`].
     Recent(Vec<crate::recent::Workspace>),
-    /// How many sessions are mid-turn and how many are waiting on the user;
-    /// see [`crate::status`].
-    Status { running: u32, waiting: u32 },
+    /// How many sessions are mid-turn and how many are waiting on the user,
+    /// and the few the tray lists by name; see [`crate::status`].
+    Status {
+        running: u32,
+        waiting: u32,
+        rows: Vec<crate::status::Row>,
+    },
 }
 
 /// Read a `dsh-window://signal` navigation. `None` for a query this build has
@@ -128,6 +132,7 @@ pub fn received(url: &Url) -> Option<Signal> {
     let mut paths = Vec::new();
     let mut running = 0;
     let mut waiting = 0;
+    let (mut wid, mut wtitle, mut rid, mut rtitle) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
 
     for (name, value) in url.query_pairs() {
         match name.as_ref() {
@@ -155,6 +160,12 @@ pub fn received(url: &Url) -> Option<Signal> {
             "path" if paths.len() < crate::recent::LIMIT => paths.push(value.trim().to_string()),
             "running" => running = value.parse().unwrap_or(0),
             "waiting" => waiting = value.parse().unwrap_or(0),
+            // The tray's session rows: waiting ones and running ones, each an
+            // id and a title repeated in step, like the recent workspaces.
+            "wid" if wid.len() < crate::status::LIMIT => wid.push(clamp(&value)),
+            "wtitle" if wtitle.len() < crate::status::LIMIT => wtitle.push(clamp(&value)),
+            "rid" if rid.len() < crate::status::LIMIT => rid.push(clamp(&value)),
+            "rtitle" if rtitle.len() < crate::status::LIMIT => rtitle.push(clamp(&value)),
             _ => {}
         }
     }
@@ -177,7 +188,20 @@ pub fn received(url: &Url) -> Option<Signal> {
             return Some(Signal::Recent(list));
         }
         "recent" => return None,
-        "status" => return Some(Signal::Status { running, waiting }),
+        // Rows whose halves do not pair up are dropped rather than the counts:
+        // the dot is worth drawing even when the menu has nothing to list.
+        "status" => {
+            let rows = rows(wid, wtitle, true)
+                .into_iter()
+                .chain(rows(rid, rtitle, false))
+                .take(crate::status::LIMIT)
+                .collect();
+            return Some(Signal::Status {
+                running,
+                waiting,
+                rows,
+            });
+        }
         _ => {}
     }
 
@@ -263,7 +287,11 @@ pub fn act(app: &AppHandle, signal: Signal) {
         Signal::FolderOpened => crate::folder::opened(),
         Signal::FolderFailed { reason } => crate::folder::failed(app, &reason),
         Signal::Recent(list) => crate::recent::set(app, list),
-        Signal::Status { running, waiting } => crate::status::set(app, running, waiting),
+        Signal::Status {
+            running,
+            waiting,
+            rows,
+        } => crate::status::set(app, running, waiting, rows),
     }
 }
 
@@ -396,9 +424,10 @@ fn generic_wait(kind: &str) -> (&'static str, &'static str) {
 ///
 /// Down the same `window.eval` the rest of the app talks to its injected
 /// scripts through, except that what answers here is the plugin rather than
-/// anything this app wrote: `ctx.sessions.open(id)` is dsh's own way to switch
-/// the current session, and the plugin puts a door to it on `window` while it is
-/// wired up. Guarded on the far side because a click can arrive after the
+/// anything this app wrote: `ctx.uiWorkspace.openSession(id)` is dsh's own way
+/// to switch the current session (`ctx.sessions.open` before dsh 0.2), and the
+/// plugin puts a door to it on `window` while it is wired up. A click on one of
+/// the tray's session rows comes here too; see [`crate::status`]. Guarded on the far side because a click can arrive after the
 /// document that raised the notification has gone -- a reload, or dsh
 /// restarting under the window -- and then there is nothing there to call.
 pub fn open(app: &AppHandle, session: &str) {
@@ -437,6 +466,24 @@ fn call(session: &str) -> String {
 /// them came off a URL the page itself can have written.
 fn reply(session: &str, key: &str, choice: &str) -> String {
     format!("window.__dshSignals && window.__dshSignals.answer({session:?}, {key:?}, {choice:?});")
+}
+
+/// One half of the tray's session rows, off its two repeated keys. Nothing
+/// when the halves do not pair up, and no row for an empty id: it would be a
+/// menu item that opens nothing.
+fn rows(ids: Vec<String>, titles: Vec<String>, waiting: bool) -> Vec<crate::status::Row> {
+    if ids.len() != titles.len() {
+        return Vec::new();
+    }
+    ids.into_iter()
+        .zip(titles)
+        .filter(|(session, _)| !session.is_empty())
+        .map(|(session, title)| crate::status::Row {
+            session,
+            title,
+            waiting,
+        })
+        .collect()
 }
 
 /// One field, trimmed on a character boundary. No ellipsis: these are
@@ -589,16 +636,60 @@ mod tests {
             read("event=status&running=2&waiting=1&n=3.4"),
             Some(Signal::Status {
                 running: 2,
-                waiting: 1
+                waiting: 1,
+                rows: vec![]
             })
         );
         assert_eq!(
             read("event=status&running=lots"),
             Some(Signal::Status {
                 running: 0,
-                waiting: 0
+                waiting: 0,
+                rows: vec![]
             })
         );
+    }
+
+    /// The tray's rows: waiting ones first, each half paired up on its own,
+    /// and a half that does not pair dropped without taking the counts along.
+    #[test]
+    fn reads_the_sessions_the_tray_lists() {
+        use crate::status::Row;
+
+        let row = |session: &str, title: &str, waiting| Row {
+            session: session.into(),
+            title: title.into(),
+            waiting,
+        };
+
+        // As `plugin/lib/client.js` builds it, rows before counts' keys or
+        // after makes no difference.
+        assert_eq!(
+            read(
+                "event=status&running=2&waiting=1&wid=s-b&wtitle=Write%20the%20docs\
+                 &rid=s-a&rtitle=Fix%20%26%20ship&n=1.2"
+            ),
+            Some(Signal::Status {
+                running: 2,
+                waiting: 1,
+                rows: vec![row("s-b", "Write the docs", true), row("s-a", "Fix & ship", false)]
+            })
+        );
+
+        let Some(Signal::Status { running, rows, .. }) =
+            read("event=status&running=1&rid=s-a&rid=s-c&rtitle=only%20one")
+        else {
+            panic!("a status");
+        };
+        assert_eq!(running, 1);
+        assert!(rows.is_empty(), "halves that do not pair");
+
+        // Bounded by count like the recent workspaces.
+        let many: String = (0..9).map(|i| format!("&wid=s{i}&wtitle=t{i}")).collect();
+        let Some(Signal::Status { rows, .. }) = read(&format!("event=status&waiting=9{many}")) else {
+            panic!("a status");
+        };
+        assert_eq!(rows.len(), crate::status::LIMIT);
     }
 
     #[test]
