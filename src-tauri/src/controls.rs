@@ -213,9 +213,9 @@ pub enum Action {
     Answered(Url),
     /// Open an external URL in the system browser.
     OpenUrl(String),
-    /// The key the settings card recorded for the global shortcut, or `""` to
-    /// turn it off; see [`crate::shortcut`].
-    Shortcut(String),
+    /// The key the settings card recorded for one of the global shortcuts, or
+    /// `""` to turn it off; see [`crate::shortcut`].
+    Shortcut(crate::shortcut::Slot, String),
 }
 
 /// Recognise a navigation as a button press. `None` for every ordinary URL,
@@ -349,10 +349,12 @@ pub fn action(url: &Url) -> Option<Action> {
         // owns the parsing because it owns the callback the answer runs.
         "ask" => Some(Action::Answered(url.clone())),
         // Absent is not off: only a `keys=` the card actually sent is a choice.
-        "shortcut" => url
-            .query_pairs()
-            .find_map(|(key, value)| (key == "keys").then(|| value.into_owned()))
-            .map(Action::Shortcut),
+        verb @ ("shortcut" | "ask-shortcut" | "paste-shortcut") => {
+            let slot = crate::shortcut::Slot::from_verb(verb)?;
+            url.query_pairs()
+                .find_map(|(key, value)| (key == "keys").then(|| value.into_owned()))
+                .map(|keys| Action::Shortcut(slot, keys))
+        }
         other => {
             eprintln!("dsh-desktop: ignoring unknown window action {other}");
             None
@@ -475,7 +477,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::Notify(notice) => return crate::notify::show(app, notice),
         Action::Signal(signal) => return crate::signal::act(app, signal),
         Action::Answered(url) => return crate::dialog::answered(app, &url),
-        Action::Shortcut(keys) => return crate::shortcut::change(app, &keys),
+        Action::Shortcut(slot, keys) => return crate::shortcut::change(app, slot, &keys),
         Action::OpenUrl(target) => {
             let _ = app.opener().open_url(target, None::<&str>);
             return;
@@ -747,7 +749,9 @@ fn labels() -> String {
         // `crate::settings`.
         ("notify-turns", t!("通知", "Notifications")),
         ("keep-awake", t!("跑任务时不睡眠", "Stay awake during turns")),
-        ("shortcut", t!("全局快捷键", "Global shortcut")),
+        ("shortcut", crate::shortcut::name(crate::shortcut::Slot::Window)),
+        ("ask-shortcut", crate::shortcut::name(crate::shortcut::Slot::Ask)),
+        ("paste-shortcut", crate::shortcut::name(crate::shortcut::Slot::Paste)),
         ("community", t!("交流群", "Feedback")),
         ("quit", t!("退出 dsh", "Quit dsh")),
     ];
@@ -841,7 +845,9 @@ fn notes() -> String {
                  Closing the lid or choosing Sleep still works."
             ),
         ),
-        ("shortcut", crate::shortcut::note()),
+        ("shortcut", crate::shortcut::note(crate::shortcut::Slot::Window)),
+        ("ask-shortcut", crate::shortcut::note(crate::shortcut::Slot::Ask)),
+        ("paste-shortcut", crate::shortcut::note(crate::shortcut::Slot::Paste)),
         ("community", community.as_str()),
     ];
 
@@ -1189,6 +1195,8 @@ pub fn script() -> String {
     // The key on the right is the control: click it, then press the new one.
     // See `__dshShortcut`.
     {{ verb: 'shortcut', keys: true }},
+    {{ verb: 'ask-shortcut', keys: true }},
+    {{ verb: 'paste-shortcut', keys: true }},
     // Last, and on the card rather than the menu: it is for someone who went
     // looking, and the menu is what everyone sees on every use.
     {{ verb: 'community', community: true }},
@@ -1741,10 +1749,11 @@ pub fn script() -> String {
 
     word(head, LABELS['settings']);
 
-    // The shortcut row's key, its note, and the words Rust last sent for it;
-    // see `__dshShortcut`.
-    var keyChip = null, keyNote = null, keyNow = '', keyWords = {{ off: '', press: '' }};
-    var recording = false;
+    // Each shortcut row's key chip and note, by verb, with the key it now has,
+    // and the words Rust last sent; see `__dshShortcut`. `recording` is the
+    // verb whose key is being recorded, or null.
+    var keyRows = {{}}, keyWords = {{ off: '', press: '' }};
+    var recording = null;
 
     SETTINGS.forEach(function (item) {{
       var row = make('button', item.close ? 'dsh-wc-set-shut' : '', card);
@@ -1765,8 +1774,7 @@ pub fn script() -> String {
         make('span', 'dsh-wc-sw', row);
         checks[item.verb] = row;
       }} else if (item.keys) {{
-        keyChip = make('span', 'dsh-wc-key', row);
-        keyNote = note;
+        keyRows[item.verb] = {{ chip: make('span', 'dsh-wc-key', row), note: note, now: '' }};
       }} else if (!item.close && !item.community) {{
         make('span', 'dsh-wc-set-go', row).innerHTML = GO_GLYPH;
       }}
@@ -1778,7 +1786,7 @@ pub fn script() -> String {
         // The same refusal a menu row makes; see the handler above.
         if (row.getAttribute('aria-disabled') === 'true') return;
         // Listens for the next key rather than signalling; see `record`.
-        if (item.keys) return record();
+        if (item.keys) return record(item.verb);
         // Chinese copies the group's number and keeps the card up, so the note
         // can say it did; English leaves for the issue tracker in the browser.
         // The language is read at the click, because dsh can switch it under
@@ -1858,21 +1866,25 @@ pub fn script() -> String {
       mark('keep-awake', on);
     }};
 
-    // The shortcut row's recorder. The next key pressed with its modifiers is
+    // A shortcut row's recorder. The next key pressed with its modifiers is
     // sent as `KeyboardEvent.code`, which names the key where it sits rather
     // than what the layout prints on it -- the same thing the OS registers.
     // Escape on its own puts the old key back; Backspace or Delete on its own
     // turns the shortcut off. Whether a key is acceptable is Rust's to say,
-    // and it says so in the row's note.
-    function record() {{
-      recording = true;
-      keyChip.textContent = keyWords.press;
-      keyChip.classList.add('dsh-wc-key-live');
+    // and it says so in the row's note. One row records at a time.
+    function record(verb) {{
+      if (recording) stopRecording();
+      recording = verb;
+      var row = keyRows[verb];
+      row.chip.textContent = keyWords.press;
+      row.chip.classList.add('dsh-wc-key-live');
     }}
     function stopRecording() {{
-      recording = false;
-      keyChip.classList.remove('dsh-wc-key-live');
-      keyChip.textContent = keyNow || keyWords.off;
+      var row = keyRows[recording];
+      recording = null;
+      if (!row) return;
+      row.chip.classList.remove('dsh-wc-key-live');
+      row.chip.textContent = row.now || keyWords.off;
     }}
     // Capturing on the window, so it runs before the card's own Escape and
     // before anything dsh listens for.
@@ -1888,27 +1900,29 @@ pub fn script() -> String {
       if (event.altKey) held.push('Alt');
       if (event.shiftKey) held.push('Shift');
       if (event.metaKey) held.push('Super');
+      var verb = recording;
       stopRecording();
       if (!held.length && key === 'Escape') return;
       if (!held.length && (key === 'Backspace' || key === 'Delete')) {{
-        return signal('shortcut?keys=');
+        return signal(verb + '?keys=');
       }}
-      signal('shortcut?keys=' + encodeURIComponent(held.concat(event.code).join('+')));
+      signal(verb + '?keys=' + encodeURIComponent(held.concat(event.code).join('+')));
     }}, true);
     window.addEventListener('blur', function () {{
       if (recording) stopRecording();
     }});
 
-    // Called from Rust; see `shortcut::sync`. `keys` is what is registered, or
-    // empty; `note` is the row's second line, which `warn` marks as the reason
-    // a key did not take.
-    window.__dshShortcut = function (keys, note, warn, words) {{
+    // Called from Rust, once per row; see `shortcut::sync`. `verb` names the
+    // row, `keys` is what is registered, or empty; `note` is the row's second
+    // line, which `warn` marks as the reason a key did not take.
+    window.__dshShortcut = function (verb, keys, note, warn, words) {{
       keyWords = words || keyWords;
-      keyNow = keys || '';
-      if (!keyChip) return;
-      if (!recording) keyChip.textContent = keyNow || keyWords.off;
-      keyNote.textContent = note || '';
-      keyNote.classList.toggle('dsh-wc-set-warn', !!warn);
+      var row = keyRows[verb];
+      if (!row) return;
+      row.now = keys || '';
+      if (recording !== verb) row.chip.textContent = row.now || keyWords.off;
+      row.note.textContent = note || '';
+      row.note.classList.toggle('dsh-wc-set-warn', !!warn);
     }};
     // `on` is the preference, `available` whether anything can act on it, and
     // `hint` what is missing when it cannot. An unavailable row reads as off

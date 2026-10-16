@@ -107,6 +107,10 @@ pub enum Signal {
     ReplyFailed { session: String },
     /// The plugin can open a folder now; see [`crate::folder`].
     FolderReady,
+    /// A line from the quick-ask box started a session; see [`crate::ask`].
+    Asked { session: String },
+    /// It could not, and why.
+    AskFailed { reason: String },
     /// dsh took the folder it was handed.
     FolderOpened,
     /// dsh would not take it, and why.
@@ -181,6 +185,8 @@ pub fn received(url: &Url) -> Option<Signal> {
         "folder-ready" => return Some(Signal::FolderReady),
         "folder-opened" => return Some(Signal::FolderOpened),
         "folder-failed" => return Some(Signal::FolderFailed { reason }),
+        "asked" => return Some(Signal::Asked { session }),
+        "ask-failed" => return Some(Signal::AskFailed { reason }),
         // A row with no path has nowhere to go, and a list whose halves do not
         // pair up cannot be trusted to pair the right ones.
         "recent" if titles.len() == paths.len() => {
@@ -304,7 +310,15 @@ pub fn act(app: &AppHandle, signal: Signal) {
                 draft(app, &session, &text);
             }
         }
-        Signal::FolderReady => crate::folder::ready(app),
+        Signal::FolderReady => {
+            crate::folder::ready(app);
+            crate::ask::ready(app);
+        }
+        Signal::Asked { session } => {
+            eprintln!("dsh-desktop: a quick ask started {session}");
+            crate::ask::asked();
+        }
+        Signal::AskFailed { reason } => crate::ask::failed(app, &reason),
         Signal::FolderOpened => crate::folder::opened(),
         Signal::FolderFailed { reason } => crate::folder::failed(app, &reason),
         Signal::Recent(list) => crate::recent::set(app, list),

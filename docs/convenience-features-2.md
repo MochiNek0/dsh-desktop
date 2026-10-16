@@ -13,9 +13,9 @@
 | 1 | 跑任务时不让电脑睡眠 | 已完成并验证（Windows） |
 | 2 | 托盘里列出在跑 / 在等你的会话 | 已完成并验证（托盘菜单的样子没截图） |
 | 3 | 通知里直接回复 | 已完成并验证（仅 Windows） |
-| 4 | 快捷键唤出的小输入框 | 未开始 |
+| 4 | 快捷键唤出的小输入框 | 已完成并验证（Windows） |
 | 5 | `dsh-desktop://` 链接 | 已完成并验证（Windows） |
-| 6 | 把剪贴板送进当前会话 | 未开始 |
+| 6 | 把剪贴板送进当前会话 | 已完成并验证（Windows） |
 
 ## 先查清楚的：插件能对会话做什么
 
@@ -135,3 +135,39 @@
 - 先只做文字。图片要走 dsh 的附件流程，`draftAttachments` 是内部的，后面再看。
 
 **完成标准**：在别的程序里复制一段报错，按快捷键，dsh 出来，输入框里是原来的草稿加上这段文字。
+
+## 4 和 6 已完成
+
+两条一起提交：都要一个新的全局快捷键，共用下面这部分改动。
+
+### 快捷键改成多个槽位
+
+- `shortcut.rs` 从「一个键」改成三个 `Slot`：显示窗口（`shortcut`，默认 Ctrl+Alt+D，和以前一样）、快速提问（`askShortcut`，默认 Ctrl+Alt+Space，macOS 上 Ctrl+Option+Space 是切换输入法，改用 Ctrl+Option+Q）、粘贴到 dsh（`pasteShortcut`，**默认不设**：Ctrl+Alt+V 是 Office 的「选择性粘贴」，顺手的组合都被各家的粘贴命令占着）。默认值和用户商量过。
+- 每个槽位各有自己的注册状态、失败原因和设置卡片上的一行；三行共用一套录制器（`keyRows` 按 verb 分开，`__dshShortcut(verb, …)`）。
+- 录一个已经被本应用别的槽位占着的键，直接提示「已经是「…」的快捷键了」，不交给系统（系统会说成被「其他程序」占用）。
+- `settings::shortcut` / `set_shortcut` 改成带键名。
+
+### 4. 快速提问
+
+- `ask.rs` + `dist/ask.html`：一个无边框、置顶、不进任务栏的小窗口，第一次用时才建。没有 IPC（capabilities 只给了主窗口），靠 `dsh-window://quick-ask|quick-close|quick-ready` 跟 Rust 说话，只有它自己的导航回调听得到。`dsh-window://ask` 已经被对话框的回答占了，所以用 `quick-` 前缀。
+- 窗口里是一个输入框和最近工作区的下拉框（默认最近的那个）。Enter 发送（输入法还在组字时不算），Shift+Enter 换行，Esc 关闭，失焦也关。Rust 只接受最近工作区里有的路径。
+- 提交后窗口收起，Rust 调插件 `__dshSignals.ask(path, text)`：`workspaces.create({ path })`（和打开文件夹同一个调用，同一路径复用）→ `sessions.create({ workspaceId })` → 和回复一样 `prompt`，回 `asked` / `ask-failed`。不切换会话；跑完靠已有的通知（能直接回复）。
+- dsh 还没起来时先存着，等 `folder-ready` 再交出去。失败时小窗口带着原来的文字和原因重新弹出来。
+- 第一次建窗口时页面还没加载完，Rust 推的数据会丢，所以页面加载后发 `quick-ready` 再要一次。
+- **修掉的坑**：第一次弹出时 WebView2 建子窗口并把焦点交给它，Tauri 把这次转手报成窗口 `Focused(false)` 再 `Focused(true)`，「失焦就隐藏」把窗口立刻藏掉了，看起来像第一次按键没反应。现在失焦后等 150ms 再问一次窗口是否真的没有焦点。
+
+### 6. 粘贴到 dsh
+
+- `paste.rs`：读剪贴板文字 → `reveal` → 插件 `__dshSignals.draft('', text)`（第 3 条加的，接在当前草稿后面、聚焦，不发送）。只认文字，图片不管，窗口照样出来。
+- 不为一段文字加剪贴板 crate：Windows 直接用 Win32 剪贴板（`OpenClipboard` 失败重试几次，读的长度同时受终止符和分配大小限制），macOS 用 `pbpaste`，Linux 依次试 `wl-paste`、`xclip`、`xsel`。
+- macOS、Linux 只在 CI 编译。
+
+**已验证**（Windows，dsh 0.2.0-rc.2，按键都是给 global-hotkey 的消息窗口 `PostMessage(WM_HOTKEY)`，没有模拟键盘）：
+
+- 启动后另一个进程 `RegisterHotKey(Ctrl+Alt+Space)` 失败（被应用占着），`Ctrl+Alt+B` 成功（粘贴默认不设）。
+- 主窗口收进托盘后按快速提问：第一次就弹出并拿到前台（修之前第一次会被藏掉，日志里是 `Focused(true)/(false)/(true)/(false)`）。截图确认样子。经 CDP 在小窗口里输入一句话回车：窗口收起，日志「a quick ask goes to C:\Users\EDY\dsh-e2e」「a quick ask started session-…」，托盘显示「正在运行：…」，跑完弹出带输入框的通知，主窗口一直在托盘里。
+- 再按一次弹出、Esc 关闭、按两次是一开一关。
+- 设置卡片三行：Ctrl+Alt+D / Ctrl+Alt+Space / 未设置。在「粘贴到 dsh」上录 Ctrl+Alt+D → 提示已经是「全局快捷键」的快捷键；录 Ctrl+Alt+B → 生效，写进 `pasteShortcut`，别的进程再注册不上。
+- 备份用户剪贴板后放进两行报错，主窗口收起，按 Ctrl+Alt+B：主窗口出来，当前会话输入框里是这两行，焦点在输入框；之后还原了剪贴板、清掉了草稿。
+
+**没验证的**：快速提问失败时带着文字重新弹出（插件单元测试覆盖了 `ask-failed`）；在已有草稿后面追加（第 3 条验证过 `draft` 追加）。

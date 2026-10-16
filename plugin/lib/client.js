@@ -229,6 +229,39 @@ window.__ModuleLoader__.load({
             }, failed);
           },
           /**
+           * Start a new session in a workspace on one line, for the shell's
+           * quick-ask box. Called from the shell over `window.eval`, and only
+           * after `folder-ready`; see its ask.rs.
+           *
+           * The workspace is made or adopted the way `openFolder` does it, the
+           * session is a new one in it — `sessions.create`, what "new
+           * session" calls — and the line goes in the way a reply does. The
+           * session is not switched to: whoever pressed the key is somewhere
+           * else, and the notification at the turn's end is how they hear.
+           *
+           * @param {string} path - the workspace's directory.
+           * @param {string} text - the line typed into the box.
+           */
+          ask: (path, text) => {
+            var failed = (error) => send({
+              event: 'ask-failed',
+              reason: (error && error.message) || String(error),
+            });
+            if (!folders || !sessions) return failed('not ready');
+            var current = { folders: folders, sessions: sessions };
+            current.folders.workspaces.create({ path: path })
+              .then((workspace) => current.sessions.create({ workspaceId: workspace.workspaceId }))
+              .then((id) => current.sessions.using(id, { source: 'controllerOperation' }, (reference) =>
+                reference.ready.then((binding) => binding.session.prompt([{ type: 'text', text: text }], 'queue')),
+              ).then((result) => {
+                if (!result || !result.ok) {
+                  throw new Error((result && result.error && result.error.message) || 'refused');
+                }
+                send({ event: 'asked', session: id });
+              }))
+              .catch(failed);
+          },
+          /**
            * Put text into a session's composer, after whatever is already
            * there, and switch to that session. For a notification reply that
            * could not be sent, and for the clipboard shortcut. Nothing is

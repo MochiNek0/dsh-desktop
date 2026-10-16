@@ -150,6 +150,12 @@ pub fn open(app: &AppHandle, dir: PathBuf) {
     }
 }
 
+/// Whether the plugin on the page now loaded can take a folder — and with it a
+/// quick ask, which needs the same two services; see [`crate::ask`].
+pub fn is_ready() -> bool {
+    STATE.lock().map(|state| state.ready).unwrap_or(false)
+}
+
 /// A navigation has started: whatever the plugin said was about the document
 /// being left.
 pub fn page_started() {

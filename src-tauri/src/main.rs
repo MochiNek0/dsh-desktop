@@ -6,6 +6,7 @@
 #[macro_use]
 mod i18n;
 
+mod ask;
 mod auth;
 mod awake;
 mod controls;
@@ -16,6 +17,7 @@ mod folder;
 mod memory;
 mod notify;
 mod panel;
+mod paste;
 mod placement;
 mod plugins;
 mod recent;

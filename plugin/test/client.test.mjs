@@ -693,6 +693,40 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   console.log('ok  sends a typed reply as the next turn, and says when it could not');
 }
 
+// --- a line from the quick-ask box starts a new session on it ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const made = [];
+  const prompts = [];
+  const s = services({
+    folders: {
+      create: ({ path }) => Promise.resolve({ workspaceId: 'ws-' + path }),
+      openWorkspace: () => { throw new Error('a quick ask does not switch workspaces'); },
+    },
+  });
+  s.ctx.sessions.create = (options) => { made.push(options.workspaceId); return Promise.resolve('session-new'); };
+  s.ctx.sessions.using = (id, options, operation) => Promise.resolve(operation({
+    ready: Promise.resolve({
+      session: { prompt: (content, mode) => { prompts.push([id, content[0].text, mode]); return Promise.resolve({ ok: true }); } },
+    }),
+  }));
+  exports.apply(s.ctx);
+
+  window.__dshSignals.ask('/work/a', 'fix the build');
+  await drain();
+  assert.deepEqual(made, ['ws-/work/a']);
+  assert.deepEqual(prompts, [['session-new', 'fix the build', 'queue']]);
+  assert.deepEqual(sent.map(query).map((p) => [p.event, p.session]).at(-1), ['asked', 'session-new']);
+  assert.deepEqual(s.opened, [], 'nothing is switched to');
+
+  // dsh refusing the workspace is a failure with dsh's reason.
+  s.ctx.workspaces.create = () => Promise.reject(new Error('not a directory'));
+  window.__dshSignals.ask('/nope', 'x');
+  await drain();
+  assert.deepEqual([query(sent.at(-1)).event, query(sent.at(-1)).reason], ['ask-failed', 'not a directory']);
+  console.log('ok  starts a new session on a quick-ask line');
+}
+
 // --- text into a composer, after what is already there ---
 {
   const { exports, window } = load({ host: true });

@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>dsh</title>
+    <!--
+      The quick-ask box; see `src-tauri/src/ask.rs`. No IPC: it talks back by
+      navigating to `dsh-window://`, which only its own window's navigation
+      handler hears. Colours are the loading page's, and follow the window's
+      theme, which Rust sets to dsh's own preference before showing it.
+    -->
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --fg: #1a1a1a;
+        --muted: #6b7280;
+        --line: #e5e7eb;
+        --accent: #4d6bfe;
+        --danger: #b42318;
+        --panel: #f7f8fa;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #17171d;
+          --fg: #ececf1;
+          --muted: #9aa0ac;
+          --line: #2c2c35;
+          --danger: #f97066;
+          --panel: #101014;
+        }
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      }
+      body {
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 14px 16px 10px;
+        border: 1px solid var(--line);
+      }
+      textarea {
+        flex: 1;
+        min-height: 0;
+        resize: none;
+        border: 0;
+        outline: 0;
+        padding: 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        font-size: 16px;
+        line-height: 1.5;
+      }
+      textarea::placeholder {
+        color: var(--muted);
+      }
+      .bar {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      select {
+        max-width: 260px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 2px 6px;
+        background: var(--panel);
+        color: var(--fg);
+        font: inherit;
+        outline: 0;
+      }
+      select:focus-visible {
+        border-color: var(--accent);
+      }
+      .hint {
+        margin-left: auto;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .error {
+        color: var(--danger);
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .error:empty {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <textarea id="text" rows="2" spellcheck="false" autofocus></textarea>
+    <div class="error" id="error"></div>
+    <div class="bar">
+      <span id="in"></span>
+      <select id="where"></select>
+      <span class="hint" id="hint"></span>
+    </div>
+    <script>
+      (function () {
+        var box = document.getElementById('text');
+        var where = document.getElementById('where');
+        var error = document.getElementById('error');
+        var label = document.getElementById('in');
+        var hint = document.getElementById('hint');
+        var none = '';
+
+        // Each navigation different from the last, or a repeated one does not
+        // navigate at all; see `notify::script`.
+        var nonce = 0;
+        function go(verb, params) {
+          var query = [];
+          for (var key in params || {}) {
+            query.push(encodeURIComponent(key) + '=' + encodeURIComponent(params[key]));
+          }
+          query.push('n=' + ++nonce + '.' + Date.now());
+          window.location.href = 'dsh-window://' + verb + '?' + query.join('&');
+        }
+
+        // Called from Rust each time the box is shown; see `ask::payload`.
+        window.__dshAsk = function (payload) {
+          var words = payload.words || {};
+          box.placeholder = words.placeholder || '';
+          hint.textContent = words.hint || '';
+          label.textContent = words['in'] || '';
+          none = words.none || '';
+
+          where.textContent = '';
+          (payload.workspaces || []).forEach(function (workspace) {
+            var option = document.createElement('option');
+            option.value = workspace.path;
+            option.textContent = workspace.title;
+            option.title = workspace.path;
+            where.appendChild(option);
+          });
+          var empty = !where.options.length;
+          where.disabled = empty;
+          box.disabled = empty;
+          error.textContent = empty ? none : payload.error || '';
+
+          box.value = payload.text || '';
+          box.focus();
+          box.setSelectionRange(box.value.length, box.value.length);
+        };
+
+        function send() {
+          var text = box.value.trim();
+          if (!text || !where.value) return;
+          go('quick-ask', { text: text, path: where.value });
+          box.value = '';
+          error.textContent = '';
+        }
+
+        document.addEventListener('keydown', function (event) {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            go('quick-close');
+            return;
+          }
+          // Not while an input method is still composing: that Enter picks a
+          // candidate, it does not send.
+          if (event.target === box && event.key === 'Enter' && !event.shiftKey &&
+              !event.isComposing && event.keyCode !== 229) {
+            event.preventDefault();
+            send();
+          }
+        });
+
+        // The box is shown after it is filled in, and a hidden window cannot
+        // take the focus, so it is taken again when the window gets it.
+        window.addEventListener('focus', function () {
+          if (!box.disabled) box.focus();
+        });
+
+        // The first time the window is built this page is not loaded yet when
+        // Rust hands it the payload, so it asks for it once it is.
+        go('quick-ready');
+      })();
+    </script>
+  </body>
+</html>
