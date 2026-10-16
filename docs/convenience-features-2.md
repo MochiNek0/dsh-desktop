@@ -14,7 +14,7 @@
 | 2 | 托盘里列出在跑 / 在等你的会话 | 已完成并验证（托盘菜单的样子没截图） |
 | 3 | 通知里直接回复 | 已完成并验证（仅 Windows） |
 | 4 | 快捷键唤出的小输入框 | 未开始 |
-| 5 | `dsh://` 链接 | 未开始 |
+| 5 | `dsh-desktop://` 链接 | 已完成并验证（Windows） |
 | 6 | 把剪贴板送进当前会话 | 未开始 |
 
 ## 先查清楚的：插件能对会话做什么
@@ -104,14 +104,29 @@
 
 **完成标准**：主窗口在托盘里时按快捷键，输入回车，dsh 里出现一个新会话在跑这句话；跑完弹通知。
 
-## 5. `dsh://` 链接
+## 5. `dsh-desktop://` 链接
 
-**要做的**：注册 `dsh://` 协议。`dsh://open?path=<路径>` 和 `dsh-desktop <路径>` 一样打开那个文件夹的工作区。
+**要做的**：注册一个协议，`dsh-desktop://open?path=<路径>` 和 `dsh-desktop <路径>` 一样打开那个文件夹的工作区。
 
-- 用 `tauri-plugin-deep-link`，安装器模板里已经有注册段。
 - 只认 `open`，参数只有 `path`。网页能点出这个链接，所以它不能做比「打开一个文件夹」更多的事。
 
-**完成标准**：在浏览器里点 `dsh://open?path=C:\work\x`，dsh 打开这个文件夹的工作区，冷启动和运行中都行。
+**完成标准**：点 `dsh-desktop://open?path=C:\work\x`，dsh 打开这个文件夹的工作区，冷启动和运行中都行。
+
+### 已完成
+
+- **协议名是 `dsh-desktop://`，不是计划里的 `dsh://`**：`dsh://` 是官方桌面端最可能用的名字，两个应用注册同一个协议，后装的会抢走先装的。
+- **没加 `tauri-plugin-deep-link`**。Windows 和 Linux 上链接本来就是作为命令行参数交给程序的，冷启动从 `args` 读，运行中经单实例插件转过来，和 `dsh-desktop <路径>` 是同一条路；macOS 上从 `RunEvent::Opened` 进来，打开文件夹已经在处理这个事件。所以只需要：
+  - `folder::requested` 认出 `dsh-desktop://open?path=…`（`folder::link`），路径必须是绝对路径、必须是已有的文件夹；也认 `file://` URI（见下面 Linux）。
+  - Windows：`tauri.conf.json` 加 `plugins.deep-link.desktop.schemes`，打包器把它填进安装器模板里现成的注册段（`HKCU\Software\Classes\dsh-desktop`，命令 `"exe" "%1"`），卸载时删掉。
+  - macOS：`Info.plist` 里自己写 `CFBundleURLTypes`，`Opened` 里先试 `folder::link`。
+  - Linux deb：`.desktop` 加 `x-scheme-handler/dsh-desktop`。协议要 `%U`，所以 `Exec` 从 `%F` 改成 `%U`，文件夹的「用其他应用打开」因此变成传 `file://` URI。AppImage 不装 `.desktop`，没有这个入口。
+- macOS、Linux 只在 CI 编译，没有实机验证。
+
+**已验证**（Windows，dsh 0.2.0-rc.2）：
+
+- `npx tauri build --debug --bundles nsis --no-sign` 生成的 `installer.nsi` 里有 `Software\Classes\dsh-desktop` 的注册和卸载清理。
+- 按安装器的写法手写注册项指向测试版，`Start-Process "dsh-desktop://open?path=<编码后的路径>"`（浏览器确认后走的就是 ShellExecute）：应用没开时启动并打开了 `C:\Users\EDY\dsh-e2e-link\with space`（带空格），新开一个会话；开着的时候再打开 `C:\Users\EDY\dsh-e2e`，只有一个进程，当前会话落在 dsh-e2e 工作区。Windows 交过来的是 `dsh-desktop://open/?path=…`（多一个斜杠），也能认。测完删掉了注册项。
+- 单元测试：编码和未编码的路径、多斜杠、相对路径、未知动作、不存在的路径、`file://` URI。
 
 ## 6. 把剪贴板送进当前会话
 

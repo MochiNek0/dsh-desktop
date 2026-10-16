@@ -228,13 +228,14 @@ fn main() {
         // With", which `Info.plist` lists this app for. macOS hands it over as
         // an event, not on the command line, whether or not the app was
         // already running — and after `setup`, so the window is there.
+        //
+        // A `dsh-desktop://` link arrives the same way, being a URL the app is
+        // listed for in `Info.plist` too.
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Opened { urls } => {
-            if let Some(dir) = urls
-                .iter()
-                .filter_map(|url| url.to_file_path().ok())
-                .find_map(|path| folder::folder_of(&path))
-            {
+            if let Some(dir) = urls.iter().find_map(|url| {
+                folder::link(url).or_else(|| folder::folder_of(&url.to_file_path().ok()?))
+            }) {
                 reveal(handle);
                 folder::open(handle, dir);
             }

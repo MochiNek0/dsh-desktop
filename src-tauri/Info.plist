@@ -7,9 +7,24 @@
   a dropped folder and puts the app under "Open With" on a folder in Finder.
   `Alternate` keeps Finder the default for a double-click. What arrives is a
   `RunEvent::Opened`; see `main.rs`.
+
+  And registers the `dsh-desktop://` scheme, whose links arrive the same way;
+  see `folder::link`. Windows and Linux register it from `tauri.conf.json` and
+  `dsh-desktop.desktop`.
 -->
 <plist version="1.0">
 <dict>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>ai.deepseek.dsh.desktop</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>dsh-desktop</string>
+      </array>
+    </dict>
+  </array>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
