@@ -12,6 +12,15 @@
 //! that reported them goes with the document. A page that loads mid-turn
 //! reports again at once. Like every signal, anything in the window can forge
 //! one, and what a forged one buys is a wrong dot.
+//!
+//! ## Which sessions, in the tray menu
+//!
+//! The counts say *that* something is running or waiting; the menu says
+//! *which*. The plugin sends a few sessions by id and title with every count —
+//! waiting ones first — and the tray lists them above the recent workspaces,
+//! where a click goes to that session through the same door a click on a
+//! notification does ([`crate::signal::open`]). A forged row is a menu item
+//! that switches to some session, which the page could already do.
 
 use std::sync::Mutex;
 
@@ -50,8 +59,41 @@ impl Look {
 
 static LOOK: Mutex<Look> = Mutex::new(Look::Idle);
 
-/// The plugin's latest counts. Repaints only when the look changes.
-pub fn set(app: &AppHandle, running: u32, waiting: u32) {
+/// How many sessions the tray lists, and how many of a list off the URL are
+/// read. The plugin sends this many; see `LISTED` there.
+pub const LIMIT: usize = 5;
+
+/// One session the tray lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub session: String,
+    /// dsh's `displayTitle`, which may be empty for a session dsh has not
+    /// titled yet.
+    pub title: String,
+    /// Stopped on the user, as opposed to getting on with it.
+    pub waiting: bool,
+}
+
+static ROWS: Mutex<Vec<Row>> = Mutex::new(Vec::new());
+
+/// The plugin's latest counts and rows. Repaints the icons only when the look
+/// changes, and the menu only when the rows do.
+pub fn set(app: &AppHandle, running: u32, waiting: u32, rows: Vec<Row>) {
+    // Before the early return below: the look does not change between one
+    // running turn and two, and neither does whether to stay awake, but the
+    // hold is its own to compare.
+    crate::awake::running(app, running);
+
+    if let Ok(mut current) = ROWS.lock() {
+        if *current != rows {
+            let labels: Vec<_> = rows.iter().map(label).collect();
+            eprintln!("dsh-desktop: the tray lists {labels:?}");
+            *current = rows;
+            drop(current);
+            crate::refresh_tray(app);
+        }
+    }
+
     let look = Look::of(running, waiting);
     let Ok(mut current) = LOOK.lock() else { return };
     if *current == look {
@@ -65,7 +107,35 @@ pub fn set(app: &AppHandle, running: u32, waiting: u32) {
 /// A navigation has started: whatever the plugin said was about the document
 /// being left.
 pub fn page_started(app: &AppHandle) {
-    set(app, 0, 0);
+    set(app, 0, 0, Vec::new());
+}
+
+/// What the tray lists now.
+pub fn rows() -> Vec<Row> {
+    ROWS.lock().map(|rows| rows.clone()).unwrap_or_default()
+}
+
+/// A click on the row at `index`.
+pub fn open(app: &AppHandle, index: usize) {
+    let Some(row) = rows().into_iter().nth(index) else {
+        return;
+    };
+    crate::reveal(app);
+    crate::signal::open(app, &row.session);
+}
+
+/// A row as the menu shows it: what it is doing, then which session.
+pub fn label(row: &Row) -> String {
+    let title = if row.title.is_empty() {
+        t!("未命名会话", "Untitled session").to_string()
+    } else {
+        crate::recent::label(&row.title)
+    };
+    if row.waiting {
+        t!("在等你：{}", "Waiting for you: {}", title)
+    } else {
+        t!("正在运行：{}", "Running: {}", title)
+    }
 }
 
 /// What the tray's tooltip adds, if anything.
@@ -150,6 +220,25 @@ fn dot(rgba: &[u8], width: u32, height: u32, colour: [u8; 3], share: f32) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{dot, Look};
+
+    /// A row says what the session is doing, keeps a title short and its `&`
+    /// literal, and has something to say about a session dsh has not titled.
+    #[test]
+    fn labels_a_row_by_what_it_is_doing() {
+        use super::{label, Row};
+
+        let row = |title: &str, waiting| Row {
+            session: "s".into(),
+            title: title.into(),
+            waiting,
+        };
+        let waiting = label(&row("R&D", true));
+        let running = label(&row("R&D", false));
+        assert!(waiting.contains("R&&D") && running.contains("R&&D"));
+        assert_ne!(waiting, running);
+        assert!(label(&row("长".repeat(60).as_str(), false)).ends_with('…'));
+        assert!(label(&row("", true)).chars().count() > label(&row("x", true)).chars().count());
+    }
 
     #[test]
     fn waiting_wins_over_running() {

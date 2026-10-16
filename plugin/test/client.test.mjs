@@ -19,13 +19,15 @@ function load({ host }) {
   const sent = [];
   const statuses = [];
   const recents = [];
+  const sessionLists = [];
   let registered = null;
   const window = {
     __ModuleLoader__: { load: (row) => { registered = row; } },
     location: {
       set href(value) {
         const event = new URL(value).searchParams.get('event');
-        (event === 'status' ? statuses : event === 'recent' ? recents : sent).push(value);
+        (event === 'status' ? statuses : event === 'recent' ? recents
+          : event === 'sessions' ? sessionLists : sent).push(value);
       },
       get href() { return ''; },
     },
@@ -36,7 +38,7 @@ function load({ host }) {
   assert.ok(registered, 'the bundle should register a factory');
   assert.equal(registered.id, 'dsh-desktop-signal');
   const exports = registered.factory(() => { throw new Error('should require nothing'); });
-  return { exports, sent, statuses, recents, window };
+  return { exports, sent, statuses, recents, sessionLists, window };
 }
 
 // Stub services with hand-driven snapshots.
@@ -105,6 +107,7 @@ function services({ uiSession = true, folders = null } = {}) {
     setList(next) { list = next; listeners.list.forEach((fn) => fn()); },
     setPending(next) { pending = next; listeners.pending.forEach((fn) => fn()); },
     setWorkspaces(items) { workspaces = { items }; workspaceListeners.forEach((fn) => fn()); },
+    setArchived(ids) { workspaces = { ...workspaces, archivedSessionIds: ids }; workspaceListeners.forEach((fn) => fn()); },
   };
 }
 
@@ -596,14 +599,16 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   await drain();
   assert.deepEqual(statuses.map(query).map((p) => [p.running, p.waiting]), [['1', '0']]);
 
-  // A repeat of the same counts says nothing.
+  // A repeat of the same counts says nothing, and a session stopped on the
+  // user is waiting rather than running, though dsh still calls its turn
+  // running.
   s.setList({ ids: ['a', 'b'], byId: { a: { running: true }, b: { running: false } } });
   s.setPending(new Map([['a', carrier({ kind: 'approval', key: 'k1' })]]));
   s.setList({ ids: ['a', 'b'], byId: { a: { running: false }, b: { running: false } } });
   await drain();
   assert.deepEqual(
     statuses.map(query).map((p) => [p.running, p.waiting]),
-    [['1', '0'], ['1', '1'], ['0', '1']],
+    [['1', '0'], ['0', '1']],
   );
 
   // A scope going away takes its count with it.
@@ -611,6 +616,230 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   await drain();
   assert.deepEqual(statuses.map(query).map((p) => [p.running, p.waiting]).at(-1), ['0', '0']);
   console.log('ok  reports how many sessions are running and waiting');
+}
+
+// --- which sessions, by name, for the shell's tray menu ---
+{
+  const { exports, statuses } = load({ host: true });
+  const s = services();
+  exports.apply(s.ctx);
+  s.setList({
+    ids: ['a', 'b', 'c', 'sub'],
+    byId: {
+      a: { running: true, displayTitle: 'Fix the build' },
+      b: { running: true, displayTitle: 'Write the docs' },
+      c: { running: false, displayTitle: 'Idle one' },
+      sub: { running: true, displayTitle: 'A subagent', origin: 'subagent' },
+    },
+  });
+  s.setPending(new Map([['b', carrier({ kind: 'approval', key: 'k1' })]]));
+  await drain();
+  const last = statuses.at(-1);
+  // Waiting first; a running subagent is counted and not listed.
+  assert.deepEqual(queryAll(last, 'wid'), ['b']);
+  assert.deepEqual(queryAll(last, 'wtitle'), ['Write the docs']);
+  assert.deepEqual(queryAll(last, 'rid'), ['a']);
+  assert.deepEqual(queryAll(last, 'rtitle'), ['Fix the build']);
+  assert.deepEqual([query(last).running, query(last).waiting], ['2', '1']);
+
+  // A title dsh fills in later goes out with the next list change.
+  const before = statuses.length;
+  s.setList({
+    ids: ['a', 'b', 'c', 'sub'],
+    byId: {
+      a: { running: true, displayTitle: 'Fix the CI build' },
+      b: { running: true, displayTitle: 'Write the docs' },
+      c: { running: false, displayTitle: 'Idle one' },
+      sub: { running: true, displayTitle: 'A subagent', origin: 'subagent' },
+    },
+  });
+  await drain();
+  assert.equal(statuses.length, before + 1);
+  assert.deepEqual(queryAll(statuses.at(-1), 'rtitle'), ['Fix the CI build']);
+  console.log('ok  lists the waiting and running sessions by name');
+}
+
+// --- a line from the quick-ask box starts a new session on it ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const made = [];
+  const prompts = [];
+  const s = services({
+    folders: {
+      create: ({ path }) => Promise.resolve({ workspaceId: 'ws-' + path }),
+      openWorkspace: () => { throw new Error('a quick ask does not switch workspaces'); },
+    },
+  });
+  s.ctx.sessions.create = (options) => { made.push(options.workspaceId); return Promise.resolve('session-new'); };
+  s.ctx.sessions.using = (id, options, operation) => Promise.resolve(operation({
+    ready: Promise.resolve({
+      session: { prompt: (content, mode) => { prompts.push([id, content[0].text, mode]); return Promise.resolve({ ok: true }); } },
+    }),
+  }));
+  exports.apply(s.ctx);
+
+  window.__dshSignals.ask('/work/a', 'fix the build');
+  await drain();
+  assert.deepEqual(made, ['ws-/work/a']);
+  assert.deepEqual(prompts, [['session-new', 'fix the build', 'queue']]);
+  assert.deepEqual(sent.map(query).map((p) => [p.event, p.session]).at(-1), ['asked', 'session-new']);
+  assert.deepEqual(s.opened, [], 'nothing is switched to');
+
+  // dsh refusing the workspace is a failure with dsh's reason.
+  s.ctx.workspaces.create = () => Promise.reject(new Error('not a directory'));
+  window.__dshSignals.ask('/nope', 'x');
+  await drain();
+  assert.deepEqual([query(sent.at(-1)).event, query(sent.at(-1)).reason], ['ask-failed', 'not a directory']);
+
+  // Into a session that is already there: nothing is made.
+  window.__dshSignals.ask('/nope', 'and the tests', 'session-old');
+  await drain();
+  assert.deepEqual(made, ['ws-/work/a'], 'no new session');
+  assert.deepEqual(prompts.at(-1), ['session-old', 'and the tests', 'queue']);
+  assert.deepEqual(sent.map(query).map((p) => [p.event, p.session]).at(-1), ['asked', 'session-old']);
+  console.log('ok  starts a new session on a quick-ask line, or sends it into one');
+}
+
+// --- the models the quick-ask box offers, and one chosen there ---
+{
+  const { exports, sent, window } = load({ host: true });
+  const calls = [];
+  const handlers = {};
+  let catalog = {
+    default: { provider: 'ds', model: 'flash' },
+    routableProviders: ['ds'],
+    groups: [{ id: 'ds', name: 'DeepSeek', models: [{ id: 'flash', name: 'Flash' }, { id: 'pro', name: 'Pro' }] }],
+    failures: [],
+  };
+  let refuse = false;
+  const s = services({
+    folders: {
+      create: ({ path }) => Promise.resolve({ workspaceId: 'ws-' + path }),
+      openWorkspace: () => {},
+    },
+  });
+  s.ctx.sessions.create = () => { calls.push('create'); return Promise.resolve('session-new'); };
+  s.ctx.sessions.using = (id, options, operation) => Promise.resolve(operation({
+    ready: Promise.resolve({
+      session: { prompt: (content) => { calls.push(['prompt', id, content[0].text]); return Promise.resolve({ ok: true }); } },
+    }),
+  }));
+  s.ctx.remote = {
+    session: {
+      modelCatalog: () => Promise.resolve({ ok: true, value: catalog }),
+      selectModel: (request) => {
+        calls.push(['select', request.sessionId, request.provider, request.model]);
+        return Promise.resolve(refuse
+          ? { ok: false, error: { code: 'session/model-unavailable', message: 'no such model' } }
+          : { ok: true, value: { selected: request } });
+      },
+    },
+    $on: (name, fn) => { handlers[name] = fn; return () => { delete handlers[name]; }; },
+  };
+  s.ctx['remote.session'] = s.ctx.remote.session;
+  exports.apply(s.ctx);
+  await drain();
+
+  const models = () => sent.filter((url) => query(url).event === 'models');
+  assert.equal(models().length, 1);
+  assert.deepEqual(queryAll(models()[0], 'mid'), ['flash', 'pro']);
+  assert.deepEqual(queryAll(models()[0], 'mname'), ['Flash', 'Pro']);
+  assert.deepEqual(queryAll(models()[0], 'mprov'), ['ds', 'ds']);
+  assert.deepEqual(queryAll(models()[0], 'mpname'), ['DeepSeek', 'DeepSeek']);
+  assert.deepEqual([query(models()[0]).dprov, query(models()[0]).dmod], ['ds', 'flash']);
+
+  // Read again when what it is made of changes, and sent only if it did.
+  handlers['settings/document-updated']();
+  await drain();
+  assert.equal(models().length, 1, 'the same catalog is not sent again');
+  catalog = { ...catalog, default: { provider: 'ds', model: 'pro' } };
+  handlers['credentials/record-updated']();
+  await drain();
+  assert.equal(models().length, 2);
+  assert.equal(query(models()[1]).dmod, 'pro');
+
+  // A model chosen in the box is selected before the line goes in.
+  // It is the default now, too, and the catalog is read again to say so.
+  catalog = { ...catalog, default: { provider: 'ds', model: 'flash' } };
+  window.__dshSignals.ask('/work/a', 'on pro', '', 'ds', 'pro');
+  await drain();
+  assert.deepEqual(calls, ['create', ['select', 'session-new', 'ds', 'pro'], ['prompt', 'session-new', 'on pro']]);
+  assert.equal(models().length, 3);
+  assert.equal(query(models()[2]).dmod, 'flash');
+
+  // None chosen, none selected.
+  calls.length = 0;
+  window.__dshSignals.ask('/work/a', 'as it was', 'session-old', '', '');
+  await drain();
+  assert.deepEqual(calls, [['prompt', 'session-old', 'as it was']]);
+
+  // dsh refusing the model: nothing goes in, and the box hears why.
+  calls.length = 0;
+  refuse = true;
+  window.__dshSignals.ask('/work/a', 'x', 'session-old', 'ds', 'gone');
+  await drain();
+  assert.deepEqual(calls, [['select', 'session-old', 'ds', 'gone']]);
+  assert.deepEqual([query(sent.at(-1)).event, query(sent.at(-1)).reason], ['ask-failed', 'no such model']);
+
+  s.stop();
+  assert.deepEqual(Object.keys(handlers), [], 'the listeners go with the scope');
+  console.log('ok  reports the model catalog and selects a model chosen in the quick-ask box');
+}
+
+// --- text into a composer, after what is already there ---
+{
+  const { exports, window } = load({ host: true });
+  const s = services();
+  let draft = 'half a thought   ';
+  const focused = [];
+  const scopes = {};
+  s.ctx.sessions.scope = (id) => scopes[id];
+  s.ctx.conversation = {
+    input: {
+      for: (scope) => ({
+        state: { getSnapshot: () => ({ draft }) },
+        setDraft: (text) => { draft = text; },
+        focus: () => { focused.push(scope.id); },
+      }),
+    },
+  };
+  exports.apply(s.ctx);
+  s.setList({
+    ids: ['a', 'b'],
+    byId: { a: { running: false, retainedBy: {} }, b: { running: false, retainedBy: { mainView: 1 } } },
+  });
+
+  // '' is the session on screen, the one the main view holds.
+  scopes.b = { id: 'b' };
+  window.__dshSignals.draft('', 'error: it broke');
+  assert.equal(draft, 'half a thought\nerror: it broke');
+  assert.deepEqual(focused, ['b']);
+
+  // A named session is switched to, and waited for until it has a scope.
+  draft = '';
+  window.__dshSignals.draft('a', 'from the clipboard');
+  assert.deepEqual(s.opened, ['a']);
+  assert.equal(draft, '', 'nothing to write into yet');
+  scopes.a = { id: 'a' };
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(draft, 'from the clipboard');
+  assert.deepEqual(focused, ['b', 'a']);
+  console.log('ok  adds text to a composer and focuses it');
+}
+
+// --- a click on a notification switches sessions the dsh 0.2 way ---
+{
+  const { exports, window } = load({ host: true });
+  const viewed = [];
+  const s = services({
+    folders: { create: () => Promise.reject(), openWorkspace: () => {} },
+  });
+  s.ctx.uiWorkspace.openSession = (id) => { viewed.push(id); };
+  exports.apply(s.ctx);
+  window.__dshSignals.open('session-7');
+  assert.deepEqual(viewed, ['session-7'], 'open should go through uiWorkspace.openSession');
+  assert.deepEqual(s.opened, [], 'and not through the sessions.open dsh 0.2 dropped');
+  console.log('ok  opens a session through the workspace view on dsh 0.2');
 }
 
 // --- dsh 0.2: the waits are on `sessionStatus` ---
@@ -675,6 +904,107 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   assert.equal(recents.length, 2);
   assert.deepEqual(queryAll(recents[1], 'title'), ['X7', 'X6', 'X5', 'X4', 'X3']);
   console.log('ok  reports the most recently used workspaces');
+}
+
+// --- each recent workspace's sessions, for the quick-ask box ---
+{
+  const { exports, recents, sessionLists } = load({ host: true });
+  const s = services({ folders: { create: () => Promise.reject(), openWorkspace: () => {} } });
+  const row = (day, more) => ({ running: false, displayTitle: 'T' + day, updatedAt: Date.parse(`2026-02-0${day}`), ...more });
+  s.setList({
+    ids: ['a1', 'a2', 'a3', 'a4', 'a5', 'b1'],
+    byId: {
+      a1: row(1),
+      a2: row(3),
+      a3: row(2, { blank: true }),
+      a4: row(4, { origin: 'subagent' }),
+      a5: row(5),
+      b1: row(6),
+    },
+  });
+  s.setWorkspaces([
+    { workspaceId: 'a', title: 'A', path: '/a', updatedAt: '2026-01-01T00:00:00Z', sessionIds: ['a1', 'a2', 'a3', 'a4', 'a5', 'gone'] },
+    { workspaceId: 'b', title: 'B', path: '/b', updatedAt: '2026-01-01T00:00:00Z', sessionIds: ['b1'] },
+  ]);
+  s.setArchived(['a5']);
+  exports.apply(s.ctx);
+  await drain();
+  assert.equal(sessionLists.length, 1);
+  // Newest workspace first, newest session first; no blank, subagent,
+  // archived or unknown ones.
+  assert.deepEqual(queryAll(sessionLists[0], 'sid'), ['b1', 'a2', 'a1']);
+  assert.deepEqual(queryAll(sessionLists[0], 'spath'), ['/b', '/a', '/a']);
+  assert.deepEqual(queryAll(sessionLists[0], 'stitle'), ['T6', 'T3', 'T1']);
+  assert.deepEqual(queryAll(sessionLists[0], 'smod'), ['', '', ''], 'no remote, no models');
+  assert.deepEqual(queryAll(sessionLists[0], 'sprov'), ['', '', '']);
+
+  // A session moving up its workspace changes this list and not the tray's.
+  s.setList({
+    ids: ['a1', 'a2', 'b1'],
+    byId: { a1: row(9), a2: row(3), b1: row(6) },
+  });
+  await drain();
+  assert.equal(recents.length, 2, 'A moved above B in the tray, once');
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'sid'), ['a1', 'a2', 'b1']);
+  const count = sessionLists.length;
+  s.setList({
+    ids: ['a1', 'a2', 'b1'],
+    byId: { a1: row(9, { running: true }), a2: row(3), b1: row(6) },
+  });
+  await drain();
+  assert.equal(sessionLists.length, count, 'the same list is not sent again');
+  console.log('ok  reports the sessions of each recent workspace');
+}
+
+// --- and the model each of those sessions runs on ---
+{
+  const { exports, sessionLists } = load({ host: true });
+  const s = services({ folders: { create: () => Promise.reject(), openWorkspace: () => {} } });
+  const read = [];
+  const selection = {
+    a1: { lastUsed: { provider: 'ds', model: 'flash' }, next: { provider: 'ds', model: 'flash' } },
+    a2: { lastUsed: { provider: 'ds', model: 'flash' }, next: { provider: 'ds', model: 'pro' } },
+  };
+  s.ctx.remote = {
+    session: {
+      modelCatalog: () => Promise.resolve({ ok: false, error: { code: 'x', message: 'not now' } }),
+      projections: ({ sessionId }) => {
+        read.push(sessionId);
+        const values = selection[sessionId] ? { modelSelection: selection[sessionId] } : {};
+        return Promise.resolve({ ok: true, value: { asOfSeq: 1, values } });
+      },
+    },
+    $on: () => () => {},
+  };
+  s.ctx['remote.session'] = s.ctx.remote.session;
+  const row = (day, more) => ({ running: false, displayTitle: 'T' + day, updatedAt: Date.parse(`2026-02-0${day}`), ...more });
+  s.setList({ ids: ['a1', 'a2', 'a3'], byId: { a1: row(1), a2: row(3), a3: row(2) } });
+  s.setWorkspaces([
+    { workspaceId: 'a', title: 'A', path: '/a', updatedAt: '2026-01-01T00:00:00Z', sessionIds: ['a1', 'a2', 'a3'] },
+  ]);
+  exports.apply(s.ctx);
+  await drain();
+  // Newest first; next, else last used, else unknown.
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'sid'), ['a2', 'a3', 'a1']);
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'smod'), ['pro', '', 'flash']);
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'sprov'), ['ds', '', 'ds']);
+  assert.deepEqual(read.sort(), ['a1', 'a2', 'a3'], 'one read a session');
+
+  // Not again until the session moves, and not while it runs.
+  read.length = 0;
+  s.setList({ ids: ['a1', 'a2', 'a3'], byId: { a1: row(1), a2: row(3), a3: row(2) } });
+  s.setList({ ids: ['a1', 'a2', 'a3'], byId: { a1: row(5, { running: true }), a2: row(3), a3: row(2) } });
+  await drain();
+  assert.deepEqual(read, []);
+
+  // Its turn over, and on another model.
+  selection.a1 = { lastUsed: { provider: 'ds', model: 'pro' }, next: { provider: 'ds', model: 'pro' } };
+  s.setList({ ids: ['a1', 'a2', 'a3'], byId: { a1: row(6), a2: row(3), a3: row(2) } });
+  await drain();
+  assert.deepEqual(read, ['a1']);
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'sid'), ['a1', 'a2', 'a3']);
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'smod'), ['pro', 'pro', '']);
+  console.log('ok  reports the model each listed session runs on');
 }
 
 // --- no desktop shell: no door either ---

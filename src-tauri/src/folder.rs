@@ -1,7 +1,8 @@
 //! A folder handed to the app from outside: `dsh-desktop <path>`, the "用 dsh
 //! 打开" entry Explorer and Linux file managers show on a folder, and on macOS
 //! a folder dropped on the Dock icon or opened from Finder's "Open With" (those
-//! arrive as `RunEvent::Opened`, not as arguments).
+//! arrive as `RunEvent::Opened`, not as arguments), and a
+//! `dsh-desktop://open?path=…` link clicked anywhere (see [`link`]).
 //!
 //! What the user means by it is "open this folder in dsh", which in dsh's own
 //! terms is a workspace for that directory and a session in it. Neither can be
@@ -74,9 +75,49 @@ static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// against the directory the command was run from. A file stands for the
 /// folder it is in, which is what dropping one onto the app means. Something
 /// that does not exist is not a request to create it.
+///
+/// Two spellings that are not paths are read as well. A [`SCHEME`] link, which
+/// is how Windows and Linux hand one over: as the argument. And a `file://`
+/// URI, which is what a Linux file manager passes for a folder now that the
+/// `.desktop` entry takes URLs (`%U`) so that it can take links too.
 pub fn requested(args: &[String], cwd: &Path) -> Option<PathBuf> {
     let arg = args.iter().skip(1).find(|arg| !arg.starts_with('-'))?;
+    if let Ok(url) = tauri::Url::parse(arg) {
+        if url.scheme() == SCHEME {
+            return link(&url);
+        }
+        if url.scheme() == "file" {
+            return folder_of(&url.to_file_path().ok()?);
+        }
+    }
     folder_of(&cwd.join(arg))
+}
+
+/// The scheme registered for links that open a folder:
+/// `dsh-desktop://open?path=<absolute path>`.
+///
+/// Not `dsh://`, which is the name dsh's own desktop app would reach for, and
+/// two apps registering one scheme is whichever was installed last winning.
+pub const SCHEME: &str = "dsh-desktop";
+
+/// The folder a [`SCHEME`] link names, or `None`.
+///
+/// One verb, `open`, and one parameter, `path`, which has to be absolute: a
+/// link has no directory it was "run from" for a relative one to mean anything
+/// against. A web page can put this link in front of the user — the browser
+/// asks before handing it over — so it does exactly what `dsh-desktop <path>`
+/// does and nothing more: open an existing folder as a workspace.
+pub fn link(url: &tauri::Url) -> Option<PathBuf> {
+    if url.scheme() != SCHEME || url.host_str() != Some("open") {
+        return None;
+    }
+    let path = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "path").then(|| PathBuf::from(value.as_ref())))?;
+    if !path.is_absolute() {
+        return None;
+    }
+    folder_of(&path)
 }
 
 /// The folder `path` stands for: itself, or the one a file is in.
@@ -107,6 +148,12 @@ pub fn open(app: &AppHandle, dir: PathBuf) {
     if ask {
         missing(app);
     }
+}
+
+/// Whether the plugin on the page now loaded can take a folder — and with it a
+/// quick ask, which needs the same two services; see [`crate::ask`].
+pub fn is_ready() -> bool {
+    STATE.lock().map(|state| state.ready).unwrap_or(false)
 }
 
 /// A navigation has started: whatever the plugin said was about the document
@@ -283,6 +330,47 @@ mod tests {
             requested(&args(&["dsh-desktop", r"C:\\."]), Path::new("/")),
             Some(PathBuf::from(r"C:\"))
         );
+    }
+
+    /// A link names an existing folder by its absolute path, percent-encoded
+    /// or not, and opens nothing else.
+    #[test]
+    fn a_link_opens_the_folder_it_names() {
+        let root = std::env::temp_dir().join("dsh-desktop-folder-test-d");
+        std::fs::create_dir_all(root.join("my project")).unwrap();
+        let folder = std::path::absolute(root.join("my project")).unwrap();
+        let encoded: String =
+            form_urlencoded::byte_serialize(folder.to_str().unwrap().as_bytes()).collect();
+        let cwd = Path::new("/");
+
+        assert_eq!(
+            requested(&args(&["dsh-desktop", &format!("dsh-desktop://open?path={encoded}")]), cwd),
+            Some(folder.clone())
+        );
+        // Browsers have been known to add the slash.
+        assert_eq!(
+            requested(&args(&["dsh-desktop", &format!("dsh-desktop://open/?path={encoded}")]), cwd),
+            Some(folder.clone())
+        );
+
+        for nothing in [
+            "dsh-desktop://open".to_string(),
+            "dsh-desktop://open?path=relative".to_string(),
+            format!("dsh-desktop://run?path={encoded}"),
+            "dsh-desktop://open?path=%2Fno%2Fsuch%2Ffolder-dsh-desktop".to_string(),
+        ] {
+            assert_eq!(requested(&args(&["dsh-desktop", &nothing]), cwd), None, "{nothing}");
+        }
+    }
+
+    /// What a Linux file manager passes for a folder under `%U`.
+    #[test]
+    fn a_file_uri_names_its_folder() {
+        let root = std::env::temp_dir().join("dsh-desktop-folder-test-e");
+        std::fs::create_dir_all(&root).unwrap();
+        let folder = std::path::absolute(&root).unwrap();
+        let uri = tauri::Url::from_file_path(&folder).unwrap().to_string();
+        assert_eq!(requested(&args(&["dsh-desktop", &uri]), Path::new("/")), Some(folder));
     }
 
     #[test]

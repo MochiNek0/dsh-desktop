@@ -29,8 +29,10 @@
  *
  * One global, `window.__dshSignals`, set while the plugin is wired up. The
  * shell calls three things on it. `open(id)` is how a click on a notification
- * gets back to the session the notification was about — `ctx.sessions.open` is
- * dsh's own way to switch the current session. `answer(id, key, choice)` is
+ * gets back to the session the notification was about, through dsh's own way
+ * to switch the current session — `ctx.uiWorkspace.openSession` on dsh 0.2,
+ * `ctx.sessions.open` before it. The tray's rows for running and waiting
+ * sessions go the same way. `answer(id, key, choice)` is
  * how a press on one of that notification's buttons reaches the request it
  * answers, which is the same carrier the snapshot above reported: the object
  * that says a question is pending is the object that answers it.
@@ -167,18 +169,26 @@ window.__ModuleLoader__.load({
       var sessions = null;
       var waits = null;
       var folders = null;
+      var composer = null;
+      var remote = null;
+      // Read the model catalog again; see `watchModels`.
+      var reloadModels = null;
+      // Each listed session's model, read on the side; see `selections`.
+      var picked = selections(() => remote);
 
-      // How many sessions are mid-turn and how many are waiting on the user,
-      // for the shell's icons. Each half fills in its own count and goes back
-      // to zero when its scope goes; only a change is sent.
-      var counts = { running: 0, waiting: 0 };
+      // Which sessions are mid-turn and which are waiting on the user, for the
+      // shell's icons, its tray menu and whether it keeps the machine awake.
+      // Each half fills in its own set and empties it when its scope goes;
+      // only a change is sent.
+      var ids = { running: new Set(), waiting: new Set() };
       var reported = null;
-      var report = (name, count) => {
-        counts[name] = count;
-        var line = counts.running + '/' + counts.waiting;
-        if (line === reported) return;
-        reported = line;
-        send({ event: 'status', running: String(counts.running), waiting: String(counts.waiting) });
+      var report = (name, set) => {
+        ids[name] = set;
+        var line = status(sessions, ids.running, ids.waiting);
+        var text = JSON.stringify(line);
+        if (text === reported) return;
+        reported = text;
+        send(line);
       };
 
       ctx.effect(() => {
@@ -190,7 +200,89 @@ window.__ModuleLoader__.load({
            * @param {string} id - session id, as it was reported from here.
            */
           open: (id) => {
-            if (sessions) sessions.open(id);
+            // dsh 0.2 moved switching sessions off `sessions` — "navigation
+            // belongs to view owners" — and onto the workspace view. The old
+            // call is kept for a dsh that predates the move.
+            if (folders && folders.uiWorkspace.openSession) folders.uiWorkspace.openSession(id);
+            else if (sessions && sessions.open) sessions.open(id);
+          },
+          /**
+           * Send one line from the shell's quick-ask box, into a new session
+           * in a workspace or into one of its sessions. Called from the shell
+           * over `window.eval`, and only after `folder-ready`; see its ask.rs.
+           *
+           * For a new session the workspace is made or adopted the way
+           * `openFolder` does it, and the session is a new one in it —
+           * `sessions.create`, what "new session" calls. Either way the line
+           * goes in through the session face's own `prompt`, the call the
+           * composer's send ends in. The session is not switched to: whoever
+           * pressed the key is somewhere else, and the notification at the
+           * turn's end is how they hear.
+           *
+           * A model chosen in the box is selected for the session first, with
+           * `selectModel` — what dsh's own model menu calls, and which makes
+           * it the default too. None chosen, none is selected, and the session
+           * keeps what it had, reasoning effort and all.
+           *
+           * @param {string} path - the workspace's directory.
+           * @param {string} text - the line typed into the box.
+           * @param {string} [session] - a session in that workspace, as
+           *   `sessions` listed it; absent or '' for a new one.
+           * @param {string} [provider] - the chosen model's provider, as
+           *   `models` listed it; absent or '' for none chosen.
+           * @param {string} [model] - and the model's id.
+           */
+          ask: (path, text, session, provider, model) => {
+            var failed = (error) => send({
+              event: 'ask-failed',
+              reason: (error && error.message) || String(error),
+            });
+            if (!folders || !sessions) return failed('not ready');
+            if (provider && model && !remote) return failed('not ready');
+            var current = { folders: folders, sessions: sessions, remote: remote };
+            var target = session
+              ? Promise.resolve(session)
+              : current.folders.workspaces.create({ path: path })
+                .then((workspace) => current.sessions.create({ workspaceId: workspace.workspaceId }));
+            var select = (id) => {
+              if (!provider || !model) return id;
+              return current.remote.session.selectModel({ sessionId: id, provider: provider, model: model })
+                .then((result) => {
+                  if (!result || !result.ok) {
+                    throw new Error((result && result.error && result.error.message) || 'model refused');
+                  }
+                  return id;
+                });
+            };
+            target
+              .then(select)
+              .then((id) => current.sessions.using(id, { source: 'controllerOperation' }, (reference) =>
+                reference.ready.then((binding) => binding.session.prompt([{ type: 'text', text: text }], 'queue')),
+              ).then((result) => {
+                if (!result || !result.ok) {
+                  throw new Error((result && result.error && result.error.message) || 'refused');
+                }
+                send({ event: 'asked', session: id });
+                // Selecting a model made it dsh's default too, which the
+                // catalog carries and nothing announces.
+                if (provider && model && reloadModels) reloadModels();
+              }))
+              .catch(failed);
+          },
+          /**
+           * Put text into a session's composer, after whatever is already
+           * there, and switch to that session. For the clipboard shortcut.
+           * Nothing is sent: the user sees it and presses Enter themselves.
+           *
+           * @param {string} id - session id, or '' for the one on screen.
+           * @param {string} text - what to add.
+           */
+          draft: (id, text) => {
+            if (!composer) return;
+            var target = id || current(composer.sessions);
+            if (!target) return;
+            if (id) window.__dshSignals.open(id);
+            fill(composer, target, text);
           },
           /**
            * Answer what a session is waiting on, for a press on one of a
@@ -251,11 +343,11 @@ window.__ModuleLoader__.load({
       ctx.inject(['sessions'], (scope) => {
         scope.effect(() => {
           sessions = scope.sessions;
-          var stop = watchTurns(scope, (count) => report('running', count));
+          var stop = watchTurns(scope, (set) => report('running', set));
           return () => {
             sessions = null;
             stop();
-            report('running', 0);
+            report('running', new Set());
           };
         }, 'dsh-desktop-signal: turn endings to the desktop shell');
       });
@@ -266,11 +358,11 @@ window.__ModuleLoader__.load({
       ctx.inject(['uiSession'], (scope) => {
         scope.effect(() => {
           waits = pendingOf(scope.uiSession);
-          var stop = watchWaits(waits, (count) => report('waiting', count));
+          var stop = watchWaits(waits, (set) => report('waiting', set));
           return () => {
             waits = null;
             stop();
-            report('waiting', 0);
+            report('waiting', new Set());
           };
         }, 'dsh-desktop-signal: pending questions to the desktop shell');
       });
@@ -288,15 +380,228 @@ window.__ModuleLoader__.load({
         }, 'dsh-desktop-signal: folders opened from the desktop shell');
       });
 
+      // A session's composer, for `draft`. `conversation` is the service that
+      // owns every session's input; a dsh without it has no draft to add to.
+      ctx.inject(['sessions', 'conversation'], (scope) => {
+        scope.effect(() => {
+          composer = { sessions: scope.sessions, conversation: scope.conversation };
+          return () => {
+            composer = null;
+          };
+        }, 'dsh-desktop-signal: text into a composer from the desktop shell');
+      });
+
       // The workspaces the shell lists in its tray menu. `sessions` is what
       // says which were used last; see `watchRecent`.
       ctx.inject(['workspaces', 'sessions'], (scope) => {
-        scope.effect(() => watchRecent(scope), 'dsh-desktop-signal: recent workspaces to the desktop shell');
+        scope.effect(() => watchRecent(scope, picked), 'dsh-desktop-signal: recent workspaces to the desktop shell');
       });
+
+      // The models the quick-ask box offers, and what `ask` selects one with.
+      // The same two services dsh's own model menu injects.
+      ctx.inject(['remote', 'remote.session'], (scope) => {
+        scope.effect(() => {
+          remote = scope.remote;
+          var watching = watchModels(scope.remote);
+          reloadModels = watching.reload;
+          // The sessions already listed went without their models.
+          picked.changed();
+          return () => {
+            remote = null;
+            reloadModels = null;
+            watching.stop();
+          };
+        }, 'dsh-desktop-signal: models to the desktop shell');
+      });
+    }
+
+    /**
+     * The session on screen: the one the main view holds. dsh keeps no
+     * "current session" anywhere a plugin can read it, but it does count who
+     * holds each one, and the main view holds exactly the one it shows.
+     */
+    function current(sessions) {
+      var list = sessions.list.getSnapshot();
+      for (var id of list.ids) {
+        var summary = list.byId[id];
+        if (summary && summary.retainedBy && summary.retainedBy.mainView > 0) return id;
+      }
+      return null;
+    }
+
+    /** How long `fill` waits for a session it just switched to. */
+    var FILL_WAIT = 3000;
+
+    /**
+     * Append to a session's draft and focus its composer, once there is one.
+     *
+     * A session that was just switched to has no scope yet — the main view
+     * retains it a moment later — and a composer only exists for a session
+     * with a scope, so this waits for one, a frame at a time, for a while.
+     * The text goes after the draft on a new line rather than over it: a
+     * half-written message is the user's, and replacing it would lose it.
+     */
+    function fill(composer, id, text, waited) {
+      var scope = composer.sessions.scope(id);
+      if (!scope) {
+        if ((waited || 0) >= FILL_WAIT) return;
+        return setTimeout(() => fill(composer, id, text, (waited || 0) + 50), 50);
+      }
+      var input = composer.conversation.input.for(scope);
+      var draft = input.state.getSnapshot().draft;
+      input.setDraft(draft ? draft.replace(/\s+$/, '') + '\n' + text : text);
+      input.focus();
+    }
+
+    /** How many sessions the shell's tray menu lists. */
+    var LISTED = 5;
+
+    /**
+     * The `status` event: how many sessions are mid-turn and how many are
+     * waiting on the user, and the few the tray lists by name.
+     *
+     * A session waiting on the user is counted as waiting and not as running,
+     * though dsh still reports its turn as running: the turn is stopped on the
+     * user, and what the shell does with "running" — a blue dot, and keeping
+     * the machine awake — is for a turn that is getting somewhere on its own.
+     *
+     * Waiting ones are listed first, being the ones worth a click. A subagent
+     * that is merely running is not listed: one turn can spawn dozens, and the
+     * row worth having is the turn that spawned them. One that stops to ask is,
+     * because that is where the question is. Titles are dsh's `displayTitle`,
+     * read when the line is built, so a title dsh fills in later goes out with
+     * the next list change rather than never.
+     *
+     * The rows travel as two pairs of repeated keys in step, the way the
+     * recent workspaces do.
+     */
+    function status(sessions, running, waiting) {
+      var list = sessions ? sessions.list.getSnapshot() : { byId: {} };
+      var title = (id) => {
+        var summary = list.byId[id];
+        return (summary && summary.displayTitle) || '';
+      };
+      var going = [...running].filter((id) => !waiting.has(id));
+      var asking = [...waiting].slice(0, LISTED);
+      var listed = going
+        .filter((id) => !(list.byId[id] && list.byId[id].origin === 'subagent'))
+        .slice(0, LISTED - asking.length);
+      return {
+        event: 'status',
+        running: String(going.length),
+        waiting: String(waiting.size),
+        wid: asking,
+        wtitle: asking.map(title),
+        rid: listed,
+        rtitle: listed.map(title),
+      };
     }
 
     /** How many workspaces the shell is told about. */
     var RECENT = 5;
+
+    /** How many sessions of each of them the quick-ask box offers. */
+    var SESSIONS = 8;
+
+    /** How many models the quick-ask box offers; the shell's `MODELS`. */
+    var MODELS = 64;
+
+    /**
+     * Tell the shell what models dsh can run a session on, and which one a new
+     * session gets: `modelCatalog`, what dsh's model menu lists, read once and
+     * again on each of the changes that menu reloads on — a provider added or
+     * a key entered. A catalog that cannot be read is not sent; the box shows
+     * no model chip until one is. Only a change is sent.
+     *
+     * @param {object} remote - the `remote` service.
+     * @returns {{ stop: () => void, reload: () => void }} The listeners' end,
+     *   and a read on demand.
+     */
+    function watchModels(remote) {
+      var last = null;
+      var stopped = false;
+      var load = () => {
+        remote.session.modelCatalog().then((response) => {
+          if (stopped || !response || !response.ok) return;
+          var rows = [];
+          response.value.groups.forEach((group) => {
+            group.models.forEach((model) => rows.push([group.id, group.name, model.id, model.name || model.id]));
+          });
+          rows = rows.slice(0, MODELS);
+          var fallback = response.value.default || {};
+          var line = JSON.stringify([rows, fallback.provider, fallback.model]);
+          if (line === last) return;
+          last = line;
+          // Four repeated keys in step, and the default.
+          send({
+            event: 'models',
+            mprov: rows.map((row) => row[0]),
+            mpname: rows.map((row) => row[1]),
+            mid: rows.map((row) => row[2]),
+            mname: rows.map((row) => row[3]),
+            dprov: fallback.provider || '',
+            dmod: fallback.model || '',
+          });
+        }, () => {});
+      };
+      load();
+      var stops = [
+        'llm/adapters-updated',
+        'settings/document-updated',
+        'credentials/record-updated',
+        'credentials/reference-updated',
+      ].map((name) => remote.$on(name, load));
+      return {
+        reload: load,
+        stop: () => {
+          stopped = true;
+          stops.forEach((stop) => { if (typeof stop === 'function') stop(); });
+        },
+      };
+    }
+
+    /**
+     * The model each session's next turn runs on: the one selected for the
+     * next request, or else the one the last used — dsh's own `modelSelection`
+     * projection, which the session list does not carry. So it is read on the
+     * side, one `projections` call a session, which reads without activating
+     * an agent, and kept until the session's `updatedAt` moves. Not while it
+     * runs: its every message moves that, and a turn does not change models.
+     * Null until read, and then the box shows dsh's default.
+     *
+     * @param {() => object | null} remoteOf - the `remote` service, if wired.
+     */
+    function selections(remoteOf) {
+      var cache = new Map();
+      var listeners = new Set();
+      var changed = () => listeners.forEach((fn) => fn());
+      return {
+        changed: changed,
+        subscribe: (fn) => {
+          listeners.add(fn);
+          return () => listeners.delete(fn);
+        },
+        of: (id, summary) => {
+          var hit = cache.get(id);
+          var stale = !hit || (hit.at !== summary.updatedAt && !summary.running);
+          var remote = remoteOf();
+          if (stale && remote && (!hit || hit.reading !== summary.updatedAt)) {
+            var at = summary.updatedAt;
+            var value = hit ? hit.value : null;
+            cache.set(id, { at: hit ? hit.at : null, value: value, reading: at });
+            remote.session.projections({ sessionId: id }).then((result) => {
+              var values = result && result.ok && result.value && result.value.values;
+              var selection = values && values.modelSelection;
+              cache.set(id, { at: at, value: (selection && (selection.next || selection.lastUsed)) || null });
+              changed();
+            }, () => {
+              cache.set(id, { at: at, value: value });
+            });
+          }
+          return hit ? hit.value : null;
+        },
+      };
+    }
 
     /**
      * The most recently used workspaces, as their list or their sessions
@@ -308,13 +613,22 @@ window.__ModuleLoader__.load({
      * workspace's own time stands in when none of its sessions is in the list.
      * Sent only when the titles, paths or their order change: the session list
      * moves on every message of a running turn.
+     *
+     * Beside it, as its own `sessions` event, the sessions of each of those
+     * workspaces that the quick-ask box offers to send into: the ones the
+     * sidebar lists — not archived, not the blank one dsh holds for its next
+     * "new session", not a subagent's — newest first. Its own event and its own
+     * check, so that a session moving up its workspace does not redraw the
+     * tray. With each, the model it runs on, from `picked`; see `selections`.
      */
-    function watchRecent(ctx) {
+    function watchRecent(ctx, picked) {
       var last = null;
+      var lastSessions = null;
 
       var read = () => {
         var byId = ctx.sessions.list.getSnapshot().byId;
-        var recent = ctx.workspaces.list.getSnapshot().items
+        var snapshot = ctx.workspaces.list.getSnapshot();
+        var recent = snapshot.items
           .map((workspace) => {
             var at = Date.parse(workspace.updatedAt) || 0;
             for (var id of workspace.sessionIds) {
@@ -328,22 +642,55 @@ window.__ModuleLoader__.load({
           .map((row) => row.workspace);
 
         var line = JSON.stringify(recent.map((workspace) => [workspace.title, workspace.path]));
-        if (line === last) return;
-        last = line;
-        // Two repeated keys in step, the way a question's options travel.
+        if (line !== last) {
+          last = line;
+          // Two repeated keys in step, the way a question's options travel.
+          send({
+            event: 'recent',
+            title: recent.map((workspace) => workspace.title),
+            path: recent.map((workspace) => workspace.path),
+          });
+        }
+
+        var archived = new Set(snapshot.archivedSessionIds || []);
+        var rows = [];
+        recent.forEach((workspace) => {
+          workspace.sessionIds
+            .filter((id) => {
+              var summary = byId[id];
+              return summary && !summary.blank && summary.origin !== 'subagent' && !archived.has(id);
+            })
+            .sort((a, b) => byId[b].updatedAt - byId[a].updatedAt)
+            .slice(0, SESSIONS)
+            .forEach((id) => {
+              var model = picked.of(id, byId[id]);
+              rows.push([workspace.path, id, byId[id].displayTitle || '',
+                (model && model.provider) || '', (model && model.model) || '']);
+            });
+        });
+        var listed = JSON.stringify(rows);
+        if (listed === lastSessions) return;
+        lastSessions = listed;
+        // Five repeated keys in step: whose, which, what it is called, and
+        // the model it runs on.
         send({
-          event: 'recent',
-          title: recent.map((workspace) => workspace.title),
-          path: recent.map((workspace) => workspace.path),
+          event: 'sessions',
+          spath: rows.map((row) => row[0]),
+          sid: rows.map((row) => row[1]),
+          stitle: rows.map((row) => row[2]),
+          sprov: rows.map((row) => row[3]),
+          smod: rows.map((row) => row[4]),
         });
       };
 
       read();
       var stopWorkspaces = ctx.workspaces.list.subscribe(read);
       var stopSessions = ctx.sessions.list.subscribe(read);
+      var stopPicked = picked.subscribe(read);
       return () => {
         stopWorkspaces();
         stopSessions();
+        stopPicked();
       };
     }
 
@@ -431,13 +778,13 @@ window.__ModuleLoader__.load({
       var read = (announce) => {
         var list = ctx.sessions.list.getSnapshot();
         var seen = Object.create(null);
-        var busy = 0;
+        var busy = new Set();
 
         for (var id of list.ids) {
           var summary = list.byId[id];
           if (!summary) continue;
           seen[id] = true;
-          if (summary.running === true) busy += 1;
+          if (summary.running === true) busy.add(id);
           var was = running[id];
           running[id] = summary.running;
           if (announce && was === true && summary.running === false && summary.origin !== 'subagent') {
@@ -503,11 +850,11 @@ window.__ModuleLoader__.load({
       var read = (announce) => {
         var snapshot = source.getSnapshot();
         var seen = Object.create(null);
-        var waiting = 0;
+        var waiting = new Set();
 
         for (var [id, pending] of snapshot) {
           seen[id] = true;
-          waiting += 1;
+          waiting.add(id);
           if (keys[id] === pending.key) continue;
           keys[id] = pending.key;
           if (announce) {

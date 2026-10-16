@@ -15,6 +15,11 @@
     }
   },
   "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["dsh-desktop"]
+      }
+    },
     "updater": {
       "endpoints": [
         "https://dsh-desktop.cc.cd/updater/latest.json",

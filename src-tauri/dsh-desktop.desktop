@@ -1,15 +1,18 @@
 # Tauri's own template for the .deb, plus the two lines that put the app under
-# "Open With" on a folder in a file manager: `%F` for the folder it was opened
-# on, `MimeType` for which. Set in `tauri.linux.conf.json`; see `folder.rs`.
+# "Open With" on a folder in a file manager and make it the handler for
+# `dsh-desktop://` links: `%U` for the folder or the link it was opened on —
+# URLs rather than `%F` paths, because a link is not a file — and `MimeType`
+# for which. Set in `tauri.linux.conf.json`; see `folder.rs`, which reads the
+# `file://` URI a folder now arrives as.
 [Desktop Entry]
 Categories={{categories}}
 {{#if comment}}
 Comment={{comment}}
 {{/if}}
-Exec={{exec}} %F
+Exec={{exec}} %U
 StartupWMClass={{exec}}
 Icon={{icon}}
 Name={{name}}
 Terminal=false
 Type=Application
-MimeType=inode/directory;
+MimeType=inode/directory;x-scheme-handler/dsh-desktop;

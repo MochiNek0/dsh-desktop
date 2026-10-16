@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>dsh</title>
+    <!--
+      The quick-ask box's dropdown; see `src-tauri/src/ask.rs`. A window of its
+      own that never takes the focus: the box keeps the keyboard and tells
+      this page what to list (`__dshMenu`) and which row the keys are on
+      (`__dshMenuActive`). A click on a row goes back through Rust as
+      `menu-pick`. Row sizes are the box's `ROW`, `RULE` and `PAD`, which it
+      sizes this window by.
+    -->
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --fg: #1a1a1a;
+        --muted: #9a9a9a;
+        --line: rgba(0, 0, 0, 0.07);
+        --hover: rgba(0, 0, 0, 0.04);
+        --active: rgba(0, 0, 0, 0.07);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1f1f1f;
+          --fg: #ededed;
+          --muted: #7c7c7c;
+          --line: rgba(255, 255, 255, 0.08);
+          --hover: rgba(255, 255, 255, 0.05);
+          --active: rgba(255, 255, 255, 0.09);
+        }
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        cursor: default;
+        user-select: none;
+      }
+      svg {
+        flex: none;
+        width: 14px;
+        height: 14px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      /* The window is no taller than Rust lets it be; a longer list scrolls. */
+      .list {
+        box-sizing: border-box;
+        height: 100%;
+        overflow-y: auto;
+        padding: 6px;
+      }
+      .list::-webkit-scrollbar {
+        width: 8px;
+      }
+      .list::-webkit-scrollbar-thumb {
+        border: 2px solid transparent;
+        border-radius: 4px;
+        background: var(--line) padding-box;
+      }
+      .list::-webkit-scrollbar-thumb:hover {
+        background: var(--muted) padding-box;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        height: 34px;
+        padding: 0 10px;
+        border-radius: 6px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .row.hover {
+        background: var(--hover);
+      }
+      .row.active {
+        background: var(--active);
+      }
+      .row > svg:first-child {
+        color: var(--muted);
+      }
+      .row .label {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .row .where {
+        max-width: 50%;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        color: var(--muted);
+        font-size: 11.5px;
+      }
+      .row .tick {
+        color: var(--fg);
+      }
+      .rule {
+        height: 1px;
+        margin: 5px 8px;
+        background: var(--line);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="list" id="list" role="listbox"></div>
+    <script>
+      (function () {
+        // Lucide icons, ISC licence. https://lucide.dev
+        var ICONS = {
+          folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+          folderPlus: '<path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+          message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+          plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+          tick: '<path d="M20 6 9 17l-5-5"/>'
+        };
+        function icon(name, className) {
+          if (!ICONS[name]) return '';
+          return '<svg viewBox="0 0 24 24"' + (className ? ' class="' + className + '"' : '') +
+            ' aria-hidden="true">' + ICONS[name] + '</svg>';
+        }
+
+        var list = document.getElementById('list');
+        var rows = [];
+
+        var nonce = 0;
+        function go(verb, params) {
+          var query = [];
+          for (var key in params || {}) {
+            query.push(encodeURIComponent(key) + '=' + encodeURIComponent(params[key]));
+          }
+          query.push('n=' + ++nonce + '.' + Date.now());
+          window.location.href = 'dsh-window://' + verb + '?' + query.join('&');
+        }
+
+        function mark(className, index) {
+          rows.forEach(function (row, i) {
+            row.classList.toggle(className, i === index);
+          });
+        }
+
+        // Called from Rust each time a chip opens it; see `ask::open_menu`.
+        window.__dshMenu = function (payload) {
+          list.textContent = '';
+          rows = [];
+          (payload.items || []).forEach(function (item) {
+            if (item.rule) {
+              var rule = document.createElement('div');
+              rule.className = 'rule';
+              list.appendChild(rule);
+              return;
+            }
+            var index = rows.length;
+            var row = document.createElement('div');
+            row.className = 'row';
+            row.setAttribute('role', 'option');
+            row.setAttribute('aria-selected', item.selected ? 'true' : 'false');
+            row.innerHTML = icon(item.icon) + '<span class="label"></span>' +
+              (item.where ? '<span class="where"></span>' : '') + (item.selected ? icon('tick', 'tick') : '');
+            row.querySelector('.label').textContent = item.label || '';
+            if (item.where) row.querySelector('.where').textContent = item.where;
+            row.title = item.where || item.label || '';
+            row.addEventListener('mouseenter', function () { mark('hover', index); });
+            row.addEventListener('mouseleave', function () { row.classList.remove('hover'); });
+            row.addEventListener('mousedown', function (event) {
+              event.preventDefault();
+              go('menu-pick', { i: index });
+            });
+            rows.push(row);
+            list.appendChild(row);
+          });
+          mark('hover', -1);
+          mark('active', payload.active);
+          // A long list opens on the row it has chosen.
+          if (rows[payload.active]) rows[payload.active].scrollIntoView({ block: 'nearest' });
+        };
+
+        // The row the box's arrow keys are on.
+        window.__dshMenuActive = function (index) {
+          mark('active', index);
+          if (rows[index]) rows[index].scrollIntoView({ block: 'nearest' });
+        };
+
+        go('menu-ready');
+      })();
+    </script>
+  </body>
+</html>

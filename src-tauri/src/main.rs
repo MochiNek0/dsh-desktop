@@ -6,7 +6,9 @@
 #[macro_use]
 mod i18n;
 
+mod ask;
 mod auth;
+mod awake;
 mod controls;
 mod cookies;
 mod dialog;
@@ -15,6 +17,7 @@ mod folder;
 mod memory;
 mod notify;
 mod panel;
+mod paste;
 mod placement;
 mod plugins;
 mod recent;
@@ -227,13 +230,14 @@ fn main() {
         // With", which `Info.plist` lists this app for. macOS hands it over as
         // an event, not on the command line, whether or not the app was
         // already running — and after `setup`, so the window is there.
+        //
+        // A `dsh-desktop://` link arrives the same way, being a URL the app is
+        // listed for in `Info.plist` too.
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Opened { urls } => {
-            if let Some(dir) = urls
-                .iter()
-                .filter_map(|url| url.to_file_path().ok())
-                .find_map(|path| folder::folder_of(&path))
-            {
+            if let Some(dir) = urls.iter().find_map(|url| {
+                folder::link(url).or_else(|| folder::folder_of(&url.to_file_path().ok()?))
+            }) {
                 reveal(handle);
                 folder::open(handle, dir);
             }
@@ -395,10 +399,14 @@ fn build_window(
                 // on, notifications are, this launch is running on no plugins,
                 // or which global shortcut took — nothing resized to tell it,
                 // and nothing was toggled. Every navigation lands here, so
-                // every navigation gets all five.
+                // every navigation gets all of them.
                 controls::sync(&webview);
                 controls::sync_autostart(webview.app_handle());
                 controls::sync_notify(webview.app_handle());
+                controls::sync_keep_awake(
+                    webview.app_handle(),
+                    settings::keep_awake(webview.app_handle()),
+                );
                 controls::sync_safe(webview.app_handle());
                 controls::sync_plugin_updates(webview.app_handle());
                 shortcut::sync(webview.app_handle());
@@ -517,6 +525,24 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     // level deep is the whole point of having them here. Nothing at all until
     // the plugin has reported — see [`recent`].
     let mut items: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = Vec::new();
+
+    // Above even those, the sessions that are running or waiting on the user,
+    // by name: when there are any, one of them is the likeliest reason the
+    // menu was opened. No heading, because each row says what it is doing.
+    let sessions = status::rows();
+    for (index, row) in sessions.iter().enumerate() {
+        items.push(Box::new(MenuItem::with_id(
+            app,
+            format!("session:{index}"),
+            status::label(row),
+            true,
+            None::<&str>,
+        )?));
+    }
+    if !sessions.is_empty() {
+        items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    }
+
     let recent = recent::list();
     if !recent.is_empty() {
         items.push(Box::new(MenuItem::with_id(
@@ -701,6 +727,10 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             id => {
                 if let Some(index) = id.strip_prefix("recent:").and_then(|at| at.parse().ok()) {
                     recent::open(app, index);
+                } else if let Some(index) =
+                    id.strip_prefix("session:").and_then(|at| at.parse().ok())
+                {
+                    status::open(app, index);
                 }
             }
         })
@@ -760,6 +790,14 @@ fn toggle_notify_turns(app: &tauri::AppHandle) {
     }
     settings::toggle_notifications(app);
     controls::sync_notify(app);
+}
+
+/// Turn "stay awake during a turn" on or off, take or drop the hold to match,
+/// and repaint the switch from what was written; see [`awake`].
+fn toggle_keep_awake(app: &tauri::AppHandle) {
+    let on = settings::toggle_keep_awake(app);
+    awake::apply(app);
+    controls::sync_keep_awake(app, on);
 }
 
 /// Quit, from the window's own menu rather than the tray.
