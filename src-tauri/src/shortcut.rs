@@ -395,8 +395,8 @@ pub(crate) fn note(slot: Slot) -> &'static str {
             "Shows or hides the window from anywhere. Click the key on the right to record a new one; Backspace while recording turns it off."
         ),
         Slot::Ask => t!(
-            "弹出一个小输入框，写一句话回车，就在最近的工作区里开一个新会话去跑。",
-            "Opens a small box: type a line and press Enter to start a new session on it in your latest workspace."
+            "弹出一个小输入框，写一句话回车就发出去。默认在最近的工作区开新会话，也可以选别的工作区或已有的会话。",
+            "Opens a small box: type a line and press Enter to send it. A new session in your latest workspace unless you choose another workspace or an existing session."
         ),
         Slot::Paste => t!(
             "把剪贴板里的文字放进当前会话的输入框，窗口跟着出来。默认没有设，点右边录一个。",

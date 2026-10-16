@@ -112,6 +112,9 @@ pub enum Signal {
     FolderFailed { reason: String },
     /// The workspaces used last, most recent first; see [`crate::recent`].
     Recent(Vec<crate::recent::Workspace>),
+    /// The sessions of each of those workspaces, for the quick-ask box; see
+    /// [`crate::ask`].
+    Sessions(Vec<crate::ask::Session>),
     /// How many sessions are mid-turn and how many are waiting on the user,
     /// and the few the tray lists by name; see [`crate::status`].
     Status {
@@ -137,6 +140,7 @@ pub fn received(url: &Url) -> Option<Signal> {
     let mut running = 0;
     let mut waiting = 0;
     let (mut wid, mut wtitle, mut rid, mut rtitle) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut spath, mut sid, mut stitle) = (Vec::new(), Vec::new(), Vec::new());
 
     for (name, value) in url.query_pairs() {
         match name.as_ref() {
@@ -170,6 +174,11 @@ pub fn received(url: &Url) -> Option<Signal> {
             "wtitle" if wtitle.len() < crate::status::LIMIT => wtitle.push(clamp(&value)),
             "rid" if rid.len() < crate::status::LIMIT => rid.push(clamp(&value)),
             "rtitle" if rtitle.len() < crate::status::LIMIT => rtitle.push(clamp(&value)),
+            // The quick-ask box's sessions: whose, which and what each is
+            // called, in step. The path unclamped, like a recent workspace's.
+            "spath" if spath.len() < crate::ask::SESSIONS => spath.push(value.trim().to_string()),
+            "sid" if sid.len() < crate::ask::SESSIONS => sid.push(clamp(&value)),
+            "stitle" if stitle.len() < crate::ask::SESSIONS => stitle.push(clamp(&value)),
             _ => {}
         }
     }
@@ -194,6 +203,17 @@ pub fn received(url: &Url) -> Option<Signal> {
             return Some(Signal::Recent(list));
         }
         "recent" => return None,
+        "sessions" if spath.len() == sid.len() && sid.len() == stitle.len() => {
+            let list = spath
+                .into_iter()
+                .zip(sid)
+                .zip(stitle)
+                .filter(|((path, id), _)| !path.is_empty() && !id.is_empty())
+                .map(|((path, id), title)| crate::ask::Session { path, id, title })
+                .collect();
+            return Some(Signal::Sessions(list));
+        }
+        "sessions" => return None,
         // Rows whose halves do not pair up are dropped rather than the counts:
         // the dot is worth drawing even when the menu has nothing to list.
         "status" => {
@@ -301,6 +321,7 @@ pub fn act(app: &AppHandle, signal: Signal) {
         Signal::FolderOpened => crate::folder::opened(),
         Signal::FolderFailed { reason } => crate::folder::failed(app, &reason),
         Signal::Recent(list) => crate::recent::set(app, list),
+        Signal::Sessions(list) => crate::ask::set_sessions(list),
         Signal::Status {
             running,
             waiting,
@@ -680,6 +701,22 @@ mod tests {
                 rows: vec![]
             })
         );
+    }
+
+    /// The quick-ask box's sessions: three halves in step, or nothing.
+    #[test]
+    fn reads_the_sessions_of_the_recent_workspaces() {
+        let session = |path: &str, id: &str, title: &str| crate::ask::Session {
+            path: path.into(),
+            id: id.into(),
+            title: title.into(),
+        };
+        assert_eq!(
+            read("event=sessions&spath=%2Fa&sid=s1&stitle=Fix%20it&spath=%2Fb&sid=s2&stitle=&n=1"),
+            Some(Signal::Sessions(vec![session("/a", "s1", "Fix it"), session("/b", "s2", "")]))
+        );
+        assert_eq!(read("event=sessions&spath=%2Fa&sid=s1&n=1"), None, "a title short");
+        assert_eq!(read("event=sessions&n=1"), Some(Signal::Sessions(vec![])));
     }
 
     /// The tray's rows: waiting ones first, each half paired up on its own,

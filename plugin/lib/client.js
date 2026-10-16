@@ -202,29 +202,35 @@ window.__ModuleLoader__.load({
             else if (sessions && sessions.open) sessions.open(id);
           },
           /**
-           * Start a new session in a workspace on one line, for the shell's
-           * quick-ask box. Called from the shell over `window.eval`, and only
-           * after `folder-ready`; see its ask.rs.
+           * Send one line from the shell's quick-ask box, into a new session
+           * in a workspace or into one of its sessions. Called from the shell
+           * over `window.eval`, and only after `folder-ready`; see its ask.rs.
            *
-           * The workspace is made or adopted the way `openFolder` does it, the
-           * session is a new one in it — `sessions.create`, what "new
-           * session" calls — and the line goes in through the session face's
-           * own `prompt`, the call the composer's send ends in. The session
-           * is not switched to: whoever pressed the key is somewhere else, and
-           * the notification at the turn's end is how they hear.
+           * For a new session the workspace is made or adopted the way
+           * `openFolder` does it, and the session is a new one in it —
+           * `sessions.create`, what "new session" calls. Either way the line
+           * goes in through the session face's own `prompt`, the call the
+           * composer's send ends in. The session is not switched to: whoever
+           * pressed the key is somewhere else, and the notification at the
+           * turn's end is how they hear.
            *
            * @param {string} path - the workspace's directory.
            * @param {string} text - the line typed into the box.
+           * @param {string} [session] - a session in that workspace, as
+           *   `sessions` listed it; absent or '' for a new one.
            */
-          ask: (path, text) => {
+          ask: (path, text, session) => {
             var failed = (error) => send({
               event: 'ask-failed',
               reason: (error && error.message) || String(error),
             });
             if (!folders || !sessions) return failed('not ready');
             var current = { folders: folders, sessions: sessions };
-            current.folders.workspaces.create({ path: path })
-              .then((workspace) => current.sessions.create({ workspaceId: workspace.workspaceId }))
+            var target = session
+              ? Promise.resolve(session)
+              : current.folders.workspaces.create({ path: path })
+                .then((workspace) => current.sessions.create({ workspaceId: workspace.workspaceId }));
+            target
               .then((id) => current.sessions.using(id, { source: 'controllerOperation' }, (reference) =>
                 reference.ready.then((binding) => binding.session.prompt([{ type: 'text', text: text }], 'queue')),
               ).then((result) => {
@@ -449,6 +455,9 @@ window.__ModuleLoader__.load({
     /** How many workspaces the shell is told about. */
     var RECENT = 5;
 
+    /** How many sessions of each of them the quick-ask box offers. */
+    var SESSIONS = 8;
+
     /**
      * The most recently used workspaces, as their list or their sessions
      * change.
@@ -459,13 +468,22 @@ window.__ModuleLoader__.load({
      * workspace's own time stands in when none of its sessions is in the list.
      * Sent only when the titles, paths or their order change: the session list
      * moves on every message of a running turn.
+     *
+     * Beside it, as its own `sessions` event, the sessions of each of those
+     * workspaces that the quick-ask box offers to send into: the ones the
+     * sidebar lists — not archived, not the blank one dsh holds for its next
+     * "new session", not a subagent's — newest first. Its own event and its own
+     * check, so that a session moving up its workspace does not redraw the
+     * tray.
      */
     function watchRecent(ctx) {
       var last = null;
+      var lastSessions = null;
 
       var read = () => {
         var byId = ctx.sessions.list.getSnapshot().byId;
-        var recent = ctx.workspaces.list.getSnapshot().items
+        var snapshot = ctx.workspaces.list.getSnapshot();
+        var recent = snapshot.items
           .map((workspace) => {
             var at = Date.parse(workspace.updatedAt) || 0;
             for (var id of workspace.sessionIds) {
@@ -479,13 +497,37 @@ window.__ModuleLoader__.load({
           .map((row) => row.workspace);
 
         var line = JSON.stringify(recent.map((workspace) => [workspace.title, workspace.path]));
-        if (line === last) return;
-        last = line;
-        // Two repeated keys in step, the way a question's options travel.
+        if (line !== last) {
+          last = line;
+          // Two repeated keys in step, the way a question's options travel.
+          send({
+            event: 'recent',
+            title: recent.map((workspace) => workspace.title),
+            path: recent.map((workspace) => workspace.path),
+          });
+        }
+
+        var archived = new Set(snapshot.archivedSessionIds || []);
+        var rows = [];
+        recent.forEach((workspace) => {
+          workspace.sessionIds
+            .filter((id) => {
+              var summary = byId[id];
+              return summary && !summary.blank && summary.origin !== 'subagent' && !archived.has(id);
+            })
+            .sort((a, b) => byId[b].updatedAt - byId[a].updatedAt)
+            .slice(0, SESSIONS)
+            .forEach((id) => rows.push([workspace.path, id, byId[id].displayTitle || '']));
+        });
+        var listed = JSON.stringify(rows);
+        if (listed === lastSessions) return;
+        lastSessions = listed;
+        // Three repeated keys in step: whose, which, and what it is called.
         send({
-          event: 'recent',
-          title: recent.map((workspace) => workspace.title),
-          path: recent.map((workspace) => workspace.path),
+          event: 'sessions',
+          spath: rows.map((row) => row[0]),
+          sid: rows.map((row) => row[1]),
+          stitle: rows.map((row) => row[2]),
         });
       };
 

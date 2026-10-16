@@ -19,13 +19,15 @@ function load({ host }) {
   const sent = [];
   const statuses = [];
   const recents = [];
+  const sessionLists = [];
   let registered = null;
   const window = {
     __ModuleLoader__: { load: (row) => { registered = row; } },
     location: {
       set href(value) {
         const event = new URL(value).searchParams.get('event');
-        (event === 'status' ? statuses : event === 'recent' ? recents : sent).push(value);
+        (event === 'status' ? statuses : event === 'recent' ? recents
+          : event === 'sessions' ? sessionLists : sent).push(value);
       },
       get href() { return ''; },
     },
@@ -36,7 +38,7 @@ function load({ host }) {
   assert.ok(registered, 'the bundle should register a factory');
   assert.equal(registered.id, 'dsh-desktop-signal');
   const exports = registered.factory(() => { throw new Error('should require nothing'); });
-  return { exports, sent, statuses, recents, window };
+  return { exports, sent, statuses, recents, sessionLists, window };
 }
 
 // Stub services with hand-driven snapshots.
@@ -105,6 +107,7 @@ function services({ uiSession = true, folders = null } = {}) {
     setList(next) { list = next; listeners.list.forEach((fn) => fn()); },
     setPending(next) { pending = next; listeners.pending.forEach((fn) => fn()); },
     setWorkspaces(items) { workspaces = { items }; workspaceListeners.forEach((fn) => fn()); },
+    setArchived(ids) { workspaces = { ...workspaces, archivedSessionIds: ids }; workspaceListeners.forEach((fn) => fn()); },
   };
 }
 
@@ -687,7 +690,14 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   window.__dshSignals.ask('/nope', 'x');
   await drain();
   assert.deepEqual([query(sent.at(-1)).event, query(sent.at(-1)).reason], ['ask-failed', 'not a directory']);
-  console.log('ok  starts a new session on a quick-ask line');
+
+  // Into a session that is already there: nothing is made.
+  window.__dshSignals.ask('/nope', 'and the tests', 'session-old');
+  await drain();
+  assert.deepEqual(made, ['ws-/work/a'], 'no new session');
+  assert.deepEqual(prompts.at(-1), ['session-old', 'and the tests', 'queue']);
+  assert.deepEqual(sent.map(query).map((p) => [p.event, p.session]).at(-1), ['asked', 'session-old']);
+  console.log('ok  starts a new session on a quick-ask line, or sends it into one');
 }
 
 // --- text into a composer, after what is already there ---
@@ -808,6 +818,54 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   assert.equal(recents.length, 2);
   assert.deepEqual(queryAll(recents[1], 'title'), ['X7', 'X6', 'X5', 'X4', 'X3']);
   console.log('ok  reports the most recently used workspaces');
+}
+
+// --- each recent workspace's sessions, for the quick-ask box ---
+{
+  const { exports, recents, sessionLists } = load({ host: true });
+  const s = services({ folders: { create: () => Promise.reject(), openWorkspace: () => {} } });
+  const row = (day, more) => ({ running: false, displayTitle: 'T' + day, updatedAt: Date.parse(`2026-02-0${day}`), ...more });
+  s.setList({
+    ids: ['a1', 'a2', 'a3', 'a4', 'a5', 'b1'],
+    byId: {
+      a1: row(1),
+      a2: row(3),
+      a3: row(2, { blank: true }),
+      a4: row(4, { origin: 'subagent' }),
+      a5: row(5),
+      b1: row(6),
+    },
+  });
+  s.setWorkspaces([
+    { workspaceId: 'a', title: 'A', path: '/a', updatedAt: '2026-01-01T00:00:00Z', sessionIds: ['a1', 'a2', 'a3', 'a4', 'a5', 'gone'] },
+    { workspaceId: 'b', title: 'B', path: '/b', updatedAt: '2026-01-01T00:00:00Z', sessionIds: ['b1'] },
+  ]);
+  s.setArchived(['a5']);
+  exports.apply(s.ctx);
+  await drain();
+  assert.equal(sessionLists.length, 1);
+  // Newest workspace first, newest session first; no blank, subagent,
+  // archived or unknown ones.
+  assert.deepEqual(queryAll(sessionLists[0], 'sid'), ['b1', 'a2', 'a1']);
+  assert.deepEqual(queryAll(sessionLists[0], 'spath'), ['/b', '/a', '/a']);
+  assert.deepEqual(queryAll(sessionLists[0], 'stitle'), ['T6', 'T3', 'T1']);
+
+  // A session moving up its workspace changes this list and not the tray's.
+  s.setList({
+    ids: ['a1', 'a2', 'b1'],
+    byId: { a1: row(9), a2: row(3), b1: row(6) },
+  });
+  await drain();
+  assert.equal(recents.length, 2, 'A moved above B in the tray, once');
+  assert.deepEqual(queryAll(sessionLists.at(-1), 'sid'), ['a1', 'a2', 'b1']);
+  const count = sessionLists.length;
+  s.setList({
+    ids: ['a1', 'a2', 'b1'],
+    byId: { a1: row(9, { running: true }), a2: row(3), b1: row(6) },
+  });
+  await drain();
+  assert.equal(sessionLists.length, count, 'the same list is not sent again');
+  console.log('ok  reports the sessions of each recent workspace');
 }
 
 // --- no desktop shell: no door either ---

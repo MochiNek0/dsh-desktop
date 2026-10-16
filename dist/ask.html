@@ -9,26 +9,36 @@
       navigating to `dsh-window://`, which only its own window's navigation
       handler hears. Colours are the loading page's, and follow the window's
       theme, which Rust sets to dsh's own preference before showing it.
+
+      Two chips under the text choose where it goes: a workspace, and a
+      session in it or a new one. Each opens a list below the box, drawn here
+      rather than as a <select>, and the window grows to fit it while it is
+      open (`quick-size`).
     -->
     <style>
       :root {
         color-scheme: light dark;
         --bg: #ffffff;
         --fg: #1a1a1a;
-        --muted: #6b7280;
-        --line: #e5e7eb;
+        --fg-2: #3f4350;
+        --muted: #8a8f9c;
+        --line: #e7e8ec;
+        --hover: rgba(0, 0, 0, 0.045);
+        --active: rgba(77, 107, 254, 0.1);
         --accent: #4d6bfe;
         --danger: #b42318;
-        --panel: #f7f8fa;
       }
       @media (prefers-color-scheme: dark) {
         :root {
-          --bg: #17171d;
+          --bg: #1b1b21;
           --fg: #ececf1;
-          --muted: #9aa0ac;
-          --line: #2c2c35;
+          --fg-2: #c9cbd3;
+          --muted: #8b90a0;
+          --line: #2e2e37;
+          --hover: rgba(255, 255, 255, 0.06);
+          --active: rgba(120, 144, 255, 0.18);
+          --accent: #6f86ff;
           --danger: #f97066;
-          --panel: #101014;
         }
       }
       html,
@@ -42,11 +52,29 @@
       }
       body {
         box-sizing: border-box;
+        border: 1px solid var(--line);
+      }
+      svg {
+        flex: none;
+        width: 14px;
+        height: 14px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      /* ------------------------------------------------------- the box -- */
+      /* 130 inside the window's 132, less its border: the height Rust gives
+         the window with no list open. */
+      .box {
+        box-sizing: border-box;
+        height: 130px;
         display: flex;
         flex-direction: column;
-        gap: 8px;
-        padding: 14px 16px 10px;
-        border: 1px solid var(--line);
+        gap: 6px;
+        padding: 14px 14px 12px 16px;
       }
       textarea {
         flex: 1;
@@ -58,64 +86,214 @@
         background: transparent;
         color: inherit;
         font: inherit;
-        font-size: 16px;
-        line-height: 1.5;
+        font-size: 15px;
+        line-height: 1.55;
       }
       textarea::placeholder {
         color: var(--muted);
       }
-      .bar {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 12px;
-        color: var(--muted);
-        white-space: nowrap;
-      }
-      select {
-        max-width: 260px;
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        padding: 2px 6px;
-        background: var(--panel);
-        color: var(--fg);
-        font: inherit;
-        outline: 0;
-      }
-      select:focus-visible {
-        border-color: var(--accent);
-      }
-      .hint {
-        margin-left: auto;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
       .error {
         color: var(--danger);
+        font-size: 12px;
+        white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
       }
       .error:empty {
         display: none;
       }
+      .bar {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+      }
+      button {
+        all: unset;
+        box-sizing: border-box;
+        cursor: pointer;
+      }
+      button:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 1px;
+      }
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 28px;
+        min-width: 0;
+        padding: 0 7px 0 9px;
+        border-radius: 8px;
+        box-shadow: inset 0 0 0 1px var(--line);
+        color: var(--fg-2);
+        font-size: 12.5px;
+        transition: background 0.12s ease, box-shadow 0.12s ease;
+      }
+      .chip:hover {
+        background: var(--hover);
+      }
+      .chip[aria-expanded="true"] {
+        background: var(--active);
+        box-shadow: inset 0 0 0 1px transparent;
+        color: var(--accent);
+      }
+      .chip[aria-disabled="true"] {
+        opacity: 0.45;
+        cursor: default;
+      }
+      .chip[aria-disabled="true"]:hover {
+        background: none;
+      }
+      .chip > svg:first-child {
+        color: var(--muted);
+      }
+      .chip[aria-expanded="true"] > svg {
+        color: inherit;
+      }
+      .chip .label {
+        max-width: 190px;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .chip .caret {
+        width: 12px;
+        height: 12px;
+        color: var(--muted);
+      }
+      .hint {
+        margin-left: auto;
+        padding-left: 6px;
+        color: var(--muted);
+        font-size: 11.5px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .send {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: none;
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        background: var(--accent);
+        color: #fff;
+        transition: background 0.12s ease, opacity 0.12s ease;
+      }
+      .send svg {
+        width: 15px;
+        height: 15px;
+        stroke-width: 2.2;
+      }
+      .send[aria-disabled="true"] {
+        background: var(--line);
+        color: var(--muted);
+        cursor: default;
+      }
+
+      /* ------------------------------------------------------ the list -- */
+      .list {
+        box-sizing: border-box;
+        max-height: 330px;
+        overflow-y: auto;
+        padding: 6px;
+        border-top: 1px solid var(--line);
+      }
+      .list[hidden] {
+        display: none;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        height: 34px;
+        padding: 0 10px;
+        border-radius: 8px;
+        color: var(--fg);
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .row.active {
+        background: var(--hover);
+      }
+      .row > svg:first-child {
+        color: var(--muted);
+      }
+      .row .label {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .row .where {
+        max-width: 45%;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        color: var(--muted);
+        font-size: 11.5px;
+      }
+      .row .tick {
+        color: var(--accent);
+      }
+      .rule {
+        height: 1px;
+        margin: 5px 6px;
+        background: var(--line);
+      }
     </style>
   </head>
   <body>
-    <textarea id="text" rows="2" spellcheck="false" autofocus></textarea>
-    <div class="error" id="error"></div>
-    <div class="bar">
-      <span id="in"></span>
-      <select id="where"></select>
-      <span class="hint" id="hint"></span>
+    <div class="box">
+      <textarea id="text" rows="2" spellcheck="false" autofocus></textarea>
+      <div class="error" id="error"></div>
+      <div class="bar">
+        <button type="button" class="chip" id="workspace" aria-haspopup="listbox" aria-expanded="false"></button>
+        <button type="button" class="chip" id="session" aria-haspopup="listbox" aria-expanded="false"></button>
+        <span class="hint" id="hint"></span>
+        <button type="button" class="send" id="send"></button>
+      </div>
     </div>
+    <div class="list" id="list" role="listbox" hidden></div>
     <script>
       (function () {
+        // Lucide icons, ISC licence. https://lucide.dev
+        var ICONS = {
+          folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+          folderPlus: '<path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+          message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+          plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+          caret: '<path d="m6 9 6 6 6-6"/>',
+          tick: '<path d="M20 6 9 17l-5-5"/>',
+          send: '<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>'
+        };
+        function icon(name, className) {
+          return '<svg viewBox="0 0 24 24"' + (className ? ' class="' + className + '"' : '') +
+            ' aria-hidden="true">' + ICONS[name] + '</svg>';
+        }
+
         var box = document.getElementById('text');
-        var where = document.getElementById('where');
         var error = document.getElementById('error');
-        var label = document.getElementById('in');
         var hint = document.getElementById('hint');
-        var none = '';
+        var chips = {
+          workspace: document.getElementById('workspace'),
+          session: document.getElementById('session')
+        };
+        var sendButton = document.getElementById('send');
+        var list = document.getElementById('list');
+
+        // What Rust last handed over, and what is chosen out of it. `session`
+        // is '' for a new one.
+        var words = {};
+        var workspaces = [];
+        var chosen = { path: '', session: '' };
+        // The list that is open, as the chip it hangs off, its rows' choices
+        // and which of them the keyboard is on.
+        var open = null, choices = [], active = -1;
 
         // Each navigation different from the last, or a repeated one does not
         // navigate at all; see `notify::script`.
@@ -129,44 +307,232 @@
           window.location.href = 'dsh-window://' + verb + '?' + query.join('&');
         }
 
+        function workspace() {
+          for (var i = 0; i < workspaces.length; i++) {
+            if (workspaces[i].path === chosen.path) return workspaces[i];
+          }
+          return null;
+        }
+        function session() {
+          var here = workspace();
+          var sessions = (here && here.sessions) || [];
+          for (var i = 0; i < sessions.length; i++) {
+            if (sessions[i].id === chosen.session) return sessions[i];
+          }
+          return null;
+        }
+
+        function chip(node, glyph, label, title, disabled) {
+          node.innerHTML = icon(glyph) + '<span class="label"></span>' + icon('caret', 'caret');
+          node.querySelector('.label').textContent = label;
+          node.title = title || '';
+          node.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+        }
+
+        function draw() {
+          var here = workspace();
+          var picked = session();
+          chip(chips.workspace, 'folder', here ? here.title : words.pick, here ? here.path : '', false);
+          chips.workspace.setAttribute('aria-label', words.workspace || '');
+          chip(chips.session, picked ? 'message' : 'plus', picked ? picked.title : words.fresh,
+            picked ? picked.title : '', !here);
+          chips.session.setAttribute('aria-label', words.session || '');
+          var empty = !box.value.trim();
+          sendButton.setAttribute('aria-disabled', empty ? 'true' : 'false');
+          sendButton.title = words.send || '';
+        }
+
+        // ------------------------------------------------------- the list --
+
+        // How tall the window has to be: the box, and the list when it is up.
+        function fit() {
+          go('quick-size', { h: 132 + (open ? list.offsetHeight : 0) });
+        }
+
+        function row(glyph, label, where, selected, choose) {
+          var node = document.createElement('div');
+          node.className = 'row';
+          node.setAttribute('role', 'option');
+          node.setAttribute('aria-selected', selected ? 'true' : 'false');
+          node.innerHTML = icon(glyph) + '<span class="label"></span>' +
+            (where ? '<span class="where"></span>' : '') + (selected ? icon('tick', 'tick') : '');
+          node.querySelector('.label').textContent = label;
+          if (where) node.querySelector('.where').textContent = where;
+          node.title = where || label;
+          var index = choices.length;
+          choices.push({ node: node, choose: choose });
+          node.addEventListener('mouseenter', function () { highlight(index); });
+          // On mousedown, so the box does not lose its focus first.
+          node.addEventListener('mousedown', function (event) {
+            event.preventDefault();
+            choose();
+          });
+          list.appendChild(node);
+          if (selected) active = index;
+        }
+
+        function rule() {
+          var node = document.createElement('div');
+          node.className = 'rule';
+          list.appendChild(node);
+        }
+
+        function highlight(index) {
+          if (!choices.length) return;
+          active = (index + choices.length) % choices.length;
+          choices.forEach(function (choice, i) {
+            choice.node.classList.toggle('active', i === active);
+          });
+          choices[active].node.scrollIntoView({ block: 'nearest' });
+        }
+
+        function show(which) {
+          if (chips[which].getAttribute('aria-disabled') === 'true') return;
+          if (open === which) return close();
+          close(true);
+          open = which;
+          chips[which].setAttribute('aria-expanded', 'true');
+          list.textContent = '';
+          choices = [];
+          active = 0;
+
+          if (which === 'workspace') {
+            workspaces.forEach(function (each) {
+              row('folder', each.title, each.path, each.path === chosen.path, function () {
+                if (each.path !== chosen.path) chosen = { path: each.path, session: '' };
+                close();
+              });
+            });
+            if (workspaces.length) rule();
+            row('folderPlus', words.other, '', false, function () {
+              close();
+              go('quick-pick');
+            });
+          } else {
+            row('plus', words.fresh, '', !chosen.session, function () {
+              chosen.session = '';
+              close();
+            });
+            var sessions = (workspace() || {}).sessions || [];
+            if (sessions.length) rule();
+            sessions.forEach(function (each) {
+              row('message', each.title, '', each.id === chosen.session, function () {
+                chosen.session = each.id;
+                close();
+              });
+            });
+          }
+
+          list.hidden = false;
+          highlight(active);
+          fit();
+        }
+
+        // `quietly` is for one list giving way to the other: the window is
+        // about to be sized again for that one.
+        function close(quietly) {
+          if (!open) return;
+          chips[open].setAttribute('aria-expanded', 'false');
+          open = null;
+          list.hidden = true;
+          list.textContent = '';
+          choices = [];
+          draw();
+          if (quietly) return;
+          fit();
+          box.focus();
+        }
+
+        chips.workspace.addEventListener('click', function () { show('workspace'); });
+        chips.session.addEventListener('click', function () { show('session'); });
+
+        // ---------------------------------------------------- what Rust says --
+
         // Called from Rust each time the box is shown; see `ask::payload`.
         window.__dshAsk = function (payload) {
-          var words = payload.words || {};
+          words = payload.words || {};
           box.placeholder = words.placeholder || '';
           hint.textContent = words.hint || '';
-          label.textContent = words['in'] || '';
-          none = words.none || '';
+          sendButton.innerHTML = icon('send');
 
-          where.textContent = '';
-          (payload.workspaces || []).forEach(function (workspace) {
-            var option = document.createElement('option');
-            option.value = workspace.path;
-            option.textContent = workspace.title;
-            option.title = workspace.path;
-            where.appendChild(option);
-          });
-          var empty = !where.options.length;
-          where.disabled = empty;
-          box.disabled = empty;
-          error.textContent = empty ? none : payload.error || '';
+          workspaces = payload.workspaces || [];
+          chosen = { path: payload.path || '', session: payload.session || '' };
+          if (!workspace()) chosen = { path: workspaces.length ? workspaces[0].path : '', session: '' };
+          if (!session()) chosen.session = '';
 
+          close(true);
+          error.textContent = payload.error || '';
           box.value = payload.text || '';
+          draw();
           box.focus();
           box.setSelectionRange(box.value.length, box.value.length);
         };
 
+        // A folder chosen in the system's picker; see `ask::pick`. Added to the
+        // list if it is not there, and chosen, with a new session.
+        window.__dshAskPicked = function (picked) {
+          var known = false;
+          workspaces.forEach(function (each) {
+            if (each.path === picked.path) known = true;
+          });
+          if (!known) workspaces.push(picked);
+          chosen = { path: picked.path, session: '' };
+          error.textContent = '';
+          draw();
+          box.focus();
+        };
+
+        // ------------------------------------------------------- sending --
+
         function send() {
           var text = box.value.trim();
-          if (!text || !where.value) return;
-          go('quick-ask', { text: text, path: where.value });
+          if (!text) return;
+          // Nowhere to send it yet: the one thing to do is choose a folder.
+          if (!chosen.path) return go('quick-pick');
+          go('quick-ask', { text: text, path: chosen.path, session: chosen.session });
           box.value = '';
           error.textContent = '';
+          draw();
         }
 
+        sendButton.addEventListener('mousedown', function (event) {
+          event.preventDefault();
+        });
+        sendButton.addEventListener('click', function () {
+          if (sendButton.getAttribute('aria-disabled') !== 'true') send();
+        });
+        box.addEventListener('input', draw);
+
         document.addEventListener('keydown', function (event) {
+          if (open) {
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault();
+              highlight(active + (event.key === 'ArrowDown' ? 1 : -1));
+              return;
+            }
+            if (event.key === 'Enter' && !event.isComposing) {
+              event.preventDefault();
+              if (choices[active]) choices[active].choose();
+              return;
+            }
+            if (event.key === 'Escape' || event.key === 'Tab') {
+              event.preventDefault();
+              close();
+              return;
+            }
+          }
           if (event.key === 'Escape') {
             event.preventDefault();
             go('quick-close');
+            return;
+          }
+          // A chip with the focus opens its list on Enter or Space, being a
+          // button, and on the down arrow the way a <select> does.
+          var on = event.target === chips.workspace ? 'workspace'
+            : event.target === chips.session ? 'session' : null;
+          if (on && event.key === 'ArrowDown') {
+            event.preventDefault();
+            show(on);
             return;
           }
           // Not while an input method is still composing: that Enter picks a
@@ -181,7 +547,7 @@
         // The box is shown after it is filled in, and a hidden window cannot
         // take the focus, so it is taken again when the window gets it.
         window.addEventListener('focus', function () {
-          if (!box.disabled) box.focus();
+          if (!open) box.focus();
         });
 
         // The first time the window is built this page is not loaded yet when
