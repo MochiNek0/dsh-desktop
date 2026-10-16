@@ -105,6 +105,11 @@ windows-core = "0.61"
 # jump-list row. And the window placement saved between launches; see
 # `placement`.
 windows = { version = "0.61", features = [
+    # The toast with a text box to reply on; see `toast::inline`.
+    "Data_Xml_Dom",
+    "Foundation",
+    "Foundation_Collections",
+    "UI_Notifications",
     "Win32_Graphics_Dwm",                  # DWMWA_CLOAK
     "Win32_Graphics_Gdi",                  # MonitorFromPoint
     "Win32_Storage_EnhancedStorage",       # PKEY_Title

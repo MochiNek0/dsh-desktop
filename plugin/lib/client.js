@@ -169,6 +169,7 @@ window.__ModuleLoader__.load({
       var sessions = null;
       var waits = null;
       var folders = null;
+      var composer = null;
 
       // Which sessions are mid-turn and which are waiting on the user, for the
       // shell's icons, its tray menu and whether it keeps the machine awake.
@@ -199,6 +200,49 @@ window.__ModuleLoader__.load({
             // call is kept for a dsh that predates the move.
             if (folders && folders.uiWorkspace.openSession) folders.uiWorkspace.openSession(id);
             else if (sessions && sessions.open) sessions.open(id);
+          },
+          /**
+           * Send a line into a session as its next turn, for a reply typed
+           * into a notification. Called from the shell over `window.eval`;
+           * see its signal.rs.
+           *
+           * The session need not be on screen: it is held for exactly as long
+           * as the prompt takes to be accepted, through the session face's own
+           * `prompt` — the call the composer's send ends in — and let go. The
+           * turn runs on the host whether or not anything is holding it here.
+           *
+           * Answers `replied` or `reply-failed`. The shell keeps the text until
+           * it hears which, and on a failure puts it into that session's
+           * composer rather than losing what the user typed.
+           *
+           * @param {string} id - session id, as it was reported from here.
+           * @param {string} text - what the user typed.
+           */
+          reply: (id, text) => {
+            var failed = () => send({ event: 'reply-failed', session: id });
+            if (!sessions) return failed();
+            sessions.using(id, { source: 'controllerOperation' }, (reference) =>
+              reference.ready.then((binding) => binding.session.prompt([{ type: 'text', text: text }], 'queue')),
+            ).then((result) => {
+              if (result && result.ok) send({ event: 'replied', session: id });
+              else failed();
+            }, failed);
+          },
+          /**
+           * Put text into a session's composer, after whatever is already
+           * there, and switch to that session. For a notification reply that
+           * could not be sent, and for the clipboard shortcut. Nothing is
+           * sent: the user sees it and presses Enter themselves.
+           *
+           * @param {string} id - session id, or '' for the one on screen.
+           * @param {string} text - what to add.
+           */
+          draft: (id, text) => {
+            if (!composer) return;
+            var target = id || current(composer.sessions);
+            if (!target) return;
+            if (id) window.__dshSignals.open(id);
+            fill(composer, target, text);
           },
           /**
            * Answer what a session is waiting on, for a press on one of a
@@ -296,11 +340,60 @@ window.__ModuleLoader__.load({
         }, 'dsh-desktop-signal: folders opened from the desktop shell');
       });
 
+      // A session's composer, for `draft`. `conversation` is the service that
+      // owns every session's input; a dsh without it has no draft to add to.
+      ctx.inject(['sessions', 'conversation'], (scope) => {
+        scope.effect(() => {
+          composer = { sessions: scope.sessions, conversation: scope.conversation };
+          return () => {
+            composer = null;
+          };
+        }, 'dsh-desktop-signal: text into a composer from the desktop shell');
+      });
+
       // The workspaces the shell lists in its tray menu. `sessions` is what
       // says which were used last; see `watchRecent`.
       ctx.inject(['workspaces', 'sessions'], (scope) => {
         scope.effect(() => watchRecent(scope), 'dsh-desktop-signal: recent workspaces to the desktop shell');
       });
+    }
+
+    /**
+     * The session on screen: the one the main view holds. dsh keeps no
+     * "current session" anywhere a plugin can read it, but it does count who
+     * holds each one, and the main view holds exactly the one it shows.
+     */
+    function current(sessions) {
+      var list = sessions.list.getSnapshot();
+      for (var id of list.ids) {
+        var summary = list.byId[id];
+        if (summary && summary.retainedBy && summary.retainedBy.mainView > 0) return id;
+      }
+      return null;
+    }
+
+    /** How long `fill` waits for a session it just switched to. */
+    var FILL_WAIT = 3000;
+
+    /**
+     * Append to a session's draft and focus its composer, once there is one.
+     *
+     * A session that was just switched to has no scope yet — the main view
+     * retains it a moment later — and a composer only exists for a session
+     * with a scope, so this waits for one, a frame at a time, for a while.
+     * The text goes after the draft on a new line rather than over it: a
+     * half-written message is the user's, and replacing it would lose it.
+     */
+    function fill(composer, id, text, waited) {
+      var scope = composer.sessions.scope(id);
+      if (!scope) {
+        if ((waited || 0) >= FILL_WAIT) return;
+        return setTimeout(() => fill(composer, id, text, (waited || 0) + 50), 50);
+      }
+      var input = composer.conversation.input.for(scope);
+      var draft = input.state.getSnapshot().draft;
+      input.setDraft(draft ? draft.replace(/\s+$/, '') + '\n' + text : text);
+      input.focus();
     }
 
     /** How many sessions the shell's tray menu lists. */
