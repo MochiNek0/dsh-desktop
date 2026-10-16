@@ -7,6 +7,7 @@
 mod i18n;
 
 mod auth;
+mod awake;
 mod controls;
 mod cookies;
 mod dialog;
@@ -395,10 +396,14 @@ fn build_window(
                 // on, notifications are, this launch is running on no plugins,
                 // or which global shortcut took — nothing resized to tell it,
                 // and nothing was toggled. Every navigation lands here, so
-                // every navigation gets all five.
+                // every navigation gets all of them.
                 controls::sync(&webview);
                 controls::sync_autostart(webview.app_handle());
                 controls::sync_notify(webview.app_handle());
+                controls::sync_keep_awake(
+                    webview.app_handle(),
+                    settings::keep_awake(webview.app_handle()),
+                );
                 controls::sync_safe(webview.app_handle());
                 controls::sync_plugin_updates(webview.app_handle());
                 shortcut::sync(webview.app_handle());
@@ -760,6 +765,14 @@ fn toggle_notify_turns(app: &tauri::AppHandle) {
     }
     settings::toggle_notifications(app);
     controls::sync_notify(app);
+}
+
+/// Turn "stay awake during a turn" on or off, take or drop the hold to match,
+/// and repaint the switch from what was written; see [`awake`].
+fn toggle_keep_awake(app: &tauri::AppHandle) {
+    let on = settings::toggle_keep_awake(app);
+    awake::apply(app);
+    controls::sync_keep_awake(app, on);
 }
 
 /// Quit, from the window's own menu rather than the tray.

@@ -101,6 +101,8 @@ pub enum Action {
     /// the finished-turn toast this verb is named after. The gate is in
     /// `notify::show`, which they all pass through; see [`crate::settings`].
     NotifyTurns,
+    /// Turn "stay awake while a turn runs" on or off; see [`crate::awake`].
+    KeepAwake,
     Quit,
     /// dsh switched language under a document that is not going to load
     /// again; see [`relabel`]. Carries the tag `<html lang>` moved to.
@@ -233,6 +235,7 @@ pub fn action(url: &Url) -> Option<Action> {
         "check-app" => Some(Action::CheckApp),
         "autostart" => Some(Action::Autostart),
         "notify-turns" => Some(Action::NotifyTurns),
+        "keep-awake" => Some(Action::KeepAwake),
         "quit" => Some(Action::Quit),
         "remote" => Some(Action::Remote),
         // The id is the store's own handle for a device, and it is checked by
@@ -418,6 +421,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::CheckApp => return crate::update::check_now(app),
         Action::Autostart => return crate::toggle_autostart(app),
         Action::NotifyTurns => return crate::toggle_notify_turns(app),
+        Action::KeepAwake => return crate::toggle_keep_awake(app),
         Action::Quit => return crate::quit(app),
         Action::Remote => return crate::remote::open(app),
         Action::RemoteKick(id) => return crate::remote::kick(app, &id),
@@ -573,6 +577,16 @@ pub fn sync_notify(app: &AppHandle) {
         },
     );
     eval(app, &call);
+}
+
+/// Put the checkmark on "stay awake while a turn runs", or take it off. Pushed
+/// on every page load and after every toggle, from the value that was read or
+/// written; see [`crate::awake`].
+pub fn sync_keep_awake(app: &AppHandle, on: bool) {
+    eval(
+        app,
+        &format!("window.__dshKeepAwake && window.__dshKeepAwake({on})"),
+    );
 }
 
 /// Say whether this launch is running on no plugins: the standing label in the
@@ -732,6 +746,7 @@ fn labels() -> String {
         // notification this app raises, a plugin's included. See
         // `crate::settings`.
         ("notify-turns", t!("通知", "Notifications")),
+        ("keep-awake", t!("跑任务时不睡眠", "Stay awake during turns")),
         ("shortcut", t!("全局快捷键", "Global shortcut")),
         ("community", t!("交流群", "Feedback")),
         ("quit", t!("退出 dsh", "Quit dsh")),
@@ -816,6 +831,14 @@ fn notes() -> String {
             t!(
                 "一轮跑完、或者 dsh 要问你点什么的时候提醒你。",
                 "Tell you when a turn finishes, or when dsh stops to ask something."
+            ),
+        ),
+        (
+            "keep-awake",
+            t!(
+                "有会话在跑时，电脑不会闲置睡眠。合盖、手动睡眠照旧。",
+                "While a turn runs, the computer will not sleep for being idle. \
+                 Closing the lid or choosing Sleep still works."
             ),
         ),
         ("shortcut", crate::shortcut::note()),
@@ -1162,6 +1185,7 @@ pub fn script() -> String {
     {{ verb: 'channel' }},
     {{ verb: 'autostart', check: true }},
     {{ verb: 'notify-turns', check: true }},
+    {{ verb: 'keep-awake', check: true }},
     // The key on the right is the control: click it, then press the new one.
     // See `__dshShortcut`.
     {{ verb: 'shortcut', keys: true }},
@@ -1830,6 +1854,10 @@ pub fn script() -> String {
       mark('autostart', on);
     }};
 
+    window.__dshKeepAwake = function (on) {{
+      mark('keep-awake', on);
+    }};
+
     // The shortcut row's recorder. The next key pressed with its modifiers is
     // sent as `KeyboardEvent.code`, which names the key where it sits rather
     // than what the layout prints on it -- the same thing the OS registers.
@@ -2207,7 +2235,7 @@ mod tests {
             .next()
             .expect("the script declares both lists");
 
-        for verb in ["runtime", "registry", "channel", "autostart", "notify-turns"] {
+        for verb in ["runtime", "registry", "channel", "autostart", "notify-turns", "keep-awake"] {
             let row = format!("verb: '{verb}'");
             assert!(!menu.contains(&row), "{verb} is still drawn into the menu");
             assert!(script.contains(&row), "{verb} is on neither list");

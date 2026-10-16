@@ -52,6 +52,10 @@ static LOOK: Mutex<Look> = Mutex::new(Look::Idle);
 
 /// The plugin's latest counts. Repaints only when the look changes.
 pub fn set(app: &AppHandle, running: u32, waiting: u32) {
+    // Before the early return below: the look does not change between one
+    // running turn and two, and neither does whether to stay awake, but the
+    // hold is its own to compare.
+    crate::awake::running(app, running);
     let look = Look::of(running, waiting);
     let Ok(mut current) = LOOK.lock() else { return };
     if *current == look {

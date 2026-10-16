@@ -86,6 +86,30 @@ pub fn toggle_notifications(app: &AppHandle) -> bool {
     wanted
 }
 
+/// Whether a running turn keeps the machine from going to sleep on its own; see
+/// [`crate::awake`]. On unless it was turned off, for the same reason as
+/// [`NOTIFY_KEY`]: a turn that dies because the laptop slept is the failure
+/// this exists for, and the user who meets it has not gone looking for a
+/// setting yet.
+const AWAKE_KEY: &str = "keepAwake";
+
+const AWAKE_DEFAULT: bool = true;
+
+/// Read the preference. Any problem reading it is the default.
+pub fn keep_awake(app: &AppHandle) -> bool {
+    read(app)
+        .get(AWAKE_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(AWAKE_DEFAULT)
+}
+
+/// Flip it, and answer with what it now is; see [`toggle_notifications`].
+pub fn toggle_keep_awake(app: &AppHandle) -> bool {
+    let wanted = !keep_awake(app);
+    write(app, AWAKE_KEY, Value::Bool(wanted));
+    wanted
+}
+
 /// Which registry an install of dsh is taken from, when the machine has an
 /// opinion of its own about that.
 ///

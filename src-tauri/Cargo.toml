@@ -120,6 +120,7 @@ windows = { version = "0.61", features = [
 # app dies without running its own shutdown. See `server::Job`.
 windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
+    "Win32_System_Power",     # SetThreadExecutionState; see `awake`
     "Win32_System_Threading", # the limit structs job objects are configured with
     "Win32_Security",         # SECURITY_ATTRIBUTES, in CreateJobObjectW's signature
 ] }
