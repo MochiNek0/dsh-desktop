@@ -18,7 +18,11 @@
   "scripts": {
     "test": "node test/client.test.mjs && node test/index.test.mjs"
   },
+  "engines": {
+    "dsh": ">=0.1.5-rc.2"
+  },
   "dsh": {
+    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
     },

@@ -2676,6 +2676,7 @@ mod tests {
     fn tags(rc: &str, alpha: &str) -> crate::dsh::Tags {
         crate::dsh::Tags {
             rc: Version::parse(rc).unwrap(),
+            rc_tag: "latest",
             alpha: Some(Version::parse(alpha).unwrap()),
         }
     }

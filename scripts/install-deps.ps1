@@ -99,6 +99,13 @@ param(
     [ValidateSet('rc', 'alpha')]
     [string] $Channel = 'rc',
 
+    # `rc` only: the npm tag the release candidates are read from when it is
+    # not `latest`. Upstream puts a new version's rcs under `next` before it
+    # moves `latest`; the app reads both and passes `next` when that is the one
+    # ahead -- see `Tags` in `src-tauri/src/dsh.rs`. Empty keeps `latest`.
+    [ValidateSet('', 'latest', 'next')]
+    [string] $RcTag = '',
+
     # `uninstall` only. Node cannot go without dsh going too: dsh is a Node
     # program, and leaving it behind would leave a command that cannot run.
     [switch] $RemoveDsh,
@@ -140,7 +147,9 @@ function T([string] $Zh, [string] $En) {
 # are published under `latest`, not under `rc`, and `@deepseek-ai/dsh@rc` is a
 # tag that does not exist. `Channel::tag` in `src-tauri/src/settings.rs` holds
 # the other half of this mapping and a test pins the two together.
-$Tag = if ($Channel -eq 'alpha') { 'alpha' } else { 'latest' }
+#
+# `-RcTag` refines the rc line and nothing else: it cannot move an alpha machine.
+$Tag = if ($Channel -eq 'alpha') { 'alpha' } elseif ($RcTag) { $RcTag } else { 'latest' }
 
 # dsh forwards plugin installs to pnpm, so a machine running dsh ends up with one
 # too — installed on demand by `ensure_pnpm` in `plugins.rs`, into whichever

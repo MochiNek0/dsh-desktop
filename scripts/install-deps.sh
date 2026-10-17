@@ -47,6 +47,8 @@ REGISTRY=''
 # always taken, and has to stay the default: nothing but an explicit answer may
 # put anyone onto the alpha line. See `-Channel` below.
 CHANNEL='rc'
+# Which tag the rc line reads; see `-RcTag` below.
+RC_TAG='latest'
 REMOVE_DSH=0
 REMOVE_NODE=0
 PROGRESS=0
@@ -103,6 +105,18 @@ while [ $# -gt 0 ]; do
             esac
             shift 2
             ;;
+        # `rc` only: the npm tag the release candidates are read from when it
+        # is not `latest`. Upstream puts a new version's rcs under `next` before
+        # it moves `latest`; the app reads both and passes `next` when that is
+        # the one ahead -- see `Tags` in `src-tauri/src/dsh.rs`.
+        -RcTag)
+            [ $# -ge 2 ] || { echo "-RcTag 后面要跟 latest 或 next" >&2; exit 2; }
+            case $2 in
+                latest|next) RC_TAG=$2 ;;
+                *) echo "-RcTag 只认 latest 或 next，收到的是：$2" >&2; exit 2 ;;
+            esac
+            shift 2
+            ;;
         -RemoveDsh) REMOVE_DSH=1; shift ;;
         -RemoveNode) REMOVE_NODE=1; shift ;;
         -Progress) PROGRESS=1; shift ;;
@@ -151,7 +165,9 @@ t() {
 # are published under `latest`, not under `rc`, and `@deepseek-ai/dsh@rc` is a
 # tag that does not exist. `Channel::tag` in `src-tauri/src/settings.rs` holds
 # the other half of this mapping and a test pins the two together.
-if [ "$CHANNEL" = alpha ]; then TAG=alpha; else TAG=latest; fi
+#
+# `-RcTag` refines the rc line and nothing else: it cannot move an alpha machine.
+if [ "$CHANNEL" = alpha ]; then TAG=alpha; else TAG=$RC_TAG; fi
 
 # dsh forwards plugin installs to pnpm, so a machine running dsh ends up with one
 # too — installed on demand by `ensure_pnpm` in `plugins.rs`, into whichever

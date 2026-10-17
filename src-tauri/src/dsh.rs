@@ -1137,9 +1137,17 @@ pub(crate) fn run(app: &AppHandle, args: &[&OsStr], report: &Report) -> Result<b
     // an ordinary update and a fresh `install-dsh` — the script defaults to rc,
     // and a missing flag here would quietly move them back.
     if fetching {
-        command
-            .arg("-Channel")
-            .arg(crate::settings::dsh_channel(app).as_str());
+        let channel = crate::settings::dsh_channel(app);
+        command.arg("-Channel").arg(channel.as_str());
+        // And which of the rc line's two tags, when it is not the one the
+        // scripts take on their own. Only ever added, so a run by hand or from
+        // the installer hooks keeps installing `latest`.
+        if channel == Channel::Rc {
+            let tag = rc_tag(app);
+            if tag != Channel::Rc.tag() {
+                command.arg("-RcTag").arg(tag);
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -1421,8 +1429,12 @@ pub fn stop() {
 /// to decide whether alpha may be chosen at all. One `npm view` also means one
 /// trip to a registry that may be slow, rather than two.
 pub struct Tags {
-    /// npm's `latest`: the release-candidate line.
+    /// The release-candidate line: npm's `latest`, or `next` when that is
+    /// ahead of it. See [`NEXT`].
     pub rc: Version,
+    /// Which of the two tags [`Tags::rc`] was read from, for the install that
+    /// has to fetch the same thing the check found.
+    pub rc_tag: &'static str,
     /// npm's `alpha`, when the package has one. A package that has never
     /// published an alpha has no such tag, and that is not an error.
     pub alpha: Option<Version>,
@@ -1456,6 +1468,44 @@ impl Tags {
             Channel::Rc => self.rc.clone(),
             Channel::Alpha => self.alpha.clone().unwrap_or_else(|| self.rc.clone()),
         }
+    }
+
+    /// The npm tag that installs what [`Tags::on`] answers for `channel`.
+    pub fn tag_on(&self, channel: Channel) -> &'static str {
+        match channel {
+            Channel::Rc => self.rc_tag,
+            Channel::Alpha => Channel::Alpha.tag(),
+        }
+    }
+}
+
+/// The dist-tag the release candidates of a new version go out under before
+/// `latest` is moved onto them. 0.2.1-rc.1 was the first: published as `next`
+/// while `latest` stayed on 0.2.0-rc.2, so an rc line that read only `latest`
+/// never saw it. Read alongside `latest` and taken only when it is ahead, so a
+/// `next` left behind once upstream moves `latest` past it loses the comparison.
+const NEXT: &str = "next";
+
+/// The tag the last answer from [`tags`] resolved the rc line to, so the
+/// install that follows a check fetches what the check found without asking
+/// the registry a second time. See [`rc_tag`].
+static RC_TAG: Mutex<Option<&'static str>> = Mutex::new(None);
+
+/// The npm tag the rc line installs from: the one the last check resolved, or
+/// a fresh check when there has been none this session, and `latest` when the
+/// registry cannot be asked — what the scripts take with no `-RcTag` at all.
+fn rc_tag(app: &AppHandle) -> &'static str {
+    if let Some(tag) = *RC_TAG.lock().unwrap() {
+        return tag;
+    }
+    tags(app).map_or(Channel::Rc.tag(), |tags| tags.rc_tag)
+}
+
+/// The npm tag the channel in use installs from.
+fn channel_tag(app: &AppHandle) -> &'static str {
+    match crate::settings::dsh_channel(app) {
+        Channel::Rc => rc_tag(app),
+        channel => channel.tag(),
     }
 }
 
@@ -1501,7 +1551,9 @@ pub fn tags(app: &AppHandle) -> Option<Tags> {
             let _ = send.send(printed(ask, CHECK_TIMEOUT).and_then(|text| read_tags(&text)));
         });
     }
-    receive.iter().take(count).flatten().next()
+    let tags = receive.iter().take(count).flatten().next()?;
+    *RC_TAG.lock().unwrap() = Some(tags.rc_tag);
+    Some(tags)
 }
 
 /// The parsing half of [`tags`], without the npm a test cannot run.
@@ -1514,10 +1566,17 @@ fn read_tags(printed: &str) -> Option<Tags> {
             .and_then(|text| Version::parse(text).ok())
     };
 
+    // No `latest` is a package this app cannot install at all, so there is
+    // nothing to answer with.
+    let latest = tag(Channel::Rc.tag())?;
+    let (rc, rc_tag) = match tag(NEXT) {
+        Some(next) if next > latest => (next, NEXT),
+        _ => (latest, Channel::Rc.tag()),
+    };
+
     Some(Tags {
-        // No `latest` is a package this app cannot install at all, so there is
-        // nothing to answer with.
-        rc: tag(Channel::Rc.tag())?,
+        rc,
+        rc_tag,
         alpha: tag(Channel::Alpha.tag()),
     })
 }
@@ -1850,8 +1909,9 @@ fn confirm(app: &AppHandle, installed: &Version, latest: &Version) -> bool {
 /// actually installed it with.
 fn tell(app: &AppHandle, installed: &Version, latest: &Version) {
     // The channel's tag rather than a bare `@latest`: on the alpha line that
-    // command would quietly move the user back onto the release candidates.
-    let command = update_command(crate::settings::dsh_channel(app));
+    // command would quietly move the user back onto the release candidates,
+    // and on the rc line it would miss an rc published under `next`.
+    let command = update_command(channel_tag(app));
     crate::dialog::ask(
         app,
         crate::dialog::Ask {
@@ -1884,8 +1944,8 @@ fn tell(app: &AppHandle, installed: &Version, latest: &Version) {
 }
 
 /// The command [`tell`] hands over, on the release line the user is on.
-fn update_command(channel: Channel) -> String {
-    format!("npm install -g {PACKAGE}@{}", channel.tag())
+fn update_command(tag: &str) -> String {
+    format!("npm install -g {PACKAGE}@{tag}")
 }
 
 /// The version the user turned down. Re-asking on every launch for a download
@@ -2385,12 +2445,18 @@ mod tests {
         // And the line in each that turns the channel into the npm tag. The rc
         // line is published under `latest`; a script that installed `@rc` would
         // name a tag that does not exist and fail every install.
+        // `-RcTag` may name `next` for the rc line, never for alpha, and with
+        // no flag the rc line stays on `latest`.
         assert!(
-            sh.contains("if [ \"$CHANNEL\" = alpha ]; then TAG=alpha; else TAG=latest; fi"),
+            sh.contains("if [ \"$CHANNEL\" = alpha ]; then TAG=alpha; else TAG=$RC_TAG; fi")
+                && sh.contains("RC_TAG='latest'")
+                && sh.contains("latest|next) RC_TAG=$2 ;;"),
             "install-deps.sh does not map the channel onto an npm tag"
         );
         assert!(
-            ps1.contains("$Tag = if ($Channel -eq 'alpha') { 'alpha' } else { 'latest' }"),
+            ps1.contains(
+                "$Tag = if ($Channel -eq 'alpha') { 'alpha' } elseif ($RcTag) { $RcTag } else { 'latest' }"
+            ) && ps1.contains("[ValidateSet('', 'latest', 'next')]"),
             "install-deps.ps1 does not map the channel onto an npm tag"
         );
 
@@ -2446,10 +2512,43 @@ mod tests {
         )
         .expect("a readable answer");
 
-        assert_eq!(tags.rc, Version::parse("0.1.5-rc.2").unwrap());
+        // `next` is ahead of `latest`, so it is what the rc line resolves to.
+        assert_eq!(tags.rc, Version::parse("0.1.5-rc.3").unwrap());
+        assert_eq!(tags.tag_on(Channel::Rc), "next");
         assert_eq!(tags.alpha, Some(Version::parse("0.1.7-alpha.1").unwrap()));
-        // `next` is a tag this app has no opinion about and does not read.
+        assert_eq!(tags.tag_on(Channel::Alpha), "alpha");
         assert!(tags.alpha_is_ahead());
+    }
+
+    /// The shape 0.2.1-rc.1 shipped in: the new rc under `next` only, with
+    /// `latest` left on the previous version's rc.
+    #[test]
+    fn an_rc_published_under_next_is_found() {
+        let tags = super::read_tags(
+            r#"{"latest":"0.2.0-rc.2","alpha":"0.2.1-alpha.5","next":"0.2.1-rc.2"}"#,
+        )
+        .expect("a readable answer");
+
+        assert_eq!(tags.on(Channel::Rc), Version::parse("0.2.1-rc.2").unwrap());
+        assert_eq!(tags.tag_on(Channel::Rc), "next");
+        // `0.2.1-alpha.5` sorts before `0.2.1-rc.2`: the rc line has overtaken it.
+        assert!(!tags.alpha_is_ahead());
+    }
+
+    /// A `next` left behind once `latest` has moved past it is ignored, and so
+    /// is one that cannot be read.
+    #[test]
+    fn a_stale_or_unreadable_next_leaves_latest() {
+        for text in [
+            r#"{"latest":"0.2.1","next":"0.2.1-rc.2"}"#,
+            r#"{"latest":"0.2.1","next":"0.2.1"}"#,
+            r#"{"latest":"0.2.1","next":"not a version"}"#,
+            r#"{"latest":"0.2.1"}"#,
+        ] {
+            let tags = super::read_tags(text).expect("a readable answer");
+            assert_eq!(tags.rc, Version::parse("0.2.1").unwrap(), "for {text:?}");
+            assert_eq!(tags.rc_tag, "latest", "for {text:?}");
+        }
     }
 
     /// A package with no alpha, and every way the answer can be unusable. None
@@ -2489,6 +2588,7 @@ mod tests {
         let ahead = |rc: &str, alpha: &str| {
             super::Tags {
                 rc: Version::parse(rc).unwrap(),
+                rc_tag: "latest",
                 alpha: Some(Version::parse(alpha).unwrap()),
             }
             .alpha_is_ahead()
@@ -3106,12 +3206,16 @@ mod tests {
     #[test]
     fn the_update_command_follows_the_channel() {
         assert_eq!(
-            super::update_command(Channel::Rc),
+            super::update_command(Channel::Rc.tag()),
             "npm install -g @deepseek-ai/dsh@latest"
         );
         assert_eq!(
-            super::update_command(Channel::Alpha),
+            super::update_command(Channel::Alpha.tag()),
             "npm install -g @deepseek-ai/dsh@alpha"
+        );
+        assert_eq!(
+            super::update_command(super::NEXT),
+            "npm install -g @deepseek-ai/dsh@next"
         );
     }
 }
