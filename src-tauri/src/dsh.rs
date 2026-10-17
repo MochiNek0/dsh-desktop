@@ -50,6 +50,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1413,9 +1414,58 @@ fn hint(message: &str) -> Option<&'static str> {
     }
 }
 
-/// Kill a bootstrap that is still running. Called on the way out: npm holds no
-/// state worth saving, and left alone it would keep unpacking into a directory
-/// this process no longer owns.
+/// Ask before a quit that would cut a running install or update short, and
+/// answer whether the quit has been held for that. The `remote::confirm_exit`
+/// of installs.
+///
+/// npm replaces a global package in place: the old dsh is taken apart, and its
+/// `dsh.cmd` removed, before the new one is finished. Killed in between, it
+/// leaves neither, and no rollback — the machine has no dsh until something
+/// installs one again. That happened to an update to 0.2.1-rc.2 whose progress
+/// bar sat at the end for minutes and was taken for hung.
+pub fn confirm_exit(app: &AppHandle, code: Option<i32>) -> bool {
+    /// Set by the answer, so the `app.exit` it triggers is not asked again.
+    static LEAVING: AtomicBool = AtomicBool::new(false);
+
+    if LEAVING.load(Ordering::Relaxed) || RUNNING.lock().unwrap().is_none() {
+        return false;
+    }
+
+    // Parked in the tray, the window would draw a question nobody sees.
+    crate::reveal(app);
+
+    let app_for_answer = app.clone();
+    crate::dialog::ask(
+        app,
+        crate::dialog::Ask {
+            title: t!("dsh 正在安装", "dsh is being installed").to_string(),
+            body: t!(
+                "现在退出会中断 npm，已经装了一半的 dsh 会无法使用，要重新安装才能恢复。安装可能要几分钟，建议等它完成。",
+                "Quitting now stops npm part way, which leaves dsh unusable until it is \
+                 installed again. The install can take a few minutes; it is best to let it finish."
+            )
+            .to_string(),
+            choices: vec![
+                crate::dialog::Choice::new("quit", t!("仍然退出", "Quit anyway")),
+                crate::dialog::Choice::primary("stay", t!("等待完成", "Wait for it")),
+            ],
+            answered: Box::new(move |_app, id| {
+                if id == "quit" {
+                    LEAVING.store(true, Ordering::Relaxed);
+                    if code == Some(tauri::RESTART_EXIT_CODE) {
+                        app_for_answer.request_restart();
+                    } else {
+                        app_for_answer.exit(code.unwrap_or(0));
+                    }
+                }
+            }),
+        },
+    )
+}
+
+/// Kill a bootstrap that is still running. Called on the way out, once
+/// [`confirm_exit`] has let the quit through: left alone it would keep
+/// unpacking into a directory this process no longer owns.
 pub fn stop() {
     if let Some(mut running) = RUNNING.lock().unwrap().take() {
         crate::server::kill_tree(&mut running.child);

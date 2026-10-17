@@ -474,7 +474,17 @@ FunctionEnd
 
 
 Function DshFinishCreate
-  ${IfThen} $PassiveMode = 1 ${|} Abort ${|}
+  ; Passive -- the app's own updater, `/P /R` -- has no finish page. But NSIS
+  ; sets the outer buttons up for every page it enters before calling the
+  ; page's function: the Back button shown again, Next and Cancel re-enabled,
+  ; both for the completed page it passes through and for this one. Nothing
+  ; hides them after that, and the window stays up while `.onInstSuccess`
+  ; starts the app, so they sat over the progress page at the very end. They
+  ; go again here, the last thing to run before the window closes.
+  ${If} $PassiveMode = 1
+    Call DshHideSiblings
+    Abort
+  ${EndIf}
 
   nsDialogs::Create 1018
   Pop $DshPage

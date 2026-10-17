@@ -245,7 +245,16 @@ $ProbeBytes = 2MB
 # tarballs have come back against how many are expected. Approximate by
 # construction, and held short of the end rather than allowed to claim more than
 # it knows.
+#
+# npm logs each package twice over an install: once for its metadata while it
+# resolves the tree, once for its tarball while it unpacks. Counting both
+# against this one number had the bar at the ceiling half way through -- 1261
+# lines for 0.2.1-rc.2's 611 packages -- and then still for minutes of
+# unpacking, long enough to look hung and be closed, which killed npm part way
+# through replacing the dsh that was there. So the two are counted apart, and
+# the metadata only gets the first `$ResolveShare` of the bar.
 $PackageCount = 600
+$ResolveShare = 0.3
 $ProgressCeiling = 99
 
 # ---------------------------------------------------------------- reporting --
@@ -878,6 +887,7 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
 
     # Script scope, and reset here rather than left over: a retry against the
     # next registry starts its count from zero, the same as its bar does.
+    $script:resolved = 0
     $script:fetched = 0
     $script:NpmCode = ''
     $script:NpmSaid = ''
@@ -896,9 +906,14 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
                 # `fetch GET 200` is a package coming off the network, `cache` one
                 # npm already had. Counting both keeps the bar moving on a machine
                 # that has installed dsh before — an update, or a reinstall.
+                # A `.tgz` is a tarball; anything else is metadata. See
+                # `$ResolveShare`.
                 if ($line -match 'npm http (fetch GET 200|cache) ') {
-                    $script:fetched++
-                    Report ([Math]::Min($From + ($To - $From) * ($script:fetched / $PackageCount), $ProgressCeiling))
+                    if ($line -match '\.tgz\b') { $script:fetched++ } else { $script:resolved++ }
+                    $split = ($To - $From) * $ResolveShare
+                    $done = $split * [Math]::Min($script:resolved / $PackageCount, 1) +
+                        ($To - $From - $split) * [Math]::Min($script:fetched / $PackageCount, 1)
+                    Report ([Math]::Min($From + $done, $ProgressCeiling))
                 } elseif ($line -match '^npm (?:error|ERR!) code (\S+)') {
                     # npm 10.6 and up spell it `npm error`; everything older
                     # `npm ERR!`. The npm running this is the user's, so both.

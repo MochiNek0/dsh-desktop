@@ -218,8 +218,12 @@ fn main() {
         // but coming down silently is what makes it the same experience as
         // having remembered to switch it off, which is how a user learns that
         // leaving it on costs nothing. See `remote::confirm_exit`.
+        //
+        // Asked first whether an install is running, since quitting through one
+        // breaks dsh rather than merely stopping something. See
+        // `dsh::confirm_exit`.
         tauri::RunEvent::ExitRequested { code, api, .. } => {
-            if remote::confirm_exit(handle, code) {
+            if dsh::confirm_exit(handle, code) || remote::confirm_exit(handle, code) {
                 api.prevent_exit();
             } else if let Some(window) = handle.get_webview_window("main") {
                 placement::save(handle, &window);

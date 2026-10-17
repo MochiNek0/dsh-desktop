@@ -251,7 +251,15 @@ PROBE_BYTES=2097152
 # tarballs have come back against how many are expected. Approximate by
 # construction, and held short of the end rather than allowed to claim more than
 # it knows.
+#
+# npm logs each package twice over an install: once for its metadata while it
+# resolves the tree, once for its tarball while it unpacks. Counting both
+# against this one number had the bar at the ceiling half way through and then
+# still for minutes of unpacking, long enough to look hung and be closed. So the
+# two are counted apart, and the metadata only gets the first RESOLVE_SHARE
+# percent of the bar. Same as `$ResolveShare` in `install-deps.ps1`.
 PACKAGE_COUNT=600
+RESOLVE_SHARE=30
 PROGRESS_CEILING=99
 
 # The block versions up to 0.1.2 appended to the user's shell profile, and how
@@ -923,13 +931,19 @@ npm_install() {
     } | {
         # A subshell of its own: the count only has to live as long as the pipe,
         # and nothing after it reads the count.
+        resolved=0
         fetched=0
+        split=$(((to - from) * RESOLVE_SHARE / 100))
         while IFS= read -r line; do
             say "$line"
             case "$line" in
                 *'npm http fetch GET 200 '*|*'npm http cache '*)
-                    fetched=$((fetched + 1))
-                    percent=$((from + (to - from) * fetched / PACKAGE_COUNT))
+                    # A `.tgz` is a tarball; anything else is metadata.
+                    case "$line" in
+                        *'.tgz '*) [ "$fetched" -ge "$PACKAGE_COUNT" ] || fetched=$((fetched + 1)) ;;
+                        *) [ "$resolved" -ge "$PACKAGE_COUNT" ] || resolved=$((resolved + 1)) ;;
+                    esac
+                    percent=$((from + split * resolved / PACKAGE_COUNT + (to - from - split) * fetched / PACKAGE_COUNT))
                     if [ "$percent" -gt "$PROGRESS_CEILING" ]; then
                         percent=$PROGRESS_CEILING
                     fi
