@@ -147,13 +147,23 @@ Function DshSetup
 FunctionEnd
 
 ; Hide every visible control of the outer window except the current page.
+;
+; Visible by the control's own WS_VISIBLE, not `IsWindowVisible`, which also
+; asks whether every parent is: on the first page shown the outer window is
+; not yet, so it said no for everything and nothing was hidden. That first
+; page is the progress page in passive mode -- the app's own updater -- and
+; there MUI2's header, buttons and branding line stayed up the whole run,
+; behind a page that covers them until something repaints them on top of it.
+; Finishing the install is what does: they showed up over the full bar.
 Function DshHideSiblings
   StrCpy $0 0
   loop:
     FindWindow $0 "" "" $HWNDPARENT $0
     StrCmp $0 0 done
     StrCmp $0 $DshPage loop
-    System::Call "user32::IsWindowVisible(p r0) i .r1"
+    ; GWL_STYLE, WS_VISIBLE.
+    System::Call "user32::GetWindowLongW(p r0, i -16) i .r1"
+    IntOp $1 $1 & 0x10000000
     IntCmp $1 0 loop
     ShowWindow $0 ${SW_HIDE}
     Goto loop
@@ -454,6 +464,17 @@ Function DshProgressShow
   System::Call "user32::SetWindowPos(p r0, p 0, i r1, i r3, i r2, i r7, i 0x34)"
 FunctionEnd
 
+; MUI2's instfiles page, as a MUI_PAGE_CUSTOMFUNCTION_LEAVE.
+;
+; Passive -- the app's own updater, `/P /R` -- has nothing to show once the
+; files are in: `.onInstSuccess` is about to start the app. So the window goes
+; here, the last moment before NSIS moves on and brings its Back button back
+; for the next page, which flashed over the full bar. Left up any longer it
+; went on to show an empty grey window for as long as the app took to start.
+Function DshProgressLeave
+  ${IfThen} $PassiveMode = 1 ${|} HideWindow ${|}
+FunctionEnd
+
 ; ---------------------------------------------------------------- finish --
 
 ; Create the desktop shortcut and start the app, each if its box is ticked,
@@ -474,17 +495,9 @@ FunctionEnd
 
 
 Function DshFinishCreate
-  ; Passive -- the app's own updater, `/P /R` -- has no finish page. But NSIS
-  ; sets the outer buttons up for every page it enters before calling the
-  ; page's function: the Back button shown again, Next and Cancel re-enabled,
-  ; both for the completed page it passes through and for this one. Nothing
-  ; hides them after that, and the window stays up while `.onInstSuccess`
-  ; starts the app, so they sat over the progress page at the very end. They
-  ; go again here, the last thing to run before the window closes.
-  ${If} $PassiveMode = 1
-    Call DshHideSiblings
-    Abort
-  ${EndIf}
+  ; Passive has no finish page; its window is already gone, see
+  ; `DshProgressLeave`.
+  ${IfThen} $PassiveMode = 1 ${|} Abort ${|}
 
   nsDialogs::Create 1018
   Pop $DshPage

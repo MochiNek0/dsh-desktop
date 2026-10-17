@@ -246,15 +246,26 @@ $ProbeBytes = 2MB
 # construction, and held short of the end rather than allowed to claim more than
 # it knows.
 #
-# npm logs each package twice over an install: once for its metadata while it
-# resolves the tree, once for its tarball while it unpacks. Counting both
-# against this one number had the bar at the ceiling half way through -- 1261
-# lines for 0.2.1-rc.2's 611 packages -- and then still for minutes of
-# unpacking, long enough to look hung and be closed, which killed npm part way
-# through replacing the dsh that was there. So the two are counted apart, and
-# the metadata only gets the first `$ResolveShare` of the bar.
+# The log alone cannot carry the bar to the end, though. npm logs each package
+# twice -- its metadata while it resolves the tree, its tarball as it starts
+# unpacking it -- and then goes quiet while the files are written. For
+# 0.2.1-rc.2 that is 63,000-odd files and, on a Windows machine with a virus
+# scanner reading each one, four minutes in which the log says nothing at all.
+# A bar driven by the log alone sat at the ceiling for all of them, long enough
+# to look hung and be closed -- which killed npm part way through replacing the
+# dsh that was there, and left none.
+#
+# So the bar has three parts: the metadata lines, the tarball lines, and then
+# the files on disk, counted every couple of seconds in the directory npm is
+# writing the package into, against how many the dsh being replaced had. Each
+# share is roughly how long that part took on the install that went wrong.
 $PackageCount = 600
-$ResolveShare = 0.3
+$ResolveShare = 0.2
+$FetchShare = 0.2
+$WriteShare = 0.6
+# What a fresh install expects to write, with no dsh already there to count.
+$FileCount = 64000
+$CountEvery = [TimeSpan]::FromSeconds(2)
 $ProgressCeiling = 99
 
 # ---------------------------------------------------------------- reporting --
@@ -318,6 +329,73 @@ function Invoke-Native([string] $Exe, [string[]] $Arguments, [scriptblock] $OnLi
         return ($LASTEXITCODE -eq 0)
     } finally {
         $ErrorActionPreference = $was
+    }
+}
+
+# `Invoke-Native`, for a command that can go quiet for minutes: `$OnTick` runs
+# about every `$Every` whether or not anything was printed. A pipeline only
+# hands over control when a line arrives, so the child is started by hand and
+# its two streams are read a line at a time, waiting at most `$Every` for each.
+#
+# Every line goes through `$OnLine` and the log here, on this thread: callbacks
+# from the process's own reader threads would run with no runspace, which
+# Windows PowerShell 5.1 does not survive.
+function Invoke-Watched([string] $Exe, [string[]] $Arguments, [scriptblock] $OnLine, [scriptblock] $OnTick, [TimeSpan] $Every) {
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $Exe
+    # Quoted the way `CommandLineToArgvW` reads it back, which is how Node
+    # splits its command line: a path under `Program Files` is one argument.
+    $start.Arguments = ($Arguments | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' } else { $_ }
+        }) -join ' '
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $start.StandardErrorEncoding = [Text.Encoding]::UTF8
+
+    $process = [Diagnostics.Process]::Start($start)
+    $streams = @($process.StandardOutput, $process.StandardError)
+    $reading = @{}
+    foreach ($stream in $streams) { $reading[$stream] = $stream.ReadLineAsync() }
+
+    $ticked = [Diagnostics.Stopwatch]::StartNew()
+    while ($reading.Count) {
+        [void] [Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]] @($reading.Values), $Every)
+        foreach ($stream in @($reading.Keys)) {
+            $task = $reading[$stream]
+            if (-not $task.IsCompleted) { continue }
+            $line = $task.Result
+            if ($null -eq $line) {
+                $reading.Remove($stream)
+                continue
+            }
+            if ($OnLine) { & $OnLine $line }
+            Say $line
+            $reading[$stream] = $stream.ReadLineAsync()
+        }
+        if ($ticked.Elapsed -ge $Every) {
+            & $OnTick
+            $ticked.Restart()
+        }
+    }
+
+    $process.WaitForExit()
+    return ($process.ExitCode -eq 0)
+}
+
+# How many files are under `$Dir`, or `$null` while it is not there to count --
+# npm moves a package aside and back as it replaces it.
+function Count-Files([string] $Dir) {
+    try {
+        if (-not [IO.Directory]::Exists($Dir)) { return $null }
+        $count = 0
+        foreach ($file in [IO.Directory]::EnumerateFiles($Dir, '*', [IO.SearchOption]::AllDirectories)) { $count++ }
+        return $count
+    } catch {
+        # A directory npm removed in the middle of the walk.
+        return $null
     }
 }
 
@@ -889,8 +967,28 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
     # next registry starts its count from zero, the same as its bar does.
     $script:resolved = 0
     $script:fetched = 0
+    $script:written = 0
     $script:NpmCode = ''
     $script:NpmSaid = ''
+
+    # Where the package's files land, and how many to expect there: as many as
+    # the dsh this replaces, or `$FileCount` if that is more. Guessing high
+    # costs a jump at the end; guessing low is the bar standing still, which is
+    # what all this is for -- and the guess from the old version is low exactly
+    # when it matters, 0.2.0's 27,000 files to 0.2.1's 64,000. On Windows a
+    # `-g` install puts `node_modules` straight under the prefix.
+    $root = $Prefix
+    if (-not $root) { $root = Get-Prefix $Exe $Cli }
+    $target = Join-Path (Join-Path $root 'node_modules') $Package
+    $expected = [Math]::Max([int] (Count-Files $target), $FileCount)
+
+    $span = $To - $From
+    $progress = {
+        $done = $ResolveShare * [Math]::Min($script:resolved / $PackageCount, 1) +
+            $FetchShare * [Math]::Min($script:fetched / $PackageCount, 1) +
+            $WriteShare * [Math]::Min($script:written / $expected, 1)
+        Report ([Math]::Min($From + $span * $done, $ProgressCeiling))
+    }
 
     # npm runs a dependency's `install` script through the shell, and the ones
     # that build something spell it `node ...` — resolved off PATH, not from the
@@ -901,19 +999,16 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
     $was = $env:Path
     $env:Path = (Split-Path -Parent $Exe) + [IO.Path]::PathSeparator + $env:Path
     try {
-        return (Invoke-Native $Exe $arguments {
+        return (Invoke-Watched $Exe $arguments {
                 param($line)
                 # `fetch GET 200` is a package coming off the network, `cache` one
                 # npm already had. Counting both keeps the bar moving on a machine
                 # that has installed dsh before — an update, or a reinstall.
                 # A `.tgz` is a tarball; anything else is metadata. See
-                # `$ResolveShare`.
+                # `$PackageCount`.
                 if ($line -match 'npm http (fetch GET 200|cache) ') {
                     if ($line -match '\.tgz\b') { $script:fetched++ } else { $script:resolved++ }
-                    $split = ($To - $From) * $ResolveShare
-                    $done = $split * [Math]::Min($script:resolved / $PackageCount, 1) +
-                        ($To - $From - $split) * [Math]::Min($script:fetched / $PackageCount, 1)
-                    Report ([Math]::Min($From + $done, $ProgressCeiling))
+                    & $progress
                 } elseif ($line -match '^npm (?:error|ERR!) code (\S+)') {
                     # npm 10.6 and up spell it `npm error`; everything older
                     # `npm ERR!`. The npm running this is the user's, so both.
@@ -923,7 +1018,16 @@ function Invoke-NpmInstall([string] $Exe, [string] $Cli, [string] $Spec, [string
                     # what npm could not find.
                     $script:NpmSaid = $Matches[1].Trim()
                 }
-            })
+            } {
+                # Only once the tarballs are coming: before that the directory
+                # holds the dsh being replaced, which is not progress. Never
+                # backwards, for the moments npm has it moved aside.
+                if ($script:fetched) {
+                    $count = Count-Files $target
+                    if ($count -gt $script:written) { $script:written = $count }
+                }
+                & $progress
+            } $CountEvery)
     } finally {
         $env:Path = $was
     }

@@ -406,6 +406,7 @@ Var AppStartMenuFolder
 ;
 ; dsh: restyled to match our other pages.
 !define MUI_PAGE_CUSTOMFUNCTION_SHOW DshProgressShow
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE DshProgressLeave
 !insertmacro MUI_PAGE_INSTFILES
 
 ; 8. Finish page

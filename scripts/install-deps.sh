@@ -252,14 +252,21 @@ PROBE_BYTES=2097152
 # construction, and held short of the end rather than allowed to claim more than
 # it knows.
 #
-# npm logs each package twice over an install: once for its metadata while it
-# resolves the tree, once for its tarball while it unpacks. Counting both
-# against this one number had the bar at the ceiling half way through and then
-# still for minutes of unpacking, long enough to look hung and be closed. So the
-# two are counted apart, and the metadata only gets the first RESOLVE_SHARE
-# percent of the bar. Same as `$ResolveShare` in `install-deps.ps1`.
+# The log alone cannot carry the bar to the end, though: npm logs each
+# package's metadata while it resolves the tree and its tarball as it starts
+# unpacking it, and then goes quiet while 60,000-odd files are written. So the
+# bar has three parts -- the metadata lines, the tarball lines, and the files
+# on disk, counted every couple of seconds -- in the shares below, out of 100.
+# See `$PackageCount` in `install-deps.ps1`, which has the story; the two
+# scripts draw the same bar.
 PACKAGE_COUNT=600
-RESOLVE_SHARE=30
+RESOLVE_SHARE=20
+FETCH_SHARE=20
+WRITE_SHARE=60
+# What a fresh install expects to write, and the least any install expects:
+# see `$FileCount` in `install-deps.ps1`.
+FILE_COUNT=64000
+COUNT_EVERY=2
 PROGRESS_CEILING=99
 
 # The block versions up to 0.1.2 appended to the user's shell profile, and how
@@ -914,6 +921,16 @@ npm_install() {
     fi
     set -- "$@" "$PACKAGE@$TAG"
 
+    # Where the package's files land, and how many to expect there: as many as
+    # the dsh this replaces, or FILE_COUNT if that is more -- guessing high
+    # costs a jump at the end, guessing low a bar standing still.
+    target="$prefix/lib/node_modules/$PACKAGE"
+    expected=$FILE_COUNT
+    if [ -d "$target" ]; then
+        before=$(find "$target" -type f 2>/dev/null | wc -l | tr -d ' ')
+        [ "$before" -le "$expected" ] || expected=$before
+    fi
+
     {
         # stdin off the null device, not inherited: the caller's loop is reading
         # its registry list from a here-document, and a child that touched stdin
@@ -926,24 +943,53 @@ npm_install() {
         # unpacked, so without this every package with a build step dies with
         # `sh: 1: node: not found`; koffi and node-pty both do, and npm then
         # rolls the whole install back.
+        #
+        # Beside it, the file count for the bar's last part: a line of our own
+        # into the same pipe every COUNT_EVERY seconds, so the reader below
+        # hears something while npm says nothing.
+        (
+            while :; do
+                sleep "$COUNT_EVERY"
+                if [ -d "$target" ]; then
+                    printf '::files %s\n' "$(find "$target" -type f 2>/dev/null | wc -l | tr -d ' ')"
+                fi
+            done
+        ) &
+        counter=$!
         PATH="$(dirname "$node"):$PATH" "$node" "$@" 2>&1 < /dev/null
         printf '%s\n' "$?" > "$code_file"
+        kill "$counter" 2>/dev/null
     } | {
         # A subshell of its own: the count only has to live as long as the pipe,
         # and nothing after it reads the count.
         resolved=0
         fetched=0
-        split=$(((to - from) * RESOLVE_SHARE / 100))
+        written=0
         while IFS= read -r line; do
-            say "$line"
             case "$line" in
-                *'npm http fetch GET 200 '*|*'npm http cache '*)
+                # Ours, from the counter above. Only once the tarballs are
+                # coming -- before that the directory holds the dsh being
+                # replaced -- and never backwards.
+                '::files '*)
+                    count=${line#::files }
+                    if [ "$fetched" -gt 0 ] && [ "$count" -gt "$written" ]; then
+                        written=$count
+                    fi
+                    [ "$written" -le "$expected" ] || written=$expected
+                    ;;
+                *) say "$line" ;;
+            esac
+            case "$line" in
+                '::files '*|*'npm http fetch GET 200 '*|*'npm http cache '*)
                     # A `.tgz` is a tarball; anything else is metadata.
                     case "$line" in
+                        '::files '*) ;;
                         *'.tgz '*) [ "$fetched" -ge "$PACKAGE_COUNT" ] || fetched=$((fetched + 1)) ;;
                         *) [ "$resolved" -ge "$PACKAGE_COUNT" ] || resolved=$((resolved + 1)) ;;
                     esac
-                    percent=$((from + split * resolved / PACKAGE_COUNT + (to - from - split) * fetched / PACKAGE_COUNT))
+                    # Hundredths of a percent, so the parts add up in integers.
+                    share=$((RESOLVE_SHARE * 100 * resolved / PACKAGE_COUNT + FETCH_SHARE * 100 * fetched / PACKAGE_COUNT + WRITE_SHARE * 100 * written / expected))
+                    percent=$((from + (to - from) * share / 10000))
                     if [ "$percent" -gt "$PROGRESS_CEILING" ]; then
                         percent=$PROGRESS_CEILING
                     fi
