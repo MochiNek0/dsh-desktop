@@ -82,6 +82,26 @@ const DOT: u32 = 12;
 const DOT_GAP: u32 = 8;
 const ROW_PAD: u32 = 14;
 
+/// Whether the window keeps the system's own three buttons, which is macOS
+/// only. A borderless window there loses its rounded corners and shadow along
+/// with the frame, so the frame stays, with its title bar made transparent
+/// over the page; and a frame that stays brings its traffic lights. The page
+/// draws no dots of its own beside them, only leaves the room they sit in.
+/// See [`traffic_lights`].
+const NATIVE_LIGHTS: bool = cfg!(target_os = "macos");
+
+/// The width the system's three take up: 14px buttons, 20px from the start of
+/// one to the next, which is the same pitch as `DOT` plus `DOT_GAP`.
+const NATIVE_LIGHTS_WIDTH: u32 = 54;
+
+/// Where the system's buttons go: at the start of the row the page's own dots
+/// would have filled, and centred down the bar. The y is the inset above the
+/// 14px buttons, not their centre.
+#[cfg(target_os = "macos")]
+pub fn traffic_lights() -> tauri::LogicalPosition<f64> {
+    tauri::LogicalPosition::new(ROW_PAD as f64, ((TITLEBAR_HEIGHT - 14) / 2) as f64)
+}
+
 /// The menu's typeface. Named rather than left to the webview, whose default for
 /// a bare `<button>` is a serif face at a size of its own choosing.
 pub(crate) const FONT: &str =
@@ -1115,6 +1135,8 @@ pub fn script() -> String {
     let icons = lucide();
     let watcher = theme_watcher("dsh-wc-dark");
     let corners = corners(&["dsh-wc", "dsh-wc-set", "dsh-wc-scrim"]);
+    let native_lights = NATIVE_LIGHTS;
+    let native_width = NATIVE_LIGHTS_WIDTH;
 
     format!(
         r#"(function () {{
@@ -1608,14 +1630,22 @@ pub fn script() -> String {
       return button;
     }}
 
-    // macOS order, left to right.
-    add('close', ICONS.close, 'dsh-wc-close');
-    add('minimize', ICONS.minimize, 'dsh-wc-min');
-    var zoom = add('maximize', ICONS.maximize, 'dsh-wc-max');
+    // macOS order, left to right. Not on macOS itself, where the system's own
+    // three are there instead and the row is only the room they take up; see
+    // `NATIVE_LIGHTS`. With no dots in it, the magnification below has nothing
+    // to move.
+    var zoom = null;
+    if ({native_lights}) {{
+      row.style.width = '{native_width}px';
+    }} else {{
+      add('close', ICONS.close, 'dsh-wc-close');
+      add('minimize', ICONS.minimize, 'dsh-wc-min');
+      zoom = add('maximize', ICONS.maximize, 'dsh-wc-max');
+    }}
 
     // Called from Rust on every resize; see `sync`.
     window.__dshMaximized = function (maximized) {{
-      zoom.innerHTML = svg(maximized ? ICONS.restore : ICONS.maximize);
+      if (zoom) zoom.innerHTML = svg(maximized ? ICONS.restore : ICONS.maximize);
     }};
 
     // ------------------------------------------------------------- the menu --

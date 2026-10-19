@@ -246,6 +246,12 @@ fn main() {
                 folder::open(handle, dir);
             }
         }
+        // The Dock icon clicked. The close button only parks the window (see
+        // `park`), so this is how it comes back on macOS, as every other app's
+        // does; the tray is there too, but up in the menu bar where nobody
+        // thinks to look for a window they just closed.
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => reveal(handle),
         _ => {}
     });
 }
@@ -300,7 +306,7 @@ fn build_window(
     let new_window_origin = origin.clone();
     let page_origin = origin.clone();
 
-    let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+    let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("dsh desktop")
         .inner_size(1360.0, 900.0)
         .min_inner_size(720.0, 520.0)
@@ -320,7 +326,11 @@ fn build_window(
         // No frame: minimise, maximise and close are drawn into the page by
         // `controls`, which carries its own colours and so needs nothing out
         // here to repaint it when dsh changes theme.
-        .decorations(false)
+        //
+        // Except on macOS, where a window with no frame is a borderless one and
+        // gets square corners and no shadow. There the frame stays, made
+        // transparent over the page below, and so do its own three buttons.
+        .decorations(cfg!(target_os = "macos"))
         // Not a frame colour — there is no frame — but the answer every media
         // query in the webview gets, dsh's own included: tauri-runtime-wry
         // creates the webview with `with_theme(window.theme())`, so this is the
@@ -456,8 +466,18 @@ fn build_window(
                 let _ = new_window_opener.opener().open_url(url.to_string(), None::<&str>);
             }
             NewWindowResponse::Deny
-        })
-        .build()?;
+        });
+
+    // The frame kept above, with its title bar drawn over the page instead of
+    // above it: the corners and shadow of a real window, and the traffic lights
+    // where the page's own dots are everywhere else. See `controls::NATIVE_LIGHTS`.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(controls::traffic_lights());
+
+    let window = builder.build()?;
 
     // Where it was last time, while it is still hidden.
     placement::restore(app, &window);
