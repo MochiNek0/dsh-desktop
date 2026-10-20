@@ -10,8 +10,10 @@
 #
 # Nothing here needs elevation, which is the point of downloading the standalone
 # Node zip rather than running the official MSI. The zip goes under
-# %LOCALAPPDATA%, `npm install -g` writes to a per-user prefix, and the only
-# thing touched outside our own directory is HKCU\Environment's Path.
+# %LOCALAPPDATA%, and `npm install -g` writes to a per-user prefix. Nothing is
+# added to the user's PATH; the only thing touched outside our own directory is
+# HKCU\Environment's Path, to take back off it the entries older versions added
+# (see `Remove-Path`).
 #
 # No mode here picks a Node. `switch` and `install-dsh` are handed the one the
 # user chose in the app's chooser, and `install-node` is the case where the user
