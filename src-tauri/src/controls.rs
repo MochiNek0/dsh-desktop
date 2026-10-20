@@ -95,11 +95,17 @@ const NATIVE_LIGHTS: bool = cfg!(target_os = "macos");
 const NATIVE_LIGHTS_WIDTH: u32 = 54;
 
 /// Where the system's buttons go: at the start of the row the page's own dots
-/// would have filled, and centred down the bar. The y is the inset above the
-/// 14px buttons, not their centre.
+/// would have filled, and centred down the bar.
+///
+/// The y is not the inset above the buttons. wry only makes the title bar's
+/// container `button height + y` tall and leaves each button where it sat
+/// from the container's bottom, which puts their centre at about `y + 2` from
+/// the top. Measured, not derived: 0.1.26-beta.1 asked for 11, as the inset
+/// it looked like, and drew them centred at 13, five points above the menu
+/// button beside them.
 #[cfg(target_os = "macos")]
 pub fn traffic_lights() -> tauri::LogicalPosition<f64> {
-    tauri::LogicalPosition::new(ROW_PAD as f64, ((TITLEBAR_HEIGHT - 14) / 2) as f64)
+    tauri::LogicalPosition::new(ROW_PAD as f64, (TITLEBAR_HEIGHT / 2 - 2) as f64)
 }
 
 /// The menu's typeface. Named rather than left to the webview, whose default for
@@ -1329,9 +1335,33 @@ pub fn script() -> String {
     }}
   }}, true);
 
+  // dsh's account sign-in opens a blank tab during the click and only points it
+  // at the authorize page once the host has handed one back. The window denies
+  // every new window, so that blank one came back null and the dialog sat on
+  // "waiting for sign-in" forever. What it gets instead is a stand-in that has
+  // no page of its own: wherever it is sent goes to the user's browser.
+  function deferredWindow() {{
+    var stub = {{
+      closed: false,
+      opener: null,
+      close: function () {{ stub.closed = true; }},
+      focus: function () {{}}
+    }};
+    function go(url) {{
+      if (!stub.closed && url && isExternal(String(url))) openExternal(String(url));
+    }}
+    var loc = {{ replace: go, assign: go }};
+    Object.defineProperty(loc, 'href', {{ get: function () {{ return 'about:blank'; }}, set: go }});
+    Object.defineProperty(stub, 'location', {{ get: function () {{ return loc; }}, set: go }});
+    return stub;
+  }}
+
   var origOpen = window.open;
   window.open = function (url, target, features) {{
-    if (url && isExternal(url)) {{
+    if (!url || String(url) === 'about:blank') {{
+      return deferredWindow();
+    }}
+    if (isExternal(url)) {{
       openExternal(url);
       return null;
     }}
