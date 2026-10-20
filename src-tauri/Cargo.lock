@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-desktop"
-version = "0.1.26-beta.2"
+version = "0.1.26-beta.3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
