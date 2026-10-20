@@ -214,7 +214,7 @@ mod platform {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::Placement;
-    use tauri::{LogicalPosition, LogicalSize, WebviewWindow};
+    use tauri::{LogicalPosition, LogicalSize, Manager, WebviewWindow};
 
     pub(super) fn read(window: &WebviewWindow) -> Option<Placement> {
         if window.is_minimized().unwrap_or(false) || window.is_fullscreen().unwrap_or(false) {
