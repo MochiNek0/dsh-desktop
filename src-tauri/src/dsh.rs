@@ -1519,14 +1519,6 @@ impl Tags {
             Channel::Alpha => self.alpha.clone().unwrap_or_else(|| self.rc.clone()),
         }
     }
-
-    /// The npm tag that installs what [`Tags::on`] answers for `channel`.
-    pub fn tag_on(&self, channel: Channel) -> &'static str {
-        match channel {
-            Channel::Rc => self.rc_tag,
-            Channel::Alpha => Channel::Alpha.tag(),
-        }
-    }
 }
 
 /// The dist-tag the release candidates of a new version go out under before
@@ -2564,9 +2556,8 @@ mod tests {
 
         // `next` is ahead of `latest`, so it is what the rc line resolves to.
         assert_eq!(tags.rc, Version::parse("0.1.5-rc.3").unwrap());
-        assert_eq!(tags.tag_on(Channel::Rc), "next");
+        assert_eq!(tags.rc_tag, "next");
         assert_eq!(tags.alpha, Some(Version::parse("0.1.7-alpha.1").unwrap()));
-        assert_eq!(tags.tag_on(Channel::Alpha), "alpha");
         assert!(tags.alpha_is_ahead());
     }
 
@@ -2580,7 +2571,7 @@ mod tests {
         .expect("a readable answer");
 
         assert_eq!(tags.on(Channel::Rc), Version::parse("0.2.1-rc.2").unwrap());
-        assert_eq!(tags.tag_on(Channel::Rc), "next");
+        assert_eq!(tags.rc_tag, "next");
         // `0.2.1-alpha.5` sorts before `0.2.1-rc.2`: the rc line has overtaken it.
         assert!(!tags.alpha_is_ahead());
     }
