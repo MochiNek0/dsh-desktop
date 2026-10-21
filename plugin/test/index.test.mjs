@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MOBILE_CSS, TRANSPORT, apply, downloaded, flag, homescreen, inject, override, rows, viewport } from '../lib/index.js';
+import { MOBILE_CSS, TRANSPORT, apply, downloaded, flag, homescreen, inject, override, rows, touch, viewport } from '../lib/index.js';
 
 // --- the tag itself ---
 {
@@ -102,10 +102,11 @@ import { MOBILE_CSS, TRANSPORT, apply, downloaded, flag, homescreen, inject, ove
   apply({ inject: (deps, callback) => { waited = deps; callback(scope); } });
 
   assert.deepEqual(waited, ['webServer'], 'and waits for it in a child fiber');
-  assert.equal(taps.length, 2, 'both taps registered');
-  assert.equal(effects.length, 2, 'through effects, so disposal takes them off');
+  assert.equal(taps.length, 3, 'all three taps registered');
+  assert.equal(effects.length, 3, 'through effects, so disposal takes them off');
   assert.ok(taps[0]('<head></head>').includes('name="viewport"'));
   assert.ok(taps[1]('<head></head>').includes('rel="manifest"'));
+  assert.ok(taps[2]('<head></head>').includes('font-size: 16px'));
   assert.deepEqual(
     Object.keys(listeners),
     ['webserver/index-inject'],
@@ -323,6 +324,10 @@ import { MOBILE_CSS, TRANSPORT, apply, downloaded, flag, homescreen, inject, ove
     return MOBILE_CSS.slice(at, MOBILE_CSS.indexOf('}', at));
   };
   assert.ok(MOBILE_CSS.includes('flex-direction: column'), 'the panel is stacked');
+  // dsh sizes the panel in `vh`, which iOS takes with Safari's bars put away:
+  // the panel overflows the screen and its close button goes under the bar.
+  assert.ok(rule('[class*="_panel"]:has(> nav[class*="_nav"]) {').includes('100dvh'),
+    'the panel fits the screen the bars leave');
   assert.ok(rule('> [class*="_content"]').includes('min-height: 0'),
     'so the content pane is let out of the min-height: auto floor');
 
@@ -456,6 +461,139 @@ import { MOBILE_CSS, TRANSPORT, apply, downloaded, flag, homescreen, inject, ove
   apply({ inject: () => { ran = true; } });
   assert.ok(ran, 'the entry itself still activates');
   console.log('ok  activates on a dsh whose composition has no webserver');
+}
+
+// --- no zoom on focus ---
+{
+  // iOS zooms the page onto any focused field set under 16px, and dsh's are 13
+  // and 14. The rule has to outrank a class, so it is `!important`, and it is
+  // gated on a touch screen so the desktop window keeps dsh's sizes.
+  const out = touch('<html><head><title>x</title></head><body></body></html>');
+  assert.ok(out.startsWith('<html><head><style>@media (hover: none) and (pointer: coarse) {'),
+    'first in the head, and only on a touch screen');
+  assert.ok(out.includes('font-size: 16px !important'), "iOS's threshold, over dsh's class");
+  assert.ok(out.includes('[contenteditable]:not([contenteditable="false"])'),
+    'an editor counts, a chip inside one does not');
+  assert.ok(!/[A-Za-z0-9-]{5,}_[a-z]/i.test(out.slice(0, out.indexOf('</style>'))),
+    'nothing of dsh named, so no release breaks it');
+  assert.equal(touch('<html><body></body></html>'), '<html><body></body></html>',
+    'no head, left alone');
+  console.log('ok  focusing a field does not zoom the phone');
+}
+
+// --- the model picker does not bring up the keyboard ---
+{
+  // Just enough of a browser to run the script: two capture listeners, a
+  // search box that names its list, and a list with a ticked row.
+  const script = touch('<head>').match(/<script>(.*)<\/script>/)[1];
+  const run = (coarse, sidebar = null) => {
+    const listeners = {};
+    class Element {
+      constructor(attrs = {}) { this.attrs = attrs; }
+      getAttribute(name) { return this.attrs[name] ?? null; }
+      contains(other) { return other === this; }
+      matches(sel) { return sel.includes(this.attrs.tag ?? 'input'); }
+      blur() { focused.push('blur'); }
+    }
+    class HTMLInputElement extends Element {}
+    const focused = [];
+    const ticked = { focus: () => focused.push('ticked') };
+    const list = { querySelector: (sel) => (sel.includes('aria-checked') ? ticked : null) };
+    const document = {
+      addEventListener: (type, fn, capture) => {
+        assert.equal(capture, true, 'seen before dsh sees it');
+        listeners[type] = fn;
+      },
+      getElementById: (id) => (id === 'm1-models' ? list : null),
+      querySelector: (sel) => (sel.includes(':not([data-sidebar-collapsed])') ? sidebar : null),
+    };
+    const window = { matchMedia: () => ({ matches: coarse }), innerWidth: 390 };
+    new Function('window', 'document', 'matchMedia', 'Element', 'HTMLInputElement', script)(
+      window, document, window.matchMedia, Element, HTMLInputElement);
+    return { listeners, focused, Element, HTMLInputElement };
+  };
+
+  const { listeners, focused, HTMLInputElement } = run(true);
+  const box = new HTMLInputElement({ role: 'searchbox', 'aria-controls': 'm1-models' });
+  listeners.pointerdown({ target: { trigger: true } });
+  listeners.focusin({ target: box });
+  assert.deepEqual(focused, ['ticked'], "dsh's focus goes to the ticked model, inside the picker");
+
+  listeners.pointerdown({ target: box });
+  listeners.focusin({ target: box });
+  assert.deepEqual(focused, ['ticked'], 'a tap on the box itself is someone asking to type');
+
+  const other = new HTMLInputElement({ role: 'searchbox', 'aria-controls': 'plugins' });
+  listeners.pointerdown({ target: null });
+  listeners.focusin({ target: other });
+  assert.deepEqual(focused, ['ticked'], "another search box is not the picker's");
+
+  assert.deepEqual(Object.keys(run(false).listeners), [], 'a desktop window keeps type-to-search');
+  console.log('ok  opening the model list does not bring up the keyboard');
+}
+
+// --- opening a session from the sidebar shuts the sidebar ---
+{
+  // Same fake as above, plus an open sidebar with its toggle in it. Opening a
+  // session or starting one ends with dsh focusing the composer, which is what
+  // the script watches for.
+  const script = touch('<head>').match(/<script>(.*)<\/script>/)[1];
+  const run = (open) => {
+    const listeners = {};
+    const done = [];
+    class Element {
+      constructor(tag) { this.tag = tag; }
+      contains(other) { return other === this; }
+      matches(sel) { return this.tag !== 'button' && sel.includes(this.tag); }
+      blur() { done.push('blur'); }
+      getAttribute() { return null; }
+    }
+    class HTMLInputElement extends Element {}
+    const toggle = { click: () => done.push('toggle') };
+    const row = new Element('button');
+    const searchInSidebar = new Element('input');
+    const sidebar = {
+      contains: (el) => el === row || el === searchInSidebar,
+      querySelector: (sel) => (sel.includes('_toggle') ? toggle : null),
+    };
+    const document = {
+      addEventListener: (type, fn) => { listeners[type] = fn; },
+      querySelector: () => (open ? sidebar : null),
+      getElementById: () => null,
+    };
+    const window = { matchMedia: () => ({ matches: true }), innerWidth: 390 };
+    new Function('window', 'document', 'matchMedia', 'Element', 'HTMLInputElement', script)(
+      window, document, window.matchMedia, Element, HTMLInputElement);
+    return { listeners, done, row, searchInSidebar, Element };
+  };
+
+  {
+    const { listeners, done, row, Element } = run(true);
+    const composer = new Element('textarea');
+    listeners.pointerdown({ target: row });
+    listeners.focusin({ target: composer });
+    assert.deepEqual(done, ['blur', 'toggle'], 'the composer is let go and the sidebar shut with its own toggle');
+  }
+  {
+    const { listeners, done, Element } = run(true);
+    const composer = new Element('textarea');
+    listeners.pointerdown({ target: composer });
+    listeners.focusin({ target: composer });
+    assert.deepEqual(done, [], 'a tap on the composer is someone asking to type');
+  }
+  {
+    const { listeners, done, searchInSidebar } = run(true);
+    listeners.pointerdown({ target: null });
+    listeners.focusin({ target: searchInSidebar });
+    assert.deepEqual(done, [], "a field inside the sidebar is the sidebar's own business");
+  }
+  {
+    const { listeners, done, row, Element } = run(false);
+    listeners.pointerdown({ target: row });
+    listeners.focusin({ target: new Element('textarea') });
+    assert.deepEqual(done, [], 'with the sidebar shut, dsh keeps its focus');
+  }
+  console.log('ok  opening a session from the sidebar shuts it and keeps the keyboard down');
 }
 
 console.log('\nall plugin host checks passed');

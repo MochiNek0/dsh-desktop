@@ -235,6 +235,7 @@ export function apply(ctx) {
   ctx.inject(['webServer'], (web) => {
     web.effect(() => web.webServer.tapIndex(viewport), 'tapIndex(viewport)');
     web.effect(() => web.webServer.tapIndex(homescreen), 'tapIndex(homescreen)');
+    web.effect(() => web.webServer.tapIndex(touch), 'tapIndex(touch)');
     web.on('webserver/index-inject', (table) => table.push(...rows()));
   });
 }
@@ -336,9 +337,16 @@ export function apply(ctx) {
 const MOBILE_CSS = [
   '@media (max-width: 560px) {',
   // The dialog: a row of [nav, pane] becomes a column of [tabs, pane].
+  // `height` is dsh's own `min(800px, 100vh - 48px)` in the units that mean
+  // what it meant. iOS takes `vh` as the viewport with Safari's bars put away,
+  // so with the bars showing the panel is taller than the screen; it is
+  // centred, so the top of it goes under the address bar when that is at the
+  // top, and the close button with it. A browser without `dvh` drops the line
+  // and keeps dsh's.
   '[class*="_panel"]:has(> nav[class*="_nav"]) {',
   '  position: relative;',
   '  flex-direction: column;',
+  '  height: min(800px, calc(100dvh - 48px));',
   '}',
   // The nav gives up its fixed width and its divider, and stays on screen.
   //
@@ -610,4 +618,114 @@ export function homescreen(html) {
   // changes nothing, which is the right answer for a body this does not
   // recognise. The same rule the viewport tap follows, for the same reason.
   return html.replace(/<head(\s[^>]*)?>/i, (head) => head + tags);
+}
+
+/**
+ * What stops iOS Safari zooming the page whenever a text field is focused.
+ *
+ * iOS zooms in on any focused field whose computed font size is under 16px,
+ * and every field dsh ships is 13 or 14px. On the composer that is a nuisance;
+ * on the model picker it is worse, because the picker focuses its search box as
+ * it opens and then places itself with `position: fixed` against
+ * `window.innerWidth` and `innerHeight` — measured mid-zoom, so the menu lands
+ * off to one side of the trigger it belongs to.
+ *
+ * 16px is the threshold itself, not a taste in type. `maximum-scale=1` would
+ * also stop the zoom and is not used, for the reason given at the top of this
+ * file: it takes pinch zoom away on Android.
+ *
+ * Not part of the stylesheet patch, and not behind its switch. The patch names
+ * dsh's markup and goes stale with it; this names only elements, so there is
+ * nothing in it for a dsh release to break. `!important` because dsh sets the
+ * size on a class, which outranks an element selector.
+ *
+ * `(hover: none) and (pointer: coarse)` is a touch screen with nothing else to
+ * point with, so the desktop window keeps dsh's sizes.
+ */
+const TOUCH_CSS =
+  '@media (hover: none) and (pointer: coarse) {' +
+  'input, textarea, select, [contenteditable]:not([contenteditable="false"]) {' +
+  'font-size: 16px !important;' +
+  '}' +
+  '}';
+
+/**
+ * What keeps the model picker from bringing up the phone's keyboard.
+ *
+ * Opening the model list focuses its search box, which on a desktop is what
+ * lets someone type a model's name straight away. On a phone, focus on a text
+ * field is the keyboard, so picking from a list of six models costs half the
+ * screen. The search box is `role="searchbox"` with `aria-controls` naming the
+ * list, `<id>-models`; both are dsh's markup rather than a class hash.
+ *
+ * Focus is moved, not dropped. dsh closes the picker on a blur whose new focus
+ * is outside it, and a bare `blur()` has no new focus at all — so the list
+ * would vanish as it opened. Moving it to the ticked model is what dsh itself
+ * does when the list has no search box, so the picker is left in a state it
+ * already knows.
+ *
+ * A tap on the search box is let through: that is someone asking to type.
+ * `pointerdown` comes before the focus a tap causes, so the last one seen says
+ * whether this focus was the user's or dsh's.
+ *
+ * ## And the sidebar that stays open over it
+ *
+ * Opening a session from the sidebar, or starting a new one, ends with dsh
+ * focusing the composer. On a phone the sidebar is still open over the
+ * conversation at that point — dsh never closes it on its own, and below its
+ * own 1024px it is something opened, used once and shut — so the keyboard
+ * comes up under a sidebar that hides what it is typing into.
+ *
+ * That focus is the one signal both paths share, so it is the one this
+ * watches: a text field outside the sidebar, focused while the sidebar is open,
+ * and not by a tap on that field. The sidebar is shut with its own toggle, so
+ * dsh's layout state says shut rather than this script saying so, and the
+ * field is let go so the keyboard waits for a tap on it.
+ *
+ * Unlike the rest of this, it names dsh's markup: the frame, the sidebar column
+ * and the toggle, by their CSS-module local names, the way the stylesheet patch
+ * does. The toggle is the one button whose class ends in `_toggle` and that is
+ * also an `_iconButton`: a bare `_toggle` fragment would also take the
+ * workspace list's `_groupToggle` and `_showHiddenToggle`. A dsh that renames them leaves this matching nothing and doing nothing,
+ * which is where things were before it.
+ *
+ * Same touch-only gate as [`TOUCH_CSS`], so a desktop window keeps its
+ * type-to-search and its focus.
+ */
+const TOUCH_JS =
+  '(function(){' +
+  "if(!window.matchMedia||!matchMedia('(hover: none) and (pointer: coarse)').matches)return;" +
+  'var tapped=null;' +
+  "document.addEventListener('pointerdown',function(e){tapped=e.target;},true);" +
+  "document.addEventListener('focusin',function(e){" +
+  'var box=e.target;' +
+  'if(!(box instanceof Element)||tapped===box||box.contains(tapped))return;' +
+  "if(box instanceof HTMLInputElement&&box.getAttribute('role')==='searchbox'){" +
+  "var controls=box.getAttribute('aria-controls')||'';" +
+  'if(!/-models$/.test(controls))return;' +
+  'var list=document.getElementById(controls);' +
+  "var row=list&&(list.querySelector('[role=\"menuitemradio\"][aria-checked=\"true\"]:not([disabled])')" +
+  "||list.querySelector('[role=\"menuitemradio\"]:not([disabled])'));" +
+  'if(row)row.focus();' +
+  'return;' +
+  '}' +
+  "if(!box.matches('textarea, input, [contenteditable]:not([contenteditable=\"false\"])'))return;" +
+  "var side=document.querySelector('[class*=\"_frame\"]:not([data-sidebar-collapsed]) > [class*=\"_sidebarCol\"]');" +
+  'if(!side||side.contains(box)||window.innerWidth>=1024)return;' +
+  "var toggle=side.querySelector('button[class*=\"_iconButton\"][class$=\"_toggle\"]');" +
+  'if(!toggle)return;' +
+  'box.blur();' +
+  'toggle.click();' +
+  '},true);' +
+  '})();';
+
+/**
+ * Put the touch stylesheet and script on an index body. See [`TOUCH_CSS`] and
+ * [`TOUCH_JS`].
+ *
+ * Exported so the test can hold it. Pure string in, string out.
+ */
+export function touch(html) {
+  return html.replace(/<head(\s[^>]*)?>/i,
+    (head) => `${head}<style>${TOUCH_CSS}</style><script>${TOUCH_JS}</script>`);
 }
