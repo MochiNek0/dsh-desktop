@@ -1,13 +1,30 @@
 {
-  // Deploys `worker.js` onto the download path of the site named in the README.
+  // Deploys `worker.js` onto two hostnames:
   //
-  // The route needs dsh-desktop.cc.cd to be a zone in the same Cloudflare
-  // account — Worker routes are matched per zone, and they win over a Pages
-  // project sitting on the same hostname, so `/updater/*` is taken over and the
-  // rest of the site is untouched. If the domain reaches Cloudflare as a CNAME
-  // from someone else's DNS instead, there is no zone to attach a route to:
-  // deploy `worker.js` as a Pages Function instead (its last line says how) and
-  // this file goes unused.
+  //   dsh-desktop.cc.cd/updater/*   the update feed, and nothing else
+  //   dl.dsh-desktop.cc.cd/*        the installer bytes
+  //
+  // The split exists because Google's Safe Browsing report kept saying the
+  // marketing site "hosts" the installers — with no sample URL — and removing
+  // the links from the pages changed nothing while `/updater/download/...`
+  // kept answering 200 with an `.exe`. See the top of worker.js.
+  //
+  // ⚠️ The `dl` DNS record must exist before this is deployed: Cloudflare
+  // dashboard → the dsh-desktop.cc.cd zone → DNS → add a proxied A record named
+  // `dl` (192.0.2.1 is the usual placeholder; the Worker route catches the
+  // request before that address is ever dialled). Without it the feed points at
+  // a hostname that does not resolve, and every update fails.
+  //
+  // Deploy order that does not break installed copies:
+  //   1. add the `dl` DNS record (it can 404 until step 2);
+  //   2. `npx wrangler deploy`;
+  //   3. check https://dl.dsh-desktop.cc.cd/v<latest>/<asset> returns 200;
+  //   4. check /updater/latest.json names dl.*, and /updater/download/...
+  //      returns 410.
+  //
+  // `DOWNLOAD_ORIGIN` is where the feed sends clients. Set it to "" to stop
+  // proxying bytes entirely: the feed then names GitHub, and users who cannot
+  // reach GitHub lose auto-update (but the marketing host is clean either way).
   "name": "dsh-desktop-updater",
   "main": "worker.js",
   "compatibility_date": "2026-09-01",
@@ -15,7 +32,14 @@
     {
       "pattern": "dsh-desktop.cc.cd/updater/*",
       "zone_name": "dsh-desktop.cc.cd"
+    },
+    {
+      "pattern": "dl.dsh-desktop.cc.cd/*",
+      "zone_name": "dsh-desktop.cc.cd"
     }
   ],
+  "vars": {
+    "DOWNLOAD_ORIGIN": "https://dl.dsh-desktop.cc.cd"
+  },
   "observability": { "enabled": true }
 }
