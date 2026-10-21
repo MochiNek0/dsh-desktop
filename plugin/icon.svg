@@ -1,0 +1,12 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="18" cy="18" r="2.75" fill="#658EFF" />
+  <path d="M22.596 13.404A6.5 6.5 0 0 1 22.596 22.596M13.404 22.596A6.5 6.5 0 0 1 13.404 13.404" stroke="url(#desktop-signal-waves)" stroke-width="3" stroke-linecap="round" />
+  <path d="M26.132 9.868A11.5 11.5 0 0 1 26.132 26.132M9.868 26.132A11.5 11.5 0 0 1 9.868 9.868" stroke="url(#desktop-signal-waves)" stroke-width="3" stroke-linecap="round" />
+  <defs>
+    <linearGradient id="desktop-signal-waves" x1="6.5" y1="9.868" x2="29.5" y2="26.132" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#41E1AC" />
+      <stop offset="0.5" stop-color="#658EFF" />
+      <stop offset="1" stop-color="#41E1AC" />
+    </linearGradient>
+  </defs>
+</svg>

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Signals",
+    "description": "Reports dsh session state to the dsh desktop shell, so a notification can say which session it is about and be answered from where it appears."
+  }
+}

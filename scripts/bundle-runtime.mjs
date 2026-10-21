@@ -78,7 +78,8 @@ const staged = join(resources, 'plugin');
 rmSync(staged, { recursive: true, force: true });
 mkdirSync(staged, { recursive: true });
 cpSync(join(root, 'plugin', 'lib'), join(staged, 'lib'), { recursive: true });
-for (const file of ['package.json', 'cordis.patch.yml', 'LICENSE']) {
+cpSync(join(root, 'plugin', 'locale'), join(staged, 'locale'), { recursive: true });
+for (const file of ['package.json', 'icon.svg', 'cordis.patch.yml', 'LICENSE']) {
   copyFileSync(join(root, 'plugin', file), join(staged, file));
 }
 console.log('[bundle] staged plugin/');

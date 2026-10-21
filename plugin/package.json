@@ -2,16 +2,20 @@
   "name": "dsh-desktop-signal",
   "version": "0.1.1",
   "description": "Reports dsh session state to the dsh desktop shell, so it can raise a notification and answer from it.",
+  "icon": "./icon.svg",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
+    "icon.svg",
+    "locale/*.json",
     "cordis.patch.yml",
     "LICENSE"
   ],
