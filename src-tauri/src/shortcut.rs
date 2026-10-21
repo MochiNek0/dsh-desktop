@@ -322,6 +322,11 @@ fn explain(shortcut: &Shortcut, failure: &Failure) -> String {
             "{} is already taken by another program.",
             keys
         ),
+        Failure::TooFew if cfg!(target_os = "macos") => t!(
+            "{} 不行：要同时按住 Control、Option、Shift、Command 中的至少两个，免得抢走其他软件的快捷键。",
+            "{} will not do: hold at least two of Control, Option, Shift and Command, so it does not take a shortcut another app uses.",
+            keys
+        ),
         Failure::TooFew => t!(
             "{} 不行：要同时按住 Ctrl、Alt、Shift、Win 中的至少两个，免得抢走其他软件的快捷键。",
             "{} will not do: hold at least two of Ctrl, Alt, Shift and Win, so it does not take a shortcut another app uses.",
@@ -353,25 +358,24 @@ pub(crate) fn name(slot: Slot) -> &'static str {
     }
 }
 
-/// How a key is written on the card: `Ctrl+Alt+D`.
+/// How a key is written on the card: `Ctrl+Alt+D`, and on macOS `⌃⌥D`, the
+/// way its own menus write one. The order is the same on both, and is the
+/// order macOS puts its symbols in.
 fn label(shortcut: &Shortcut) -> String {
+    let mac = cfg!(target_os = "macos");
     let mut parts = Vec::new();
     if shortcut.mods.contains(Modifiers::CONTROL) {
-        parts.push("Ctrl");
+        parts.push(if mac { "⌃" } else { "Ctrl" });
     }
     if shortcut.mods.contains(Modifiers::ALT) {
-        parts.push(if cfg!(target_os = "macos") {
-            "Option"
-        } else {
-            "Alt"
-        });
+        parts.push(if mac { "⌥" } else { "Alt" });
     }
     if shortcut.mods.contains(Modifiers::SHIFT) {
-        parts.push("Shift");
+        parts.push(if mac { "⇧" } else { "Shift" });
     }
     if shortcut.mods.contains(Modifiers::SUPER) {
-        parts.push(if cfg!(target_os = "macos") {
-            "Cmd"
+        parts.push(if mac {
+            "⌘"
         } else if cfg!(windows) {
             "Win"
         } else {
@@ -384,7 +388,7 @@ fn label(shortcut: &Shortcut) -> String {
         .or_else(|| code.strip_prefix("Digit"))
         .unwrap_or(&code);
     parts.push(key);
-    parts.join("+")
+    parts.join(if mac { "" } else { "+" })
 }
 
 /// A row's second line while nothing has gone wrong.
@@ -442,19 +446,18 @@ pub(crate) fn sync(app: &AppHandle) {
 mod tests {
     use super::*;
 
-    /// What the card calls Alt: macOS names the key Option.
-    const ALT: &str = if cfg!(target_os = "macos") {
-        "Option"
-    } else {
-        "Alt"
-    };
+    /// What the card writes for each key: macOS's menu symbols there, the
+    /// names elsewhere.
+    fn written(mac: &str, other: &str) -> String {
+        if cfg!(target_os = "macos") { mac } else { other }.to_string()
+    }
 
     #[test]
     fn the_default_is_two_modifiers_and_d() {
         let shortcut = accept(Slot::Window.default())
             .ok()
             .expect("the default passes its own rule");
-        assert_eq!(label(&shortcut), format!("Ctrl+{ALT}+D"));
+        assert_eq!(label(&shortcut), written("⌃⌥D", "Ctrl+Alt+D"));
     }
 
     /// Every slot's default passes the card's own rule, no two are the same
@@ -485,9 +488,9 @@ mod tests {
     fn what_the_card_sends_is_what_it_shows() {
         // The card sends `KeyboardEvent.code`.
         let shortcut = accept("Ctrl+Shift+Digit1").ok().unwrap();
-        assert_eq!(label(&shortcut), "Ctrl+Shift+1");
+        assert_eq!(label(&shortcut), written("⌃⇧1", "Ctrl+Shift+1"));
         let shortcut = accept("Alt+Shift+F5").ok().unwrap();
-        assert_eq!(label(&shortcut), format!("{ALT}+Shift+F5"));
+        assert_eq!(label(&shortcut), written("⌥⇧F5", "Alt+Shift+F5"));
     }
 
     #[test]

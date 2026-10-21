@@ -42,7 +42,8 @@
 //! (`quick-menu-active`), and a click on a row comes back here
 //! (`menu-pick`) and goes on to the box as the choice it was.
 //!
-//! Both windows are plain and opaque, with rounded corners on Windows 11. Not
+//! Both windows are plain and opaque, with rounded corners on Windows 11 and
+//! macOS. Not
 //! acrylic: Windows draws that backdrop only behind the active window, and
 //! every hand-over of activation between the two showed as the box flashing.
 //! On Windows the list is put up without being activated, and in front of the
@@ -338,7 +339,44 @@ fn round(window: &WebviewWindow) {
     };
 }
 
-#[cfg(not(windows))]
+/// The same on macOS, where a borderless window is square too and nothing
+/// will round it on request: the window is made clear, its content view is
+/// clipped to rounded corners, and the shadow is worked out again from what
+/// is left. AppKit wants all of that on the main thread.
+#[cfg(target_os = "macos")]
+fn round(window: &WebviewWindow) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    let target = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = target.ns_window() else {
+            return;
+        };
+        let ns_window = ns_window as *mut AnyObject;
+        // SAFETY: a live NSWindow, on the main thread, sent only messages
+        // NSWindow, NSView and CALayer answer.
+        unsafe {
+            let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+            let _: () = msg_send![ns_window, setOpaque: false];
+            let _: () = msg_send![ns_window, setBackgroundColor: clear];
+            let view: *mut AnyObject = msg_send![ns_window, contentView];
+            if view.is_null() {
+                return;
+            }
+            let _: () = msg_send![view, setWantsLayer: true];
+            let layer: *mut AnyObject = msg_send![view, layer];
+            if layer.is_null() {
+                return;
+            }
+            let _: () = msg_send![layer, setCornerRadius: 10.0_f64];
+            let _: () = msg_send![layer, setMasksToBounds: true];
+            let _: () = msg_send![ns_window, invalidateShadow];
+        }
+    });
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn round(_: &WebviewWindow) {}
 
 /// Put the list up in front of the box without activating it. `show` would

@@ -83,6 +83,12 @@ npm run build   # production bundle, written to src-tauri/target/release/bundle/
 - **Upstream**: [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 - **Friends**: [DSH Market](https://github.com/dsh-market/dsh-market) — the visual plugin market inside dsh; browse, search and install community plugins in one click ([dshmarket.com](https://dshmarket.com))
 
+## Code signing and privacy
+
+Free code signing for the Windows build is provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/) (application pending). Every installer is built by GitHub Actions from this repository's source, and every signing request is approved by hand by the maintainer, [MochiNek0](https://github.com/MochiNek0).
+
+Apart from the app update check, the dsh update check and (when switched on) the phone stylesheet patch at startup, this program will not transfer any information to other networked systems unless specifically requested by the user. It collects no usage statistics and sends no crash reports. The full code signing policy and privacy statement are on [the website](https://dsh-desktop.cc.cd/en/docs/code-signing/).
+
 ## License
 
 [GNU AGPL-3.0](LICENSE). Copyright © 2026 MochiNek0.

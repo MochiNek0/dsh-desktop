@@ -246,6 +246,27 @@ pub fn firewall_hint(state: super::firewall::Firewall) -> Option<String> {
 /// those words rather than in the firewall's: from the phone the page simply
 /// never loads, and from here nothing happened at all.
 pub fn silence_hint() -> String {
+    // Windows Security is where Windows keeps the rule, and nowhere else does.
+    if cfg!(target_os = "macos") {
+        return t!(
+            "手机打不开的话，多半是防火墙拦住了入站连接。在「系统设置 › 网络 › 防火墙 › 选项」里\
+             允许 dsh-desktop 接收传入连接，再扫一次。也确认一下手机和电脑连的是同一个 Wi-Fi。",
+            "If the phone cannot open the page, the firewall is usually what is stopping it. \
+             Allow incoming connections for dsh-desktop in System Settings › Network › Firewall › Options, \
+             and scan again. Check that the phone is on the same Wi-Fi, too."
+        )
+        .to_string();
+    }
+    if !cfg!(windows) {
+        return t!(
+            "手机打不开的话，多半是防火墙拦住了入站连接（比如 ufw 或 firewalld），放行后再扫一次。\
+             也确认一下手机和电脑连的是同一个 Wi-Fi。",
+            "If the phone cannot open the page, a firewall such as ufw or firewalld is usually \
+             blocking inbound connections. Let them through and scan again. \
+             Check that the phone is on the same Wi-Fi, too."
+        )
+        .to_string();
+    }
     t!(
         "手机打不开的话，多半是防火墙拦住了入站连接。在 Windows 安全中心里\
          允许 dsh-desktop 的专用网络入站，再扫一次。也确认一下手机和电脑连的是同一个 Wi-Fi。",

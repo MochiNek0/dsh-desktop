@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.25"
+version = "0.1.26"
 description = "Desktop client for the DeepSeek Harness browser UI"
 license = "AGPL-3.0-only"
 edition = "2021"
@@ -91,6 +91,12 @@ form_urlencoded = "1"
 # And on Linux `prctl(PR_SET_PDEATHSIG)`, which stands in for the job object
 # below when that path never runs. See `server::tethered`.
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Rounding the quick-ask windows, which takes a few messages to the NSWindow
+# Tauri hands out; see `ask::round`. Already in the tree under wry, at this
+# version.
+objc2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 # `MemoryUsageTargetLevel`, for the webview nobody is looking at; see `memory`.
