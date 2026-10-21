@@ -22,10 +22,17 @@
 //! between them are every way the window stops being looked at. Not on every
 //! move: that is a file write per frame of a drag.
 //!
-//! ## Windows only
+//! ## Windows and macOS
 //!
-//! Every release is the NSIS installer. Elsewhere the window opens centred at
-//! the default size, as it always has.
+//! macOS has no normal rectangle to ask for, so it is read off the window as
+//! Tauri reports it, in points — the coordinates AppKit itself places windows
+//! in, which come back the same whatever display the window is on. A zoomed
+//! window keeps the rectangle saved before it was zoomed, and a minimised or
+//! full-screen one saves nothing, since what it reports is not where it goes
+//! back to.
+//!
+//! Not Linux: under Wayland a window cannot place itself at all. There the
+//! window opens centred at the default size, as it always has.
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, WebviewWindow};
@@ -204,7 +211,68 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::Placement;
+    use tauri::{LogicalPosition, LogicalSize, Manager, WebviewWindow};
+
+    pub(super) fn read(window: &WebviewWindow) -> Option<Placement> {
+        if window.is_minimized().unwrap_or(false) || window.is_fullscreen().unwrap_or(false) {
+            return None;
+        }
+        // Zoomed, the frame is the screen's; the one worth keeping is the one
+        // it was saved with before it was zoomed.
+        if window.is_maximized().unwrap_or(false) {
+            let saved = crate::settings::window_placement(window.app_handle())
+                .as_ref()
+                .and_then(Placement::from_json)?;
+            return Some(Placement {
+                maximized: true,
+                ..saved
+            });
+        }
+        let scale = window.scale_factor().ok()?;
+        let position: LogicalPosition<i32> = window.outer_position().ok()?.to_logical(scale);
+        // Inner, because `set_size` sets the inner size. With the title bar
+        // drawn over the page the two are the same anyway; see `build_window`.
+        let size: LogicalSize<i32> = window.inner_size().ok()?.to_logical(scale);
+        Some(Placement {
+            left: position.x,
+            top: position.y,
+            right: position.x + size.width,
+            bottom: position.y + size.height,
+            maximized: false,
+        })
+    }
+
+    pub(super) fn restore(window: &WebviewWindow, saved: Placement) {
+        let (x, y) = saved.center();
+        // Each monitor in its own points, which are the coordinates `read`
+        // saved in.
+        let on_screen = window.available_monitors().is_ok_and(|monitors| {
+            monitors.iter().any(|monitor| {
+                let scale = monitor.scale_factor();
+                let at: LogicalPosition<i32> = monitor.position().to_logical(scale);
+                let size: LogicalSize<i32> = monitor.size().to_logical(scale);
+                (at.x..at.x + size.width).contains(&x) && (at.y..at.y + size.height).contains(&y)
+            })
+        });
+        if !on_screen {
+            return;
+        }
+
+        let _ = window.set_size(LogicalSize::new(
+            saved.right - saved.left,
+            saved.bottom - saved.top,
+        ));
+        let _ = window.set_position(LogicalPosition::new(saved.left, saved.top));
+        if saved.maximized {
+            let _ = window.maximize();
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
     use super::Placement;
     use tauri::WebviewWindow;
