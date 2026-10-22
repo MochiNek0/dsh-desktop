@@ -42,12 +42,13 @@ pub fn explain(app: &AppHandle) -> String {
         "dsh 的配置要求监听所有网卡（0.0.0.0），新版 dsh 出于安全考虑拒绝这样启动。\
          这段配置通常是第三方“局域网访问”插件写进去的，在：\n{}\n\n\
          点“改为仅本机并重启”会把其中的 host 改成 127.0.0.1（原文件会先备份）。\
-         手机访问请使用桌面端自带的远程访问。",
+         要从手机访问，请用标题栏菜单里的“手机连接…”。",
         "dsh's settings ask it to listen on every interface (0.0.0.0), which newer dsh \
          refuses to do for safety. A third-party \"LAN access\" plugin usually writes \
          that setting, in:\n{}\n\n\
          \"Bind to this machine and restart\" changes that host to 127.0.0.1, after \
-         backing up the file. To reach dsh from a phone, use the desktop's remote access.",
+         backing up the file. To reach dsh from a phone, use \"Connect a phone…\" in the \
+         titlebar menu.",
         path(app).display()
     )
 }
