@@ -144,11 +144,57 @@ jobs:
 
           Write-Host "$script is UTF-8 with a BOM and parses clean."
 
-  bundle:
+  # The one release every platform uploads to, made before any of them start.
+  #
+  # tauri-action can make it itself — look the tag up, create a release if there
+  # is none — but three jobs doing that at once is a race: a draft cannot be
+  # found by its tag until it exists, so two jobs that finish their builds in the
+  # same second each create one. v0.1.27 came out as two drafts that way, one
+  # with the macOS and Windows bundles and one with Linux, each carrying a
+  # `latest.json` that named only its own platforms. Made here once, and handed
+  # to the matrix by id, there is nothing left to race on.
+  #
+  # A re-run comes back through here, so an existing release for the tag is
+  # taken rather than a second one made beside it.
+  release:
     needs: [lint, lint-windows]
     # A tag is the only thing worth bundling for. A run started by hand stops
     # after the checks above.
     if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    outputs:
+      id: ${{ steps.release.outputs.id }}
+    steps:
+      - id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          id=$(gh api --paginate "repos/$REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n 1)
+
+          if [ -z "$id" ]; then
+            # A `-` in a tag is a semver prerelease suffix and nothing else —
+            # the stable tags are `v0.1.19`. See the note at the top for why a
+            # beta is published where a stable release is drafted.
+            case "$TAG" in
+              *-*) draft=false prerelease=true ;;
+              *) draft=true prerelease=false ;;
+            esac
+            id=$(gh api -X POST "repos/$REPO/releases" \
+              -f tag_name="$TAG" \
+              -f name="dsh desktop $TAG" \
+              -F draft="$draft" \
+              -F prerelease="$prerelease" \
+              --jq .id)
+          fi
+
+          echo "release $id for $TAG"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  bundle:
+    needs: [release]
 
     strategy:
       # One platform failing should not throw away the others' hour of build.
@@ -260,15 +306,18 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          # Both, and both are needed. The id is where the bundles go, and with
+          # it set the action no longer looks for or creates a release of its
+          # own. The tag is what it writes into `latest.json` in place of the
+          # `untagged-…` path a draft's download URLs carry, which stop working
+          # the moment the draft is published.
+          releaseId: ${{ needs.release.outputs.id }}
           tagName: ${{ github.ref_name }}
-          releaseName: dsh desktop ${{ github.ref_name }}
-          # A `-` in a tag is a semver prerelease suffix and nothing else — the
-          # stable tags are `v0.1.19`. See the note at the top for why a beta is
-          # published where a stable release is drafted.
-          releaseDraft: ${{ !contains(github.ref_name, '-') }}
-          prerelease: ${{ contains(github.ref_name, '-') }}
           # Merged across the matrix, so the file the updater fetches carries an
           # entry for every platform rather than whichever job finished last.
+          # The merge is a read, an edit and a re-upload, so two jobs that get
+          # there in the same few seconds can still lose one another's entries;
+          # the `check` job below is what notices.
           includeUpdaterJson: true
           args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
@@ -294,5 +343,62 @@ jobs:
             echo "$appimage bundles libwayland-client, which a current Mesa will"
             echo "refuse to talk to — see issue #7:"
             echo "$found"
+            exit 1
+          fi
+
+  # What the updater will actually be handed, read back once every platform is
+  # in: one release for the tag, and a `latest.json` in it that names every
+  # signed bundle there, at the tagged path, with that bundle's own signature.
+  #
+  # The `release` job above takes care of the first. The second can still go
+  # wrong on its own, because each platform merges itself into `latest.json` by
+  # reading it, editing it and uploading it again — two that finish within a
+  # few seconds of each other can each write a file without the other. A stable
+  # release is still a draft at this point, so a red run here is caught before
+  # anyone can update to it. Re-running the bundle job of the platform it names
+  # puts its entry back: the action replaces assets of the same name.
+  check:
+    needs: [release, bundle]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: check the release has every platform in its updater feed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          ID: ${{ needs.release.outputs.id }}
+        run: |
+          releases=$(gh api --paginate "repos/$REPO/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"$TAG\")] | length" | awk '{ n += $1 } END { print n }')
+          if [ "$releases" != 1 ]; then
+            echo "$releases releases carry $TAG; there should be exactly one"
+            exit 1
+          fi
+
+          gh api "repos/$REPO/releases/$ID/assets?per_page=100" > assets.json
+          feed=$(jq -r '.[] | select(.name == "latest.json") | .id' assets.json)
+          [ -n "$feed" ] || { echo "release $ID has no latest.json"; exit 1; }
+          gh api -H 'Accept: application/octet-stream' "repos/$REPO/releases/assets/$feed" > latest.json
+
+          missing=0
+          for sig in $(jq -r '.[] | select(.name | endswith(".sig")) | .id' assets.json); do
+            name=$(jq -r ".[] | select(.id == $sig) | .name" assets.json)
+            bundle=${name%.sig}
+            gh api -H 'Accept: application/octet-stream' "repos/$REPO/releases/assets/$sig" > "$name"
+
+            entries=$(jq --arg url "/download/$TAG/$bundle" --rawfile sig "$name" \
+              '[.platforms[] | select((.url | endswith($url)) and .signature == $sig)] | length' latest.json)
+            if [ "$entries" = 0 ]; then
+              echo "latest.json has no entry for $bundle at /download/$TAG/ with its signature"
+              missing=1
+            else
+              echo "$bundle: $entries entries"
+            fi
+          done
+
+          if [ "$missing" != 0 ]; then
+            echo
+            echo "Re-run the bundle job for the platform above, then this one."
+            jq '.platforms | map_values(.url)' latest.json
             exit 1
           fi
