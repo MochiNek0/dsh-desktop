@@ -376,11 +376,13 @@
         margin-top: 14px;
       }
       #error-retry,
-      #error-safe {
+      #error-safe,
+      #error-fix {
         display: none;
       }
       body.failed.retryable #error-retry,
-      body.failed.rescuable #error-safe {
+      body.failed.rescuable #error-safe,
+      body.failed.fixable #error-fix {
         display: inline-flex;
       }
       button {
@@ -435,6 +437,7 @@
         <h2 id="error-title"></h2>
         <pre id="error-detail"></pre>
         <div class="actions">
+          <button id="error-fix" class="primary"></button>
           <button id="error-retry" class="primary"></button>
           <button id="error-safe"></button>
           <button id="error-copy"></button>
@@ -601,6 +604,17 @@
           signal('safe-start');
         });
 
+        // The way out of a profile that asks dsh to listen on every interface,
+        // which newer dsh refuses to start on. The app swaps that one host for
+        // loopback, backing the file up first, and starts again. Offered only
+        // on that failure -- see `wildcard` in src-tauri.
+        id('error-fix').textContent = t('改为仅本机并重启', 'Bind to this machine and restart');
+        id('error-fix').addEventListener('click', function () {
+          document.body.classList.remove('failed', 'retryable', 'rescuable', 'fixable');
+          id('status').textContent = t('正在启动 dsh…', 'Starting dsh…');
+          signal('fix-host');
+        });
+
         var copy = id('error-copy');
         copy.textContent = t('复制详情', 'Copy details');
         copy.addEventListener('click', function () {
@@ -674,10 +688,11 @@
           id('progress-fill').style.width =
             Math.min(100, Math.max(0, value)) + '%';
         };
-        window.dshError = function (title, detail, retry, rescue) {
+        window.dshError = function (title, detail, retry, rescue, fix) {
           document.body.classList.add('failed');
           document.body.classList.toggle('retryable', retry === 'retry');
           document.body.classList.toggle('rescuable', rescue === 'rescue');
+          document.body.classList.toggle('fixable', fix === 'fix');
           id('error-title').textContent = title;
           id('error-detail').textContent = detail || '';
         };

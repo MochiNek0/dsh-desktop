@@ -222,6 +222,10 @@ pub enum Action {
     /// loading page's second button, offered on a dsh that would not come up;
     /// see [`crate::plugins::engage_safe`].
     SafeStart,
+    /// Replace the profile's wildcard webserver host with loopback and start
+    /// again. The loading page's third button, offered only on that failure;
+    /// see [`crate::wildcard`].
+    FixHost,
     /// dsh's page saying its plugin boot stopped on a plugin; see
     /// [`crate::plugins::stall_watch`]. Not a request for anything — the page
     /// reporting a state this app has no other way to see — so what it leads to
@@ -343,6 +347,7 @@ pub fn action(url: &Url) -> Option<Action> {
         "terminal" => Some(Action::Terminal),
         "restart-dsh" => Some(Action::RestartDsh),
         "safe-start" => Some(Action::SafeStart),
+        "fix-host" => Some(Action::FixHost),
         "plugins-stalled" => Some(Action::PluginsStalled(said(url))),
         "safe-off" => Some(Action::SafeOff),
         // Not a request for anything: the page saying what it has already
@@ -498,6 +503,7 @@ pub fn perform(app: &AppHandle, action: Action) {
         Action::Channel => return crate::open_channel(app),
         Action::RestartDsh => return crate::restart_dsh(app, false),
         Action::SafeStart => return crate::safe_start(app),
+        Action::FixHost => return crate::fix_host(app),
         Action::PluginsStalled(said) => return crate::plugins_stalled(app, &said),
         Action::SafeOff => return crate::safe_off(app),
         Action::Notify(notice) => return crate::notify::show(app, notice),

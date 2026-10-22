@@ -31,6 +31,7 @@ mod status;
 mod theme;
 mod toast;
 mod update;
+mod wildcard;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1856,30 +1857,40 @@ fn give_up(window: &WebviewWindow, session: &Session, output: &str) {
         }
     });
 
+    // The restart is a fresh read of the profile, so a plugin that rewrote its
+    // wildcard block mid-session fails here rather than at boot.
+    let fix = wildcard::spotted(output);
+    let detail = if output.is_empty() {
+        t!(
+            "dsh 意外退出了，重新启动也没能让它回来，且没有留下任何输出。",
+            "dsh exited unexpectedly and did not come back when it was restarted, \
+             without printing anything."
+        )
+        .to_string()
+    } else {
+        t!(
+            "dsh 意外退出了，重新启动也没能让它回来。它最后的输出：\n\n{}",
+            "dsh exited unexpectedly and did not come back when it was restarted. \
+             Its last output:\n\n{}",
+            output
+        )
+    };
+
     // Queued by `rearm` until the loading page above has loaded.
     session.splash.failed(
         window,
         t!("dsh 已退出", "dsh exited"),
-        &if output.is_empty() {
-            t!(
-                "dsh 意外退出了，重新启动也没能让它回来，且没有留下任何输出。",
-                "dsh exited unexpectedly and did not come back when it was restarted, \
-                 without printing anything."
-            )
-            .to_string()
+        &if fix {
+            format!("{}\n\n{detail}", wildcard::explain(window.app_handle()))
         } else {
-            t!(
-                "dsh 意外退出了，重新启动也没能让它回来。它最后的输出：\n\n{}",
-                "dsh exited unexpectedly and did not come back when it was restarted. \
-                 Its last output:\n\n{}",
-                output
-            )
+            detail
         },
         true,
         // A dsh that served and then kept dying is a weaker case against the
         // plugins than one that never served at all — but it is still a case,
         // and a plugin is one of the few things here the user can act on.
         plugins::rescuable(window.app_handle()),
+        fix,
     );
 }
 
@@ -2087,6 +2098,22 @@ fn safe_start_only(app: &tauri::AppHandle, names: &[String]) {
                 why
             ),
         ),
+    }
+}
+
+/// The loading page's "bind to this machine" button: take the wildcard host
+/// out of the profile and start again. Offered only on that failure; see
+/// [`wildcard`].
+fn fix_host(app: &tauri::AppHandle) {
+    match wildcard::repair(app) {
+        Ok(backup) => {
+            eprintln!(
+                "dsh-desktop: wildcard host replaced; the old layer is {}",
+                backup.display()
+            );
+            restart_dsh(app, false);
+        }
+        Err(why) => dsh::note(app, t!("没能自动修复", "Could not fix it automatically"), &why),
     }
 }
 
@@ -2497,24 +2524,31 @@ fn serve(
                 // profile's layer stack before it binds a port, so a bundle
                 // that throws is an exit with no URL ever printed — this branch
                 // exactly.
+                let fix = wildcard::spotted(&output);
+                let detail = if output.is_empty() {
+                    t!(
+                        "dsh 在开始服务前就退出了，且没有任何输出。",
+                        "dsh exited before it began serving, without printing anything."
+                    )
+                    .to_string()
+                } else {
+                    t!(
+                        "dsh 在开始服务前就退出了。它的输出：\n\n{}",
+                        "dsh exited before it began serving. Its output:\n\n{}",
+                        output
+                    )
+                };
                 splash.failed(
                     window,
                     t!("dsh 已退出", "dsh exited"),
-                    &if output.is_empty() {
-                        t!(
-                            "dsh 在开始服务前就退出了，且没有任何输出。",
-                            "dsh exited before it began serving, without printing anything."
-                        )
-                        .to_string()
+                    &if fix {
+                        format!("{}\n\n{detail}", wildcard::explain(window.app_handle()))
                     } else {
-                        t!(
-                            "dsh 在开始服务前就退出了。它的输出：\n\n{}",
-                            "dsh exited before it began serving. Its output:\n\n{}",
-                            output
-                        )
+                        detail
                     },
                     false,
                     plugins::rescuable(window.app_handle()),
+                    fix,
                 );
                 return false;
             }
@@ -2605,7 +2639,7 @@ impl Splash {
 
     /// Replace the spinner with an error the user can read and copy.
     fn fail(&self, window: &WebviewWindow, title: &str, detail: &str) {
-        self.failed(window, title, detail, false, false);
+        self.failed(window, title, detail, false, false, false);
     }
 
     /// The same, with the buttons the user can do something with from here.
@@ -2614,7 +2648,8 @@ impl Splash {
     /// starts it with the installed plugins off the layer stack. The second is
     /// only offered where a plugin is a candidate for the cause — a dsh that
     /// would not come up — and only where there is a plugin to set aside; see
-    /// [`plugins::rescuable`].
+    /// [`plugins::rescuable`]. `fix` is the one that takes a wildcard host out
+    /// of the profile, offered only on that failure; see [`wildcard`].
     fn failed(
         &self,
         window: &WebviewWindow,
@@ -2622,6 +2657,7 @@ impl Splash {
         detail: &str,
         retry: bool,
         rescue: bool,
+        fix: bool,
     ) {
         eprintln!("dsh-desktop: {title}: {detail}");
         self.call(
@@ -2632,6 +2668,7 @@ impl Splash {
                 detail,
                 if retry { "retry" } else { "" },
                 if rescue { "rescue" } else { "" },
+                if fix { "fix" } else { "" },
             ],
         );
 
