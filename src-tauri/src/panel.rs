@@ -57,9 +57,14 @@ fn labels() -> String {
             "The preset list could not be read; the box below still works."
         ),
         "fix": t!("修复", "Fix"),
-        // The icon that opens a card's description. The cards are laid out
-        // several to a row now, and one has no room for the text itself.
-        "about": t!("看介绍", "What it does"),
+        // Over the list: what narrows it once there are more plugins than fit
+        // on the card at once. The tabs are counted, so each is one word.
+        "search": t!("搜索插件…", "Search plugins…"),
+        "tabAll": t!("全部", "All"),
+        "tabInstalled": t!("已安装", "Installed"),
+        "tabOffered": t!("可安装", "Available"),
+        "tabUpdates": t!("有更新", "Updates"),
+        "none": t!("没有符合条件的插件。", "No plugin matches."),
         // On the card, at the end of its name: what used to be a heading
         // over a list of its own. Both halves are one list now.
         "have": t!("已安装", "Installed"),
@@ -67,11 +72,10 @@ fn labels() -> String {
         // name dsh still loads that nothing installed. See `plugins::holdings`.
         "residue": t!("残留", "Residue"),
         // The group headings. `recommended` and `authored` are the two the
-        // shipped list uses; `other` catches a section name the list invents
-        // that this panel has no heading for. See `section` in plugins.rs.
+        // shipped list uses; any other section name draws no mark. See
+        // `section` in plugins.rs.
         "groupRecommended": t!("推荐", "Recommended"),
         "groupAuthored": t!("作者创建", "By the author"),
-        "groupOther": t!("其他", "More"),
         // On the one button that changes the machine from a card rather than
         // from the bar at the bottom. The version it would move to is in the
         // label, because the button is an icon and the number is the whole
@@ -163,6 +167,11 @@ pub fn script() -> String {
   var TEXT = {labels};
 
   var root = null, sheet, lede, list, hint, spec, log, note;
+  // What narrows the list, and what it narrows. `rows` is every card `fill`
+  // built, with the text a search is matched against worked out once there;
+  // a keystroke only flips `hidden`, so a long list costs nothing to search.
+  var bar, search, tabs = {{}}, rows = [], notice = null, none;
+  var query = '', filter = 'all';
   // The folder chosen with the system picker, shown but never sent: Rust holds
   // the path and the install only says whether to use it. See `pick_local`.
   var local, picked, chosen = false;
@@ -213,12 +222,13 @@ pub fn script() -> String {
   // titlebar draws from too, for the same reason it exists at all: the page
   // underneath has an icon set of its own and none of it is reachable here.
   var ICONS = {{
-    about: 'info',
     // The arrow leaving the box: this one goes out to the user's browser.
     repo: 'externalLink',
     recommended: 'star',
     authored: 'user',
-    other: 'package',
+    search: 'search',
+    // What a plugin that ships no picture of its own wears in its place.
+    plugin: 'puzzle',
     // The one inside a ticked box. A shape rather than a character, because a
     // glyph would inherit whatever the page underneath does to fonts.
     tick: 'check',
@@ -238,9 +248,9 @@ pub fn script() -> String {
    *
    *  This is what the group headings used to say. Three headings over four
    *  cards was most of the panel, and a card can carry the distinction
-   *  itself. Anything else falls back to `other`, which keeps a preset
-   *  visible even when the shipped list names a section this panel predates
-   *  -- the same fallback the headings had. */
+   *  itself. Anything else wears nothing: every card has a picture of its
+   *  own now, and a box drawn beside each plugin the shipped list has never
+   *  heard of said only that. */
   function kindOf(section) {{
     if (section === 'recommended') {{
       return {{ icon: ICONS.recommended, label: TEXT.groupRecommended }};
@@ -248,7 +258,38 @@ pub fn script() -> String {
     if (section === 'authored') {{
       return {{ icon: ICONS.authored, label: TEXT.groupAuthored }};
     }}
-    return {{ icon: ICONS.other, label: TEXT.groupOther }};
+    return null;
+  }}
+
+  /** The picture at the head of a card: the plugin's own where it ships one,
+   *  and otherwise the default one -- a puzzle piece on a colour worked out
+   *  from its name, so two plugins without a picture are still told apart,
+   *  and the same plugin wears the same tile every time the panel opens. */
+  function face(parent, item) {{
+    var tile = make('span', 'dsh-pp-icon', parent);
+    tile.setAttribute('aria-hidden', 'true');
+
+    function blank() {{
+      tile.className = 'dsh-pp-icon dsh-pp-blank';
+      var hash = 0;
+      for (var i = 0; i < item.value.length; i++) {{
+        hash = (hash * 31 + item.value.charCodeAt(i)) | 0;
+      }}
+      tile.style.setProperty('--pp-hue', String(Math.abs(hash) % 360));
+      tile.innerHTML = lucide(ICONS.plugin, 18);
+    }}
+
+    if (!item.icon) {{
+      blank();
+      return;
+    }}
+    var picture = make('img', '', tile);
+    picture.alt = '';
+    picture.decoding = 'async';
+    // A file that turns out not to be the image its name says still gets a
+    // tile rather than the broken-image glyph.
+    picture.addEventListener('error', blank);
+    picture.src = item.icon;
   }}
 
   /** One pressable icon on a card's bottom line.
@@ -273,52 +314,6 @@ pub fn script() -> String {
     line.classList.toggle('dsh-pp-on', box.checked);
   }}
 
-  /** The one description on screen, and the icon that asked for it. */
-  var pop = null, popFor = null;
-
-  function forget() {{
-    if (pop) pop.hidden = true;
-    popFor = null;
-  }}
-
-  /** Say what a plugin does, beside the card that was asked.
-   *
-   *  Parented to the panel rather than to the card: a card takes a transform
-   *  on hover, and `position:fixed` inside a transformed element is fixed to
-   *  that element rather than to the window -- so a popover built into the
-   *  card would be clipped by the scrolling list the card sits in.
-   *
-   *  One at a time, and a second press on the same icon puts it away. */
-  function explain(from, text) {{
-    if (popFor === from) {{
-      forget();
-      return;
-    }}
-    if (!pop) pop = make('div', 'dsh-pp-pop', root);
-    pop.textContent = text;
-    pop.hidden = false;
-    popFor = from;
-
-    // Measured from a corner, not from where it happens to be: with no `left`
-    // of its own it takes its static position -- off to one side of a card
-    // that is centred in the window -- and a shrink-to-fit box squeezed
-    // against the window's edge is not the size it is about to be.
-    pop.style.left = '0px';
-    pop.style.top = '0px';
-
-    var at = from.getBoundingClientRect();
-    var size = pop.getBoundingClientRect();
-    var edge = 10;
-    var left = Math.min(at.left - 8, window.innerWidth - size.width - edge);
-    // Under the icon where there is room for it, over it where there is not.
-    var under = at.bottom + 8;
-    var top = under + size.height > window.innerHeight - edge
-      ? at.top - size.height - 8
-      : under;
-    pop.style.left = Math.round(Math.max(edge, left)) + 'px';
-    pop.style.top = Math.round(Math.max(edge, top)) + 'px';
-  }}
-
   /** One card, whichever half of the listing it came out of.
    *
    *  There is one kind of card. A preset and something already installed are
@@ -337,12 +332,7 @@ pub fn script() -> String {
     box.value = item.value;
     box.checked = !!item.checked;
 
-    // The tick the user actually sees. The real checkbox stays in the DOM --
-    // it is what `ticked()` reads and what keyboard focus lands on -- but it is
-    // taken out of the layout by the stylesheet and drawn as this instead.
-    var mock = make('span', 'dsh-pp-tick', line);
-    mock.innerHTML = svg(ICONS.tick);
-    mock.setAttribute('aria-hidden', 'true');
+    face(line, item);
 
     var body = make('div', 'dsh-pp-body', line);
     var name = make('div', 'dsh-pp-name', body);
@@ -350,6 +340,22 @@ pub fn script() -> String {
     // the name the part of this line that gives way when there is not room for
     // all of it. See `.dsh-pp-title`.
     make('span', 'dsh-pp-title', name).textContent = item.name;
+
+    // Which list it came off. A mark rather than a button -- there is nothing
+    // to press -- and what it means is on the hover.
+    var kind = kindOf(item.section);
+    if (kind) {{
+      var flag = make('span', 'dsh-pp-kind dsh-pp-' + item.section, name);
+      flag.innerHTML = svg(kind.icon);
+      flag.title = kind.label;
+    }}
+
+    // What is actually going on the machine, where the name does not already
+    // say it. The names are translated, so `插件市场` on its own names nothing
+    // pnpm has heard of. Beside the name, said quietly, and the first thing on
+    // the line to give way.
+    if (item.detail) make('span', 'dsh-pp-pkg', name).textContent = item.detail;
+
     if (item.fix) name.appendChild(chip('fix', TEXT.fix));
     // Last on the line, after any chip a preset came with. Residue instead of
     // "installed", never both: the tick does the same thing to either, but
@@ -357,23 +363,16 @@ pub fn script() -> String {
     if (item.stale) name.appendChild(chip('stale', TEXT.residue));
     else if (item.installed) name.appendChild(chip('installed', TEXT.have));
 
-    // What is actually going on the machine, where the name does not already
-    // say it. The names are translated, so `插件市场` on its own names nothing
-    // pnpm has heard of. Under the name rather than beside it -- a card three
-    // to a row has not the width for both -- and ellipsised by the stylesheet
-    // rather than wrapped.
-    if (item.detail) make('div', 'dsh-pp-pkg', body).textContent = item.detail;
-
-    var bar = make('div', 'dsh-pp-tools', body);
-
-    // The description is nowhere on the card -- it is what made every card
-    // four lines tall -- so this icon is the whole of the way to it.
+    // On the card, two lines of it, which is where most of them end. The whole
+    // of a longer one is on the hover; what is left over is rarely the part
+    // that says which plugin this is.
     if (item.description) {{
-      var about = act(bar, ICONS.about, TEXT.about);
-      about.addEventListener('click', function () {{
-        explain(about, item.description);
-      }});
+      var about = make('div', 'dsh-pp-desc', body);
+      about.textContent = item.description;
+      about.title = item.description;
     }}
+
+    var bar = make('div', 'dsh-pp-tools', line);
 
     if (item.url) {{
       // A link rather than a button: the shell sends every navigation out of
@@ -383,8 +382,8 @@ pub fn script() -> String {
     }}
 
     // Only where there is one to do. A card with no newer release has no
-    // button rather than a disabled one: the panel is three cards to a row and
-    // a control that never does anything is the one worth not drawing.
+    // button rather than a disabled one: a control that never does anything is
+    // the one worth not drawing.
     //
     // It acts on the one plugin it is on, not on whatever happens to be ticked.
     // The tick means install or remove, and a button that quietly obeyed it
@@ -407,12 +406,13 @@ pub fn script() -> String {
       }});
     }}
 
-    // Which list it came off. A mark rather than a button -- there is nothing
-    // to press -- and what it means is on the hover.
-    var kind = kindOf(item.section);
-    var flag = make('span', 'dsh-pp-kind dsh-pp-' + (item.section || 'other'), bar);
-    flag.innerHTML = svg(kind.icon);
-    flag.title = kind.label;
+    // The tick the user actually sees, at the far end of the line. The real
+    // checkbox stays in the DOM -- it is what `ticked()` reads and what
+    // keyboard focus lands on -- but it is taken out of the layout by the
+    // stylesheet and drawn as this instead.
+    var mock = make('span', 'dsh-pp-tick', line);
+    mock.innerHTML = svg(ICONS.tick);
+    mock.setAttribute('aria-hidden', 'true');
 
     box.addEventListener('change', function () {{
       mark(line, box);
@@ -473,9 +473,9 @@ pub fn script() -> String {
     }}
     var scrolled = keep ? list.scrollTop : 0;
 
-    // Whatever it was pointing at is about to be thrown away.
-    forget();
     list.textContent = '';
+    rows = [];
+    notice = null;
 
     // Recommended first, then the ones this app's author wrote, then a section
     // this panel has no order for. The headings that used to say which was
@@ -496,6 +496,7 @@ pub fn script() -> String {
       return {{
         value: preset.id,
         name: preset.name,
+        icon: preset.icon,
         detail: preset.package === preset.name ? '' : preset.package,
         description: preset.description,
         url: preset.url,
@@ -508,6 +509,7 @@ pub fn script() -> String {
       return {{
         value: item.name,
         name: item.label || item.name,
+        icon: item.icon,
         // The package name, where that is not already the label, and the
         // range pnpm recorded. Between them they say which thing this is.
         detail: [item.label === item.name ? '' : item.name, item.version]
@@ -527,17 +529,92 @@ pub fn script() -> String {
     // At the end, which is where the installed ones are: nothing is offered
     // after the first thing that is already here.
     if (!presets.length) {{
-      make('p', 'dsh-pp-lede', list).textContent = installed.length ? TEXT.allIn : TEXT.empty;
+      notice = make('p', 'dsh-pp-lede', list);
+      notice.textContent = installed.length ? TEXT.allIn : TEXT.empty;
     }}
 
+    // Built off to one side and put in at once, so a long list is one layout
+    // rather than one per card.
+    var batch = document.createDocumentFragment();
     cards.forEach(function (item) {{
       var key = (item.installed ? 'in:' : 'out:') + item.value;
       if (key in was) item.checked = was[key];
-      list.appendChild(card(item));
+      var node = card(item);
+      batch.appendChild(node);
+      rows.push({{
+        node: node,
+        installed: item.installed,
+        update: !!item.update,
+        hay: [item.name, item.value, item.detail, item.description]
+          .join('\n')
+          .toLowerCase()
+      }});
     }});
+    list.appendChild(batch);
+    none = make('p', 'dsh-pp-lede dsh-pp-none', list);
+    none.textContent = TEXT.none;
+
+    count();
+    narrow();
     list.scrollTop = scrolled;
 
     offerRemoval();
+  }}
+
+  /** Whether a card belongs under the tab that is up. */
+  function under(row, which) {{
+    if (which === 'installed') return row.installed;
+    if (which === 'offered') return !row.installed;
+    if (which === 'updates') return row.update;
+    return true;
+  }}
+
+  /** The number on each tab, and the updates tab only while there are any:
+   *  a tab that can only ever say nothing is one more thing to read. */
+  function count() {{
+    Object.keys(tabs).forEach(function (which) {{
+      var n = rows.filter(function (row) {{ return under(row, which); }}).length;
+      tabs[which].count.textContent = String(n);
+      if (which === 'updates') {{
+        tabs[which].node.hidden = !n;
+        if (!n && filter === 'updates') filter = 'all';
+      }}
+    }});
+    Object.keys(tabs).forEach(function (which) {{
+      var on = which === filter;
+      tabs[which].node.classList.toggle('dsh-pp-on', on);
+      tabs[which].node.setAttribute('aria-selected', on ? 'true' : 'false');
+    }});
+  }}
+
+  /** Show the cards the tab and the search both admit, and hide the rest.
+   *
+   *  Every word of the search has to be somewhere in the card -- name,
+   *  package, or description -- in any order, so `搜索 免费` and `free search`
+   *  both find the same plugin. Hiding rather than rebuilding is what keeps a
+   *  ticked card ticked while it is out of view. */
+  function narrow() {{
+    var words = query.toLowerCase().split(/\s+/).filter(Boolean);
+    var seen = 0;
+    rows.forEach(function (row) {{
+      var show = under(row, filter) && words.every(function (word) {{
+        return row.hay.indexOf(word) !== -1;
+      }});
+      row.node.hidden = !show;
+      if (show) seen++;
+    }});
+    // The sentence about the shipped list is about what can be installed, and
+    // says nothing to a search or to the installed tab.
+    var told = !!notice && !words.length && (filter === 'all' || filter === 'offered');
+    if (notice) notice.hidden = !told;
+    none.hidden = !!seen || told;
+  }}
+
+  function pickTab(which) {{
+    filter = which;
+    count();
+    narrow();
+    list.scrollTop = 0;
   }}
 
   function start() {{
@@ -626,36 +703,77 @@ pub fn script() -> String {
       'font-size:12px;line-height:1.6;color:var(--pp-muted)}}' +
       '.dsh-pp-trust svg{{flex:none;margin-top:2px;color:var(--pp-warn)}}' +
       '.dsh-pp-trust b{{display:block;font-weight:600;color:var(--pp-fg)}}' +
-      // Padded, and pulled back out again by the same margin, so a card that
-      // lifts on hover has somewhere to lift into. Without it the scroller's
-      // own edge cut the top off the whole first row.
+      // The search and the tabs, on one line while there is room for both.
+      '.dsh-pp-bar{{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;' +
+      'margin:0 0 10px}}' +
+      '.dsh-pp-find{{position:relative;flex:1 1 220px;min-width:0}}' +
+      '.dsh-pp-find svg{{position:absolute;left:10px;top:50%;margin-top:-7px;' +
+      'width:14px;height:14px;color:var(--pp-muted);pointer-events:none}}' +
+      '.dsh-pp-find input{{width:100%;height:32px;padding:0 11px 0 31px;' +
+      'border:1px solid var(--pp-line);border-radius:8px;background:var(--pp-bg);' +
+      'color:var(--pp-fg);font-size:13px;user-select:text;-webkit-user-select:text}}' +
+      '.dsh-pp-find input::placeholder{{color:var(--pp-muted)}}' +
+      '.dsh-pp-find input:focus{{outline:2px solid var(--pp-accent);outline-offset:-1px}}' +
+      // A segmented control: the tabs sit in one soft trough, and the one that
+      // is up is lifted out of it.
+      '.dsh-pp-tabs{{display:flex;flex:none;gap:2px;padding:2px;border-radius:9px;' +
+      'background:var(--pp-soft);box-shadow:inset 0 0 0 1px var(--pp-line)}}' +
+      // Written with the class twice over to outrank `.dsh-pp button` below.
+      '.dsh-pp .dsh-pp-tab{{height:28px;padding:0 10px;gap:5px;border:0;' +
+      'border-radius:7px;font-size:12.5px;color:var(--pp-muted)}}' +
+      '.dsh-pp .dsh-pp-tab:hover{{background:none;color:var(--pp-fg)}}' +
+      '.dsh-pp .dsh-pp-tab.dsh-pp-on{{background:var(--pp-bg);color:var(--pp-fg);' +
+      'font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08),0 0 0 1px var(--pp-line)}}' +
+      '.dsh-pp .dsh-pp-tab:focus-visible{{outline:2px solid var(--pp-accent);' +
+      'outline-offset:1px}}' +
+      '.dsh-pp-count{{font-weight:500;font-size:11px;color:var(--pp-muted);' +
+      'font-variant-numeric:tabular-nums}}' +
+      '.dsh-pp-tab[data-tab=updates] .dsh-pp-count{{color:var(--pp-accent)}}' +
       '.dsh-pp-list{{flex:1 1 auto;min-height:0;overflow:auto;' +
-      'margin:-6px -4px;padding:6px 4px}}' +
-      // Several cards to a row, and as many of them as the width takes: three
-      // at the card's full width, two at the narrowest window the app opens
-      // at. `align-content` keeps a short list at the top of the scroller
-      // rather than stretched down it.
-      '.dsh-pp-grid{{display:grid;gap:8px;align-content:start;' +
-      'grid-template-columns:repeat(auto-fill,minmax(196px,1fr))}}' +
+      'display:flex;flex-direction:column;gap:6px;margin:0 -4px;padding:0 4px 2px}}' +
       // The line that stands in for an empty list is a sentence, not a card.
-      '.dsh-pp-list>.dsh-pp-lede{{grid-column:1/-1;margin:2px 0 0}}' +
-      // A card rather than a row: it lifts on hover and takes an accent border
-      // when it is ticked, so a selection is visible without reading the box.
-      // No margin -- the grid's gap is what separates them.
-      '.dsh-pp-row{{position:relative;display:flex;gap:9px;align-items:flex-start;' +
-      'padding:10px 11px;border:1px solid var(--pp-line);border-radius:10px;' +
-      'background:var(--pp-bg);cursor:pointer;' +
-      'transition:border-color .15s,background .15s,box-shadow .15s,transform .15s}}' +
-      '.dsh-pp-row:hover{{border-color:var(--pp-hover);background:var(--pp-soft);' +
-      'transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.07)}}' +
+      '.dsh-pp-list>.dsh-pp-lede{{margin:2px 0 0}}' +
+      '.dsh-pp-list>.dsh-pp-none{{padding:18px 0;text-align:center}}' +
+      '.dsh-pp-list>[hidden]{{display:none}}' +
+      // One plugin to a line, the way an extension list draws them: the
+      // picture, what it is called and what it does, then what can be done to
+      // it and the tick at the far end. A ticked card takes an accent border,
+      // so a selection is visible without reading the box.
+      //
+      // `content-visibility` is what keeps a long list cheap: a card scrolled
+      // out of view is not laid out or painted, which is the part of a virtual
+      // list worth having without the part that rebuilds the DOM under the
+      // pointer. The intrinsic size is about a two-line card, so the scrollbar
+      // is near enough right before each card has been seen once. An engine
+      // that has neither property draws every card, as it did before.
+      '.dsh-pp-row{{position:relative;display:flex;flex:none;gap:12px;' +
+      'align-items:center;padding:10px 12px;border:1px solid var(--pp-line);' +
+      'border-radius:10px;background:var(--pp-bg);cursor:pointer;' +
+      'content-visibility:auto;contain-intrinsic-size:auto 64px;' +
+      'transition:border-color .15s,background .15s}}' +
+      '.dsh-pp-row[hidden]{{display:none}}' +
+      '.dsh-pp-row:hover{{border-color:var(--pp-hover);background:var(--pp-soft)}}' +
       '.dsh-pp-row.dsh-pp-on{{border-color:var(--pp-accent);background:var(--pp-tint)}}' +
       '.dsh-pp-row.dsh-pp-on:hover{{border-color:var(--pp-accent)}}' +
+      // The plugin's own picture, drawn whole at the tile's size: most of them
+      // are a tile already, corners and all.
+      '.dsh-pp-icon{{flex:none;display:flex;align-items:center;justify-content:center;' +
+      'width:34px;height:34px;border-radius:9px;overflow:hidden}}' +
+      '.dsh-pp-icon img{{display:block;width:100%;height:100%;object-fit:contain}}' +
+      // The stand-in for a plugin that ships no picture: a puzzle piece, on a
+      // colour of its own. Pale on a light panel and deep on a dark one, so
+      // no tile is ever louder than a real icon beside it.
+      '.dsh-pp-blank{{background:hsl(var(--pp-hue),70%,93%);' +
+      'color:hsl(var(--pp-hue),45%,40%)}}' +
+      '.dsh-pp-dark .dsh-pp-blank{{background:hsl(var(--pp-hue),28%,22%);' +
+      'color:hsl(var(--pp-hue),70%,76%)}}' +
+      '.dsh-pp-blank svg{{display:block}}' +
       // The real checkbox: still focusable and still what `ticked()` reads,
       // but out of the layout so the drawn tick can take its place.
       '.dsh-pp-row input{{position:absolute;opacity:0;width:1px;height:1px;' +
       'margin:0;pointer-events:none}}' +
       '.dsh-pp-tick{{flex:none;display:flex;align-items:center;' +
-      'justify-content:center;width:16px;height:16px;margin-top:1px;' +
+      'justify-content:center;width:16px;height:16px;' +
       'border-radius:5px;border:1.5px solid var(--pp-line);' +
       'background:var(--pp-bg);transition:border-color .15s,background .15s}}' +
       '.dsh-pp-row:hover .dsh-pp-tick{{border-color:var(--pp-hover)}}' +
@@ -688,19 +806,18 @@ pub fn script() -> String {
       // The package name, said quietly: it is what the row installs, not what
       // the row is called. Monospace because it is a thing to be typed —
       // `dsh plugin add` takes this exact string.
-      // Ellipsised rather than wrapped: it is one token, and a card this
-      // narrow would give a long one a line and a half of its own.
-      '.dsh-pp-pkg{{margin-top:1px;font-weight:400;font-size:11.5px;' +
+      // Ellipsised rather than wrapped, and the first thing on the line to
+      // give way: the name it sits beside is what the card is looked for by.
+      '.dsh-pp-pkg{{flex:0 100 auto;min-width:0;font-weight:400;font-size:11.5px;' +
       'color:var(--pp-muted);font-family:ui-monospace,Consolas,monospace;' +
       'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}' +
-      // The bottom line of a card: what it can be asked, then the mark for
-      // which list it came off, at the far end.
-      // Pulled left by the slack inside the first icon's hit box, so the row
-      // of glyphs starts where the name and the package above it start. The
-      // box used to draw that slack and make it look deliberate; nothing draws
-      // it now, so it read as an indent.
-      '.dsh-pp-tools{{display:flex;align-items:center;gap:6px;' +
-      'margin:8px 0 0 -5px}}' +
+      // Two lines at most, and cut short with an ellipsis after that.
+      '.dsh-pp-desc{{margin-top:2px;font-size:12px;line-height:1.5;' +
+      'color:var(--pp-muted);display:-webkit-box;-webkit-box-orient:vertical;' +
+      '-webkit-line-clamp:2;overflow:hidden;word-break:break-word}}' +
+      // What can be done to it, between the text and the tick.
+      '.dsh-pp-tools{{flex:none;display:flex;align-items:center;gap:2px}}' +
+      '.dsh-pp-tools:empty{{display:none}}' +
       '.dsh-pp-tools svg{{display:block;width:14px;height:14px}}' +
       // Written with the class twice over to outrank `.dsh-pp button` below,
       // which is the panel's ordinary button and nothing like this one.
@@ -719,26 +836,19 @@ pub fn script() -> String {
       'background:var(--pp-tint)}}' +
       '.dsh-pp .dsh-pp-act:focus-visible{{outline:2px solid var(--pp-accent);' +
       'outline-offset:1px}}' +
-      // Not a button: nothing to press, and no box around it, so the two that
-      // are pressable still read as the only two.
-      '.dsh-pp-kind{{display:inline-flex;align-items:center;margin-left:auto;' +
+      // Not a button: nothing to press, and no box around it, so the ones
+      // that are pressable still read as the only ones.
+      '.dsh-pp-kind{{flex:none;display:inline-flex;align-items:center;' +
       'color:var(--pp-muted)}}' +
-      // The one mark worth picking out of a grid at a glance, and the only
+      '.dsh-pp-kind svg{{display:block;width:13px;height:13px}}' +
+      // The one mark worth picking out of a list at a glance, and the only
       // thing on the panel that is yellow. Its own colour rather than the
       // amber `--pp-fix` lends a chip: a star is a star.
       '.dsh-pp-kind.dsh-pp-recommended{{color:var(--pp-star)}}' +
-      // The description, on the card that was asked for it. Fixed to the
-      // window, so the scrolling list it is raised over cannot clip it.
-      '.dsh-pp-pop{{position:fixed;z-index:1;max-width:300px;' +
-      'padding:9px 11px;border-radius:10px;border:1px solid var(--pp-line);' +
-      'background:var(--pp-bg);color:var(--pp-fg);font-size:12.5px;' +
-      'line-height:1.55;box-shadow:0 12px 32px rgba(0,0,0,.24)}}' +
-      '.dsh-pp-pop[hidden]{{display:none}}' +
       // Nothing here is load-bearing; a user who asked for less movement can
       // have the same panel without any of it.
       '@media (prefers-reduced-motion:reduce){{.dsh-pp-row,.dsh-pp-tick,' +
-      '.dsh-pp-tick svg,.dsh-pp .dsh-pp-act{{transition:none}}' +
-      '.dsh-pp-row:hover{{transform:none}}}}' +
+      '.dsh-pp-tick svg,.dsh-pp .dsh-pp-act{{transition:none}}}}' +
       '.dsh-pp-chip{{flex:none;font-size:11px;font-weight:500;line-height:1.5;' +
       'padding:0 7px;border-radius:999px;border:1px solid currentColor}}' +
       '.dsh-pp-chip.dsh-pp-fix{{color:var(--pp-fix)}}' +
@@ -772,6 +882,7 @@ pub fn script() -> String {
       // While it runs the log has the card to itself; once it is over the list
       // comes back above it and the log keeps what it printed, because on a
       // failure that output is the whole of what the user has to go on.
+      '.dsh-pp-running .dsh-pp-bar,' +
       '.dsh-pp-running .dsh-pp-list,' +
       '.dsh-pp-running .dsh-pp-hint,' +
       '.dsh-pp-running .dsh-pp-entry,' +
@@ -823,10 +934,39 @@ pub fn script() -> String {
     var said = make('div', '', trust);
     make('b', '', said).textContent = TEXT.trustLead;
     make('span', '', said).textContent = TEXT.trust;
-    list = make('div', 'dsh-pp-list dsh-pp-grid', card);
-    // A description is raised over the list; the icon it was raised from goes
-    // out from under it as soon as the list moves.
-    list.addEventListener('scroll', forget);
+    bar = make('div', 'dsh-pp-bar', card);
+    var find = make('div', 'dsh-pp-find', bar);
+    find.innerHTML = svg(ICONS.search);
+    search = make('input', '', find);
+    search.type = 'text';
+    search.spellcheck = false;
+    search.placeholder = TEXT.search;
+    search.setAttribute('aria-label', TEXT.search);
+    search.addEventListener('input', function () {{
+      query = search.value.trim();
+      narrow();
+      list.scrollTop = 0;
+    }});
+    var strip = make('div', 'dsh-pp-tabs', bar);
+    strip.setAttribute('role', 'tablist');
+    tabs = {{}};
+    [
+      ['all', TEXT.tabAll],
+      ['installed', TEXT.tabInstalled],
+      ['offered', TEXT.tabOffered],
+      ['updates', TEXT.tabUpdates]
+    ].forEach(function (tab) {{
+      var node = button(strip, '', function () {{
+        pickTab(tab[0]);
+      }});
+      node.className = 'dsh-pp-tab';
+      node.setAttribute('role', 'tab');
+      node.setAttribute('data-tab', tab[0]);
+      make('span', '', node).textContent = tab[1];
+      tabs[tab[0]] = {{ node: node, count: make('span', 'dsh-pp-count', node) }};
+    }});
+
+    list = make('div', 'dsh-pp-list', card);
 
     // The label names the box by id rather than wrapping it: the box shares a
     // row with two buttons now, and a button inside a label is one more thing
@@ -888,21 +1028,13 @@ pub fn script() -> String {
     if (root && root.parentNode) root.parentNode.removeChild(root);
     sheet = null;
     root = null;
-    // It hung off the root that has just gone; the next one builds another.
-    pop = null;
-    popFor = null;
+    // They were the old card's; the next one builds its own.
+    rows = [];
+    notice = null;
     // The card showing it has gone; the next one starts with nothing chosen.
     chosen = false;
     stale = false;
   }}
-
-  // A press anywhere else puts an open description away. The icons stop their
-  // own clicks where they are raised (see `act`), so this only ever sees the
-  // other kind -- including a press on the card behind the popover, which is
-  // a tick and should not also have to be a dismissal.
-  document.addEventListener('click', function () {{
-    if (popFor) forget();
-  }});
 
   // The way out that is not at the far end of the card. Ignored while an
   // install runs, which is exactly when the button it stands in for is
@@ -914,10 +1046,12 @@ pub fn script() -> String {
   // card, which is what keeps the rest of the line from being read then.
   document.addEventListener('keydown', function (event) {{
     if (event.key !== 'Escape' || !shown()) return;
-    // The description first: it is the smaller thing to be rid of, and a user
-    // who wanted the panel gone has not been asked twice for nothing.
-    if (popFor) {{
-      forget();
+    // The search first: it is the smaller thing to be rid of, and the key a
+    // user typing into a box reaches for to empty it.
+    if (query && !root.classList.contains('dsh-pp-running')) {{
+      search.value = '';
+      query = '';
+      narrow();
       return;
     }}
     if (!leave.disabled) done();
@@ -945,6 +1079,10 @@ pub fn script() -> String {
 
       var first = how === 'first';
       lede.textContent = first ? TEXT.ledeFirst : TEXT.ledeBack;
+      // Each opening starts from the whole list.
+      search.value = '';
+      query = '';
+      filter = 'all';
       fill(data);
 
       say('', '');
@@ -1014,7 +1152,6 @@ pub fn script() -> String {
   /** Put it away. Rust decides when: leaving means either going back to a dsh
    *  that is still running or starting one that is not. */
   window.__dshPluginHide = function () {{
-    forget();
     if (root) root.classList.remove('dsh-pp-shown');
   }};
 

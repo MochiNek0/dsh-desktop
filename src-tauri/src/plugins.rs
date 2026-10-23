@@ -464,9 +464,18 @@ pub fn listing(app: &AppHandle, behind: &[(String, String, String)]) -> String {
         .iter()
         .filter(|preset| !installed.contains(&preset.package))
         .map(|preset| {
+            // Only a preset that ships inside the app has a package on this
+            // machine to take a picture out of before it is installed. The
+            // rest get the panel's lettered tile until they are.
+            let icon = preset
+                .spec
+                .strip_prefix(BUNDLED)
+                .and_then(|name| bundled(app, name))
+                .and_then(|dir| own(&dir).icon);
             serde_json::json!({
                 "id": preset.id,
                 "name": preset.name,
+                "icon": icon,
                 // Beside the name on the card. The names are translated now,
                 // so the card no longer says anywhere what it is about to put
                 // on the machine — the row on the installed list carries the
@@ -488,17 +497,22 @@ pub fn listing(app: &AppHandle, behind: &[(String, String, String)]) -> String {
     // one kind of card for both halves of this listing: an installed plugin
     // keeps the description, the repository and the section it had while it
     // was still something to install. A plugin the shipped list has never
-    // heard of has none of the three, and gets the card that is left.
+    // heard of has none of the three, and gets what the package says about
+    // itself instead; see [`own`].
+    let modules = profile_dir(app).join("node_modules");
     let held: Vec<serde_json::Value> = holdings(&manifest)
         .into_iter()
         .map(|(name, version, stale)| {
             let preset = presets.iter().find(|preset| preset.package == name);
+            let own = own(&modules.join(&name));
             let label = preset
                 .map(|preset| preset.name.clone())
+                .or(own.title)
                 .unwrap_or_else(|| name.clone());
             serde_json::json!({
                 "name": name,
                 "label": label,
+                "icon": own.icon,
                 "version": version,
                 // What residue is, in place of whatever the shipped list says
                 // the package does. A card reading "插件市场" with a red chip on
@@ -514,7 +528,11 @@ pub fn listing(app: &AppHandle, behind: &[(String, String, String)]) -> String {
                     )
                     .to_string()
                 } else {
-                    preset.map(|preset| preset.description.clone()).unwrap_or_default()
+                    preset
+                        .map(|preset| preset.description.clone())
+                        .filter(|description| !description.is_empty())
+                        .or(own.description)
+                        .unwrap_or_default()
                 },
                 "url": preset.map(|preset| preset.url.as_str()),
                 "section": preset.map(|preset| preset.section.as_str()),
@@ -820,6 +838,106 @@ fn bundles_in(manifest: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// What a plugin says about itself, out of the package it installed as.
+///
+/// The shipped list only speaks for the handful of presets on it. Anything
+/// else in the profile — whatever the market put there, or `dsh plugin add`
+/// in a terminal — used to be drawn as its bare package name with nothing
+/// under it, though most of them say what they are: `locale/<lang>.json`
+/// carries the `meta.title` and `meta.description` dsh's own plugin list reads,
+/// and the manifest's `icon` names the picture that goes with them.
+#[derive(Default)]
+struct Own {
+    title: Option<String>,
+    description: Option<String>,
+    /// A `data:` URL, so the panel can draw it without a fetch into a page
+    /// whose network this app does not own; see `controls::lucide`.
+    icon: Option<String>,
+}
+
+/// The most an icon may weigh and still be drawn. Every one installed today is
+/// under a kilobyte; the listing is sent into the page whole each time the
+/// panel opens, and a plugin that ships a photograph as its icon should cost
+/// that plugin its picture rather than every card a slower panel.
+const ICON_LIMIT: u64 = 64 * 1024;
+
+/// [`Own`] for the package installed at `dir`. Empty for a directory that is
+/// not there, which is what residue's always is.
+fn own(dir: &Path) -> Own {
+    let read = |path: PathBuf| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    let Some(manifest) = read(dir.join("package.json")) else {
+        return Own::default();
+    };
+
+    // The language of the moment first, the other one after it, the way a
+    // preset's two halves fall back; see `parse`. The manifest's own
+    // description is English by convention, so it comes before the Chinese
+    // locale in an English panel and after it in a Chinese one.
+    let locale = |lang: &str| read(dir.join("locale").join(format!("{lang}.json")));
+    let (first, second) = if crate::i18n::chinese() {
+        (locale("zh"), locale("en"))
+    } else {
+        (locale("en"), locale("zh"))
+    };
+    let said = |file: &Option<serde_json::Value>, key: &str| {
+        let text = file.as_ref()?.get("meta")?.get(key)?.as_str()?.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    };
+    let summary = || {
+        let text = manifest.get("description")?.as_str()?.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    };
+
+    Own {
+        title: said(&first, "title").or_else(|| said(&second, "title")),
+        description: if crate::i18n::chinese() {
+            said(&first, "description")
+                .or_else(|| said(&second, "description"))
+                .or_else(summary)
+        } else {
+            said(&first, "description")
+                .or_else(summary)
+                .or_else(|| said(&second, "description"))
+        },
+        icon: manifest
+            .get("icon")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|path| icon(dir, path)),
+    }
+}
+
+/// The picture the manifest's `icon` names, as a `data:` URL.
+///
+/// Only from inside the package: the path is the plugin's to write, and a
+/// `../../` out of it is a file on the user's disk being read into a page.
+/// Only the image types an `<img>` draws, so the panel never needs anything but
+/// one — which is also what keeps a script inside an SVG from running.
+fn icon(dir: &Path, path: &str) -> Option<String> {
+    let kind = match Path::new(path).extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => return None,
+    };
+    // Both resolved, so a `link:` dependency — a junction, for the bundled
+    // plugin — is compared where it actually is.
+    let root = dir.canonicalize().ok()?;
+    let file = root.join(path).canonicalize().ok()?;
+    if !file.starts_with(&root) || std::fs::metadata(&file).ok()?.len() > ICON_LIMIT {
+        return None;
+    }
+
+    use base64::Engine as _;
+    let bytes = std::fs::read(&file).ok()?;
+    Some(format!(
+        "data:{kind};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 /// The scope dsh's own in-box bundles are named in.
@@ -4087,6 +4205,50 @@ mod tests {
     fn with_bundles_refuses_a_manifest_it_did_not_come_from() {
         assert!(with_bundles("{\n  \"name\": \"x\"\n}\n", &["a".to_string()]).is_err());
         assert!(with_bundles("{ not json", &[]).is_err());
+    }
+
+    /// A plugin off the shipped list is drawn with the name, description and
+    /// icon its own package gives, rather than as its bare package name.
+    #[test]
+    fn a_plugin_speaks_for_itself_out_of_its_package() {
+        let scratch = Scratch::new("own");
+        let dir = scratch.dir("node_modules/dsh-ghost-prompt");
+        // One locale only, so the answer is the same whichever language the
+        // test process happens to be in.
+        std::fs::create_dir_all(dir.join("locale")).unwrap();
+        std::fs::write(
+            dir.join("locale").join("zh.json"),
+            r#"{"meta":{"title":"输入预测","description":"预测下一句"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("icon.svg"), "<svg/>").unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"dsh-ghost-prompt","icon":"./icon.svg"}"#,
+        )
+        .unwrap();
+
+        let own = super::own(&dir);
+
+        assert_eq!(own.title.as_deref(), Some("输入预测"));
+        assert_eq!(own.description.as_deref(), Some("预测下一句"));
+        assert_eq!(own.icon.as_deref(), Some("data:image/svg+xml;base64,PHN2Zy8+"));
+    }
+
+    /// The icon path is the plugin's to write, and is only followed as far as
+    /// the plugin's own directory, only to an image, and only to a small one.
+    #[test]
+    fn an_icon_is_only_read_from_inside_the_package() {
+        let scratch = Scratch::new("icon");
+        let dir = scratch.dir("node_modules/p");
+        std::fs::write(scratch.0.join("secret.svg"), "<svg/>").unwrap();
+        std::fs::write(dir.join("icon.js"), "alert(1)").unwrap();
+        std::fs::write(dir.join("big.png"), vec![0u8; super::ICON_LIMIT as usize + 1]).unwrap();
+
+        assert_eq!(super::icon(&dir, "../../secret.svg"), None);
+        assert_eq!(super::icon(&dir, "icon.js"), None);
+        assert_eq!(super::icon(&dir, "big.png"), None);
+        assert_eq!(super::icon(&dir, "missing.svg"), None);
     }
 
     /// A directory of this test's own, gone again when it ends. Built on disk,
