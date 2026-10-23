@@ -98,14 +98,141 @@ const NATIVE_LIGHTS_WIDTH: u32 = 54;
 /// would have filled, and centred down the bar.
 ///
 /// The y is not the inset above the buttons. wry only makes the title bar's
-/// container `button height + y` tall and leaves each button where it sat
-/// from the container's bottom, which puts their centre at about `y + 2` from
-/// the top. Measured, not derived: 0.1.26-beta.1 asked for 11, as the inset
-/// it looked like, and drew them centred at 13, five points above the menu
-/// button beside them.
+/// container `button height + y` tall and leaves each button where AppKit
+/// put it from the container's bottom, so where their centre lands depends on
+/// the button's size and that gap — both AppKit's, and both changed between
+/// macOS releases. A constant was tried: 0.1.26-beta.1 measured `y + 2` on one
+/// system, and macOS 27 drew the buttons off the menu button's line again.
+///
+/// So it is measured on the system it runs on, before the real window exists;
+/// see [`lights`]. Called while the window is being built, on the main thread,
+/// which is where AppKit wants it.
 #[cfg(target_os = "macos")]
 pub fn traffic_lights() -> tauri::LogicalPosition<f64> {
-    tauri::LogicalPosition::new(ROW_PAD as f64, (TITLEBAR_HEIGHT / 2 - 2) as f64)
+    let centre = (TITLEBAR_HEIGHT / 2) as f64;
+    // The old measurement, for a system where the new one cannot be taken.
+    let y = lights::inset_for(centre).unwrap_or(centre - 2.0);
+    tauri::LogicalPosition::new(ROW_PAD as f64, y)
+}
+
+/// Where the system's buttons actually land, read off a window that is never
+/// shown.
+///
+/// The window is built with the real one's style — titled, full-size content,
+/// a transparent title bar with no title, which is what `TitleBarStyle::Overlay`
+/// and `hidden_title` make — and its title bar is given the shape wry gives the
+/// real one for a trial `y`. Where the close button's centre lands says how far
+/// off the trial was; the second `y` corrects it and is checked the same way. A
+/// system on which moving the container does not move the buttons one for one
+/// fails the check, and gets the old constant rather than a wrong answer.
+#[cfg(target_os = "macos")]
+mod lights {
+    use objc2::encode::{Encode, Encoding};
+    use objc2::rc::{Allocated, Retained};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Point {
+        x: f64,
+        y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Size {
+        width: f64,
+        height: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Rect {
+        origin: Point,
+        size: Size,
+    }
+
+    // SAFETY: laid out as CoreGraphics lays out the structs these encodings name.
+    unsafe impl Encode for Point {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+    unsafe impl Encode for Size {
+        const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+    }
+    unsafe impl Encode for Rect {
+        const ENCODING: Encoding = Encoding::Struct("CGRect", &[Point::ENCODING, Size::ENCODING]);
+    }
+
+    /// The `y` that puts the buttons' centre `centre` points below the top of
+    /// the window, or `None` when it could not be found.
+    pub fn inset_for(centre: f64) -> Option<f64> {
+        // SAFETY: on the main thread (see `traffic_lights`), sending NSWindow
+        // and NSView only messages they answer, with arguments of the types
+        // they take.
+        unsafe {
+            let window: Allocated<AnyObject> = msg_send![class!(NSWindow), alloc];
+            let content = Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size { width: 800.0, height: 600.0 },
+            };
+            // Titled, closable, miniaturizable, resizable, full-size content.
+            let style: usize = 1 | 2 | 4 | 8 | 1 << 15;
+            let window: Option<Retained<AnyObject>> = msg_send![
+                window,
+                initWithContentRect: content,
+                styleMask: style,
+                backing: 2usize,
+                defer: true
+            ];
+            let window = window?;
+            let _: () = msg_send![&*window, setReleasedWhenClosed: false];
+            let _: () = msg_send![&*window, setTitlebarAppearsTransparent: true];
+            // NSWindowTitleHidden.
+            let _: () = msg_send![&*window, setTitleVisibility: 1isize];
+            let _: () = msg_send![&*window, layoutIfNeeded];
+
+            let landed = centre_at(&window, centre);
+            let y = landed.map(|landed| centre + (centre - landed));
+            let checked = y.and_then(|y| centre_at(&window, y));
+            let _: () = msg_send![&*window, close];
+
+            let (y, checked) = (y?, checked?);
+            ((checked - centre).abs() < 0.5).then_some(y)
+        }
+    }
+
+    /// Where the close button's centre lands, from the top of the window, once
+    /// the title bar's container has been made `button height + y` tall and
+    /// pinned to the top — wry's own steps, for the one axis that matters here.
+    unsafe fn centre_at(window: &AnyObject, y: f64) -> Option<f64> {
+        // NSWindowCloseButton.
+        let close: *mut AnyObject = msg_send![window, standardWindowButton: 0usize];
+        if close.is_null() {
+            return None;
+        }
+        let parent: *mut AnyObject = msg_send![close, superview];
+        if parent.is_null() {
+            return None;
+        }
+        let container: *mut AnyObject = msg_send![parent, superview];
+        if container.is_null() {
+            return None;
+        }
+
+        let button: Rect = msg_send![close, frame];
+        let outer: Rect = msg_send![window, frame];
+        let mut bar: Rect = msg_send![container, frame];
+        bar.size.height = button.size.height + y;
+        bar.origin.y = outer.size.height - bar.size.height;
+        let _: () = msg_send![container, setFrame: bar];
+
+        // In the window's own coordinates, whose origin is its bottom left.
+        let bounds: Rect = msg_send![close, bounds];
+        let nowhere: *mut AnyObject = std::ptr::null_mut();
+        let placed: Rect = msg_send![close, convertRect: bounds, toView: nowhere];
+        Some(outer.size.height - (placed.origin.y + placed.size.height / 2.0))
+    }
 }
 
 /// The menu's typeface. Named rather than left to the webview, whose default for
