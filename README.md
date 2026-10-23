@@ -14,6 +14,7 @@ DeepSeek Harness (`dsh web`) 的轻量桌面客户端，支持用手机远程连
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/MochiNek0/badge.svg)](https://hub.xerj.org/contributors/MochiNek0)
 
 <br/>
 <br/>
