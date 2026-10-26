@@ -16,7 +16,7 @@
 # matters is someone pressing Publish, which is what `release: published` is.
 #
 # A beta does leave that workflow published, as a prerelease — and still does
-# not arrive here. It is `tauri-action` that publishes it, with `GITHUB_TOKEN`,
+# not arrive here. It is release.yml's `check` job that publishes it, with `GITHUB_TOKEN`,
 # and an event raised by that token starts no workflow run; v0.1.20-beta.0 went
 # public and this file did not run at all, not even to skip. A stable release
 # reaches us only because the Publish at the end of it is a person pressing a

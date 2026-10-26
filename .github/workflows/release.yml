@@ -8,12 +8,14 @@
 #
 # ── Betas ───────────────────────────────────────────────────────────────
 # A tag carrying a prerelease suffix — `v0.1.20-beta.1` — takes the other path:
-# it is published straight away, as a GitHub *prerelease*. That is safe for the
-# same reason the draft is necessary. `releases/latest` resolves to the newest
-# release that is neither a draft nor a prerelease, so a prerelease is invisible
-# to every installed copy and there is nothing for a look to catch; drafting one
-# would only hide it from the testers it exists for, since a draft is visible to
-# collaborators and to no one else.
+# it is published without anyone pressing a button, as a GitHub *prerelease*,
+# by the `check` job once the tests and the feed have passed. That is safe for
+# the same reason the draft is necessary. `releases/latest` resolves to the
+# newest release that is neither a draft nor a prerelease, so a prerelease is
+# invisible to every installed copy and there is nothing for a look to catch;
+# leaving one a draft would only hide it from the testers it exists for, since
+# a draft is visible to collaborators and to no one else. It is a draft only
+# while it is being built, so that a failing test keeps it from them too.
 #
 # Nothing has to carry a beta machine back to stable, either. The updater
 # compares with semver, and semver puts `0.1.20-beta.1` above `0.1.19` and below
@@ -53,9 +55,14 @@ permissions:
 
 jobs:
   # Does it still compile, and do the unit tests still pass, on all three platforms?
-  # This job only runs on manual dispatch to check code health without doing a full release bundle.
+  #
+  # Beside the bundles rather than in front of them, and in the debug profile.
+  # Inside the bundle job it was `cargo test --release`, which under this
+  # crate's fat LTO and single codegen unit cost three to five minutes on every
+  # platform's critical path, for a build the installer then compiled again with
+  # different features. `check` waits on this, and every release — beta or not —
+  # stays a draft until `check` has passed.
   test:
-    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -176,16 +183,17 @@ jobs:
 
           if [ -z "$id" ]; then
             # A `-` in a tag is a semver prerelease suffix and nothing else —
-            # the stable tags are `v0.1.19`. See the note at the top for why a
-            # beta is published where a stable release is drafted.
+            # the stable tags are `v0.1.19`. Both start as drafts; see the note
+            # at the top for why `check` publishes a beta and leaves a stable
+            # release to a person.
             case "$TAG" in
-              *-*) draft=false prerelease=true ;;
-              *) draft=true prerelease=false ;;
+              *-*) prerelease=true ;;
+              *) prerelease=false ;;
             esac
             id=$(gh api -X POST "repos/$REPO/releases" \
               -f tag_name="$TAG" \
               -f name="dsh desktop $TAG" \
-              -F draft="$draft" \
+              -F draft=true \
               -F prerelease="$prerelease" \
               --jq .id)
           fi
@@ -297,9 +305,6 @@ jobs:
 
       - run: npm ci
 
-      - name: run cargo test
-        run: cargo test --release --manifest-path src-tauri/Cargo.toml
-
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -358,7 +363,7 @@ jobs:
   # anyone can update to it. Re-running the bundle job of the platform it names
   # puts its entry back: the action replaces assets of the same name.
   check:
-    needs: [release, bundle]
+    needs: [release, bundle, test]
     runs-on: ubuntu-22.04
     steps:
       - name: check the release has every platform in its updater feed
@@ -402,3 +407,14 @@ jobs:
             jq '.platforms | map_values(.url)' latest.json
             exit 1
           fi
+
+      # Reached only with the tests and the feed both green. A stable release
+      # stays a draft for a person to publish; a beta goes out now, as the
+      # prerelease it was created as. See the note at the top.
+      - name: publish a beta
+        if: contains(github.ref_name, '-')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ID: ${{ needs.release.outputs.id }}
+        run: gh api -X PATCH "repos/$REPO/releases/$ID" -F draft=false -F prerelease=true --jq '.html_url'
