@@ -15,11 +15,22 @@
     "package": "dsh-web-search-free",
     "spec": "dsh-web-search-free",
     "section": "authored",
-    "name": "免费网络搜索",
+    "name": "免费网页搜索",
     "nameEn": "Web Search Free",
-    "description": "免费的联网搜索与网页抓取通道：Tavily / Exa / Jina / Firecrawl / Brave 多引擎按序 fallback，可拖动排序、每个引擎填多个 Key。走各家专用检索接口，不经过任何模型，因此一次搜索 0 模型 token，也不需要 DEEPSEEK_API_KEY。",
-    "descriptionEn": "A free web search and fetch channel: Tavily, Exa, Jina, Firecrawl and Brave chained with automatic fallback, reorderable by drag, several keys per engine. It calls each engine's own search endpoint rather than a model, so a search costs zero model tokens and needs no DEEPSEEK_API_KEY.",
+    "description": "免费的联网搜索与网页抓取通道：TinyFish、SearXNG、Tavily、Brave、Exa、百度千帆等十几个引擎按序 fallback，可拖动排序、每个引擎填多个 Key。走各家专用检索接口，不经过任何模型，因此一次搜索 0 模型 token，也不需要 DEEPSEEK_API_KEY。",
+    "descriptionEn": "A free web search and fetch channel: TinyFish, SearXNG, Tavily, Brave, Exa, Baidu Qianfan and a dozen engines in all, chained with automatic fallback, reorderable by drag, several keys per engine. It calls each engine's own search endpoint rather than a model, so a search costs zero model tokens and needs no DEEPSEEK_API_KEY.",
     "url": "https://github.com/MochiNek0/dsh-web-search-free"
+  },
+  {
+    "id": "dsh-ghost-prompt",
+    "package": "dsh-ghost-prompt",
+    "spec": "dsh-ghost-prompt",
+    "section": "authored",
+    "name": "输入预测",
+    "nameEn": "Prompt Suggestions",
+    "description": "每轮对话结束后，模型猜你接下来想说什么，以灰色幽灵文字显示在输入框里：按 → 接受，直接打字则忽略。预测模型默认跟随当前会话，也可以另配 ModelScope、硅基流动等 OpenAI 兼容模型。",
+    "descriptionEn": "After each turn, the model guesses what you will say next and shows it as ghost text in the composer: press → to accept it, or just type to ignore it. Predictions use the session's model by default, or any OpenAI-compatible one such as ModelScope or SiliconFlow.",
+    "url": "https://github.com/MochiNek0/dsh-ghost-prompt"
   },
   {
     "id": "dsh-desktop-signal",
