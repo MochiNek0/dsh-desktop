@@ -128,6 +128,10 @@ pub async fn serve(
             continue;
         };
 
+        // Off, or Nagle holds each streamed token back until the phone's
+        // delayed ACK for the previous one arrives. Here and on the way to dsh.
+        let _ = stream.set_nodelay(true);
+
         let shared = shared.clone();
         tokio::spawn(async move {
             let _slot = slot;
@@ -555,6 +559,7 @@ where
     B::Error: Into<BoxedError>,
 {
     let stream = TcpStream::connect(authority).await?;
+    let _ = stream.set_nodelay(true);
     let (mut sender, connection) =
         hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
 
