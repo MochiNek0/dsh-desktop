@@ -1251,10 +1251,20 @@ pub fn stall_watch() -> String {
     format!(
         r#"(function () {{
   var told = false;
+  var seen = false;
+  var observer = null;
 
   function look() {{
     if (told) return;
     var boot = document.querySelector('[data-dsh-boot]');
+    // The overlay is only replaced once the app mounts, which is once every
+    // plugin has come up -- so one seen and then gone is a boot that worked,
+    // and every later mutation of a streaming page would be a scan for nothing.
+    if (boot !== null) seen = true;
+    else if (seen && observer !== null) {{
+      observer.disconnect();
+      return;
+    }}
     // An overlay with no spinner under it. Never true on the way up: the card
     // is built with the spinner in it before the overlay is attached to
     // anything, so there is no moment where one is in the document without the
@@ -1277,7 +1287,8 @@ pub fn stall_watch() -> String {
   // document that arrived already failed.
   function arm() {{
     if (!document.documentElement) return false;
-    new MutationObserver(look).observe(document.documentElement, {{
+    observer = new MutationObserver(look);
+    observer.observe(document.documentElement, {{
       childList: true,
       subtree: true,
     }});
