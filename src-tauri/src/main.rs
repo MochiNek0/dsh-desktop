@@ -1275,6 +1275,12 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 /// at the panel".
 static PANEL: AtomicBool = AtomicBool::new(false);
 
+/// Whether a pnpm run started from the panel is still going. Narrower than
+/// [`BUSY`], which the boot and an update hold too: this is the one case in
+/// which leaving the panel has to wait, because the run stopped dsh and
+/// starting it again is left to the way out. See [`leave_plugins`].
+static PLUGIN_JOB: AtomicBool = AtomicBool::new(false);
+
 /// Clears [`BUSY`] however the thread holding it ends, including the early
 /// returns for an app that is quitting.
 struct Busy;
@@ -2281,10 +2287,13 @@ where
             return;
         };
 
+        PLUGIN_JOB.store(true, Ordering::SeqCst);
         stop_server(&app, &session);
 
         let log = |line: &str| session.splash.plugin_log(&window, line);
-        match work(&app, &log) {
+        let worked = work(&app, &log);
+        PLUGIN_JOB.store(false, Ordering::SeqCst);
+        match worked {
             Ok(()) => {
                 session
                     .splash
@@ -2368,6 +2377,14 @@ fn leave_plugins(app: &tauri::AppHandle) {
         let Some(window) = app.get_webview_window("main") else {
             return;
         };
+
+        // Not while a run is going. It stopped dsh, it starts nothing when it
+        // ends, and the flag below would be held by it — so a panel closed now
+        // is a stopped dsh with nobody left to bring it back. The button is
+        // disabled for the same span; this is for whatever else sends the verb.
+        if PLUGIN_JOB.load(Ordering::SeqCst) {
+            return;
+        }
 
         // Down first, and without asking anyone. Taking [`BUSY`] before this
         // meant a panel opened while the boot was still running could not be

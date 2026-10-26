@@ -1093,6 +1093,14 @@ pub fn script() -> String {
   /** The listing, and which of the two ways this was opened. */
   window.__dshPlugins = function (listing, how) {{
     ready(function () {{
+      // Opened again from the menu while a run is going: the titlebar sits
+      // above this card, so the menu still answers. Resetting would throw the
+      // log away and hand back a way out that leaves dsh stopped under a job
+      // nobody restarts it after -- so it only comes back to the front.
+      if (root && root.classList.contains('dsh-pp-running')) {{
+        root.classList.add('dsh-pp-shown');
+        return;
+      }}
       if (stale) discard();
       if (!root) build();
 
