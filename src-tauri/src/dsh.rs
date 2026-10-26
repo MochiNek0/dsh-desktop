@@ -1721,18 +1721,32 @@ pub(crate) fn printed(mut command: Command, timeout: Duration) -> Option<String>
         .ok()?;
 
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (send, read) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut printed = Vec::new();
         let _ = stdout.read_to_end(&mut printed);
-        printed
+        let _ = send.send(printed);
     });
 
+    // Waited on the pipe rather than polled on the process: the pipe closes
+    // with the process, so the read ending is the answer arriving — where a
+    // poll made every `--version` take a whole tick however fast it printed.
+    // The early returns leave the reader running, which costs nothing: they
+    // all end with a process that is gone or killed.
     let deadline = Instant::now() + timeout;
+    let Ok(printed) = read.recv_timeout(timeout) else {
+        crate::server::kill_tree(&mut child);
+        return None;
+    };
+
+    // Closed is not quite exited, so the status is still waited for — briefly,
+    // and against the same deadline, for a child that shut its stdout and
+    // carried on.
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break,
             Ok(Some(_)) => return None,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
                 crate::server::kill_tree(&mut child);
                 return None;
@@ -1741,10 +1755,6 @@ pub(crate) fn printed(mut command: Command, timeout: Duration) -> Option<String>
         }
     }
 
-    // The pipe closes with the process, so the reader is already done or a
-    // syscall away from it. The early returns above leave it running, which
-    // costs nothing: they all end with a process that is gone or killed.
-    let printed = reader.join().ok()?;
     Some(String::from_utf8_lossy(&printed).trim().to_string())
 }
 
