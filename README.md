@@ -90,12 +90,6 @@ npm run build   # 构建发布包，输出至 src-tauri/target/release/bundle/
 - **上游项目**：[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 - **友情链接**：[DSH Market](https://github.com/dsh-market/dsh-market) —— dsh 里的可视化插件市场，浏览、搜索并一键安装社区插件（[dshmarket.com](https://dshmarket.com)）
 
-## 代码签名与隐私
-
-Windows 版的免费代码签名由 [SignPath.io](https://about.signpath.io/) 提供，证书由 [SignPath Foundation](https://signpath.org/) 颁发（申请中）。安装包全部由 GitHub Actions 从本仓库源码构建，每次签名由维护者 [MochiNek0](https://github.com/MochiNek0) 手动批准。
-
-除启动时的应用更新检查、dsh 更新检查和（开启时的）手机样式补丁外，本程序不会向其他联网系统传输任何信息，除非用户明确要求。不收集使用统计、不上报崩溃。完整的签名政策与隐私说明见 [官网](https://dsh-desktop.cc.cd/docs/code-signing/)。
-
 ## 许可证
 
 本项目采用 [GNU AGPL-3.0](LICENSE)。Copyright © 2026 MochiNek0。
