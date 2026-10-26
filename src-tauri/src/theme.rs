@@ -119,7 +119,7 @@ pub fn background(window: &WebviewWindow, preference: Preference) {
 }
 
 /// How often the settings file is looked at, with the window on screen and
-/// without.
+/// without (in front and not, on Windows; see [`watch`]).
 ///
 /// The gap between the two is what makes the fast one affordable. This poll is
 /// the whole of the delay a user sees after picking `system` in dsh — dsh has
@@ -149,15 +149,30 @@ pub fn watch(window: WebviewWindow, launched_with: Preference) {
         let mut seen = stamp();
         let mut preference = launched_with;
 
+        // On Windows: is the window the one in front, asked of the OS. Not
+        // `is_visible`, which a minimised or buried window also answers yes to
+        // and which wakes the event loop to answer at all; and not the window's
+        // `Focused` event, which reads false while the webview holds the focus.
+        // Switching the theme in dsh means clicking in this window, so in front
+        // is the only time the fast poll is earning anything.
+        #[cfg(windows)]
+        let looked_at = {
+            let hwnd = window.hwnd().ok().map(|hwnd| hwnd.0 as isize);
+            move || match hwnd {
+                Some(raw) => unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize == raw
+                },
+                None => true,
+            }
+        };
+        #[cfg(not(windows))]
+        let looked_at = || window.is_visible().unwrap_or(true);
+
         loop {
             // Asked every time rather than remembered: the window is hidden and
             // shown from the tray, from the close button and from a second
             // launch, and none of those come past here.
-            std::thread::sleep(if window.is_visible().unwrap_or(true) {
-                WATCHING
-            } else {
-                HIDDEN
-            });
+            std::thread::sleep(if looked_at() { WATCHING } else { HIDDEN });
 
             let now = stamp();
             if now == seen {
