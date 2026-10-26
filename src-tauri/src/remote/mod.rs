@@ -123,6 +123,10 @@ const STARTUP: Duration = Duration::from_secs(45);
 /// How often the card looks while a tunnel is coming up.
 const STARTUP_TICK: Duration = Duration::from_millis(300);
 
+/// How often it looks once nobody is watching the card: only the tray and the
+/// idle timer are waiting on it then, and neither is in a hurry.
+const IDLE_POLL: Duration = Duration::from_secs(2);
+
 /// Who decides whether a device that redeemed a nonce gets in.
 ///
 /// In the app it is a human at the desktop, asked through [`crate::dialog`].
@@ -982,30 +986,53 @@ fn setup(app: &AppHandle, remote: &Remote, kind: TunnelType) -> Option<card::Set
 /// on screen. The tunnel is left where it is: `cloudflared` may still be
 /// retrying, and a user who watches it finally connect and presses the button
 /// again finds it already up.
+///
+/// Giving up on the card is not giving up on the tunnel. One that connects
+/// after the card was closed, or after it said so, is still on the internet —
+/// so the watch stays until it settles, and then does the two things `present`
+/// would have: the tray's warning and the idle timer.
 fn watch_startup(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         let until = Instant::now() + STARTUP;
+        // The card is no longer this watch's to draw: closed, or told it
+        // timed out.
+        let mut done_drawing = false;
 
         loop {
-            std::thread::sleep(STARTUP_TICK);
+            std::thread::sleep(if done_drawing {
+                IDLE_POLL
+            } else {
+                STARTUP_TICK
+            });
 
             let Some(remote) = app.try_state::<Remote>() else {
                 return;
             };
-            // The user closed the card. Putting it back up because a tunnel
-            // they stopped waiting for finally connected is the same mistake
-            // `remint` is written to avoid.
-            if !remote.card.load(Ordering::Relaxed) {
+
+            let state = remote.shared.state();
+            if !matches!(state, TunnelState::Starting) {
+                if !done_drawing && remote.card.load(Ordering::Relaxed) {
+                    return present(&app, &remote, Ok(()));
+                }
+                crate::refresh_tray(&app);
+                if remote.shared.public() && state.base_url().is_some() {
+                    watch_idle(&app);
+                }
                 return;
             }
 
-            if !matches!(remote.shared.state(), TunnelState::Starting) {
-                return present(&app, &remote, Ok(()));
+            // The user closed the card. Putting it back up because a tunnel
+            // they stopped waiting for finally connected is the same mistake
+            // `remint` is written to avoid.
+            if done_drawing || !remote.card.load(Ordering::Relaxed) {
+                done_drawing = true;
+                continue;
             }
 
             if Instant::now() >= until {
-                return waiting(
+                done_drawing = true;
+                waiting(
                     &app,
                     &remote,
                     Some(
