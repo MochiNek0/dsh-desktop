@@ -9,7 +9,7 @@
 //!
 //! There is no language setting here, and no menu item to add one. There is one
 //! already, in dsh's own Settings → General, and dsh writes what was picked into
-//! the same `settings.yaml` the theme is read out of — see [`crate::theme`].
+//! the same settings the theme is read out of — see [`crate::theme::setting`].
 //! This app is a frame around that page, so the frame asks the page's own
 //! setting rather than asking the question a second time in a second place. The
 //! system locale is what is left when dsh has not been asked, which is also
@@ -93,21 +93,13 @@ fn is_chinese(locale: &str) -> bool {
 /// with dsh rather than guessing past it. And a file that cannot be read at all
 /// is dsh's to complain about, not a reason for the frame around it to refuse
 /// to draw.
-fn dsh_locale() -> Option<String> {
-    let text = std::fs::read_to_string(crate::theme::settings_file()?).ok()?;
-    parse(&text)
-}
-
-/// Read `locale.preference` out of the settings document.
 ///
-/// The same scan [`crate::theme`] reads `ui-theme.preference` with, and now
-/// literally the same one — see [`crate::theme::field`]. A key that is present
+/// The `preference` of dsh's `locale` plugin, read the way [`crate::theme`]
+/// reads `ui-theme`'s — see [`crate::theme::setting`]. A key that is present
 /// but empty is nothing said, which leaves the answer `None`: the system
 /// locale, what this did before there was a preference to read.
-fn parse(text: &str) -> Option<String> {
-    crate::theme::field(text, "locale", "preference")
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+fn dsh_locale() -> Option<String> {
+    crate::theme::setting("locale", "preference")
 }
 
 /// One string in both languages, Chinese first.
@@ -139,7 +131,34 @@ macro_rules! t {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_chinese, parse};
+    use super::is_chinese;
+    use crate::theme::lookup;
+
+    fn parse(text: &str) -> Option<String> {
+        lookup(text, true, "locale", "preference")
+    }
+
+    /// dsh 0.2's profile patch, where `ui-theme`'s entry is the one above.
+    #[test]
+    fn reads_the_language_out_of_the_profile_patch() {
+        let patch = "\
+- id: ui-theme
+  config:
+    preference: dark
+- id: locale
+  name: '@deepseek-ai/dsh-client-locale'
+  config:
+    preference: en
+";
+        assert_eq!(
+            lookup(patch, false, "locale", "preference").as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            lookup("- id: locale\n  config:\n    preference: ''\n", false, "locale", "preference"),
+            None
+        );
+    }
 
     /// Both arms compile and pick the same half, whichever half that is.
     #[test]

@@ -1,7 +1,9 @@
 //! The light/dark preference, taken from dsh rather than invented here.
 //!
-//! The browser UI keeps its theme in `$DSH_HOME/settings.yaml` under
-//! `ui-theme.preference` — `light`, `dark`, or `system`. Two things out here
+//! The browser UI keeps its theme as the `preference` of its `ui-theme` plugin
+//! — `light`, `dark`, or `system` — which dsh 0.2 writes into the profile's
+//! `cordis.patch.yml` and dsh 0.1 kept in `$DSH_HOME/settings.yaml`; see
+//! [`setting`]. Two things out here
 //! are set from it: the colour behind the webview, which is what shows in the
 //! gap between two documents, and the window's own theme.
 //!
@@ -87,17 +89,10 @@ impl Preference {
 /// set — or if anything at all is wrong with the file, which is dsh's problem
 /// to report, not a reason to fail to open a window.
 pub fn preference() -> Preference {
-    read().unwrap_or_default()
-}
-
-/// `None` when the file could not be read at all, which is a different thing
-/// from a file that is readable and says nothing about the theme — that one
-/// answers `Some(default)`. [`preference`] collapses the two, since the default
-/// is the answer either way; the distinction is kept here because this is where
-/// it is still knowable.
-fn read() -> Option<Preference> {
-    let text = std::fs::read_to_string(settings_file()?).ok()?;
-    Some(parse(&text).unwrap_or_default())
+    setting("ui-theme", "preference")
+        .as_deref()
+        .and_then(named)
+        .unwrap_or_default()
 }
 
 /// Put the background behind the webview, and WebView2's own default one, in
@@ -201,22 +196,55 @@ pub fn watch(window: WebviewWindow, launched_with: Preference) {
     });
 }
 
-/// What the settings file looks like from the outside. `None` while there is no
-/// file to look at — a dsh that has never run has not written one — which
-/// compares equal to itself, so the file appearing later is a move like any
-/// other.
-fn stamp() -> Option<(SystemTime, u64)> {
-    let data = std::fs::metadata(settings_file()?).ok()?;
-    Some((data.modified().ok()?, data.len()))
+/// What the two files a setting can come from look like from the outside —
+/// both, because which of them answers changes when dsh 0.2 imports the old
+/// one; see [`setting`]. `None` while there is no file to look at — a dsh that
+/// has never run has not written one — which compares equal to itself, so the
+/// file appearing later is a move like any other.
+fn stamp() -> [Option<(SystemTime, u64)>; 2] {
+    [legacy_file(), patch_file()].map(|path| {
+        let data = std::fs::metadata(path?).ok()?;
+        Some((data.modified().ok()?, data.len()))
+    })
 }
 
-/// `$DSH_HOME/settings.yaml`, wherever that resolves to.
+/// One field of one of dsh's settings, as dsh would read it right now. `None`
+/// when nothing says — a field present with nothing after the colon included —
+/// or when there is nothing to read.
 ///
-/// Public because the theme is not the only thing this app takes from dsh
-/// rather than deciding for itself: [`crate::i18n`] reads the language the
-/// user picked out of the same file, and the rule for finding it belongs in
-/// one place.
-pub fn settings_file() -> Option<PathBuf> {
+/// dsh 0.1 kept every setting in `$DSH_HOME/settings.yaml`, one top-level
+/// section per plugin. dsh 0.2 keeps them in the profile, as the `config` of
+/// each plugin's entry in `cordis.patch.yml`; on its first boot it moves the
+/// old file's sections there and renames the file to `settings.yaml.imported`.
+/// So while `settings.yaml` exists it is the answer — on 0.1 it is the only
+/// one, and on 0.2 it is what the first boot is about to import — and once it
+/// is gone, the profile is.
+///
+/// Public to the crate because the theme is not the only thing this app takes
+/// from dsh rather than deciding for itself: [`crate::i18n`] reads the language
+/// the user picked the same way, and the rule for finding it belongs in one
+/// place.
+pub(crate) fn setting(entry: &str, name: &str) -> Option<String> {
+    let read = |path: Option<PathBuf>| std::fs::read_to_string(path?).ok();
+    match read(legacy_file()) {
+        Some(text) => lookup(&text, true, entry, name),
+        None => lookup(&read(patch_file())?, false, entry, name),
+    }
+}
+
+/// [`setting`] without the files: `legacy` is which of the two documents
+/// `text` is.
+pub(crate) fn lookup(text: &str, legacy: bool, entry: &str, name: &str) -> Option<String> {
+    let value = if legacy {
+        field(text, entry, name)
+    } else {
+        configured(text, entry, name)
+    }?;
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// `$DSH_HOME`, wherever that resolves to.
+fn home() -> Option<PathBuf> {
     #[allow(deprecated)]
     let home = match std::env::var_os("DSH_HOME") {
         Some(home) if !home.is_empty() => PathBuf::from(home),
@@ -224,26 +252,36 @@ pub fn settings_file() -> Option<PathBuf> {
         _ => std::env::home_dir()?.join(".dsh"),
     };
 
-    Some(home.join("settings.yaml"))
+    Some(home)
 }
 
-/// One indented field out of one top-level section of the settings document,
-/// unquoted and trimmed. `None` when the section is absent or holds no such
-/// field; `Some("")` when it holds the field with nothing after the colon,
-/// which is a distinction both callers care about.
+/// `$DSH_HOME/settings.yaml`, dsh 0.1's settings document.
+fn legacy_file() -> Option<PathBuf> {
+    Some(home()?.join("settings.yaml"))
+}
+
+/// The patch layer of the profile this app boots dsh with, which is where dsh
+/// 0.2 writes what its Settings page changes.
+fn patch_file() -> Option<PathBuf> {
+    Some(
+        home()?
+            .join("profiles")
+            .join(crate::plugins::PROFILE)
+            .join("cordis.patch.yml"),
+    )
+}
+
+/// One indented field out of one top-level section of dsh 0.1's settings
+/// document, unquoted and trimmed. `None` when the section is absent or holds
+/// no such field; `Some("")` when it holds the field with nothing after the
+/// colon, which [`lookup`] counts as nothing said.
 ///
 /// Every namespace in the file is a top-level key with its section indented
 /// under it, so the field wanted is the first `<name>:` inside the block that
 /// starts at column zero with `<section>:`. That is little enough of YAML to
 /// read directly rather than pull in a parser for one string — and the rest of
 /// the file belongs to dsh's plugins, which this has no business parsing.
-///
-/// Public to the crate because two things are read this way: the theme below
-/// and the language in [`crate::i18n`]. It was written out once per caller,
-/// which put the one tricky part — that a `preference:` only counts inside the
-/// right section, and `ui-theme` and `locale` both have one — in two places at
-/// once.
-pub(crate) fn field<'a>(text: &'a str, section: &str, name: &str) -> Option<&'a str> {
+fn field<'a>(text: &'a str, section: &str, name: &str) -> Option<&'a str> {
     let heading = format!("{section}:");
     let key = format!("{name}:");
     let mut inside = false;
@@ -272,11 +310,93 @@ pub(crate) fn field<'a>(text: &'a str, section: &str, name: &str) -> Option<&'a 
     None
 }
 
-/// Read `ui-theme.preference` out of the settings document. Anything the file
-/// says that is not one of the three known values is `None`, the same as
-/// saying nothing.
-fn parse(text: &str) -> Option<Preference> {
-    match field(text, "ui-theme", "preference")? {
+/// One field out of one entry's `config:` in a profile patch, unquoted and
+/// trimmed, with the same `None` and `Some("")` as [`field`].
+///
+/// The patch is a top-level YAML list with one item per plugin entry, which dsh
+/// writes as
+///
+/// ```yaml
+/// - id: ui-theme
+///   name: "@deepseek-ai/dsh-client-ui-theme"
+///   config:
+///     preference: dark
+/// ```
+///
+/// so an item runs from a `-` at column zero to the next one, its `id` is one
+/// of its own keys (on the `-` line or not), and the field wanted is a direct
+/// child of its `config:` — not anything deeper, where some other setting of
+/// the same plugin could have a `preference` of its own. An id patched twice
+/// ends up with both items merged in order, so a later value wins.
+fn configured<'a>(text: &'a str, entry: &str, name: &str) -> Option<&'a str> {
+    let key = format!("{name}:");
+    let unquote = |value: &'a str| value.trim().trim_matches(['"', '\'']);
+
+    let mut found = None;
+    // The item being read: whether it is the entry wanted, what its config
+    // says, the indent of its own keys, and that of its config's.
+    let mut wanted = false;
+    let mut value = None;
+    let mut keys = None;
+    let mut config = None;
+
+    for line in text.trim_start_matches('\u{feff}').lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let (indent, body) = match line.strip_prefix('-') {
+            Some(rest) => {
+                if wanted {
+                    found = value.or(found);
+                }
+                wanted = false;
+                value = None;
+                config = None;
+                keys = None;
+
+                let body = rest.trim_start();
+                if body.is_empty() {
+                    continue;
+                }
+                (line.len() - body.len(), body.trim_end())
+            }
+            None => (line.len() - line.trim_start().len(), trimmed),
+        };
+
+        let own = *keys.get_or_insert(indent);
+        if indent == own {
+            config = None;
+            if let Some(id) = body.strip_prefix("id:") {
+                wanted = unquote(id) == entry;
+            } else if body == "config:" {
+                // Its children's indent, once the first of them says.
+                config = Some(None);
+            }
+            continue;
+        }
+
+        let Some(children) = config.as_mut() else {
+            continue;
+        };
+        if indent == *children.get_or_insert(indent) {
+            if let Some(found) = body.strip_prefix(&key) {
+                value = Some(unquote(found));
+            }
+        }
+    }
+
+    if wanted {
+        found = value.or(found);
+    }
+    found
+}
+
+/// The preference a value names. Anything that is not one of the three known
+/// values is `None`, the same as saying nothing.
+fn named(value: &str) -> Option<Preference> {
+    match value {
         "light" => Some(Preference::Light),
         "dark" => Some(Preference::Dark),
         "system" => Some(Preference::System),
@@ -286,7 +406,82 @@ fn parse(text: &str) -> Option<Preference> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, Preference};
+    use super::{lookup, named, Preference};
+
+    fn parse(text: &str) -> Option<Preference> {
+        named(&lookup(text, true, "ui-theme", "preference")?)
+    }
+
+    fn patched(text: &str) -> Option<Preference> {
+        named(&lookup(text, false, "ui-theme", "preference")?)
+    }
+
+    /// The shape dsh 0.2 writes, between two other entries.
+    #[test]
+    fn reads_the_profile_patch() {
+        let patch = "\
+# Your patch layer for this dsh profile
+- id: agent-default-model
+  name: \"@deepseek-ai/dsh-agent-default-model\"
+  config:
+    provider: agy
+- id: ui-theme
+  name: \"@deepseek-ai/dsh-client-ui-theme\"
+  config:
+    preference: dark
+- id: next-prompt
+  name: dsh-ghost-prompt
+  config:
+    preference: light
+";
+        assert_eq!(patched(patch), Some(Preference::Dark));
+    }
+
+    #[test]
+    fn reads_the_patch_with_the_id_not_first() {
+        let patch = "\
+- name: '@deepseek-ai/dsh-client-ui-theme'
+  config:
+    fontSize: 15
+    preference: light
+  id: ui-theme
+";
+        assert_eq!(patched(patch), Some(Preference::Light));
+    }
+
+    #[test]
+    fn ignores_a_preference_deeper_than_the_config() {
+        let patch = "\
+- id: ui-theme
+  config:
+    fonts:
+      preference: dark
+    fontSize: 15
+";
+        assert_eq!(patched(patch), None);
+    }
+
+    #[test]
+    fn takes_the_later_of_two_patches_to_one_entry() {
+        let patch = "\
+- id: ui-theme
+  config:
+    preference: dark
+- id: other
+- id: ui-theme
+  config:
+    preference: light
+- id: ui-theme
+  disabled: false
+";
+        assert_eq!(patched(patch), Some(Preference::Light));
+    }
+
+    #[test]
+    fn has_nothing_to_say_without_the_entry() {
+        assert_eq!(patched("- id: next-prompt\n  config:\n    preference: dark\n"), None);
+        assert_eq!(patched("- id: ui-theme\n  name: x\n"), None);
+    }
 
     #[test]
     fn reads_the_field() {

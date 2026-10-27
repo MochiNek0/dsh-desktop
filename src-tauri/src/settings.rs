@@ -2,7 +2,7 @@
 //! installer makes.
 //!
 //! Almost nothing belongs here. The theme is dsh's, read out of its
-//! `settings.yaml` (see [`crate::theme`]); the login item is the operating
+//! settings (see [`crate::theme`]); the login item is the operating
 //! system's, and is asked about rather than recorded. What is left is the
 //! preferences that are this window's alone, and today that is one: whether
 //! this app raises notifications at all.

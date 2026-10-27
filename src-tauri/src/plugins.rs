@@ -85,7 +85,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The profile the app's `dsh web` boots, and so the one a plugin has to be
 /// installed into to be part of what the window shows.
-const PROFILE: &str = "web";
+pub(crate) const PROFILE: &str = "web";
 
 /// The list that ships with the app.
 const PRESETS: &str = "preset-plugins.json";
