@@ -1332,6 +1332,10 @@ fn boot(app: tauri::AppHandle, window: WebviewWindow, session: Session) {
             return;
         }
 
+        // The Node is settled now. See [`dsh::link_shims`]: once, for a machine
+        // whose app-installed Node predates `dsh` and `pnpm` going on its PATH.
+        dsh::link_shims(&app);
+
         // The plugin every notification starts at, put in on the first launch
         // that has a dsh to put it into. See [`plugins::adopt`], which does it
         // once and then leaves the decision to the user.

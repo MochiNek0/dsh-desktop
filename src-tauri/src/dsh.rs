@@ -2097,6 +2097,58 @@ pub(crate) fn script(app: &AppHandle) -> Option<PathBuf> {
     script.is_file().then_some(script)
 }
 
+/// Put `dsh` and `pnpm` on the user's PATH for a machine whose Node this app
+/// installed before the script learned to.
+///
+/// The script does it itself now, whenever the Node changes — see `Add-Shims`
+/// in `install-deps.ps1` for what goes on the PATH and why it is not the Node
+/// directory. What it cannot reach is a machine that set up its Node under an
+/// older version and has no reason to run the script again; this runs its
+/// `link` mode for that machine, once.
+///
+/// Once, and recorded whether or not it worked: a user who takes the entry back
+/// off their PATH has decided something, and a launch that put it back would be
+/// arguing. Only on the app's own Node — on any other the dsh and pnpm a user
+/// can type are theirs to arrange — and without a window, since it neither
+/// downloads nor asks anything.
+#[cfg(windows)]
+pub fn link_shims(app: &AppHandle) {
+    let Some(dir) = app_dir(app) else { return };
+    let marker = dir.join("shims-linked");
+    if marker.exists() || dir.join("bin").exists() {
+        return;
+    }
+    let managed = dir.join("node");
+    let ours = active_node(app)
+        .as_deref()
+        .and_then(Path::parent)
+        .is_some_and(|parent| {
+            parent
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&managed.to_string_lossy())
+        });
+    if !ours {
+        return;
+    }
+    let Some(script) = script(app) else { return };
+
+    let mut command = interpreter(&script);
+    command.args(["-Mode", "link"]).stdin(Stdio::null());
+    command.creation_flags(CREATE_NO_WINDOW);
+    if printed(command, Duration::from_secs(30)).is_none() {
+        eprintln!("dsh-desktop: could not put dsh and pnpm on the user's PATH");
+    }
+    if let Err(error) = std::fs::write(&marker, b"") {
+        eprintln!("dsh-desktop: could not record shims-linked: {error}");
+    }
+}
+
+/// Windows only. On macOS and Linux a PATH entry means editing the user's shell
+/// startup files, which this app does not do; [`terminal`] is the way to a dsh
+/// there.
+#[cfg(not(windows))]
+pub fn link_shims(_app: &AppHandle) {}
+
 /// What to run the script with.
 #[cfg(windows)]
 pub(crate) fn interpreter(script: &Path) -> Command {

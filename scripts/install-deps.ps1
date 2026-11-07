@@ -10,10 +10,11 @@
 #
 # Nothing here needs elevation, which is the point of downloading the standalone
 # Node zip rather than running the official MSI. The zip goes under
-# %LOCALAPPDATA%, and `npm install -g` writes to a per-user prefix. Nothing is
-# added to the user's PATH; the only thing touched outside our own directory is
-# HKCU\Environment's Path, to take back off it the entries older versions added
-# (see `Remove-Path`).
+# %LOCALAPPDATA%, and `npm install -g` writes to a per-user prefix. The only
+# thing touched outside our own directory is HKCU\Environment's Path: to take
+# back off it the entries older versions added (see `Remove-Path`), and to add
+# the one directory of `dsh`/`pnpm` forwarders while the Node in use is ours
+# (see `Add-Shims`).
 #
 # No mode here picks a Node. `switch` and `install-dsh` are handed the one the
 # user chose in the app's chooser, and `install-node` is the case where the user
@@ -59,14 +60,18 @@ param(
     # app happens to have recorded — fine for an uninstaller, useless for a
     # machine with a dsh in three Nodes.
     #
-    # None of them writes the user's PATH. See the note above `Remove-Path`.
+    # None of them puts a Node on the user's PATH. See the note above
+    # `Remove-Path`, and `Add-Shims` for the one entry that does go on it.
+    #
+    # `link` puts that entry up for a machine whose Node this script unpacked
+    # before the entry existed; the app runs it once.
     #
     # There is no default. There used to be — `install`, a mode that picked a
     # Node itself and installed dsh into it — and a bare run of this script is
     # not a thing that should still be able to change the machine.
     [Parameter(Mandatory)]
     [ValidateSet('update', 'uninstall', 'unlink-plugin', 'list', 'switch', 'install-dsh',
-        'install-node', 'uninstall-dsh', 'remove-node', 'delete-node')]
+        'install-node', 'uninstall-dsh', 'remove-node', 'delete-node', 'link')]
     [string] $Mode,
 
     # `update` only: the npm global prefix holding the dsh to replace. The app
@@ -1108,7 +1113,8 @@ function Install-Failure([string] $Whose) {
 #
 # `Remove-Path` stays, and now has two things to clean up: the entry versions up
 # to 0.1.2 added, and the one the interactive chooser briefly added back before
-# this. Nothing adds one any more.
+# this. Nothing adds a Node directory any more; `Add-Shims` below adds a
+# directory of two forwarders, which is a different thing.
 
 # Rebuild `$env:Path` from the registry. Whatever the installer just did — a Node
 # unpacked, a prefix prepended — is on the user's PATH and not on this process's,
@@ -1157,6 +1163,99 @@ function Remove-Path([string] $Dir) {
     Set-ItemProperty -Path $key -Name Path -Value ($entries -join ';') -Type ExpandString
     Publish-Environment
     Say "已把 $Dir 移出 PATH。"
+}
+
+# The one entry this script does put on the user's PATH: `$BinDir`, and only
+# while the Node in use is the one it unpacked.
+#
+# Without it a machine that had no Node before this app has a dsh and a pnpm
+# that nothing outside the app can run — not a terminal, not another program
+# that shells out to `pnpm`. What the note above rules out is the Node
+# directory itself going on the PATH, and none of its reasons apply to this
+# one: `$BinDir` holds two forwarders, `dsh` and `pnpm`, and no `node`, `npm`
+# or `npx` to shadow a version manager with. It is appended to the *end* of
+# the user PATH, so a dsh or pnpm the user installs later, anywhere, wins over
+# these.
+#
+# Each forwarder is a `.cmd` for cmd and PowerShell, and an extensionless `sh`
+# script for Git Bash. No `.ps1`: PowerShell runs the `.cmd` when there is none,
+# and Windows 10's default execution policy would refuse a `.ps1` outright.
+# Both find their target relative to themselves, so nothing non-ASCII in the
+# user's profile path has to survive a batch file's code page.
+$BinDir = Join-Path $AppDir 'bin'
+$Forwarded = @('dsh', 'pnpm')
+
+function Add-Path([string] $Dir) {
+    $key = 'HKCU:\Environment'
+    if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+    $current = (Get-Item -Path $key).GetValue('Path', $null, 'DoNotExpandEnvironmentNames')
+    $entries = @()
+    if ($current) { $entries = @($current.Split(';') | Where-Object { $_ -ne '' }) }
+    foreach ($entry in $entries) {
+        if ([Environment]::ExpandEnvironmentVariables($entry).TrimEnd('\') -eq $Dir.TrimEnd('\')) { return }
+    }
+
+    Set-ItemProperty -Path $key -Name Path -Value (($entries + $Dir) -join ';') -Type ExpandString
+    Publish-Environment
+    Say "已把 $Dir 加入 PATH。"
+}
+
+function Add-Shims {
+    New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+    $ascii = New-Object System.Text.ASCIIEncoding
+    foreach ($name in $Forwarded) {
+        # `%~dp0` ends in a backslash. No `call`: handing control to npm's shim
+        # is the last thing this does, and that way its exit code is this one's.
+        # No parentheses in the message — it sits inside an `if` block.
+        $cmd = @(
+            '@echo off'
+            "if not exist `"%~dp0..\node\$name.cmd`" ("
+            "  echo $name is not installed in the Node dsh-desktop manages. Open dsh-desktop to set it up. 1>&2"
+            '  exit /b 1'
+            ')'
+            "`"%~dp0..\node\$name.cmd`" %*"
+        ) -join "`r`n"
+        [IO.File]::WriteAllText((Join-Path $BinDir "$name.cmd"), $cmd + "`r`n", $ascii)
+
+        $sh = @(
+            '#!/bin/sh'
+            "target=`"`$(dirname `"`$0`")/../node/$name`""
+            "if [ ! -f `"`$target`" ]; then"
+            "  echo `"$name is not installed in the Node dsh-desktop manages. Open dsh-desktop to set it up.`" >&2"
+            '  exit 1'
+            'fi'
+            "exec `"`$target`" `"`$@`""
+        ) -join "`n"
+        [IO.File]::WriteAllText((Join-Path $BinDir $name), $sh + "`n", $ascii)
+    }
+    Add-Path $BinDir
+}
+
+function Remove-Shims {
+    Remove-Path $BinDir
+    Remove-Item -LiteralPath $BinDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Shims for the Node the app now runs, or none: the forwarders only ever point
+# into `$NodeDir`, so they are put up when that is the Node chosen and taken
+# down when another one is.
+function Set-Shims([string] $Exe) {
+    if ($Exe -and $Exe.StartsWith($NodeDir, [StringComparison]::OrdinalIgnoreCase)) {
+        Add-Shims
+    } else {
+        Remove-Shims
+    }
+}
+
+# `link`: put the shims up for a machine that installed our Node before they
+# existed. The app runs this once, on the first launch that finds itself on
+# that Node with no `$BinDir` — see `link_shims` in `src-tauri/src/dsh.rs`.
+function Link-Shims {
+    $state = Read-Marker
+    $node = [string] $state['nodeExe']
+    if (-not $node -or -not (Test-Path -LiteralPath $node)) { return }
+    if (-not $node.StartsWith($NodeDir, [StringComparison]::OrdinalIgnoreCase)) { return }
+    Add-Shims
 }
 
 # -------------------------------------------------------------------- modes --
@@ -1310,6 +1409,7 @@ function Uninstall-All {
         # the same directory on Windows, but a `switch` records the Node's own
         # directory here and the two are worth taking off independently.
         if ($state['pathEntry']) { Remove-Path $state['pathEntry'] }
+        Remove-Shims
         Say '正在删除 Node 和 dsh…'
         Remove-Item -LiteralPath $NodeDir -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $NodeDir) {
@@ -1602,6 +1702,7 @@ function Switch-Node {
     if ($prefix.StartsWith($AppDir, 'OrdinalIgnoreCase')) { $state['dsh'] = 'managed' } else { $state['dsh'] = 'system' }
     if (-not $state.ContainsKey('node')) { $state['node'] = 'system' }
     Write-Marker $state
+    Set-Shims $NodeExe
 
     Say "应用会使用 $nodeDir 里的 Node 和 dsh。"
     Say "终端里用的还是你的版本管理器当前指定的那个 Node，本应用不会去改它。"
@@ -1650,6 +1751,7 @@ function Install-DshInto {
     $state['dsh'] = 'managed'
     $state['prefix'] = $prefix
     Write-Marker $state
+    Set-Shims $NodeExe
     Step (T 'dsh 安装完成。' 'dsh is installed.') 100
 }
 
@@ -1689,6 +1791,7 @@ function Install-NodeAndDsh {
     $state['dsh'] = 'managed'
     $state['prefix'] = $prefix
     Write-Marker $state
+    Add-Shims
     Step (T 'dsh 安装完成。' 'dsh is installed.') 100
 }
 
@@ -1749,6 +1852,8 @@ function Remove-ManagedNode {
 
     Step (T '正在删除应用安装的 Node 和 dsh…' 'Deleting the Node and dsh the app installed…') 0
     Remove-Item -LiteralPath $NodeDir -Recurse -Force -ErrorAction SilentlyContinue
+    # Whichever Node the marker names, the forwarders only ever pointed here.
+    Remove-Shims
 
     # The marker is only wiped when it was describing the Node that just went.
     # A user who has since moved onto a Node of their own keeps their answer.
@@ -1941,6 +2046,7 @@ switch ($Mode) {
     'uninstall-dsh' { Uninstall-DshFrom }
     'remove-node' { Remove-ManagedNode }
     'delete-node' { Remove-Node }
+    'link' { Link-Shims }
 }
 
 exit 0
