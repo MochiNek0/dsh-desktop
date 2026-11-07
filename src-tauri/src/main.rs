@@ -14,6 +14,7 @@ mod cookies;
 mod dialog;
 mod dsh;
 mod folder;
+mod login_env;
 mod memory;
 mod notify;
 mod panel;
@@ -147,6 +148,10 @@ fn main() {
             Some(vec![AUTOSTART_FLAG]),
         ))
         .setup(move |app| {
+            // Before anything spawns a child: the read runs while the window
+            // comes up, and `dsh::apply_path` waits for whatever is left of it.
+            login_env::start();
+
             let preference = theme::preference();
             let origin: Origin = Arc::new(RwLock::new(None));
             let home: Home = Arc::new(RwLock::new(None));

@@ -276,8 +276,9 @@ fn search_path(app: &AppHandle) -> Vec<PathBuf> {
     // Last of the three, so a pnpm beside dsh still wins over a stale copy here.
     let own = app_dir(app).map(|dir| shim_dir(&dir.join("npm")));
 
-    let inherited: Vec<PathBuf> =
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    // The user's terminal PATH rather than launchd's on a Finder launch; see
+    // `login_env`.
+    let inherited: Vec<PathBuf> = std::env::split_paths(&crate::login_env::path()).collect();
     let marked: Vec<PathBuf> = [shims, node_dir, own].into_iter().flatten().collect();
 
     // One block or the other first, never interleaved, so the Node found here is
@@ -293,8 +294,9 @@ fn search_path(app: &AppHandle) -> Vec<PathBuf> {
     }
 }
 
-/// Whether the dsh on the PATH this process inherited is one the app can
-/// actually run — the condition [`search_path`] orders itself by.
+/// Whether the dsh on the user's PATH — their login shell's, see
+/// [`crate::login_env`] — is one the app can actually run: the condition
+/// [`search_path`] orders itself by.
 ///
 /// Also what the runtime panel greys its switch buttons off: while this is true
 /// the marker a switch writes is the loser of that ordering on every launch, so
@@ -316,8 +318,7 @@ pub fn usable_dsh_on_path() -> bool {
     static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
     *ANSWER.get_or_init(|| {
-        let inherited: Vec<PathBuf> =
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        let inherited: Vec<PathBuf> = std::env::split_paths(&crate::login_env::path()).collect();
 
         if !dsh_on(&inherited) {
             return false;
@@ -2247,6 +2248,10 @@ pub fn note(app: &AppHandle, title: &str, detail: &str) {
 /// here too, and the sites that shape a command without needing dsh's PATH call
 /// it on their own.
 pub fn apply_path(app: &AppHandle, command: &mut Command) {
+    // The user's own terminal environment first, so the PATH below and
+    // `unbundle` after it have the last word. See `login_env`.
+    crate::login_env::apply(command);
+
     if let Ok(path) = std::env::join_paths(search_path(app)) {
         command.env("PATH", path);
     }

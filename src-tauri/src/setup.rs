@@ -873,7 +873,7 @@ fn payload(
         // `switch` writes the marker, and the marker is what that PATH outranks
         // on the next launch — so the panel says so and draws those buttons
         // dead. Read from the process rather than passed in: it is a fact about
-        // the PATH this app inherited, and [`crate::dsh::usable_dsh_on_path`]
+        // the user's PATH, and [`crate::dsh::usable_dsh_on_path`]
         // answers it once for the whole run.
         "followsPath": crate::dsh::usable_dsh_on_path(),
     })

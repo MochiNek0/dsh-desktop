@@ -458,11 +458,11 @@ pub fn binary(app: Option<&AppHandle>) -> Option<PathBuf> {
         "cloudflared"
     };
 
-    if let Some(found) = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|directory| directory.join(name))
-            .find(|candidate| candidate.is_file())
-    }) {
+    // The terminal's PATH, where Homebrew puts it, not launchd's.
+    if let Some(found) = std::env::split_paths(&crate::login_env::path())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+    {
         return Some(found);
     }
 
