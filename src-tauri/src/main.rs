@@ -11,6 +11,7 @@ mod auth;
 mod awake;
 mod controls;
 mod cookies;
+mod desktop_import;
 mod dialog;
 mod dsh;
 mod folder;
@@ -598,6 +599,19 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         items.push(Box::new(PredefinedMenuItem::separator(app)?));
     }
 
+    // Only on a machine that has had the official Desktop; see
+    // [`desktop_import`]. The first start offers it by itself, this is the
+    // way back to the question.
+    if desktop_import::available() {
+        items.push(Box::new(MenuItem::with_id(
+            app,
+            "import-desktop",
+            t!("从官方桌面端导入设置…", "Import settings from Desktop…"),
+            true,
+            None::<&str>,
+        )?));
+    }
+
     // The standing indication the specification asks for, and the third and
     // fourth items this menu has ever had. They are here rather than only on
     // the card because the card is a thing you have to go and open: a tunnel
@@ -758,6 +772,13 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             // Exits the run loop, which stops the dsh server on the way out.
             "quit" => app.exit(0),
             "public-off" => remote::stop_public(app),
+            // The question is asked by the start, with dsh down; see
+            // [`desktop_import::request`].
+            "import-desktop" => {
+                reveal(app);
+                desktop_import::request(app);
+                restart_dsh(app, false);
+            }
             id => {
                 if let Some(index) = id.strip_prefix("recent:").and_then(|at| at.parse().ok()) {
                     recent::open(app, index);
@@ -1499,6 +1520,10 @@ fn reinstall_dsh(
 /// Start `dsh web` and hand the window over to it. Blocks until it is serving or
 /// has given up, reporting either onto the loading page.
 fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Session) {
+    // First, with dsh down: the import writes the profile and may install
+    // plugins. See [`desktop_import`].
+    desktop_import::offer(app, window_is_visible(app), &reporter(&session.splash, window));
+
     // Before the spawn, because what it repairs is a `dsh web` that exits on
     // the way up rather than one that misbehaves once it is serving: a name on
     // the profile's layer stack that no longer resolves is a `throw` before the

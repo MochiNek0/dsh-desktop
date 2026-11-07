@@ -507,6 +507,14 @@ pub struct Install {
     prefix: Option<PathBuf>,
 }
 
+impl Install {
+    /// The installed `@deepseek-ai/dsh` package, for a script that needs one
+    /// of the libraries it carries. See `desktop_import`.
+    pub fn package_dir(&self) -> PathBuf {
+        root_of(&self.bin).join("node_modules").join(PACKAGE)
+    }
+}
+
 /// Find it, the same way for every caller, so that the version being checked is
 /// the version that will run.
 ///

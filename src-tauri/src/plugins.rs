@@ -1873,7 +1873,7 @@ pub fn update(app: &AppHandle, names: &[String], log: &Log) -> Result<(), String
 
 /// Hand `specs` to `dsh plugin add`, which is the whole of installing and the
 /// whole of updating alike.
-fn add(app: &AppHandle, specs: &[String], log: &Log) -> Result<(), String> {
+pub(crate) fn add(app: &AppHandle, specs: &[String], log: &Log) -> Result<(), String> {
     let dsh = crate::dsh::current(app).ok_or_else(|| {
         // `current` answers `None` both for a machine with no dsh and for one
         // whose `dsh` shim is present but broken — a dangling symlink left by a
