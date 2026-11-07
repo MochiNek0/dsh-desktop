@@ -1677,6 +1677,32 @@ pub fn adopt(app: &AppHandle, report: &crate::dsh::Report) -> bool {
     }
 
     remember(app, ADOPTED);
+
+    // To the terminal and nowhere else. This install is the app's own idea,
+    // running before the window belongs to dsh and with no panel to print
+    // into; a wall of pnpm output on the loading page would be answering a
+    // question nobody asked. What the user sees is the status lines below.
+    let log = |line: &str| eprintln!("dsh-desktop: {line}");
+
+    // pnpm first, as a step of its own on the loading page. On a machine that
+    // has never installed a plugin it is an `npm install -g` — the one part of
+    // this that reaches the network and takes minutes rather than seconds — and
+    // a single "installing the plugin" line over all of it read as a hang.
+    // `install` asks the same question again and finds pnpm already there.
+    if !matches!(crate::dsh::tool(app, PNPM), Tool::Ready) {
+        report(
+            t!(
+                "正在装上「会话信号」插件：先安装 pnpm（插件都靠它安装，只需这一次，可能要一两分钟）…",
+                "Installing the session signal plugin: setting up pnpm first (plugins install through it; this happens once and can take a minute or two)…"
+            ),
+            -1.0,
+        );
+        if let Err(why) = ensure_pnpm(app, &log) {
+            eprintln!("dsh-desktop: could not install {SIGNAL} on this launch: {why}");
+            return true;
+        }
+    }
+
     report(
         t!(
             "正在装上「会话信号」插件…",
@@ -1684,12 +1710,6 @@ pub fn adopt(app: &AppHandle, report: &crate::dsh::Report) -> bool {
         ),
         -1.0,
     );
-
-    // To the terminal and nowhere else. This install is the app's own idea,
-    // running before the window belongs to dsh and with no panel to print
-    // into; a wall of pnpm output on the loading page would be answering a
-    // question nobody asked. What the user sees is the line above.
-    let log = |line: &str| eprintln!("dsh-desktop: {line}");
     match install(app, &[SIGNAL.to_string()], None, false, &log) {
         Ok(()) => false,
         Err(why) => {
@@ -2375,7 +2395,10 @@ fn ensure_pnpm(app: &AppHandle, log: &Log) -> Result<(), String> {
         )
         .to_string()
     })?;
-    npm.args(["install", "-g", "pnpm"]);
+    // The major dsh is developed against, and a single JS package; 12 is a
+    // wrapper plus a 54 MB native binary. See `$PnpmSpec` in the bootstrap
+    // scripts, which install the same one.
+    npm.args(["install", "-g", "pnpm@11"]);
 
     // Where it goes is chosen rather than left to npm; see `tool_prefix`. Two
     // failures come from letting npm decide: an `EACCES` on a prefix under

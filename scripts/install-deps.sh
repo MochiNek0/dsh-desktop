@@ -170,13 +170,20 @@ t() {
 if [ "$CHANNEL" = alpha ]; then TAG=alpha; else TAG=$RC_TAG; fi
 
 # dsh forwards plugin installs to pnpm, so a machine running dsh ends up with one
-# too — installed on demand by `ensure_pnpm` in `plugins.rs`, into whichever
-# prefix the running dsh sits in. This script never installs it; what it needs to
-# know is which prefixes hold *our* pnpm rather than one the user put there
-# themselves, and that is what the file below records. `ensure_pnpm` writes it
-# beside its install and nothing else ever writes one, so a pnpm without it is
-# the user's and is never touched from here.
+# too — put in beside dsh by `install_pnpm` when this script installs dsh, and
+# otherwise on demand by `ensure_pnpm` in `plugins.rs`, into whichever prefix the
+# running dsh sits in. What the uninstall side needs to know is which prefixes
+# hold *our* pnpm rather than one the user put there themselves, and that is
+# what the file below records. Those two write it beside their install and
+# nothing else ever writes one, so a pnpm without it is the user's and is never
+# touched from here.
 PNPM='pnpm'
+# What is installed: the major dsh itself is developed against (its repository
+# pins `packageManager: pnpm@11`). Also the small one: 11 is a single JS package,
+# while 12 is a wrapper plus fourteen per-platform native packages and a 54 MB
+# binary, which turned a first plugin install into minutes. `ensure_pnpm` in
+# `plugins.rs` and `install-deps.ps1` name the same major.
+PNPM_SPEC='pnpm@11'
 PNPM_MARK='.dsh-owns-pnpm'
 
 # The same directory Tauri resolves as `app_local_data_dir()`. The two have to
@@ -1042,6 +1049,7 @@ install_package() {
         step "$(t "正在安装 dsh（$label）…" "Installing dsh ($label)…")" "$from"
         if npm_install "$node" "$cli" "$prefix" "$url" "$from" "$to"; then
             say "dsh 安装完成（$label）。"
+            WINNER=$url
             return 0
         fi
 
@@ -1063,6 +1071,45 @@ $sources
 SOURCES
 
     return 1
+}
+
+# The registry `install_package` last succeeded with, for `install_pnpm` to
+# reuse. Empty is npm's own default.
+WINNER=''
+
+# pnpm beside the dsh just installed, from the registry that just served dsh.
+#
+# dsh forwards plugin installs to pnpm, and the app's `ensure_pnpm` puts one in
+# on demand -- but on demand is the first launch, under one status line and with
+# npm's default registry, where it measured over a minute. Here it is one more
+# step on a bar that is already up, through the source this run measured.
+#
+# Best effort: a failure leaves the machine where it was before this step
+# existed, with `ensure_pnpm` still there to install it. Skipped when a pnpm is
+# already in the prefix or on PATH -- `ensure_pnpm` would accept either.
+install_pnpm() {
+    node=$1
+    cli=$2
+    prefix=$3
+
+    pnpm_present "$prefix" && return 0
+    resolve "$PNPM" >/dev/null && return 0
+
+    step "$(t '正在安装 pnpm（安装插件要用到）…' 'Installing pnpm (plugins install through it)…')" "$PROGRESS_CEILING"
+    set -- "$cli" install -g --prefix "$prefix" --no-audit --no-fund --loglevel=error
+    if [ -n "$WINNER" ]; then
+        set -- "$@" "--registry=$WINNER"
+    fi
+    set -- "$@" "$PNPM_SPEC"
+
+    # Same PATH and stdin as `npm_install`, for the same reasons.
+    if PATH="$(dirname "$node"):$PATH" "$node" "$@" 2>&1 < /dev/null | while IFS= read -r line; do say "$line"; done &&
+        pnpm_present "$prefix"; then
+        # See `PNPM_MARK`: what lets an uninstall take this pnpm with it.
+        : > "$prefix/$PNPM_MARK" 2>/dev/null || true
+    else
+        say "$(t 'pnpm 没有装上，第一次安装插件时应用会再装一次。' 'pnpm did not install; the app installs it the first time a plugin is installed.')"
+    fi
 }
 
 # What to tell the user when `install_package` gave up, given what it was trying
@@ -1661,6 +1708,7 @@ install_dsh_into() {
     M_PREFIX=$prefix
     M_PATH_ENTRY=''
     write_marker
+    install_pnpm "$NODE_EXE" "$cli" "$prefix"
     step "$(t 'dsh 安装完成。' 'dsh is installed.')" 100
 }
 
@@ -1694,6 +1742,7 @@ install_node_and_dsh() {
     M_PREFIX=$prefix
     M_PATH_ENTRY=''
     write_marker
+    install_pnpm "$node" "$cli" "$prefix"
     step "$(t 'dsh 安装完成。' 'dsh is installed.')" 100
 }
 

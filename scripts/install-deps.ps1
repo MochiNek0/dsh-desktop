@@ -159,13 +159,20 @@ function T([string] $Zh, [string] $En) {
 $Tag = if ($Channel -eq 'alpha') { 'alpha' } elseif ($RcTag) { $RcTag } else { 'latest' }
 
 # dsh forwards plugin installs to pnpm, so a machine running dsh ends up with one
-# too — installed on demand by `ensure_pnpm` in `plugins.rs`, into whichever
-# prefix the running dsh sits in. This script never installs it; what it needs to
-# know is which prefixes hold *our* pnpm rather than one the user put there
-# themselves, and that is what the file below records. `ensure_pnpm` writes it
-# beside its install and nothing else ever writes one, so a pnpm without it is
-# the user's and is never touched from here.
+# too — put in beside dsh by `Install-Pnpm` when this script installs dsh, and
+# otherwise on demand by `ensure_pnpm` in `plugins.rs`, into whichever prefix the
+# running dsh sits in. What the uninstall side needs to know is which prefixes
+# hold *our* pnpm rather than one the user put there themselves, and that is
+# what the file below records. Those two write it beside their install and
+# nothing else ever writes one, so a pnpm without it is the user's and is never
+# touched from here.
 $Pnpm = 'pnpm'
+# What is installed: the major dsh itself is developed against (its repository
+# pins `packageManager: pnpm@11`). Also the small one: 11 is a single JS package,
+# while 12 is a wrapper plus fourteen per-platform native packages and a 54 MB
+# binary, which turned a first plugin install into minutes. `ensure_pnpm` in
+# `plugins.rs` and `install-deps.sh` name the same major.
+$PnpmSpec = 'pnpm@11'
 
 # The app's own dsh plugin, by the name it installs under. Written down here
 # because by the time `unlink-plugin` runs, the manifest that would have said it
@@ -1061,6 +1068,7 @@ function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [string] 
     foreach ($source in (Sort-Registries $Exe $Cli $From)) {
         if (Invoke-NpmInstall $Exe $Cli $Spec $Prefix $source $From $To) {
             Say "dsh 安装完成（$($source.Label)）。"
+            $script:Winner = $source
             return $true
         }
         # npm read the registry and turned down what it found. See
@@ -1073,6 +1081,42 @@ function Install-Package([string] $Exe, [string] $Cli, [string] $Spec, [string] 
         Say "从 $($source.Label) 安装失败，换下一个源重试。"
     }
     return $false
+}
+
+# The source `Install-Package` last succeeded with, for `Install-Pnpm` to reuse.
+$script:Winner = $null
+
+# pnpm beside the dsh just installed, from the registry that just served dsh.
+#
+# dsh forwards plugin installs to pnpm, and the app's `ensure_pnpm` puts one in
+# on demand — but on demand is the first launch, under one status line and with
+# npm's default registry, where it measured over a minute. Here it is one more
+# step on a bar that is already up, through the source this run measured.
+#
+# Best effort: a failure leaves the machine where it was before this step
+# existed, with `ensure_pnpm` still there to install it. Skipped when a pnpm is
+# already in the prefix or on PATH — `ensure_pnpm` would accept either.
+function Install-Pnpm([string] $Exe, [string] $Cli, [string] $Prefix) {
+    if (Test-Pnpm $Prefix) { return }
+    # Not our own forwarder in `$BinDir`, which points at this prefix and is
+    # there whether or not a pnpm is.
+    Sync-Path
+    $elsewhere = Get-Command $Pnpm -All -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -and -not $_.Source.StartsWith($BinDir, [StringComparison]::OrdinalIgnoreCase) }
+    if ($elsewhere) { return }
+
+    Step (T '正在安装 pnpm（安装插件要用到）…' 'Installing pnpm (plugins install through it)…') $ProgressCeiling
+    $arguments = @($Cli, 'install', '-g', '--no-audit', '--no-fund', '--loglevel=error')
+    if ($Prefix) { $arguments += "--prefix=$Prefix" }
+    if ($script:Winner -and $script:Winner.Url) { $arguments += "--registry=$($script:Winner.Url)" }
+    $arguments += $PnpmSpec
+
+    if (-not (Invoke-Native $Exe $arguments $null)) {
+        Say (T 'pnpm 没有装上，第一次安装插件时应用会再装一次。' 'pnpm did not install; the app installs it the first time a plugin is installed.')
+    } elseif ($Prefix) {
+        # See `$PnpmMark`: what lets an uninstall take this pnpm with it.
+        Set-Content -LiteralPath (Join-Path $Prefix $PnpmMark) -Value '' -ErrorAction SilentlyContinue
+    }
 }
 
 # What to tell the user when `Install-Package` gave up, given what it was trying
@@ -1751,6 +1795,7 @@ function Install-DshInto {
     $state['dsh'] = 'managed'
     $state['prefix'] = $prefix
     Write-Marker $state
+    Install-Pnpm $NodeExe $cli $prefix
     Set-Shims $NodeExe
     Step (T 'dsh 安装完成。' 'dsh is installed.') 100
 }
@@ -1791,6 +1836,7 @@ function Install-NodeAndDsh {
     $state['dsh'] = 'managed'
     $state['prefix'] = $prefix
     Write-Marker $state
+    Install-Pnpm $node $cli $prefix
     Add-Shims
     Step (T 'dsh 安装完成。' 'dsh is installed.') 100
 }
