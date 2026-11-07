@@ -551,6 +551,49 @@ pub fn current(app: &AppHandle) -> Option<Install> {
     })
 }
 
+/// Why there is still no dsh to start after a script that said it put one
+/// there, or `None` when [`current`] finds one.
+///
+/// The script's exit code only covers what happened while it ran. On Windows
+/// an antivirus (Defender, 360, Huorong) can quarantine `node.exe`, the shim or
+/// files out of the package moments after npm wrote them, and the boot then
+/// went on to spawn a dsh that was no longer there. Listing what is gone, from
+/// what the marker says was installed, is what points at the cause.
+pub fn vanished(app: &AppHandle) -> Option<String> {
+    if current(app).is_some() {
+        return None;
+    }
+
+    let state = bootstrap(app);
+    let mut expected: Vec<PathBuf> = state.node.into_iter().collect();
+    if let Some(prefix) = state.prefix.as_deref() {
+        let shim = if cfg!(windows) { "dsh.cmd" } else { "dsh" };
+        expected.push(shim_dir(prefix).join(shim));
+        expected.push(package_root(prefix).join(PACKAGE).join("package.json"));
+    }
+    let gone: Vec<String> = expected
+        .iter()
+        .filter(|path| !path.exists())
+        .map(|path| format!("  {}", path.display()))
+        .collect();
+
+    let dir = app_dir(app).map_or_else(String::new, |dir| dir.display().to_string());
+    Some(if gone.is_empty() {
+        t!(
+            "安装脚本报告成功，但装好的 dsh 无法运行。如果装了杀毒软件（Windows 安全中心、360、火绒等），它可能拦下了其中的文件：请把 {} 加进杀毒软件的排除项或信任区，再重新安装。",
+            "The install reported success, but the dsh it installed cannot run. If an antivirus is installed (Windows Security, 360, Huorong…), it may have blocked some of its files: add {} to its exclusions or trusted list, then install again.",
+            dir
+        )
+    } else {
+        t!(
+            "安装脚本报告成功，但这些文件随后不见了：\n{}\n\n多半是杀毒软件（Windows 安全中心、360、火绒等）把它们隔离了。请把 {} 加进杀毒软件的排除项或信任区，再重新安装。",
+            "The install reported success, but these files have since disappeared:\n{}\n\nThat is almost always an antivirus (Windows Security, 360, Huorong…) quarantining them. Add {} to its exclusions or trusted list, then install again.",
+            gone.join("\n"),
+            dir
+        )
+    })
+}
+
 /// The npm global prefix holding `bin`, if the tree around it is the one a
 /// global install builds.
 ///

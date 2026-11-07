@@ -1563,26 +1563,26 @@ fn start_serving(app: &tauri::AppHandle, window: &WebviewWindow, session: &Sessi
                 watch(window, session, events);
             }
         }
-        // Most often this is a machine where fetching dsh failed: neither the
-        // installer nor the boot above carries one, they download it, and an app
-        // that got this far without one has nothing to run. By now both have
-        // tried, so what is left to suggest is the network and doing it by hand.
+        // Not a failed download: that ends in the setup panel with the reason,
+        // and never gets here. What gets here is a dsh the gate found that was
+        // gone or unrunnable by the time it was spawned — on Windows most often
+        // an antivirus quarantining it. A restart with no dsh goes back to the
+        // setup panel, which can install it again.
         Err(error) => session.splash.fail(
             window,
             t!("启动 dsh 失败", "Could not start dsh"),
             &t!(
                 "无法执行 dsh：{}\n\n\
-                 dsh 没有安装成功，通常是网络或代理的问题。\
-                 换一个网络或代理后重启应用，它会再试一次。\n\n\
-                 也可以自己在终端里执行 `npm install -g @deepseek-ai/dsh` 安装，\
-                 或用 DSH_BIN 环境变量指向 dsh 可执行文件的完整路径。",
+                 dsh 不见了或无法运行。如果装了杀毒软件（Windows 安全中心、360、火绒等），\
+                 多半是它把 dsh 的文件隔离了：请把 {} 加进杀毒软件的排除项或信任区，\
+                 然后重启应用，在弹出的运行环境面板里重新安装。",
                 "dsh could not be executed: {}\n\n\
-                 It did not install, which is usually the network or a proxy. \
-                 Restart the app on a different connection and it will try again.\n\n\
-                 You can also install it yourself with \
-                 `npm install -g @deepseek-ai/dsh`, or point the DSH_BIN \
-                 environment variable at the dsh executable.",
-                error
+                 It is missing or cannot run. If an antivirus is installed \
+                 (Windows Security, 360, Huorong…), it has most likely quarantined \
+                 dsh's files: add {} to its exclusions or trusted list, then restart \
+                 the app and install again from the runtime panel that comes up.",
+                error,
+                dsh::app_dir(app).map_or_else(String::new, |dir| dir.display().to_string())
             ),
         ),
     }

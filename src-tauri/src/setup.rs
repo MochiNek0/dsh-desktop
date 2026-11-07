@@ -423,6 +423,14 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
                 // take a session with it for a directory the app was not using.
                 let listed_again = matches!(choice, Choice::DeleteNode(_));
 
+                // The three that leave a dsh behind them, and so the three whose
+                // success can be checked by looking for one. See
+                // [`crate::dsh::vanished`].
+                let installs = matches!(
+                    choice,
+                    Choice::Use(_) | Choice::InstallDsh(_) | Choice::InstallNode
+                );
+
                 // The menu's panel stays up while the action runs. Its own
                 // status line is the only thing on screen that can report one —
                 // see [`crate::setup_status`] — and hidden, an `install-dsh`
@@ -461,7 +469,19 @@ fn show(app: &AppHandle, report: &Report, mode: Mode) -> bool {
                     None
                 };
 
-                match act(app, choice, listed, report) {
+                let outcome = match act(app, choice, listed, report) {
+                    // A script that exited cleanly over files something has
+                    // since taken away. Back to the panel with what is gone,
+                    // rather than on to a spawn that can only fail with
+                    // "program not found".
+                    Outcome::Done if installs => match crate::dsh::vanished(app) {
+                        Some(message) => Outcome::Failed(message),
+                        None => Outcome::Done,
+                    },
+                    outcome => outcome,
+                };
+
+                match outcome {
                     Outcome::Done if mode == Mode::Manage && listed_again => {
                         error = None;
                         nodes = scan(app, report, mode);
