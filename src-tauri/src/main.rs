@@ -227,9 +227,13 @@ fn main() {
         //
         // Asked first whether an install is running, since quitting through one
         // breaks dsh rather than merely stopping something. See
-        // `dsh::confirm_exit`.
+        // `dsh::confirm_exit`. Then whether a turn would be cut short; see
+        // `status::confirm_exit`.
         tauri::RunEvent::ExitRequested { code, api, .. } => {
-            if dsh::confirm_exit(handle, code) || remote::confirm_exit(handle, code) {
+            if dsh::confirm_exit(handle, code)
+                || status::confirm_exit(handle, code)
+                || remote::confirm_exit(handle, code)
+            {
                 api.prevent_exit();
             } else if let Some(window) = handle.get_webview_window("main") {
                 placement::save(handle, &window);

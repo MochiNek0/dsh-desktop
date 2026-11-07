@@ -22,6 +22,7 @@
 //! notification does ([`crate::signal::open`]). A forged row is a menu item
 //! that switches to some session, which the page could already do.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use tauri::image::Image;
@@ -150,6 +151,82 @@ pub fn label(row: &Row) -> String {
     }
 }
 
+/// Ask before a quit that would cut a turn short, and answer whether the quit
+/// has been held for that. Beside [`crate::dsh::confirm_exit`] and
+/// `remote::confirm_exit`, in `main`'s `ExitRequested`.
+///
+/// Closing the window parks it in the tray precisely so a turn can go on, so
+/// the quit that ends one is a deliberate menu click — and from the tray, with
+/// the window hidden, nothing on screen said a session was mid-turn or
+/// waiting on a question. Which sessions is what the tray already lists, so
+/// the question names them.
+///
+/// Not asked for the update's restart, whose own question already says a
+/// session in progress will be interrupted. Nor can it be asked on the ways
+/// out that never reach `ExitRequested`: macOS's ⌘Q and a shutdown go through
+/// `applicationWillTerminate`, which cannot be cancelled, and a Windows log-off
+/// ends the process without a quit request — so this never holds up the system
+/// going down. And with no plugin reporting — safe mode, a page still loading —
+/// the look is idle and the quit goes through as it always did.
+pub fn confirm_exit(app: &AppHandle, code: Option<i32>) -> bool {
+    /// Set by the answer, so the `app.exit` it triggers is not asked again.
+    static LEAVING: AtomicBool = AtomicBool::new(false);
+
+    if LEAVING.load(Ordering::Relaxed) || code == Some(tauri::RESTART_EXIT_CODE) {
+        return false;
+    }
+    let look = LOOK.lock().map(|look| *look).unwrap_or(Look::Idle);
+    let Some((title, body)) = question(look, &rows()) else {
+        return false;
+    };
+
+    // Parked in the tray, the window would draw a question nobody sees.
+    crate::reveal(app);
+
+    let app_for_answer = app.clone();
+    crate::dialog::ask(
+        app,
+        crate::dialog::Ask {
+            title,
+            body,
+            choices: vec![
+                crate::dialog::Choice::new("quit", t!("仍然退出", "Quit anyway")),
+                crate::dialog::Choice::primary("stay", t!("留下", "Stay open")),
+            ],
+            answered: Box::new(move |_app, id| {
+                if id == "quit" {
+                    LEAVING.store(true, Ordering::Relaxed);
+                    app_for_answer.exit(code.unwrap_or(0));
+                }
+            }),
+        },
+    );
+    true
+}
+
+/// The quit question for `look`, naming the sessions in `rows`; `None` when
+/// nothing would be interrupted.
+fn question(look: Look, rows: &[Row]) -> Option<(String, String)> {
+    let title = match look {
+        Look::Idle => return None,
+        Look::Running => t!("有会话正在运行", "A session is still running"),
+        Look::Waiting => t!("有会话在等你回应", "A session is waiting for you"),
+    };
+    let mut body = t!(
+        "退出会停掉 dsh，正在进行的这一轮会被中断。",
+        "Quitting stops dsh, and the turn in progress is interrupted."
+    )
+    .to_string();
+    if !rows.is_empty() {
+        body.push('\n');
+        for row in rows {
+            body.push('\n');
+            body.push_str(&label(row));
+        }
+    }
+    Some((title.to_string(), body))
+}
+
 /// What the tray's tooltip adds, if anything.
 pub fn describe() -> Option<&'static str> {
     match LOOK.lock().map(|look| *look).unwrap_or(Look::Idle) {
@@ -232,6 +309,34 @@ fn dot(rgba: &[u8], width: u32, height: u32, colour: [u8; 3], share: f32) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{dot, Look};
+
+    /// Idle quits without a word; otherwise the question names every listed
+    /// session the way the tray does.
+    #[test]
+    fn asks_only_when_a_turn_would_be_cut_short() {
+        use super::{label, question, Row};
+
+        assert_eq!(question(Look::Idle, &[]), None);
+
+        let rows = vec![
+            Row {
+                session: "a".into(),
+                title: "Fix the build".into(),
+                waiting: true,
+            },
+            Row {
+                session: "b".into(),
+                title: "Write docs".into(),
+                waiting: false,
+            },
+        ];
+        let (_, body) = question(Look::Waiting, &rows).unwrap();
+        assert!(body.contains(&label(&rows[0])));
+        assert!(body.contains(&label(&rows[1])));
+
+        // A running subagent alone lists no row; the question still stands.
+        assert!(question(Look::Running, &[]).is_some());
+    }
 
     /// A row says what the session is doing, keeps a title short and its `&`
     /// literal, and has something to say about a session dsh has not titled.
