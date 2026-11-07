@@ -1703,6 +1703,56 @@ pub fn adopt(app: &AppHandle, report: &crate::dsh::Report) -> bool {
     }
 }
 
+/// Put pnpm beside the dsh this launch is about to run, if it is not there.
+///
+/// [`ensure_pnpm`] used to be reached only through this module's own installs,
+/// and the first of those is [`adopt`], which happens once per app — so pnpm
+/// went into whichever Node the app ran on its first launch and nowhere else.
+/// A user who then switched to their own Node had a dsh with no pnpm beside it,
+/// and everything that installs plugins *through dsh* rather than through this
+/// app — dsh's own plugin command, a marketplace plugin — failed on a missing
+/// `pnpm`. Asked on every launch, the answer follows the Node.
+///
+/// A pnpm that is already there is a lookup and nothing more. A missing one is
+/// an `npm install -g`, which is the network, so a failure is remembered
+/// against the Node it was for: an offline machine pays for it once rather
+/// than on every launch, and switching Node tries again.
+pub fn provide_pnpm(app: &AppHandle, report: &crate::dsh::Report) {
+    if matches!(crate::dsh::tool(app, PNPM), Tool::Ready) {
+        return;
+    }
+
+    let node = crate::dsh::active_node(app)
+        .map(|node| node.display().to_string())
+        .unwrap_or_default();
+    let failed = marker(app, PNPM_FAILED);
+    if failed
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|recorded| recorded == node)
+    {
+        return;
+    }
+
+    report(t!("正在安装 pnpm…", "Installing pnpm…"), -1.0);
+    let log = |line: &str| eprintln!("dsh-desktop: {line}");
+    match ensure_pnpm(app, &log) {
+        Ok(()) => {
+            if let Some(path) = failed {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        Err(why) => {
+            eprintln!("dsh-desktop: could not put pnpm beside dsh: {why}");
+            if let Some(path) = failed {
+                if let Err(error) = std::fs::write(&path, node) {
+                    eprintln!("dsh-desktop: could not record {PNPM_FAILED}: {error}");
+                }
+            }
+        }
+    }
+}
+
 /// The directory name under `resources/` for the [`SIGNAL`] preset, if it is
 /// still a [`BUNDLED`] entry.
 ///
@@ -2722,6 +2772,10 @@ const GUIDED: &str = "plugins-guided";
 
 /// [`SIGNAL`] has had its one offer. See [`adopt`].
 const ADOPTED: &str = "signal-adopted";
+
+/// The Node a launch last failed to put pnpm beside, so [`provide_pnpm`] does
+/// not retry it on every launch. Unlike the markers above it has contents.
+const PNPM_FAILED: &str = "pnpm-failed";
 
 /// Whether a launch has already done the thing `name` stands for.
 ///

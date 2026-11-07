@@ -1346,6 +1346,13 @@ fn boot(app: tauri::AppHandle, window: WebviewWindow, session: Session) {
         // above is: nobody is looking, and this can reach the network — an
         // absent pnpm is an `npm install -g` away. The next launch someone
         // actually asks for does it.
+        //
+        // pnpm first, for the same reasons and on the same launches: dsh hands
+        // every plugin install to it, including the ones that never pass
+        // through this app. See [`plugins::provide_pnpm`].
+        if window_is_visible(&app) {
+            plugins::provide_pnpm(&app, &report);
+        }
         let adoption_failed = window_is_visible(&app) && plugins::adopt(&app, &report);
 
         // Once, on the launch that first has a dsh to add plugins to — and once
