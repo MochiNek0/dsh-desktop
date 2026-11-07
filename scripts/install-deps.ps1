@@ -707,11 +707,23 @@ function Test-NodeVersion([string] $Exe) {
 # not answer. Split out of [`Test-NodeVersion`] because the setup panel shows the
 # number, not only the yes/no of whether it is new enough, and because listing
 # every Node on the machine needs the string rather than the verdict.
+#
+# `$ErrorActionPreference` is dropped to Continue for the call, for the reason
+# `Invoke-Native` drops it: under Windows PowerShell 5.1 a native command's
+# stderr becomes ErrorRecords even when redirected to `$null`, and under Stop
+# the first one throws. A Node that prints a warning on its way to the version
+# — a deprecated flag in `NODE_OPTIONS` is enough — was caught below as no
+# Node at all, and the chooser told the user their machine had none. What
+# decides is the exit code and what reached stdout.
 function Get-NodeVersion([string] $Exe) {
+    $was = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         $printed = & $Exe --version 2>$null
     } catch {
         return $null
+    } finally {
+        $ErrorActionPreference = $was
     }
     if ($LASTEXITCODE -ne 0 -or -not $printed) { return $null }
 
