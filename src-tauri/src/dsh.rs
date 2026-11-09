@@ -278,7 +278,11 @@ fn search_path(app: &AppHandle) -> Vec<PathBuf> {
 
     // The user's terminal PATH rather than launchd's on a Finder launch; see
     // `login_env`.
-    let inherited: Vec<PathBuf> = std::env::split_paths(&crate::login_env::path()).collect();
+    // Minus an AppImage's `usr/bin`, which `AppRun` puts first: it carries its
+    // own `xdg-open`, and nothing a child runs should be the bundle's.
+    let inherited: Vec<PathBuf> = std::env::split_paths(&crate::login_env::path())
+        .filter(|entry| !in_an_appimage(entry))
+        .collect();
     let marked: Vec<PathBuf> = [shims, node_dir, own].into_iter().flatten().collect();
 
     // One block or the other first, never interleaved, so the Node found here is
@@ -2306,10 +2310,10 @@ const BUNDLED: &[&str] = &[
 /// ```
 ///
 /// `AppRun` prepends, leaving whatever the user already had at the tail, so
-/// dropping the entries that live under `$APPDIR` hands the child back exactly
-/// the value this process was started with. Outside an AppImage `APPDIR` is
-/// unset and there is nothing to do — which is every Windows and macOS launch,
-/// and a `.deb` install too.
+/// dropping the entries that live in an AppImage — `$APPDIR`, or another
+/// AppImage's mount; see [`host_entries`] — hands the child back the value the
+/// user had. Outside an AppImage `APPDIR` is unset and there is nothing to do —
+/// which is every Windows and macOS launch, and a `.deb` install too.
 ///
 /// Not done once to this process's own environment, which would save doing it
 /// per child: the bundled webkit spawns `WebKitWebProcess` and dlopens its GIO
@@ -2333,12 +2337,22 @@ pub(crate) fn unbundle(command: &mut Command) {
     }
 }
 
-/// `value` with every entry under `appdir` dropped, and `None` when that leaves
-/// nothing — the caller's cue to unset the variable rather than hand the child
-/// an empty one, which for `XDG_DATA_DIRS` is not the same thing at all.
+/// `value` with every entry inside an AppImage dropped, and `None` when that
+/// leaves nothing — the caller's cue to unset the variable rather than hand the
+/// child an empty one, which for `XDG_DATA_DIRS` is not the same thing at all.
+///
+/// Inside an AppImage means under `appdir`, or [`in_an_appimage`]. The other
+/// AppImage is most often the version this one updated from. The updater's restart starts this process with the old
+/// version's environment, so `AppRun` adds this mount's directories in front of
+/// the old ones and `APPDIR` names only this mount. The old mount does not go
+/// away either. Its runtime unmounts once nothing holds its keepalive pipe
+/// open, and this process inherited that pipe from the old version. So
+/// `/tmp/.mount_<old>/usr/lib` stays at the tail of `LD_LIBRARY_PATH` and still
+/// serves libraries. Issue #16 is the result: a host `node` resolving libffi to
+/// the bundle's Ubuntu 22.04 copy on the first start after an update.
 fn host_entries(value: &OsStr, appdir: &Path) -> Option<OsString> {
     let kept: Vec<PathBuf> = std::env::split_paths(value)
-        .filter(|entry| !entry.starts_with(appdir))
+        .filter(|entry| !entry.starts_with(appdir) && !in_an_appimage(entry))
         .collect();
 
     if kept.is_empty() {
@@ -2347,6 +2361,92 @@ fn host_entries(value: &OsStr, appdir: &Path) -> Option<OsString> {
 
     std::env::join_paths(kept).ok()
 }
+
+/// Whether `path` is inside a running AppImage: under a directory the runtime
+/// made — `.mount_XXXXXX` for the FUSE mount, `appimage_extracted_<hash>` for
+/// `--appimage-extract-and-run` — that has an `AppRun` in it. The `AppRun` is
+/// what tells the runtime's directory from a user's own `~/.mount_cache`, and it
+/// is only there while that AppImage is: a dead mount's entries are ones the
+/// loader cannot read from anyway.
+fn in_an_appimage(path: &Path) -> bool {
+    path.ancestors().any(|dir| {
+        dir.file_name().is_some_and(|name| {
+            let name = name.as_encoded_bytes();
+            name.starts_with(b".mount_") || name.starts_with(b"appimage_extracted_")
+        }) && dir.join("AppRun").is_file()
+    })
+}
+
+/// Stop holding the AppImage's mount on behalf of anything this process
+/// starts. Called first thing in `main`, before there are other threads.
+///
+/// The runtime keeps its mount up for as long as anyone holds the read end of
+/// its keepalive pipe, and `AppRun` leaves this process's working directory at
+/// `$APPDIR/usr`. Every child inherited both: the pipe because it is not
+/// close-on-exec, the directory because nothing changed it. The child that
+/// matters is the updater's restart. It held the old version's mount open for
+/// as long as the new version ran, and that mount still served libraries —
+/// issue #16. The restarted runtime also mounts the new version from inside
+/// the old one, which keeps the old mount busy after it should have gone.
+///
+/// So: back to the directory the AppImage was started from (`OWD`, set by the
+/// runtime), which is also the directory a relative path on the command line
+/// means, and close-on-exec on every inherited descriptor. Only close-on-exec,
+/// never closed: this process still has to hold its own mount up.
+///
+/// What it cannot do is let go of the *previous* version's mount on the first
+/// start after an update from a version without this: that pipe is held by
+/// this process itself, and it cannot be told from this AppImage's own. That
+/// mount stays up until the app quits; [`unbundle`] and [`search_path`] keep it
+/// out of the children.
+#[cfg(target_os = "linux")]
+pub fn leave_the_mount() {
+    // `APPIMAGE` alone is inherited: a `.deb` install started from a terminal
+    // that is itself an AppImage has it too. Running from inside `APPDIR` is
+    // what makes this process the one `AppRun` started.
+    let (Some(appdir), Ok(exe)) = (std::env::var_os("APPDIR"), std::env::current_exe()) else {
+        return;
+    };
+    if std::env::var_os("APPIMAGE").is_none() || !exe.starts_with(&appdir) {
+        return;
+    }
+
+    // An `OWD` inside an AppImage is a launch by an older version's restart,
+    // which started us from its `$APPDIR/usr`.
+    let dirs = [std::env::var_os("OWD"), std::env::var_os("HOME")]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .filter(|dir| !in_an_appimage(dir))
+        .chain([PathBuf::from("/")]);
+    for dir in dirs {
+        if std::env::set_current_dir(&dir).is_ok() {
+            break;
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return;
+    };
+    let fds: Vec<libc::c_int> = entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
+    for fd in fds {
+        // SAFETY: flag changes on a descriptor number; one that has closed
+        // since the listing (the listing's own) fails with EBADF and is skipped.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
+/// Linux only: there is no AppImage anywhere else.
+#[cfg(not(target_os = "linux"))]
+pub fn leave_the_mount() {}
 
 /// Drop the `\\?\` prefix Tauri's path APIs come back with on Windows. Rust's
 /// own file APIs accept a verbatim path, but Node's module resolver parses one
@@ -2517,14 +2617,51 @@ mod tests {
     /// A directory whose *name* merely begins with the AppDir's is not inside
     /// it. `Path::starts_with` compares whole components, and this is here so
     /// that nobody swaps it for a string prefix and takes
-    /// `/tmp/.mount_dshdesQWERTYnot` out of a value that had nothing to do with
-    /// the bundle.
+    /// `/opt/dsh.AppDirnot` out of a value that had nothing to do with the
+    /// bundle. (An extracted AppDir, so the `.mount_` rule stays out of it.)
     #[test]
     fn only_whole_path_components_count_as_inside_the_bundle() {
-        let appdir = Path::new("/tmp/.mount_dshdesQWERTY");
-        let value = std::ffi::OsString::from("/tmp/.mount_dshdesQWERTYnot/lib");
+        let appdir = Path::new("/opt/dsh.AppDir");
+        let value = std::ffi::OsString::from("/opt/dsh.AppDirnot/lib");
 
         assert_eq!(host_entries(&value, appdir), Some(value.clone()));
+    }
+
+    /// Issue #16: the first start after an in-app update. `AppRun` puts the
+    /// new mount in front, `APPDIR` names only the new one, and the old
+    /// version's entries are still at the tail of what was inherited, with the
+    /// old mount still alive behind them.
+    #[test]
+    fn the_previous_versions_mount_is_dropped_too() {
+        let scratch = Scratch::new("old-mount");
+        let old = scratch.shim(".mount_dsh-deDdbccj/AppRun");
+        let old = old.parent().expect("the mount");
+        let appdir = scratch.at(".mount_dsh-deNEWNEW");
+        let value = std::env::join_paths([
+            appdir.join("usr/lib"),
+            old.join("usr/lib"),
+            old.join("lib64"),
+            PathBuf::from("/home/user/.local/lib"),
+        ])
+        .expect("a joinable value");
+
+        let kept = host_entries(&value, &appdir).expect("the user's own entry to survive");
+        assert_eq!(kept, std::ffi::OsString::from("/home/user/.local/lib"));
+    }
+
+    /// The name alone is not an AppImage: a user's own `.mount_` directory,
+    /// with no `AppRun` in it, stays where it was.
+    #[test]
+    fn a_users_own_mount_directory_is_kept() {
+        let scratch = Scratch::new("own-mount");
+        let own = scratch.at(".mount_cache/lib");
+        std::fs::create_dir_all(&own).expect("the user's directory");
+        let value = own.clone().into_os_string();
+
+        assert_eq!(
+            host_entries(&value, Path::new("/tmp/.mount_dsh-deNEWNEW")),
+            Some(value.clone())
+        );
     }
 
     /// The Node npm is being run with has to be the one its install scripts

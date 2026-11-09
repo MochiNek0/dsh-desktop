@@ -121,6 +121,9 @@ struct Session {
 }
 
 fn main() {
+    // Before any thread or child exists. See [`dsh::leave_the_mount`].
+    dsh::leave_the_mount();
+
     // Before anything else, and from the thread that is about to become the
     // event loop: `dialog::confirm` blocks on a message only this thread can
     // deliver, and this is what lets it assert it is not being called here.
