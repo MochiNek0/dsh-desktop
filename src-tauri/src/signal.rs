@@ -110,6 +110,10 @@ pub enum Signal {
     FolderOpened,
     /// dsh would not take it, and why.
     FolderFailed { reason: String },
+    /// dsh's "add workspace" asked for a directory, in this window: open the
+    /// system's own folder picker and answer the request `key` names. See
+    /// [`crate::folder::pick`].
+    PickFolder { key: String },
     /// The workspaces used last, most recent first; see [`crate::recent`].
     Recent(Vec<crate::recent::Workspace>),
     /// The sessions of each of those workspaces, for the quick-ask box; see
@@ -210,6 +214,9 @@ pub fn received(url: &Url) -> Option<Signal> {
         "folder-ready" => return Some(Signal::FolderReady),
         "folder-opened" => return Some(Signal::FolderOpened),
         "folder-failed" => return Some(Signal::FolderFailed { reason }),
+        // No key, no request to answer, and a picker nobody can hear back from.
+        "pick-folder" if !key.is_empty() => return Some(Signal::PickFolder { key }),
+        "pick-folder" => return None,
         "asked" => return Some(Signal::Asked { session }),
         "ask-failed" => return Some(Signal::AskFailed { reason }),
         // A row with no path has nowhere to go, and a list whose halves do not
@@ -370,6 +377,7 @@ pub fn act(app: &AppHandle, signal: Signal) {
         Signal::AskFailed { reason } => crate::ask::failed(app, &reason),
         Signal::FolderOpened => crate::folder::opened(),
         Signal::FolderFailed { reason } => crate::folder::failed(app, &reason),
+        Signal::PickFolder { key } => crate::folder::pick(app, key),
         Signal::Recent(list) => crate::recent::set(app, list),
         Signal::Sessions(list) => crate::ask::set_sessions(list),
         Signal::Models { list, default } => crate::ask::set_models(list, default),
@@ -712,6 +720,11 @@ mod tests {
                 reason: "not a directory".into()
             })
         );
+        assert_eq!(
+            read("event=pick-folder&key=3"),
+            Some(Signal::PickFolder { key: "3".into() })
+        );
+        assert_eq!(read("event=pick-folder"), None);
     }
 
     /// The plugin's own too: two lists in step, and the counts.

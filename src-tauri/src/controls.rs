@@ -3,20 +3,16 @@
 //! The window has no frame, so minimise, maximise and close have to come from
 //! inside it — and the page inside it is dsh's, not ours. So they are injected:
 //! an initialization script runs on every document the window loads, the
-//! loading page and the dsh UI alike, and puts three buttons in the top-left
-//! corner plus a thin strip along the top edge to drag the window by.
+//! loading page and the dsh UI alike, and draws a bar of its own along the top
+//! edge, [`TITLEBAR_HEIGHT`] tall, that the window is dragged by.
 //!
-//! They sit on the left, in macOS order and shape, because dsh puts its own
-//! controls in the top-right — the session log download among them — and a
-//! Windows-style button row lands right on top of them. The top-left strip
-//! above dsh's logo is the one piece of the header that is reliably empty.
-//!
-//! Nothing is reserved for them. They float over whatever the page draws rather
-//! than pushing it down, because pushing dsh's layout down means guessing at how
-//! it measures itself, and that guess would break on a dsh release we do not
-//! control. The cost is that they sit on top of the page's own top-left corner,
-//! which is why they are dimmed, and show their glyphs only once the pointer
-//! comes near.
+//! The bar reserves its height: dsh's `#root` is pushed down below it. So both
+//! of its ends are the bar's, and the buttons go where each system puts them —
+//! on Windows its own three in the top-right corner (see [`WINDOWS_CAPTION`]),
+//! on macOS the system's traffic lights at the left (see [`NATIVE_LIGHTS`]),
+//! and on Linux the same three as dots at the left, which is where they were
+//! everywhere back when the bar floated over dsh's header and the right end
+//! was where dsh kept its own controls.
 //!
 //! ## The menu
 //!
@@ -89,6 +85,24 @@ const ROW_PAD: u32 = 14;
 /// draws no dots of its own beside them, only leaves the room they sit in.
 /// See [`traffic_lights`].
 const NATIVE_LIGHTS: bool = cfg!(target_os = "macos");
+
+/// Whether minimise, maximise and close are Windows' own shape, in Windows'
+/// own corner: three 46px cells the height of the bar, flush with the top
+/// right, drawn in the system's icon font, with close turning red.
+///
+/// The page still draws them — Tauri has no way to put the system's caption
+/// buttons over a webview on Windows, as `NATIVE_LIGHTS` does on macOS, and a
+/// real frame would be a second title bar stacked on this one. But the reason
+/// they were dots on the left is gone: they went there because dsh's own
+/// controls sat in the top-right corner, and since the bar reserves its height
+/// and pushes dsh's page below it, that corner is the bar's and empty.
+///
+/// Linux keeps the dots: its desktops disagree about which side the buttons
+/// go on, and none of them draws them like this.
+const WINDOWS_CAPTION: bool = cfg!(windows);
+
+/// One caption button's width, Windows' own.
+const CAPTION_WIDTH: u32 = 46;
 
 /// The width the system's three take up: 14px buttons, 20px from the start of
 /// one to the next, which is the same pitch as `DOT` plus `DOT_GAP`.
@@ -864,6 +878,21 @@ pub(crate) fn eval(app: &AppHandle, call: &str) {
     }
 }
 
+/// The tooltips of Windows' caption buttons, by verb; see [`WINDOWS_CAPTION`].
+///
+/// Apart from [`labels`], which is the menu's and is checked row for row
+/// against it. Written once, when the document loads: a caption tooltip that
+/// stays in the launch's language until the next page is not worth a second
+/// path through [`relabel`].
+fn caption_tips() -> String {
+    serde_json::json!({
+        "minimize": t!("最小化", "Minimize"),
+        "maximize": t!("最大化", "Maximize"),
+        "close": t!("关闭", "Close"),
+    })
+    .to_string()
+}
+
 /// Every menu label, against the verb its entry signals, as the object the
 /// script indexes by verb.
 ///
@@ -1275,6 +1304,7 @@ pub fn script() -> String {
     let night = crate::theme::dark_css();
 
     let labels = labels();
+    let tips = caption_tips();
     let notes = notes();
     let community = community();
     let maker = dom_make();
@@ -1284,6 +1314,8 @@ pub fn script() -> String {
     let corners = corners(&["dsh-wc", "dsh-wc-set", "dsh-wc-scrim"]);
     let native_lights = NATIVE_LIGHTS;
     let native_width = NATIVE_LIGHTS_WIDTH;
+    let windows_caption = WINDOWS_CAPTION;
+    let caption_width = CAPTION_WIDTH;
 
     format!(
         r#"(function () {{
@@ -1314,10 +1346,22 @@ pub fn script() -> String {
     close: '<path d="M2.9 2.9l4.2 4.2m0-4.2l-4.2 4.2"/>'
   }};
 
+  // Windows' caption glyphs, out of the font the system draws its own with:
+  // Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets on 10, same code
+  // points in both. See `WINDOWS_CAPTION`.
+  var CAPTION = {{
+    minimize: '\uE921',
+    maximize: '\uE922',
+    restore: '\uE923',
+    close: '\uE8BB'
+  }};
+
   // The labels come from Rust so there is one place the two languages live;
   // see `i18n`. Keyed by verb rather than laid out in order, because
   // `__dshRelabel` sends this same shape again when dsh changes language.
   var LABELS = {labels};
+  // The caption buttons' tooltips; see `caption_tips` in controls.rs.
+  var TIPS = {tips};
   // The second line each settings row carries; see `notes` in controls.rs.
   var NOTES = {notes};
   // The community row's payload; see `community` in controls.rs.
@@ -1522,7 +1566,7 @@ pub fn script() -> String {
       // drawn at `opacity:.85`, which every descendant inherits, and a card
       // washed out to 85% is not a card. So it is a sibling on the body, with
       // its own copy of the set and its own `paint`.
-      '.dsh-wc,.dsh-wc-set{{--dsh-wc-fg:rgba(0,0,0,.55);--dsh-wc-fg-hi:rgba(0,0,0,.85);' +
+      '.dsh-wc,.dsh-wc-set,.dsh-wc-caps{{--dsh-wc-fg:rgba(0,0,0,.55);--dsh-wc-fg-hi:rgba(0,0,0,.85);' +
       '--dsh-wc-panel:rgba(255,255,255,.96);--dsh-wc-line:rgba(0,0,0,.09);' +
       '--dsh-wc-hover:rgba(0,0,0,.06);--dsh-wc-accent:#4d6bfe;' +
       // The switch track when it is off. Not `--dsh-wc-line`, which is the
@@ -1533,7 +1577,7 @@ pub fn script() -> String {
       // Under each group of rows on the settings card.
       '--dsh-wc-group:rgba(0,0,0,.035);' +
       '--dsh-wc-shadow:0 12px 32px rgba(0,0,0,.18),0 0 0 .5px rgba(0,0,0,.09);}}' +
-      '.dsh-wc.dsh-wc-dark,.dsh-wc-set.dsh-wc-dark{{' +
+      '.dsh-wc.dsh-wc-dark,.dsh-wc-set.dsh-wc-dark,.dsh-wc-caps.dsh-wc-dark{{' +
       '--dsh-wc-fg:rgba(255,255,255,.62);--dsh-wc-fg-hi:rgba(255,255,255,.94);' +
       '--dsh-wc-panel:rgba(42,42,46,.96);--dsh-wc-line:rgba(255,255,255,.11);' +
       '--dsh-wc-hover:rgba(255,255,255,.09);--dsh-wc-sw-off:rgba(255,255,255,.26);' +
@@ -1609,6 +1653,23 @@ pub fn script() -> String {
       // there to keep the magnification off the green dot, and there is no dot
       // on this side to keep clear of.
       '.dsh-wc button.dsh-wc-phone{{margin-left:2px}}' +
+      // Windows: no dots on this side, so nothing for the menu to keep clear
+      // of. See `WINDOWS_CAPTION`.
+      '.dsh-wc-win .dsh-wc-dots{{display:none}}' +
+      '.dsh-wc.dsh-wc-win button.dsh-wc-menu{{margin-left:0}}' +
+      // The caption buttons: their own root, beside the bar rather than in
+      // it, because the bar is drawn at `opacity:.85` and a close button
+      // that turns a washed-out red is not the one Windows draws.
+      '.dsh-wc-caps{{position:fixed;top:0;right:0;z-index:2147483647;display:flex;' +
+      'height:{titlebar_height}px}}' +
+      '.dsh-wc-caps button{{all:unset;width:{caption_width}px;height:100%;' +
+      'display:grid;place-items:center;cursor:default;' +
+      'font:10px "Segoe Fluent Icons","Segoe MDL2 Assets";color:var(--dsh-wc-fg-hi);' +
+      'transition:background .1s ease,color .1s ease}}' +
+      '.dsh-wc-caps button:hover{{background:var(--dsh-wc-hover)}}' +
+      '.dsh-wc-caps button:active{{background:var(--dsh-wc-line)}}' +
+      '.dsh-wc-caps button.dsh-wc-cap-close:hover{{background:#c42b1c;color:#fff}}' +
+      '.dsh-wc-caps button.dsh-wc-cap-close:active{{background:#c84031;color:#fff}}' +
       // The panel. `visibility` rather than `display` so the fade has something
       // to fade, with its own transition delayed until the opacity is done.
       '.dsh-wc-pop{{position:absolute;top:calc(100% - 3px);left:0;min-width:184px;' +
@@ -1806,8 +1867,29 @@ pub fn script() -> String {
     // `NATIVE_LIGHTS`. With no dots in it, the magnification below has nothing
     // to move.
     var zoom = null;
+    // Windows' own three, in Windows' place; see `WINDOWS_CAPTION`. Built
+    // here, appended beside the bar below.
+    var caps = null;
     if ({native_lights}) {{
       row.style.width = '{native_width}px';
+    }} else if ({windows_caption}) {{
+      bar.classList.add('dsh-wc-win');
+      caps = document.createElement('div');
+      caps.className = 'dsh-wc-caps';
+      [['minimize', CAPTION.minimize, ''], ['maximize', CAPTION.maximize, 'dsh-wc-cap-max'],
+        ['close', CAPTION.close, 'dsh-wc-cap-close']].forEach(function (cap) {{
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = cap[2];
+        button.textContent = cap[1];
+        button.title = TIPS[cap[0]] || '';
+        button.setAttribute('aria-label', button.title);
+        button.addEventListener('click', function () {{
+          signal(cap[0]);
+        }});
+        caps.appendChild(button);
+        if (cap[0] === 'maximize') zoom = button;
+      }});
     }} else {{
       add('close', ICONS.close, 'dsh-wc-close');
       add('minimize', ICONS.minimize, 'dsh-wc-min');
@@ -1816,7 +1898,9 @@ pub fn script() -> String {
 
     // Called from Rust on every resize; see `sync`.
     window.__dshMaximized = function (maximized) {{
-      if (zoom) zoom.innerHTML = svg(maximized ? ICONS.restore : ICONS.maximize);
+      if (!zoom) return;
+      if (caps) zoom.textContent = maximized ? CAPTION.restore : CAPTION.maximize;
+      else zoom.innerHTML = svg(maximized ? ICONS.restore : ICONS.maximize);
     }};
 
     // ------------------------------------------------------------- the menu --
@@ -2293,9 +2377,11 @@ pub fn script() -> String {
     // Its own watcher, because the card is not inside the bar; see the note on
     // the palette in the stylesheet above.
     paint(card);
+    if (caps) paint(caps);
 
     document.body.appendChild(drag);
     document.body.appendChild(bar);
+    if (caps) document.body.appendChild(caps);
     document.body.appendChild(scrim);
     document.body.appendChild(card);
 

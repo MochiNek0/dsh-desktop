@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 struct State {
     /// The plugin said `folder-ready` on the page now loaded.
@@ -232,6 +232,58 @@ fn call(dir: &Path) -> String {
     format!("window.__dshSignals && window.__dshSignals.openFolder({path});")
 }
 
+/// The system's folder picker is up for the main window.
+static PICKING: AtomicBool = AtomicBool::new(false);
+
+/// dsh's "add workspace" asked for a directory, in this window.
+///
+/// The plugin pins dsh's picker to its in-app browser, because the choice is
+/// made once per dsh process and a phone has to be able to use it too (see
+/// `plugin/cordis.patch.yml`). In this window, and only here, it puts an
+/// occupant of its own in front of that browser, which asks for this instead:
+/// the system's own dialog, with every drive and every shortcut the user
+/// already knows. A phone never has the global the occupant checks for, so it
+/// keeps the browser.
+///
+/// Every request is answered, `null` included — an unanswered one would leave
+/// dsh's flow open with nothing on screen to close it. A second while one is
+/// up is answered `null` at once rather than stacking a second dialog.
+///
+/// Anything in the window can send this, as with every verb on the channel.
+/// What it can get is a dialog only the user can answer, and the folder they
+/// chose handed back to the page they chose it for.
+pub fn pick(app: &AppHandle, key: String) {
+    if PICKING.swap(true, Ordering::SeqCst) {
+        crate::controls::eval(app, &picked_call(&key, None));
+        return;
+    }
+    let handle = app.clone();
+    let reply = key.clone();
+    let queued = app.run_on_main_thread(move || {
+        let mut dialog =
+            rfd::FileDialog::new().set_title(t!("选择工作区目录", "Choose a workspace folder"));
+        if let Some(window) = handle.get_webview_window("main") {
+            dialog = dialog.set_parent(&window);
+        }
+        let picked = dialog.pick_folder().filter(|path| path.is_dir());
+        PICKING.store(false, Ordering::SeqCst);
+        crate::controls::eval(&handle, &picked_call(&reply, picked.as_deref()));
+    });
+    if queued.is_err() {
+        PICKING.store(false, Ordering::SeqCst);
+        crate::controls::eval(app, &picked_call(&key, None));
+    }
+}
+
+/// The call [`pick`] answers with. Both halves through `serde_json`: the key
+/// came from the page, and the path is whatever the file system allowed.
+fn picked_call(key: &str, path: Option<&Path>) -> String {
+    let key = serde_json::to_string(key).expect("a string is always serializable");
+    let path = serde_json::to_string(&path.map(|path| path.to_string_lossy()))
+        .expect("a string is always serializable");
+    format!("window.__dshSignals && window.__dshSignals.picked && window.__dshSignals.picked({key}, {path});")
+}
+
 /// Say that the plugin is not there, and offer the way back.
 fn missing(app: &AppHandle) {
     let set_aside = crate::plugins::signal_set_aside(app);
@@ -283,6 +335,20 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// The key is the page's and the path the file system's: neither may
+    /// close the string it is put in.
+    #[test]
+    fn a_picked_folder_is_handed_back_as_json() {
+        assert_eq!(
+            picked_call("7", Some(Path::new(r#"D:\a "b"\c"#))),
+            r#"window.__dshSignals && window.__dshSignals.picked && window.__dshSignals.picked("7", "D:\\a \"b\"\\c");"#
+        );
+        assert_eq!(
+            picked_call("x\"); alert(1); (\"", None),
+            r#"window.__dshSignals && window.__dshSignals.picked && window.__dshSignals.picked("x\"); alert(1); (\"", null);"#
+        );
     }
 
     #[test]

@@ -38,6 +38,9 @@
  * that says a question is pending is the object that answers it.
  * `openFolder(path)` is how a folder handed to the app from outside becomes a
  * workspace on screen, through dsh's own `workspaces` and `uiWorkspace`.
+ * `picked(key, path)` answers a `pick-folder` request: dsh's "add workspace"
+ * asking for a directory in the desktop window, where it gets the system's
+ * folder dialog rather than the in-app browser. See `folderFlow`.
  *
  * Removed again on teardown, so a click that arrives after the plugin was
  * disabled finds nothing rather than half of something — the shell guards
@@ -155,6 +158,115 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The three holes dsh's workspace UI asks for a directory through: the
+     * sidebar's "add workspace", the empty conversation's picker, and every
+     * workspace-picker menu. A directory-picker package fills all three with
+     * the same occupant, and so does this.
+     */
+    var FLOW_HOLES = [
+      'conversation.hero.workspace.directoryFlow',
+      'sidebar.workspaces.directoryFlow',
+      'workspace.picker.directoryFlow',
+    ];
+
+    /**
+     * Ahead of the in-app browser this plugin's patch mounts, which registers
+     * at the default 0. Each hole is a `single` slot, where the lowest
+     * priority is the one that renders; the browser stays registered behind
+     * this one and is back the moment it goes.
+     */
+    var FLOW_PRIORITY = -100;
+
+    /**
+     * The requests out with the shell's folder picker, by key.
+     *
+     * `pick` sends one and resolves with what came back; `settle` is the
+     * shell's answer; `drop` answers every one still out with null, for a
+     * teardown that would otherwise leave dsh's flow open forever.
+     */
+    function folderPicks() {
+      var waiting = new Map();
+      var next = 0;
+      return {
+        pick: () => new Promise((resolve) => {
+          var key = String(++next);
+          waiting.set(key, resolve);
+          send({ event: 'pick-folder', key: key });
+        }),
+        settle: (key, path) => {
+          var resolve = waiting.get(String(key));
+          if (!resolve) return;
+          waiting.delete(String(key));
+          resolve(typeof path === 'string' && path ? path : null);
+        },
+        drop: () => {
+          var all = Array.from(waiting.values());
+          waiting.clear();
+          all.forEach((resolve) => resolve(null));
+        },
+      };
+    }
+
+    /**
+     * The occupant that answers dsh's request for a directory with the
+     * system's own picker, or null when React cannot be had.
+     *
+     * Why this exists at all: the patch beside this file pins dsh's picker to
+     * its in-app browser, because the choice is made once per dsh process and
+     * a phone on the gateway cannot use a dialog that opens on the desktop.
+     * In the desktop window that costs the system dialog — no drive list, no
+     * Quick Access, a path to type for anything off the home drive. So here,
+     * and only here, this sits in front of the browser; a phone has no
+     * `__DSH_NATIVE_PICKER__` and never registers it.
+     *
+     * The same shape as dsh's own native occupant: renderless, one pick per
+     * rising edge of `open`, exactly one outcome per pick, and nothing
+     * reported once it has unmounted.
+     *
+     * @param {Function} require - the module loader's require.
+     * @param {() => Promise<string | null>} pick - the shell's picker.
+     */
+    function folderFlow(require, pick) {
+      var react;
+      try {
+        react = require('react');
+      } catch (error) {
+        return null;
+      }
+      if (!react || !react.useEffect || !react.useRef) return null;
+
+      return function DesktopDirectoryFlow(props) {
+        var armed = react.useRef(false);
+        var latest = react.useRef(props);
+        latest.current = props;
+        var alive = react.useRef(true);
+        react.useEffect(() => {
+          alive.current = true;
+          return () => {
+            alive.current = false;
+          };
+        }, []);
+        react.useEffect(() => {
+          if (!props.open) {
+            armed.current = false;
+            return;
+          }
+          if (armed.current) return;
+          armed.current = true;
+          (props.pick || pick)().then((path) => {
+            if (!alive.current) return;
+            if (path === null) latest.current.onCancel();
+            else latest.current.onPicked(path);
+          }, (reason) => {
+            if (!alive.current) return;
+            latest.current.onError(reason instanceof Error ? reason.message : String(reason));
+          });
+        }, [props.open]);
+        return null;
+      };
+    }
+
+    /**
      * Put up the shell's door, and each watcher behind the service it needs.
      *
      * @param {import('@deepseek-ai/cordis').Context} ctx - client context.
@@ -175,6 +287,8 @@ window.__ModuleLoader__.load({
       var reloadModels = null;
       // Each listed session's model, read on the side; see `selections`.
       var picked = selections(() => remote);
+      // Folder-picker requests out with the shell; see `folderPicks`.
+      var picker = folderPicks();
 
       // Which sessions are mid-turn and which are waiting on the user, for the
       // shell's icons, its tray menu and whether it keeps the machine awake.
@@ -333,11 +447,39 @@ window.__ModuleLoader__.load({
               return current.uiWorkspace.openWorkspace(workspace.workspaceId);
             }, failed).catch(() => {});
           },
+          /**
+           * What the system's folder picker came back with, for the request
+           * `pick-folder` named. Called from the shell over `window.eval`;
+           * see its folder.rs.
+           *
+           * @param {string} key - the request, as it was sent from here.
+           * @param {string | null} path - the folder chosen, or null.
+           */
+          picked: (key, path) => picker.settle(key, path),
         };
         return () => {
           delete window.__dshSignals;
+          // A dialog still up when this goes answers nobody; the flows waiting
+          // on it are told now instead of never.
+          picker.drop();
         };
       }, 'dsh-desktop-signal: the shell\'s way back into dsh');
+
+      // The system's folder picker, in this window only; see `folderFlow`.
+      if (window.__DSH_NATIVE_PICKER__) {
+        var flow = folderFlow(require, picker.pick);
+        if (flow) {
+          ctx.inject(['slots'], (scope) => {
+            FLOW_HOLES.forEach((hole) => {
+              scope.slots.inject(hole, () => scope.slots.register({
+                name: hole,
+                priority: FLOW_PRIORITY,
+                inject: () => ({ pick: picker.pick }),
+              }, flow));
+            });
+          });
+        }
+      }
 
       // Turn endings, and the session a notification click goes back to.
       ctx.inject(['sessions'], (scope) => {
