@@ -52,7 +52,9 @@
 # negative priority — in the desktop window only, the one document the shell
 # injects `__DSH_NATIVE_PICKER__` into — that asks the shell for its own folder
 # dialog (`pick-folder`; see the shell's `folder::pick`). The browse occupant
-# stays registered behind it, and is the only one a phone ever sees.
+# stays registered behind it, and is the only one a phone ever sees — and, for
+# now, the only one Linux sees too: the shell leaves the flag off there (see
+# `build_window` in its main.rs).
 #
 # The two packages below are resolved by name out of the profile's hoisted
 # `node_modules` (`nodeLinker: hoisted`), where `dsh-web-app` already puts

@@ -394,7 +394,15 @@ fn build_window(
         // the system's folder picker in front of dsh's in-app one. Its own
         // flag rather than the version above: a plugin newer than the shell
         // would otherwise open a flow nothing ever answers. See `folder::pick`.
-        .initialization_script("window.__DSH_NATIVE_PICKER__ = true;")
+        //
+        // Not on Linux, for now: there it is rfd's GTK dialog, which is not
+        // modal under Wayland and cannot be counted on inside every AppImage,
+        // and with this flag set the desktop window has no in-app browser to
+        // fall back to. Linux keeps dsh's in-app browser.
+        .initialization_script(format!(
+            "window.__DSH_NATIVE_PICKER__ = {};",
+            !cfg!(target_os = "linux")
+        ))
         // Watches dsh's own boot for the one failure this app cannot see any
         // other way: the server serving a page whose plugins did not load. See
         // `plugins::stall_watch`.
