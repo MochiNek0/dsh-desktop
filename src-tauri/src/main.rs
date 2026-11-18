@@ -2238,6 +2238,34 @@ fn show_plugins(app: &tauri::AppHandle, session: &Session, first: bool) {
     // goes up now and the marks arrive when they arrive; see `look_for_updates`.
     session.splash.plugins(&window, &plugins::listing(app, &[]), first);
     look_for_updates(app, session);
+    refresh_preset_icons(app, session);
+}
+
+/// Fetch the icons of the presets not yet installed out of their published
+/// packages, and redraw the lists if any of them changed. On a thread, because
+/// it reaches the network; the panel goes up first with whatever was fetched
+/// last time.
+///
+/// The same two checks before the redraw as [`look_for_updates`], for the same
+/// reasons, and the update marks the last check found are carried into it —
+/// a redraw with none would take them off the cards.
+fn refresh_preset_icons(app: &tauri::AppHandle, session: &Session) {
+    let app = app.clone();
+    let session = session.clone();
+
+    std::thread::spawn(move || {
+        if !plugins::refresh_icons(&app) {
+            return;
+        }
+        if !PANEL.load(Ordering::SeqCst) || BUSY.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(window) = app.get_webview_window("main") {
+            session
+                .splash
+                .plugin_lists(&window, &plugins::listing(&app, &plugins::behind()));
+        }
+    });
 }
 
 /// Ask pnpm which installed plugins are behind, and redraw the lists with what

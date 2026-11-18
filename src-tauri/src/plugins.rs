@@ -466,12 +466,16 @@ pub fn listing(app: &AppHandle, behind: &[(String, String, String)]) -> String {
         .map(|preset| {
             // Only a preset that ships inside the app has a package on this
             // machine to take a picture out of before it is installed. The
-            // rest get the panel's lettered tile until they are.
+            // rest are drawn with the one [`refresh_icons`] last fetched out of
+            // their published package, and only an entry with neither — never
+            // fetched, or offline since the first launch — gets the panel's
+            // lettered tile.
             let icon = preset
                 .spec
                 .strip_prefix(BUNDLED)
                 .and_then(|name| bundled(app, name))
-                .and_then(|dir| own(&dir).icon);
+                .and_then(|dir| own(&dir).icon)
+                .or_else(|| cached_icon(app, &preset.package));
             serde_json::json!({
                 "id": preset.id,
                 "name": preset.name,
@@ -627,6 +631,13 @@ pub fn check_updates(app: &AppHandle) -> Option<Vec<(String, String, String)>> {
         }
     }
     Some(behind)
+}
+
+/// The whole of what the last kept check found behind, for a redraw that is
+/// not itself an update check to keep the update marks on the cards; see
+/// `refresh_preset_icons` in `main`.
+pub fn behind() -> Vec<(String, String, String)> {
+    BEHIND.lock().map(|kept| kept.1.clone()).unwrap_or_default()
 }
 
 /// The names of the plugins the last kept check found behind.
@@ -917,13 +928,7 @@ fn own(dir: &Path) -> Own {
 /// Only the image types an `<img>` draws, so the panel never needs anything but
 /// one — which is also what keeps a script inside an SVG from running.
 fn icon(dir: &Path, path: &str) -> Option<String> {
-    let kind = match Path::new(path).extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        _ => return None,
-    };
+    image_kind(path)?;
     // Both resolved, so a `link:` dependency — a junction, for the bundled
     // plugin — is compared where it actually is.
     let root = dir.canonicalize().ok()?;
@@ -932,12 +937,216 @@ fn icon(dir: &Path, path: &str) -> Option<String> {
         return None;
     }
 
+    data_url(path, &std::fs::read(&file).ok()?)
+}
+
+/// The type an `<img>` is told the picture at `path` is, by its extension;
+/// `None` for anything that is not one of the four it is allowed to be.
+fn image_kind(path: &str) -> Option<&'static str> {
+    Some(
+        match Path::new(path).extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "svg" => "image/svg+xml",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => return None,
+        },
+    )
+}
+
+/// `bytes` as a `data:` URL of the kind `path` names, under the same type and
+/// size rules wherever the bytes came from — a package on disk, or one fetched
+/// before it is installed; see [`refresh_icons`].
+fn data_url(path: &str, bytes: &[u8]) -> Option<String> {
+    let kind = image_kind(path)?;
+    if bytes.len() as u64 > ICON_LIMIT {
+        return None;
+    }
+
     use base64::Engine as _;
-    let bytes = std::fs::read(&file).ok()?;
     Some(format!(
         "data:{kind};base64,{}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
     ))
+}
+
+/// Where the icons [`refresh_icons`] fetched are kept between launches: one
+/// file per package, holding the `data:` URL the panel is handed. In the app's
+/// own data directory rather than `$DSH_HOME`, because nothing but this app
+/// reads them and an uninstall should take them along.
+fn icon_cache(app: &AppHandle) -> Option<PathBuf> {
+    Some(crate::dsh::app_dir(app)?.join("preset-icons"))
+}
+
+/// The cache file for `package`. A scoped name's `/` would be a directory, so
+/// it is spelled out of the way; `@` is legal on every filesystem.
+fn icon_cache_file(cache: &Path, package: &str) -> PathBuf {
+    cache.join(format!("{}.txt", package.replace('/', "__")))
+}
+
+/// The last icon fetched for `package`, if there is one. Checked on the way
+/// back in, so a file that is not what this module wrote is never put into the
+/// page.
+fn cached_icon(app: &AppHandle, package: &str) -> Option<String> {
+    let text = std::fs::read_to_string(icon_cache_file(&icon_cache(app)?, package)).ok()?;
+    let text = text.trim();
+    let ok = ["image/svg+xml", "image/png", "image/jpeg", "image/webp"]
+        .iter()
+        .any(|kind| text.starts_with(&format!("data:{kind};base64,")));
+    ok.then(|| text.to_string())
+}
+
+/// The CDNs that serve one file out of a published npm package by path, in the
+/// order they are tried. A registry only hands out whole tarballs; these three
+/// read the same tarball and answer with the single file. npmmirror's own
+/// equivalent is not here: it only serves packages on a whitelist, and none of
+/// the presets are on it.
+const PACKAGE_CDNS: [&str; 3] = [
+    "https://cdn.jsdelivr.net/npm/",
+    "https://fastly.jsdelivr.net/npm/",
+    "https://unpkg.com/",
+];
+
+/// How long one request to one CDN may take before the next CDN is tried.
+const ICON_PATIENCE: Duration = Duration::from_secs(8);
+
+/// Fetch, out of each preset's published package, the icon its manifest names
+/// — the same picture [`own`] reads once the package is installed — and keep
+/// it in [`icon_cache`] for [`listing`] to draw.
+///
+/// Fetched again every time the panel opens, rather than once: an icon a
+/// plugin changes in a release then reaches the card without this app having
+/// to know, which is the whole point of reading it out of the package instead
+/// of shipping a copy. Only for presets not yet installed and not bundled —
+/// the rest already have their package on the machine to read.
+///
+/// What a failure leaves is the previous cache, so a launch offline draws
+/// yesterday's pictures. A package that no longer names an icon has its cached
+/// one removed. Answers whether any cached icon changed, which is whether the
+/// open panel is worth redrawing.
+///
+/// Blocking: call it on a thread of its own.
+pub fn refresh_icons(app: &AppHandle) -> bool {
+    let Some(cache) = icon_cache(app) else {
+        return false;
+    };
+    let installed = installed_in(&profile_manifest(app));
+    let packages: Vec<String> = presets(app)
+        .into_iter()
+        .filter(|preset| !preset.spec.starts_with(BUNDLED))
+        .filter(|preset| !installed.contains(&preset.package))
+        .map(|preset| preset.package)
+        .collect();
+    if packages.is_empty() {
+        return false;
+    }
+
+    // See `remote::patch::fetch`: reqwest on `rustls-no-provider` panics on
+    // building a client unless a provider is installed. `Err` is "already".
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let Ok(client) = reqwest::Client::builder().timeout(ICON_PATIENCE).build() else {
+        return false;
+    };
+
+    let fetched: Vec<(String, Option<Option<String>>)> = tauri::async_runtime::block_on(async {
+        // All at once: each one is two requests to a CDN that can take
+        // seconds, and the presets have nothing to wait on each other for.
+        let tasks: Vec<_> = packages
+            .into_iter()
+            .map(|package| {
+                let client = client.clone();
+                tauri::async_runtime::spawn(async move {
+                    let icon = fetch_icon(&client, &package).await;
+                    (package, icon)
+                })
+            })
+            .collect();
+        let mut out = Vec::new();
+        for task in tasks {
+            if let Ok(done) = task.await {
+                out.push(done);
+            }
+        }
+        out
+    });
+
+    if std::fs::create_dir_all(&cache).is_err() {
+        return false;
+    }
+    let mut changed = false;
+    for (package, icon) in fetched {
+        let file = icon_cache_file(&cache, &package);
+        match icon {
+            // Unreachable from every CDN: keep what is there.
+            None => {}
+            Some(None) => {
+                if file.exists() && std::fs::remove_file(&file).is_ok() {
+                    changed = true;
+                }
+            }
+            Some(Some(url)) => {
+                let same = std::fs::read_to_string(&file).is_ok_and(|old| old.trim() == url);
+                if !same && std::fs::write(&file, &url).is_ok() {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// One package's icon, from the first CDN that answers.
+///
+/// `None` is no answer from any of them — the network, not the package.
+/// `Some(None)` is an answer: the package names no icon, or one this panel
+/// would not draw.
+async fn fetch_icon(client: &reqwest::Client, package: &str) -> Option<Option<String>> {
+    for cdn in PACKAGE_CDNS {
+        let Some(manifest) = fetch_bytes(client, &format!("{cdn}{package}@latest/package.json")).await
+        else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&manifest) else {
+            continue;
+        };
+        let Some(path) = manifest.get("icon").and_then(serde_json::Value::as_str) else {
+            return Some(None);
+        };
+        // A URL path, not a file: but the same rule as on disk, that the icon
+        // is a file inside the package and nothing the manifest reaches out to.
+        let path = path.trim_start_matches("./");
+        if path.starts_with('/') || path.split(['/', '\\']).any(|part| part == "..") {
+            return Some(None);
+        }
+        if image_kind(path).is_none() {
+            return Some(None);
+        }
+        // Pinned to the version the manifest came from, so a release published
+        // between the two requests cannot pair one version's manifest with
+        // another's picture.
+        let version = manifest
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("latest");
+        let Some(bytes) = fetch_bytes(client, &format!("{cdn}{package}@{version}/{path}")).await
+        else {
+            continue;
+        };
+        return Some(data_url(path, &bytes));
+    }
+    None
+}
+
+/// One GET's body, or `None` for anything but a 2xx with a body under
+/// [`ICON_LIMIT`] — the manifest is held to the same cap, which every real one
+/// is far under.
+async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
+    let answer = client.get(url).send().await.ok()?.error_for_status().ok()?;
+    if answer.content_length().is_some_and(|size| size > ICON_LIMIT) {
+        return None;
+    }
+    let body = answer.bytes().await.ok()?;
+    (body.len() as u64 <= ICON_LIMIT).then(|| body.to_vec())
 }
 
 /// The scope dsh's own in-box bundles are named in.
@@ -4283,6 +4492,21 @@ mod tests {
         assert_eq!(super::icon(&dir, "icon.js"), None);
         assert_eq!(super::icon(&dir, "big.png"), None);
         assert_eq!(super::icon(&dir, "missing.svg"), None);
+    }
+
+    /// A fetched icon is held to the same rules as one read off the disk: one
+    /// of the four picture types, and no bigger than the limit.
+    #[test]
+    fn a_fetched_icon_is_held_to_the_same_rules() {
+        assert_eq!(
+            super::data_url("assets/logo.svg", b"<svg/>").as_deref(),
+            Some("data:image/svg+xml;base64,PHN2Zy8+")
+        );
+        assert_eq!(super::data_url("icon.js", b"alert(1)"), None);
+        assert_eq!(
+            super::data_url("big.png", &vec![0u8; super::ICON_LIMIT as usize + 1]),
+            None
+        );
     }
 
     /// A directory of this test's own, gone again when it ends. Built on disk,
