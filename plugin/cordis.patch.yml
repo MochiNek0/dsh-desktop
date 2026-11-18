@@ -44,10 +44,15 @@
 #
 # That is accepted rather than overlooked. The in-app browser works everywhere
 # and the native one works in one place, and a picker that opens on the wrong
-# machine is a dead end with no error message. If it ever needs to be
-# conditional, the seam it would go through is `dsh web --patch`: the desktop
-# knows at launch whether remote access is on, and could apply this overlay
-# only then, at the price of restarting dsh when the user toggles it.
+# machine is a dead end with no error message.
+#
+# The desktop window gets the system dialog back one layer up, in the client.
+# The three directory-flow holes are `single` slots, where the lowest priority
+# renders, so `lib/client.js` registers an occupant of its own there at a
+# negative priority — in the desktop window only, the one document the shell
+# injects `__DSH_NATIVE_PICKER__` into — that asks the shell for its own folder
+# dialog (`pick-folder`; see the shell's `folder::pick`). The browse occupant
+# stays registered behind it, and is the only one a phone ever sees.
 #
 # The two packages below are resolved by name out of the profile's hoisted
 # `node_modules` (`nodeLinker: hoisted`), where `dsh-web-app` already puts

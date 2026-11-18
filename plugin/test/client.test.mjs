@@ -15,7 +15,7 @@ const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'
 // `status` and `recent` are kept apart from everything else the plugin sends:
 // they go out on every change to the counts and the workspace list, and most
 // checks here count the events they are about.
-function load({ host }) {
+function load({ host, picker = false, require = null }) {
   const sent = [];
   const statuses = [];
   const recents = [];
@@ -33,11 +33,12 @@ function load({ host }) {
     },
   };
   if (host) window.__DSH_VERSION__ = '0.1.13';
+  if (picker) window.__DSH_NATIVE_PICKER__ = true;
   const context = vm.createContext({ window, setTimeout, console });
   vm.runInContext(source, context);
   assert.ok(registered, 'the bundle should register a factory');
   assert.equal(registered.id, 'dsh-desktop-signal');
-  const exports = registered.factory(() => { throw new Error('should require nothing'); });
+  const exports = registered.factory(require || (() => { throw new Error('should require nothing'); }));
   return { exports, sent, statuses, recents, sessionLists, window };
 }
 
@@ -1005,6 +1006,118 @@ const asked = (options) => [{ id: 'q1', question: 'Which?', options }];
   assert.deepEqual(queryAll(sessionLists.at(-1), 'sid'), ['a1', 'a2', 'a3']);
   assert.deepEqual(queryAll(sessionLists.at(-1), 'smod'), ['pro', 'pro', '']);
   console.log('ok  reports the model each listed session runs on');
+}
+
+// --- the system's folder picker, in front of dsh's in-app one ---
+{
+  // Just enough of React for a renderless occupant: refs that persist across
+  // calls of one instance, and effects run when their deps change.
+  function fakeReact() {
+    let slots = [];
+    let index = 0;
+    const effects = [];
+    const react = {
+      useRef: (value) => {
+        const i = index++;
+        if (!slots[i]) slots[i] = { current: value };
+        return slots[i];
+      },
+      useEffect: (fn, deps) => {
+        const i = index++;
+        const prev = slots[i];
+        if (!prev || !deps || deps.some((d, k) => d !== prev.deps[k])) {
+          slots[i] = { deps };
+          effects.push(fn);
+        }
+      },
+    };
+    return {
+      react,
+      render(component, props) {
+        index = 0;
+        component(props);
+        effects.splice(0).forEach((fn) => fn());
+      },
+    };
+  }
+
+  const fake = fakeReact();
+  const { exports, sent, window } = load({
+    host: true,
+    picker: true,
+    require: (name) => { assert.equal(name, 'react'); return fake.react; },
+  });
+  const s = services();
+  const registered = [];
+  s.ctx.slots = {
+    inject: (hole, callback) => callback(),
+    register: (options, component) => { registered.push({ options, component }); return () => {}; },
+  };
+  exports.apply(s.ctx);
+
+  assert.deepEqual(registered.map((r) => r.options.name).sort(), [
+    'conversation.hero.workspace.directoryFlow',
+    'sidebar.workspaces.directoryFlow',
+    'workspace.picker.directoryFlow',
+  ]);
+  assert.ok(registered.every((r) => r.options.priority < 0), 'ahead of the in-app browser at 0');
+
+  const outcomes = [];
+  const props = (open) => ({
+    open,
+    busy: false,
+    onPicked: (path) => outcomes.push(['picked', path]),
+    onCancel: () => outcomes.push(['cancel']),
+    onError: (message) => outcomes.push(['error', message]),
+    ...registered[0].options.inject(),
+  });
+  const flow = registered[0].component;
+
+  // Opened: one request to the shell, however often it renders.
+  fake.render(flow, props(true));
+  fake.render(flow, props(true));
+  await drain();
+  const asks = sent.map(query).filter((q) => q.event === 'pick-folder');
+  assert.equal(asks.length, 1);
+
+  // A stray answer settles nothing; the real one picks.
+  window.__dshSignals.picked('nope', 'C:/x');
+  window.__dshSignals.picked(asks[0].key, 'D:/work');
+  await drain();
+  assert.deepEqual(outcomes, [['picked', 'D:/work']]);
+
+  // Closed and opened again: a second request, and a dismissal cancels.
+  fake.render(flow, props(false));
+  fake.render(flow, props(true));
+  await drain();
+  const second = sent.map(query).filter((q) => q.event === 'pick-folder');
+  assert.equal(second.length, 2);
+  window.__dshSignals.picked(second[1].key, null);
+  await drain();
+  assert.deepEqual(outcomes.at(-1), ['cancel']);
+
+  // A request still out when the door comes down is answered, not left open.
+  fake.render(flow, props(false));
+  fake.render(flow, props(true));
+  await drain();
+  s.stop();
+  await drain();
+  assert.deepEqual(outcomes.at(-1), ['cancel']);
+  console.log('ok  puts the system folder picker in front of the in-app one');
+}
+
+// --- a shell that cannot answer a pick: the in-app browser stays ---
+{
+  const { exports } = load({ host: true });
+  const s = services();
+  const registered = [];
+  s.ctx.slots = {
+    inject: (hole, callback) => callback(),
+    register: (options) => { registered.push(options); return () => {}; },
+  };
+  exports.apply(s.ctx);
+  assert.deepEqual(registered, []);
+  console.log('ok  leaves the in-app picker alone for a shell without one');
 }
 
 // --- no desktop shell: no door either ---

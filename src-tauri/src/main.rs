@@ -390,6 +390,11 @@ fn build_window(
             "window.__DSH_VERSION__ = {:?};",
             env!("CARGO_PKG_VERSION")
         ))
+        // That this shell answers `pick-folder`, so the signal plugin may put
+        // the system's folder picker in front of dsh's in-app one. Its own
+        // flag rather than the version above: a plugin newer than the shell
+        // would otherwise open a flow nothing ever answers. See `folder::pick`.
+        .initialization_script("window.__DSH_NATIVE_PICKER__ = true;")
         // Watches dsh's own boot for the one failure this app cannot see any
         // other way: the server serving a page whose plugins did not load. See
         // `plugins::stall_watch`.
