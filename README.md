@@ -13,7 +13,7 @@ DeepSeek Harness (`dsh web`) 的轻量桌面客户端，支持用手机远程连
 ![QQ 群](https://img.shields.io/badge/QQ群-1125671315-12B7F5?logo=tencentqq&logoColor=white)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/MochiNek0/badge.svg)](https://hub.xerj.org/contributors/MochiNek0)
 
 <br/>
@@ -57,7 +57,9 @@ DeepSeek Harness (`dsh web`) 的轻量桌面客户端，支持用手机远程连
 
 - **Node 版本**：`dsh` 需要 Node.js 22.19.0 或更高。安装包不内置 Node 与 `dsh`，首次启动缺失时需联网拉取。
 - **关闭即最小化**：关窗口只收进托盘以免中断任务，退出请用菜单里的「退出 dsh」。
-- **自动更新**：启动时静默检查，有更新才提示，下载前先征求同意。
+- **自动更新**：启动时静默检查，有更新才提示，下载前先征求同意。更新包带 minisign 签名，校验不过不会安装。
+- **校验安装包**：每个 Release 都附带 `SHA256SUMS.txt`，手动下载的安装包可以拿它核对。只从 [Releases](https://github.com/MochiNek0/dsh-desktop/releases) 或官网下载；npm 上的同名包 `dsh-desktop` 与本项目无关。
+- **安全**：手机连接的安全模型与漏洞报告方式见 [SECURITY.md](SECURITY.md)，安全问题请勿发公开 Issue。
 - **macOS 首次运行被拦截**：在访达中右键点按应用选择「打开」，或执行 `xattr -dr com.apple.quarantine /Applications/dsh-desktop.app`。
 - **安装 `github:` 形式的插件**：pnpm 默认拦截 git 来源的构建脚本，如报错请按面板提示在 `$DSH_HOME/profiles/web/pnpm-workspace.yaml` 的 `allowBuilds` 中放行。
 
@@ -92,8 +94,6 @@ npm run build   # 构建发布包，输出至 src-tauri/target/release/bundle/
 
 ## 许可证
 
-本项目采用 [GNU AGPL-3.0](LICENSE)。Copyright © 2026 MochiNek0。
+本项目采用 [MIT](LICENSE)。Copyright © 2026 MochiNek0。
 
-本项目此前采用 MIT，自本次变更后的版本起改为 AGPL-3.0。原因是加入手机远程连接之后，这个应用能把一台有完整终端执行权的机器接到网络上，将来还会有中继。AGPL 的用意是，任何人基于它改出来的版本——包括作为网络服务提供给别人的那种——也必须把源码交出来。**v0.1.19 及更早的已发布版本仍然是 MIT**，那份授权不可撤销。
-
-`plugin/`（dsh 插件 `dsh-desktop-signal`）单独保留 [MIT](plugin/LICENSE)。它会装进你自己的 dsh profile，和一堆与本项目无关的包躺在同一个 `node_modules` 里，不该把 copyleft 传染给那边。
+v0.1.20 到 v0.1.33 曾以 GNU AGPL-3.0 发布，从 v0.1.34 起改回 MIT。所有提交都出自同一位作者，所以这次改协议不需要征得其他人同意。随包插件 `plugin/`（`dsh-desktop-signal`）一直是 MIT，见 [plugin/LICENSE](plugin/LICENSE)。

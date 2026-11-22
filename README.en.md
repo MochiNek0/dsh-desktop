@@ -12,7 +12,7 @@ A lightweight desktop client for DeepSeek Harness (`dsh web`), with phone access
 [![Release](https://img.shields.io/github/v/release/MochiNek0/dsh-desktop?color=blue)](https://github.com/MochiNek0/dsh-desktop/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/MochiNek0/badge.svg)](https://hub.xerj.org/contributors/MochiNek0)
 
 <br/>
@@ -56,7 +56,9 @@ Download the package for your system from the **[website](https://dsh-desktop.cc
 
 - **Node version**: `dsh` needs Node.js 22.19.0 or newer. Neither Node nor `dsh` is bundled, so the first launch needs a connection if they are missing.
 - **Closing parks in the tray**: closing the window keeps an in-flight task alive. Use **Quit dsh** in the menu to exit for real.
-- **Auto update**: checked silently on launch, raised only when there is one, downloaded only with your consent.
+- **Auto update**: checked silently on launch, raised only when there is one, downloaded only with your consent. Update bundles are minisign-signed and refused if the signature does not verify.
+- **Verifying a download**: every release ships a `SHA256SUMS.txt` to check a hand-downloaded installer against. Download only from [Releases](https://github.com/MochiNek0/dsh-desktop/releases) or the website; the npm package named `dsh-desktop` is not this project.
+- **Security**: see [SECURITY.md](SECURITY.md) for the phone-connection security model and how to report a vulnerability privately. Please do not file security issues in public.
 - **Blocked by Gatekeeper on macOS**: right-click the app in Finder and choose "Open", or run `xattr -dr com.apple.quarantine /Applications/dsh-desktop.app`.
 - **Installing `github:` plugins**: pnpm blocks build scripts from git sources by default. If it fails, allow the package under `allowBuilds` in `$DSH_HOME/profiles/web/pnpm-workspace.yaml` as the panel describes.
 
@@ -86,16 +88,6 @@ npm run build   # production bundle, written to src-tauri/target/release/bundle/
 
 ## License
 
-[GNU AGPL-3.0](LICENSE). Copyright © 2026 MochiNek0.
+[MIT](LICENSE). Copyright © 2026 MochiNek0.
 
-This project was MIT; every release after this change is AGPL-3.0. With the
-mobile connection in it this app puts a machine that holds a full terminal
-session onto a network, and a relay is coming after that. The AGPL is here so
-that anything built on it — including anything offered to other people as a
-network service — has to hand its source back. **v0.1.19 and every release
-before it remain MIT**, and that grant cannot be withdrawn.
-
-`plugin/` — the dsh plugin `dsh-desktop-signal` — stays [MIT](plugin/LICENSE).
-It installs into your own dsh profile and sits in a `node_modules` beside
-packages that have nothing to do with this project, which is no place to put a
-copyleft.
+v0.1.20 through v0.1.33 were released under the GNU AGPL-3.0; from v0.1.34 the project is MIT again. Every commit has a single author, so no one else's consent was needed for the change. The bundled plugin in `plugin/` (`dsh-desktop-signal`) has always been MIT; see [plugin/LICENSE](plugin/LICENSE).

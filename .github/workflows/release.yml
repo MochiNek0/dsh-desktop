@@ -408,6 +408,29 @@ jobs:
             exit 1
           fi
 
+      # One file a person can check a hand-downloaded installer against. The
+      # updater has its own minisign signatures and does not read this; it is
+      # for whoever got the bundle from the release page or the site, and for
+      # directories that look for checksums beside a release. Built from the
+      # assets as they sit on the release, after the feed check above, so it
+      # names exactly the bytes a download returns — and replaced, not
+      # appended to, when a bundle job is re-run and this one with it.
+      - name: attach SHA256SUMS.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir sums && cd sums
+          for id in $(jq -r '.[] | select(.name != "SHA256SUMS.txt" and (.name | endswith(".sig") | not) and .name != "latest.json") | .id' ../assets.json); do
+            name=$(jq -r ".[] | select(.id == $id) | .name" ../assets.json)
+            gh api -H 'Accept: application/octet-stream' "repos/$REPO/releases/assets/$id" > "$name"
+          done
+          sha256sum -- * | sort -k2 > ../SHA256SUMS.txt
+          cd ..
+          cat SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt --clobber --repo "$REPO"
+
       # Reached only with the tests and the feed both green. A stable release
       # stays a draft for a person to publish; a beta goes out now, as the
       # prerelease it was created as. See the note at the top.
