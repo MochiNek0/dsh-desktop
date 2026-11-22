@@ -1,0 +1,77 @@
+# Copy a release's notes into the `notes` of its `latest.json`.
+#
+# The updater shows `notes` under "Version X is available" (see `offer` in
+# src-tauri/src/update.rs), and release.yml cannot fill it in: the feed is
+# written by the bundle jobs, and a stable release's notes are written by a
+# person afterwards, while it sits as a draft. So every feed went out with
+# `"notes": ""` and the dialog said nothing about what was in the update.
+#
+# This runs when the release is published, and again whenever its notes are
+# edited afterwards, so the feed follows the release page instead of being a
+# second copy someone has to remember. Drafts raise neither event, which is
+# what we want: the feed of a draft is read by nobody.
+#
+# The dialog is plain text, so Markdown backticks are dropped rather than
+# shown. Only `notes` is touched — the platforms, URLs and signatures are
+# compared before and after, and the run fails instead of uploading if
+# anything else would change. `latest.json` itself is not signed (the bundles
+# it names are), so rewriting it does not affect what the updater verifies.
+#
+# The upload is made with GITHUB_TOKEN, and events raised by that token start
+# no workflow, so replacing the asset cannot set this off again.
+name: feed notes
+
+on:
+  release:
+    types: [published, edited]
+  # For an older release, or to re-run after a failure.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag, e.g. v0.1.34
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feed-notes-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.event.release.draft != true
+    runs-on: ubuntu-latest
+    steps:
+      - name: write the release notes into latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh api "repos/$REPO/releases/tags/$TAG" > release.json
+          feed=$(jq -r '.assets[] | select(.name == "latest.json") | .id' release.json)
+          if [ -z "$feed" ]; then
+            echo "$TAG has no latest.json; nothing to do"
+            exit 0
+          fi
+          gh api -H 'Accept: application/octet-stream' "repos/$REPO/releases/assets/$feed" > latest.json
+
+          # CRLF from the web editor, backticks the dialog would print as-is,
+          # and blank lines at either end.
+          jq -r '.body // ""' release.json | tr -d '\r`' > notes.txt
+          jq --rawfile notes notes.txt \
+            '.notes = ($notes | sub("^\\s+"; "") | sub("\\s+$"; ""))' latest.json > new.json
+
+          if ! diff <(jq -S 'del(.notes)' latest.json) <(jq -S 'del(.notes)' new.json); then
+            echo "rewriting notes would change more than notes; refusing"
+            exit 1
+          fi
+          if [ "$(jq -r .notes latest.json)" = "$(jq -r .notes new.json)" ]; then
+            echo "notes already match the release; nothing to upload"
+            exit 0
+          fi
+
+          jq -r .notes new.json
+          mv new.json latest.json
+          gh release upload "$TAG" latest.json --clobber --repo "$REPO"
