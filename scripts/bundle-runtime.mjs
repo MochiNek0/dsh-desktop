@@ -67,10 +67,11 @@ console.log('[bundle] staged install-deps.ps1 and install-deps.sh');
 // hand-written JavaScript with no build step — that is the point of it.
 //
 // `LICENSE` is in that list and is the plugin's own, not the repository's:
-// the app is AGPL-3.0 and this directory stays MIT, because it installs into
-// the user's own dsh profile and sits in their `node_modules` beside packages
-// that are nothing to do with us. A copy that travelled without its licence
-// would be an MIT package nobody could tell was one.
+// the plugin installs into the user's own dsh profile and sits in their
+// `node_modules` beside packages that are nothing to do with us, so it carries
+// its own copy rather than pointing back at this repository. A copy that
+// travelled without its licence would be an MIT package nobody could tell was
+// one.
 //
 // Cleared first, so a file deleted from `plugin/` does not live on in an
 // installer built afterwards.
